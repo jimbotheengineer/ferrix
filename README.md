@@ -239,6 +239,41 @@ Click or arrow to a cell and type. `F2` edits in place, `Esc` cancels, `Enter`
 commits and moves down, `Tab` commits and moves right. `Delete` clears.
 `Ctrl+Z` / `Ctrl+Y` undo and redo. Formula cells are marked with a small dot.
 
+### Undo history
+
+Undo history is **bounded at 500 entries**. A long session would otherwise grow
+it without limit; when the cap is reached the *oldest* entry is dropped. The
+edits themselves are never lost by this — only the ability to step back past
+them.
+
+Rapid edits to the **same cell** collapse into **one** undo entry. The rule is
+deliberately narrow, because unpredictable undo is worse than verbose undo:
+
+- same cell, **and**
+- within **1 second** of the previous edit, **and**
+- neither edit is a bulk operation.
+
+Moving the cursor off the cell, undoing, redoing, or saving all end the run, so
+the next edit starts a fresh entry. Bulk operations — paste, range clear, fill —
+are each exactly one undo step and are never merged into a neighbouring edit.
+
+**Undo history is cleared on save.** It is not persisted alongside the
+`.fxedits` sidecar. The sidecar stores the overlay, a snapshot, not a timeline;
+undoing past a save would leave the screen and the file on disk disagreeing
+about what the document is. Clearing is the honest option, and it is not done
+silently — the status bar reports it:
+
+```
+Saved 12 edits (431 bytes) to sales.ferrix.fxedits in 0.9 ms · undo history cleared (7 steps)
+```
+
+### Closing with unsaved changes
+
+Closing the window while edits are unsaved is intercepted: the close is
+cancelled and a modal offers **Save and close**, **Discard and close**, or
+**Cancel**. If the save fails, the window stays open with the error in the
+status bar rather than closing over the top of unsaved work.
+
 Formulas: `SUM` `AVERAGE` `COUNT` `MIN` `MAX` `IF` `AND` `OR` `NOT` `ABS`
 `SQRT` `ROUND` `FLOOR` `CEILING` `INT` `LN` `LOG10` `EXP`, operators
 `+ - * / ^ & % = <> < > <= >=`, parentheses, ranges, and absolute refs.

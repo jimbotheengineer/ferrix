@@ -24,7 +24,23 @@ pub struct UndoEntry {
     /// Formula cells whose cached values changed as a side effect, so undo
     /// restores the whole visible state rather than leaving stale results.
     side_effects: Vec<(CellRef, Value)>,
+    /// True for bulk operations (paste, range clear, fill). Bulk entries are
+    /// never coalesced into or out of: collapsing a paste into a neighbouring
+    /// keystroke would make undo unpredictable.
+    bulk: bool,
 }
+
+/// Default cap on the undo stack. A long session would otherwise grow it
+/// without limit; 500 steps is far more than anyone reaches by hand and keeps
+/// the memory cost bounded and predictable.
+pub const DEFAULT_UNDO_LIMIT: usize = 500;
+
+/// How long after an edit a further edit to the SAME cell folds into it.
+///
+/// Typing a value, immediately retyping it, and correcting it again is one
+/// logical edit to a user; it should be one undo step. Anything slower than
+/// this — or to a different cell — stays its own step.
+pub const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
 #[derive(Debug)]
 struct CellChange {
@@ -48,6 +64,14 @@ pub struct Workbook {
     pub graph: DepGraph,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
+    /// Maximum number of undo entries kept. When exceeded, the OLDEST entry is
+    /// dropped — recent history is what users actually reach for.
+    undo_limit: usize,
+    /// The cell and wall-clock time of the last single-cell edit, used to
+    /// decide whether the next edit folds into it. Cleared by anything that
+    /// breaks the "same continuous edit" story: a bulk op, an undo, a redo, a
+    /// save, or an edit to a different cell.
+    last_edit: Option<(CellRef, std::time::Instant)>,
     /// Edits made since the last save. Drives the dirty indicator and the
     /// close prompt; without it a user can lose work by closing the window.
     dirty: bool,
@@ -61,8 +85,54 @@ impl Workbook {
             graph: DepGraph::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_limit: DEFAULT_UNDO_LIMIT,
+            last_edit: None,
             dirty: false,
         }
+    }
+
+    /// Override the undo depth cap. Mainly for tests and future configuration;
+    /// a limit of 0 disables undo entirely.
+    pub fn set_undo_limit(&mut self, limit: usize) {
+        self.undo_limit = limit;
+        self.enforce_undo_limit();
+    }
+
+    #[inline]
+    pub fn undo_limit(&self) -> usize {
+        self.undo_limit
+    }
+
+    /// End the current coalescing run without touching history.
+    ///
+    /// The next edit — even to the same cell, even immediately — starts a new
+    /// undo entry. The UI calls this when the user leaves the cell, so moving
+    /// away and coming back is two undo steps rather than one.
+    #[inline]
+    pub fn end_edit_run(&mut self) {
+        self.last_edit = None;
+    }
+
+    /// Drop history from the bottom until the stack fits the cap.
+    fn enforce_undo_limit(&mut self) {
+        if self.undo.len() > self.undo_limit {
+            let excess = self.undo.len() - self.undo_limit;
+            self.undo.drain(0..excess);
+        }
+    }
+
+    /// Discard undo and redo history, returning how many undo steps were lost.
+    ///
+    /// Called on save: history is deliberately NOT persisted (see README), and
+    /// undoing past a save would leave the file on disk and the screen telling
+    /// different stories. The caller is expected to say so in the UI rather
+    /// than dropping it silently.
+    pub fn clear_history(&mut self) -> usize {
+        let lost = self.undo.len();
+        self.undo.clear();
+        self.redo.clear();
+        self.last_edit = None;
+        lost
     }
 
     /// Adopt edits loaded from a sidecar. Marks the workbook clean, since what
@@ -81,6 +151,19 @@ impl Workbook {
     #[inline]
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+    }
+
+    /// Mark the workbook saved AND drop undo/redo history, returning how many
+    /// undo steps were discarded so the UI can report it.
+    ///
+    /// This is the documented save behaviour (README, "Editing"): history is
+    /// cleared on save rather than persisted. It is the honest option — the
+    /// sidecar stores the overlay, not a timeline, so undo cannot meaningfully
+    /// cross a save — and it is surfaced in the status bar rather than dropped
+    /// in silence.
+    pub fn save_committed(&mut self) -> usize {
+        self.dirty = false;
+        self.clear_history()
     }
 
     #[inline]
@@ -271,15 +354,49 @@ impl Workbook {
         }
 
         let after = self.overlay.get(cell).cloned();
-        self.push_undo(UndoEntry {
-            cell,
-            changes: vec![CellChange {
+        let now = std::time::Instant::now();
+
+        // Coalesce: if the previous undo entry is a single-cell edit to THIS
+        // same cell, made within COALESCE_WINDOW, fold this edit into it so one
+        // logical edit is one undo step. Keep the older `before` (undo must
+        // rewind to the state before the burst started) and adopt the new
+        // `after`.
+        let coalesce = match (self.last_edit, self.undo.last()) {
+            (Some((last_cell, at)), Some(top)) => {
+                last_cell == cell
+                    && !top.bulk
+                    && top.changes.len() == 1
+                    && top.changes[0].cell == cell
+                    && now.duration_since(at) < COALESCE_WINDOW
+            }
+            _ => false,
+        };
+
+        if coalesce {
+            let top = self.undo.last_mut().expect("checked above");
+            top.changes[0].after = after;
+            // Merge side effects, keeping the FIRST recorded prior value for
+            // each dependent — that is the one that predates the burst.
+            for (dep, prev) in side_effects {
+                if !top.side_effects.iter().any(|(d, _)| *d == dep) {
+                    top.side_effects.push((dep, prev));
+                }
+            }
+            // A fresh edit still invalidates the redo branch.
+            self.redo.clear();
+        } else {
+            self.push_undo(UndoEntry {
                 cell,
-                before,
-                after,
-            }],
-            side_effects,
-        });
+                changes: vec![CellChange {
+                    cell,
+                    before,
+                    after,
+                }],
+                side_effects,
+                bulk: false,
+            });
+        }
+        self.last_edit = Some((cell, now));
 
         report.micros = start.elapsed().as_micros();
         report
@@ -287,10 +404,17 @@ impl Workbook {
 
     /// Record an undoable action. A new action always invalidates the redo
     /// branch — redoing after an edit would replay a history that no longer
-    /// exists.
+    /// exists. The stack is capped at `undo_limit`, dropping the oldest entry
+    /// first.
     fn push_undo(&mut self, entry: UndoEntry) {
+        // Anything pushed through here that is not the coalescing single-cell
+        // path ends a coalescing run.
+        if entry.bulk {
+            self.last_edit = None;
+        }
         self.undo.push(entry);
         self.redo.clear();
+        self.enforce_undo_limit();
     }
 
     /// Evaluate a single formula cell and store its result.
@@ -333,6 +457,9 @@ impl Workbook {
     pub fn undo(&mut self) -> Option<CellRef> {
         let entry = self.undo.pop()?;
         self.dirty = true;
+        // An undo ends any coalescing run: the next keystroke must not fold
+        // into an entry the user has just stepped away from.
+        self.last_edit = None;
         // Reverse order so overlapping writes unwind exactly as they were made.
         for ch in entry.changes.iter().rev() {
             self.overlay.restore(ch.cell, ch.before.clone());
@@ -350,6 +477,7 @@ impl Workbook {
     pub fn redo(&mut self) -> Option<CellRef> {
         let entry = self.redo.pop()?;
         self.dirty = true;
+        self.last_edit = None;
         for ch in &entry.changes {
             self.overlay.restore(ch.cell, ch.after.clone());
             self.resync_graph(ch.cell);
@@ -426,6 +554,7 @@ impl Workbook {
             cell: sel.bounds().0,
             changes,
             side_effects: Vec::new(),
+            bulk: true,
         });
         self.recalc_all();
         Ok(n)
@@ -476,6 +605,7 @@ impl Workbook {
             cell: origin,
             changes,
             side_effects: Vec::new(),
+            bulk: true,
         });
         self.recalc_all();
         Ok(n)
@@ -663,6 +793,7 @@ impl Workbook {
             cell: tgt_tl,
             changes,
             side_effects: Vec::new(),
+            bulk: true,
         });
         self.recalc_all();
         Ok((n, kind))
@@ -850,8 +981,13 @@ mod tests {
     fn multi_level_undo() {
         let mut w = wb();
         let c = CellRef::new(0, 1);
+        // `end_edit_run` between each keeps these three distinct logical
+        // edits rather than one coalesced burst — this test is about undo
+        // depth, not coalescing (which has its own tests below).
         w.commit_edit(c, "1");
+        w.end_edit_run();
         w.commit_edit(c, "2");
+        w.end_edit_run();
         w.commit_edit(c, "3");
         assert_eq!(val(&w, 0, 1), Value::Number(3.0));
         w.undo();
@@ -1176,5 +1312,191 @@ mod tests {
             .unwrap();
         assert_eq!(kind, FillKind::Copy);
         assert_eq!(w.view().display(CellRef::new(2, 1)), "north");
+    }
+
+    // --- bounded history, coalescing, and save behaviour (issue #2) ---
+
+    #[test]
+    fn undo_stack_is_bounded_and_drops_the_oldest() {
+        let mut w = wb();
+        w.set_undo_limit(5);
+        // 20 edits to 20 different cells, each its own undo entry.
+        for r in 0..20u32 {
+            w.commit_edit(CellRef::new(r, 1), &format!("{r}"));
+        }
+        assert_eq!(w.undo_depth(), 5, "stack must be capped at the limit");
+
+        // The five surviving entries are the NEWEST ones: rows 15..19.
+        for r in (15..20u32).rev() {
+            assert_eq!(val(&w, r, 1), Value::Number(r as f64));
+            w.undo();
+            assert_eq!(val(&w, r, 1), Value::Empty, "row {r} was undoable");
+        }
+        assert!(!w.can_undo(), "nothing older than the cap survived");
+        // The dropped edits are still applied — capping loses the ability to
+        // undo them, not the edits themselves.
+        assert_eq!(val(&w, 0, 1), Value::Number(0.0));
+    }
+
+    #[test]
+    fn default_undo_limit_is_five_hundred() {
+        let w = wb();
+        assert_eq!(w.undo_limit(), DEFAULT_UNDO_LIMIT);
+        assert_eq!(DEFAULT_UNDO_LIMIT, 500);
+    }
+
+    #[test]
+    fn lowering_the_limit_trims_existing_history() {
+        let mut w = wb();
+        for r in 0..10u32 {
+            w.commit_edit(CellRef::new(r, 1), "1");
+        }
+        assert_eq!(w.undo_depth(), 10);
+        w.set_undo_limit(3);
+        assert_eq!(w.undo_depth(), 3);
+    }
+
+    #[test]
+    fn rapid_edits_to_one_cell_collapse_to_one_undo_step() {
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        let before = w.undo_depth();
+        // Three edits in immediate succession — well inside COALESCE_WINDOW.
+        w.commit_edit(c, "1");
+        w.commit_edit(c, "12");
+        w.commit_edit(c, "123");
+        assert_eq!(
+            w.undo_depth(),
+            before + 1,
+            "a typing burst on one cell is one undo step"
+        );
+        assert_eq!(val(&w, 0, 1), Value::Number(123.0));
+        // One undo rewinds the whole burst, back to before it started.
+        w.undo();
+        assert_eq!(val(&w, 0, 1), Value::Empty);
+        // And redo replays it as one step too.
+        w.redo();
+        assert_eq!(val(&w, 0, 1), Value::Number(123.0));
+    }
+
+    #[test]
+    fn rapid_edits_to_different_cells_do_not_coalesce() {
+        let mut w = wb();
+        let before = w.undo_depth();
+        w.commit_edit(CellRef::new(0, 1), "1");
+        w.commit_edit(CellRef::new(0, 2), "2");
+        w.commit_edit(CellRef::new(0, 3), "3");
+        assert_eq!(
+            w.undo_depth(),
+            before + 3,
+            "coalescing must never cross cells"
+        );
+    }
+
+    #[test]
+    fn edits_separated_by_the_window_do_not_coalesce() {
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        w.commit_edit(c, "1");
+        std::thread::sleep(COALESCE_WINDOW + std::time::Duration::from_millis(50));
+        w.commit_edit(c, "2");
+        assert_eq!(w.undo_depth(), 2, "a pause ends the coalescing run");
+    }
+
+    #[test]
+    fn leaving_the_cell_ends_the_coalescing_run() {
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        w.commit_edit(c, "1");
+        w.end_edit_run();
+        w.commit_edit(c, "2");
+        assert_eq!(w.undo_depth(), 2);
+    }
+
+    #[test]
+    fn a_bulk_op_is_never_coalesced_into() {
+        // A paste immediately after typing must stay its own undo step, and a
+        // subsequent keystroke must not fold into the paste.
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        w.commit_edit(c, "1");
+        w.paste_block(c, &[vec!["9".into(), "8".into()]], 1_000_000)
+            .unwrap();
+        assert_eq!(w.undo_depth(), 2, "paste is its own step");
+        w.commit_edit(c, "5");
+        assert_eq!(w.undo_depth(), 3, "a keystroke never folds into a paste");
+    }
+
+    #[test]
+    fn coalesced_burst_still_restores_dependent_formulas() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "=A1*2"); // B1 = 2
+        w.end_edit_run();
+        let a1 = CellRef::new(0, 0);
+        w.commit_edit(a1, "50"); // B1 -> 100
+        w.commit_edit(a1, "60"); // coalesces; B1 -> 120
+        assert_eq!(val(&w, 0, 1), Value::Number(120.0));
+        w.undo();
+        assert_eq!(val(&w, 0, 0), Value::Number(1.0));
+        assert_eq!(
+            val(&w, 0, 1),
+            Value::Number(2.0),
+            "undo must restore the value from before the burst, not mid-burst"
+        );
+    }
+
+    #[test]
+    fn undo_ends_the_coalescing_run() {
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        w.commit_edit(c, "1");
+        w.undo();
+        w.commit_edit(c, "2");
+        assert_eq!(w.undo_depth(), 1);
+        assert!(!w.can_redo(), "a fresh edit still invalidates redo");
+    }
+
+    #[test]
+    fn saving_clears_undo_history() {
+        // DOCUMENTED BEHAVIOUR (README, "Editing"): undo history does not
+        // survive a save. The sidecar stores the overlay, not a timeline, so
+        // undoing past a save would desync the screen from the file. The
+        // count returned lets the UI say so out loud.
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "1");
+        w.end_edit_run();
+        w.commit_edit(CellRef::new(0, 2), "2");
+        w.undo();
+        assert!(w.can_undo() && w.can_redo());
+
+        let lost = w.save_committed();
+        assert_eq!(lost, 1, "reports how many undo steps were discarded");
+        assert!(!w.is_dirty(), "save_committed marks the workbook clean");
+        assert!(!w.can_undo(), "undo history is cleared on save");
+        assert!(!w.can_redo(), "redo history is cleared on save");
+        assert_eq!(w.undo_depth(), 0);
+
+        // The edits themselves survive — only the history is gone.
+        assert_eq!(val(&w, 0, 1), Value::Number(1.0));
+
+        // And editing after a save starts a fresh history.
+        w.commit_edit(CellRef::new(0, 3), "3");
+        assert_eq!(w.undo_depth(), 1);
+    }
+
+    #[test]
+    fn save_does_not_coalesce_across_the_boundary() {
+        let mut w = wb();
+        let c = CellRef::new(0, 1);
+        w.commit_edit(c, "1");
+        w.save_committed();
+        w.commit_edit(c, "2");
+        assert_eq!(w.undo_depth(), 1, "post-save edit starts a new entry");
+        w.undo();
+        assert_eq!(
+            val(&w, 0, 1),
+            Value::Number(1.0),
+            "undo rewinds to the saved state, not past it"
+        );
     }
 }

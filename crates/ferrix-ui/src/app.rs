@@ -99,6 +99,14 @@ pub struct FerrixApp {
     last_painted: usize,
     /// Height of the grid body last frame, used for page-up/down sizing.
     last_viewport_h: f32,
+
+    /// True while the unsaved-changes confirmation is on screen. Closing the
+    /// window with a dirty workbook is the last silent data-loss path in the
+    /// app, so the close request is intercepted and the user gets a choice.
+    close_prompt: bool,
+    /// Set once the user has resolved the prompt, so the follow-up close
+    /// request is allowed straight through rather than re-prompting forever.
+    allow_close: bool,
 }
 
 impl FerrixApp {
@@ -135,6 +143,8 @@ impl FerrixApp {
             frame_ms: 0.0,
             last_painted: 0,
             last_viewport_h: 600.0,
+            close_prompt: false,
+            allow_close: false,
         };
         if let Some(p) = initial {
             app.start_load(p);
@@ -279,6 +289,11 @@ impl FerrixApp {
         let r = (self.selection.cursor.row as i64 + drow).clamp(0, max_row.max(0));
         let c = (self.selection.cursor.col as i64 + dcol).clamp(0, max_col.max(0));
         let target = CellRef::new(r as u32, c as u32);
+        if target != self.selection.cursor {
+            // Moving off a cell ends its coalescing run, so coming back later
+            // is a separate undo step rather than folding into the old one.
+            self.wb.end_edit_run();
+        }
         if extend {
             self.selection.extend_to(target);
         } else {
@@ -406,33 +421,129 @@ impl FerrixApp {
     /// Cheap by construction: only the overlay is written, so saving a handful
     /// of edits over a 200M-row dataset writes a handful of kilobytes and
     /// never touches the base.
-    fn save_edits(&mut self) {
+    /// Returns true if edits were actually written to disk.
+    fn save_edits(&mut self) -> bool {
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
-            return;
+            return false;
         };
         if self.wb.overlay.is_empty() && !self.wb.is_dirty() {
             self.status = "No edits to save".into();
-            return;
+            return false;
         }
         let t = std::time::Instant::now();
         match ferrix_io::edits::save_edits(&path, &self.wb.overlay, fp) {
             Ok(bytes) => {
-                self.wb.mark_saved();
+                // Undo history does not survive a save (see README, "Editing").
+                // Say so out loud: silently dropping it is exactly the kind of
+                // thing that makes a user distrust the undo button.
+                let lost = self.wb.save_committed();
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let history = if lost > 0 {
+                    format!(
+                        " · undo history cleared ({} step{})",
+                        fmt_int(lost),
+                        if lost == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "Saved {} edit{} ({} bytes) to {} in {:.1} ms",
+                    "Saved {} edit{} ({} bytes) to {} in {:.1} ms{}",
                     fmt_int(self.wb.overlay.len()),
                     if self.wb.overlay.len() == 1 { "" } else { "s" },
                     fmt_int(bytes as usize),
                     name,
-                    t.elapsed().as_secs_f64() * 1000.0
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    history
                 );
+                true
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Err(e) => {
+                self.status = format!("Save failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// The unsaved-changes modal shown when the user tries to close the window
+    /// with a dirty workbook.
+    ///
+    /// Three honest options: Save (write the sidecar, then close), Discard
+    /// (close and lose the edits — stated plainly), and Cancel (stay put).
+    /// If saving fails, the close is NOT allowed to proceed: the status bar
+    /// carries the error and the user keeps their data.
+    fn show_close_prompt(&mut self, ctx: &egui::Context) {
+        let mut save_and_close = false;
+        let mut discard = false;
+        let mut cancel = false;
+
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let edits = self.wb.edit_count();
+                ui.label(
+                    RichText::new(format!(
+                        "{} unsaved edit{} will be lost.",
+                        fmt_int(edits),
+                        if edits == 1 { "" } else { "s" }
+                    ))
+                    .size(13.5),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_save = self.edits_path.is_some();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save and close"))
+                        .clicked()
+                    {
+                        save_and_close = true;
+                    }
+                    if ui.button("Discard and close").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if self.edits_path.is_none() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("No file is open, so there is nowhere to save these edits.")
+                            .color(Theme::TEXT_DIM)
+                            .size(11.5),
+                    );
+                }
+            });
+
+        // Escape cancels, matching every other dialog in the app.
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            cancel = true;
+        }
+
+        if cancel {
+            self.close_prompt = false;
+            return;
+        }
+        if save_and_close {
+            if self.save_edits() {
+                self.close_prompt = false;
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // Save failed: leave the prompt up with the error in the status
+            // bar rather than closing over the top of lost work.
+            return;
+        }
+        if discard {
+            self.close_prompt = false;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -440,7 +551,6 @@ impl FerrixApp {
         self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
     }
-
     /// Re-run the search for the current input.
     ///
     /// Cheap enough to call on every keystroke even at 200M rows, because the
@@ -544,7 +654,7 @@ impl FerrixApp {
             )
         });
         if ctrl_s {
-            self.save_edits();
+            let _ = self.save_edits();
             return;
         }
         // Clipboard and select-all only apply when the grid owns the keyboard;
@@ -733,6 +843,22 @@ impl eframe::App for FerrixApp {
         }
         let frame_start = std::time::Instant::now();
 
+        // --- unsaved-changes guard on window close ---
+        //
+        // egui 0.29 reports a close request as viewport state; cancelling it
+        // and showing a modal is the only way to stop the window vanishing
+        // with unsaved edits in it. `allow_close` lets the second, deliberate
+        // close request through instead of looping.
+        if ctx.input(|i| i.viewport().close_requested()) && self.wb.is_dirty() && !self.allow_close
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_prompt = true;
+        }
+
+        if self.close_prompt {
+            self.show_close_prompt(ctx);
+        }
+
         self.handle_keys(ctx);
 
         // --- toolbar ---
@@ -760,7 +886,7 @@ impl eframe::App for FerrixApp {
                         .on_hover_text("Save edits (Ctrl+S)")
                         .clicked()
                     {
-                        self.save_edits();
+                        let _ = self.save_edits();
                     }
                     if ui
                         .add_enabled(self.wb.can_undo(), egui::Button::new("↶ Undo"))
