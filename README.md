@@ -175,6 +175,29 @@ the source preserves `$`, the user's spacing, and anything the scanner does not
 recognise — including `"A1"` inside a string literal, which is text, not a
 reference.
 
+### Getting data back out
+
+Saving writes a `.fxedits` sidecar that only Ferrix reads, so **Export CSV**
+writes the sheet as the grid shows it — base data with edits applied — to a
+file any other tool can open.
+
+The exporter streams: rows are formatted one at a time into a single reused
+buffer, so peak memory tracks the widest row rather than the row count.
+Measured at **89 MB/s** over 500,000 rows.
+
+Fields containing the delimiter, quotes, or newlines are quoted per RFC 4180.
+This is not cosmetic — without it a value containing a comma silently becomes
+two columns on reimport, and one containing a newline becomes two rows. A
+round-trip test exports `has,comma and "quotes"` and `two\nlines`, reimports
+with the ordinary CSV loader, and asserts both come back byte-identical.
+
+Writes go to a temporary file and are renamed into place, so a cancelled or
+failed export leaves the previous file untouched rather than replacing it with
+a truncated one. A test pins exactly that.
+
+Exports above 5,000,000 rows are currently refused with a message rather than
+blocking the UI; streaming those off-thread is tracked in issue #10.
+
 ### Editing without touching the base
 
 Edits never modify the dataset. They live in a sparse copy-on-write overlay
@@ -265,7 +288,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 262 tests
+cargo test --workspace     # 272 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

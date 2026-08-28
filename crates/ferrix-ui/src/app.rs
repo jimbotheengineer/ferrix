@@ -436,6 +436,58 @@ impl FerrixApp {
         }
     }
 
+    /// Export the current sheet — base plus edits — to a CSV the rest of the
+    /// world can read.
+    ///
+    /// Runs synchronously against a snapshot bound by `MAX_SYNC_EXPORT_ROWS`;
+    /// larger sheets are refused with a message rather than freezing the UI
+    /// for minutes. Streaming a 200M-row export off-thread needs the exporter
+    /// to borrow the workbook across a thread boundary, which is the next step
+    /// and is tracked separately.
+    fn export_dialog(&mut self) {
+        const MAX_SYNC_EXPORT_ROWS: usize = 5_000_000;
+
+        let rows = self.wb.view().row_count();
+        if rows > MAX_SYNC_EXPORT_ROWS {
+            self.status = format!(
+                "Sheet has {} rows — exports above {} rows are not yet supported \
+                 (would block the UI). See issue #10.",
+                fmt_int(rows),
+                fmt_int(MAX_SYNC_EXPORT_ROWS)
+            );
+            return;
+        }
+
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("export.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        let t = std::time::Instant::now();
+        let view = self.wb.view();
+        let result = ferrix_io::export::export_csv(
+            &path,
+            &view,
+            ferrix_io::export::ExportOptions::default(),
+            |_, _| {},
+            || false,
+        );
+        self.status = match result {
+            Ok(stats) => format!(
+                "Exported {} rows × {} cols ({:.1} MB) in {:.1}s → {}",
+                fmt_int(stats.rows),
+                stats.cols,
+                stats.bytes as f64 / 1e6,
+                t.elapsed().as_secs_f64(),
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
     fn sync_formula_bar(&mut self) {
         self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
@@ -749,6 +801,13 @@ impl eframe::App for FerrixApp {
                     ui.add_space(12.0);
                     if ui.button("Open CSV…").clicked() {
                         self.open_dialog();
+                    }
+                    if ui
+                        .button("⬈ Export CSV…")
+                        .on_hover_text("Write this sheet, including edits, to a CSV file")
+                        .clicked()
+                    {
+                        self.export_dialog();
                     }
                     ui.add_space(4.0);
                     let dirty = self.wb.is_dirty();
@@ -1222,6 +1281,26 @@ impl eframe::App for FerrixApp {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
+    }
+}
+
+/// Export adapter over the live base+overlay view.
+///
+/// Exporting must write what the user *sees* — base data with edits applied —
+/// not the untouched base. `SheetView` already composes those, so the exporter
+/// reads through it rather than reimplementing the merge.
+impl ferrix_io::export::ExportSource for crate::sheet_view::SheetView<'_> {
+    fn row_count(&self) -> usize {
+        crate::sheet_view::SheetView::row_count(self)
+    }
+    fn col_count(&self) -> usize {
+        crate::sheet_view::SheetView::col_count(self)
+    }
+    fn display(&self, cell: CellRef) -> String {
+        crate::sheet_view::SheetView::display(self, cell)
+    }
+    fn header(&self, col: usize) -> String {
+        crate::sheet_view::SheetView::header_or_letter(self, col)
     }
 }
 

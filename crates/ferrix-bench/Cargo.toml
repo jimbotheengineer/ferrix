@@ -21,6 +21,10 @@ name = "bench-load"
 path = "src/bench_load.rs"
 
 [[bin]]
+name = "check-export"
+path = "src/check_export.rs"
+
+[[bin]]
 name = "check-persist"
 path = "src/check_persist.rs"
 
