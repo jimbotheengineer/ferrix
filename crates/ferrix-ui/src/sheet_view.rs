@@ -6,7 +6,7 @@
 //! in-RAM `Sheet` or a memory-mapped 12GB file, or whether a given value came
 //! from disk or from an edit.
 
-use ferrix_core::{CellRef, EditOverlay, Sheet, StrId, Value};
+use ferrix_core::{CellRef, EditOverlay, Sheet, SheetOrder, StrId, Value};
 use ferrix_io::MappedSheet;
 
 /// The immutable data under the overlay.
@@ -99,14 +99,129 @@ impl BaseData {
 }
 
 /// Read-only composite view. Cheap to construct — it borrows both layers.
+///
+/// ## Display space vs data space
+///
+/// Every `CellRef` crossing this boundary is a DISPLAY reference — what the
+/// user is pointing at. Only the base read is translated into data space,
+/// through [`SheetOrder`]. That is the entire cost of row/column reordering on
+/// the read path: one `O(log runs)` lookup per axis, skipped outright when
+/// nothing has been reordered.
 pub struct SheetView<'a> {
     pub base: &'a BaseData,
     pub overlay: &'a EditOverlay,
+    /// Display permutation. `None` — and the identity case — take a fast path
+    /// that costs nothing, so an unreordered sheet is exactly as fast as
+    /// before this feature existed.
+    pub order: Option<&'a SheetOrder>,
 }
 
 impl<'a> SheetView<'a> {
     pub fn new(base: &'a BaseData, overlay: &'a EditOverlay) -> Self {
-        Self { base, overlay }
+        Self {
+            base,
+            overlay,
+            order: None,
+        }
+    }
+
+    /// A view whose base reads are permuted by `order`.
+    pub fn with_order(base: &'a BaseData, overlay: &'a EditOverlay, order: &'a SheetOrder) -> Self {
+        Self {
+            base,
+            overlay,
+            // Carrying an identity order would pay the mapping cost for
+            // nothing; drop it here so every read below stays on the fast path.
+            order: (!order.is_identity()).then_some(order),
+        }
+    }
+
+    /// Translate a display cell to the base cell it shows.
+    ///
+    /// `None` means the position addresses no base data at all — an inserted
+    /// row or column — which reads as empty rather than as some other cell's
+    /// value.
+    #[inline]
+    fn base_cell(&self, cell: CellRef) -> Option<CellRef> {
+        match self.order {
+            None => Some(cell),
+            Some(o) => o
+                .to_data(cell.row, cell.col)
+                .map(|(r, c)| CellRef::new(r, c)),
+        }
+    }
+
+    /// Read the base through the display permutation.
+    #[inline]
+    fn base_get(&self, cell: CellRef) -> Value {
+        match self.base_cell(cell) {
+            Some(c) => self.base.get(c),
+            None => Value::Empty,
+        }
+    }
+
+    /// Decompose a DISPLAY rectangle into the base rectangles it covers.
+    ///
+    /// A block that is contiguous on screen need not be contiguous in the data
+    /// once an axis is reordered: display columns A:C might be data columns
+    /// 0, 2, 3. Rather than give up and walk cell by cell — which would turn a
+    /// 200M-row SUM into a 200M-iteration loop — the rectangle is cut into the
+    /// runs it spans and each piece keeps the base's columnar fast path.
+    ///
+    /// The piece count is bounded by the number of runs the user's edits
+    /// created, not by the size of the range, so a reordered 200M-row SUM is
+    /// still a handful of streaming scans.
+    fn base_rects(&self, start: CellRef, end: CellRef) -> Vec<(CellRef, CellRef)> {
+        let (r0, r1) = (start.row.min(end.row), start.row.max(end.row));
+        let (c0, c1) = (start.col.min(end.col), start.col.max(end.col));
+        let Some(order) = self.order else {
+            return vec![(CellRef::new(r0, c0), CellRef::new(r1, c1))];
+        };
+        let row_spans = match &order.rows {
+            None => vec![(r0, r1 - r0 + 1)],
+            Some(o) => o.data_spans(u64::from(r0), u64::from(r1 - r0 + 1)),
+        };
+        let col_spans = match &order.cols {
+            None => vec![(c0, c1 - c0 + 1)],
+            Some(o) => o.data_spans(u64::from(c0), u64::from(c1 - c0 + 1)),
+        };
+        let mut out = Vec::with_capacity(row_spans.len() * col_spans.len());
+        for &(rs, rn) in &row_spans {
+            for &(cs, cn) in &col_spans {
+                out.push((CellRef::new(rs, cs), CellRef::new(rs + rn - 1, cs + cn - 1)));
+            }
+        }
+        out
+    }
+
+    /// Base sum over a display rectangle, keeping the columnar fast path.
+    fn base_sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
+        if self.order.is_none() {
+            return self.base.sum_rect(start, end);
+        }
+        // Compensated accumulation across the pieces, so splitting a range
+        // into runs cannot change the answer it would have had unsplit.
+        let mut total = 0.0f64;
+        let mut c = 0.0f64;
+        for (a, b) in self.base_rects(start, end) {
+            let v = self.base.sum_rect(a, b);
+            let y = v - c;
+            let t = total + y;
+            c = (t - total) - y;
+            total = t;
+        }
+        total
+    }
+
+    /// Base numeric count over a display rectangle.
+    fn base_count_rect(&self, start: CellRef, end: CellRef) -> usize {
+        if self.order.is_none() {
+            return self.base.count_rect(start, end);
+        }
+        self.base_rects(start, end)
+            .into_iter()
+            .map(|(a, b)| self.base.count_rect(a, b))
+            .sum()
     }
 
     /// Rows, accounting for edits that extend past the base.
@@ -125,7 +240,7 @@ impl<'a> SheetView<'a> {
     pub fn get(&self, cell: CellRef) -> Value {
         match self.overlay.value(cell) {
             Some(v) => v,
-            None => self.base.get(cell),
+            None => self.base_get(cell),
         }
     }
 
@@ -146,8 +261,22 @@ impl<'a> SheetView<'a> {
         self.overlay.has_formula(cell)
     }
 
+    /// Header text for a DISPLAY column — so a reordered column carries its
+    /// own name with it rather than inheriting the name of whatever position
+    /// it landed in.
     pub fn header_or_letter(&self, col: usize) -> String {
-        self.base.header_or_letter(col)
+        match self.order {
+            None => self.base.header_or_letter(col),
+            Some(o) => match o.cols.as_ref() {
+                None => self.base.header_or_letter(col),
+                // An inserted column has no base header; it is named by its
+                // position, like a fresh spreadsheet column.
+                Some(c) => match c.data_of(col as u64) {
+                    Some(d) => self.base.header_or_letter(d as usize),
+                    None => ferrix_core::column_name(col as u32),
+                },
+            },
+        }
     }
 
     /// Text shown in a cell.
@@ -160,7 +289,10 @@ impl<'a> SheetView<'a> {
                 Value::Text(id) => self.resolve(id).to_string(),
                 Value::Error(e) => e.to_string(),
             },
-            None => self.base.display(cell),
+            None => match self.base_cell(cell) {
+                Some(c) => self.base.display(c),
+                None => String::new(),
+            },
         }
     }
 
@@ -179,7 +311,7 @@ impl<'a> SheetView<'a> {
     /// 200M-row SUM stays a streaming scan even when cells in the range have
     /// been edited.
     pub fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
-        let base_total = self.base.sum_rect(start, end);
+        let base_total = self.base_sum_rect(start, end);
         if self.overlay.is_empty() {
             return base_total;
         }
@@ -199,7 +331,7 @@ impl<'a> SheetView<'a> {
         for (cell, input) in self.overlay.edited_cells() {
             if cell.row >= r0 && cell.row <= r1 && cell.col >= c0 && cell.col <= c1 {
                 // Remove the base contribution, add the edited one.
-                if let Value::Number(n) = self.base.get(*cell) {
+                if let Value::Number(n) = self.base_get(*cell) {
                     add(-n);
                 }
                 if let Value::Number(n) = input.value() {
@@ -212,7 +344,7 @@ impl<'a> SheetView<'a> {
 
     /// Count of numeric cells in a rectangle, overlay-corrected.
     pub fn count_rect(&self, start: CellRef, end: CellRef) -> usize {
-        let mut total = self.base.count_rect(start, end) as i64;
+        let mut total = self.base_count_rect(start, end) as i64;
         if self.overlay.is_empty() {
             return total.max(0) as usize;
         }
@@ -220,7 +352,7 @@ impl<'a> SheetView<'a> {
         let (c0, c1) = (start.col.min(end.col), start.col.max(end.col));
         for (cell, input) in self.overlay.edited_cells() {
             if cell.row >= r0 && cell.row <= r1 && cell.col >= c0 && cell.col <= c1 {
-                if matches!(self.base.get(*cell), Value::Number(_)) {
+                if matches!(self.base_get(*cell), Value::Number(_)) {
                     total -= 1;
                 }
                 if matches!(input.value(), Value::Number(_)) {

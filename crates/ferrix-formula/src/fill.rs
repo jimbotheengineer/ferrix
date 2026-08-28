@@ -15,7 +15,9 @@
 //! anything it does not touch. The scanner below mirrors the tokenizer's own
 //! rules for what counts as a reference.
 
-use ferrix_core::{column_name, CellRef};
+use ferrix_core::CellRef;
+
+use crate::refscan;
 
 /// How a fill should populate the cells it extends into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,170 +35,40 @@ pub enum FillKind {
 /// the edge rather than wrapping — Excel emits `#REF!` there, but clamping
 /// keeps a filled block usable, and the alternative would silently poison
 /// cells the user can see.
+///
+/// The scanning rules (what counts as a reference, and what is a string, a
+/// sheet name, or a function call) live in [`crate::refscan`], shared with the
+/// structural-reorder rewriter so the two can never disagree about which
+/// bytes of a formula are a reference.
 pub fn offset_formula(src: &str, drow: i64, dcol: i64) -> String {
     if drow == 0 && dcol == 0 {
         return src.to_string();
     }
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0usize;
-
-    while i < b.len() {
-        let ch = b[i];
-
-        // Skip string literals wholesale: "A1" is text, not a reference.
-        if ch == b'"' {
-            let start = i;
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'"' {
-                    // A doubled quote is an escaped quote, not the end.
-                    if b.get(i + 1) == Some(&b'"') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
+    let words = refscan::scan(src);
+    refscan::rewrite(src, &words, |_, w| {
+        let p = refscan::parse_ref(&src[w.start..w.end])?;
+        // `$` pins against a FILL — this is the case where honouring it is
+        // correct. A structural reorder is the opposite; see `crate::remap`.
+        let new_row = if p.abs_row {
+            p.row
+        } else {
+            (p.row as i64 + drow).max(0) as u32
+        };
+        let new_col = if p.abs_col {
+            p.col
+        } else {
+            (p.col as i64 + dcol).max(0) as u32
+        };
+        Some(
+            refscan::ParsedRef {
+                col: new_col,
+                row: new_row,
+                abs_col: p.abs_col,
+                abs_row: p.abs_row,
             }
-            out.push_str(&src[start..i]);
-            continue;
-        }
-
-        // Skip quoted sheet names wholesale: 'Q1 2024'!A1 contains the word
-        // Q1, which is a perfectly good cell reference and would otherwise be
-        // shifted, silently renaming the sheet the formula points at.
-        if ch == b'\'' {
-            let start = i;
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\'' {
-                    if b.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str(&src[start..i]);
-            continue;
-        }
-
-        // A word starts at $ or a letter.
-        if ch == b'$' || ch.is_ascii_alphabetic() || ch == b'_' {
-            let start = i;
-            while i < b.len()
-                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] == b'.')
-            {
-                i += 1;
-            }
-            let word = &src[start..i];
-
-            // A bare word followed by `!` is a sheet qualifier, not a cell —
-            // `Sheet1!A1` filled down must stay Sheet1, and only A1 moves.
-            if b.get(i) == Some(&b'!') {
-                out.push_str(word);
-                continue;
-            }
-
-            // A word immediately followed by '(' is a function call, never a
-            // reference — the same disambiguation the tokenizer uses, which is
-            // what stops LOG10( being treated as cell LOG10.
-            let mut j = i;
-            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-                j += 1;
-            }
-            let is_call = b.get(j) == Some(&b'(');
-
-            if is_call {
-                out.push_str(word);
-                continue;
-            }
-            match shift_ref(word, drow, dcol) {
-                Some(shifted) => out.push_str(&shifted),
-                None => out.push_str(word),
-            }
-            continue;
-        }
-
-        out.push(ch as char);
-        i += 1;
-    }
-    out
-}
-
-/// Shift one `A1`-style token, honouring `$`. Returns `None` when the word is
-/// not a reference at all.
-fn shift_ref(word: &str, drow: i64, dcol: i64) -> Option<String> {
-    let b = word.as_bytes();
-    let mut i = 0;
-
-    let abs_col = b.first() == Some(&b'$');
-    if abs_col {
-        i += 1;
-    }
-    let letter_start = i;
-    while i < b.len() && b[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    if i == letter_start {
-        return None;
-    }
-    let letters = &word[letter_start..i];
-    // Excel's widest column is XFD; more letters means it is a name.
-    if letters.len() > 3 {
-        return None;
-    }
-
-    let abs_row = b.get(i) == Some(&b'$');
-    if abs_row {
-        i += 1;
-    }
-    let digit_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == digit_start || i != b.len() {
-        // No digits, or trailing junk — not a plain reference.
-        return None;
-    }
-    let row_1based: u32 = word[digit_start..i].parse().ok()?;
-    if row_1based == 0 {
-        return None;
-    }
-
-    let mut col: u32 = 0;
-    for byte in letters.bytes() {
-        let v = (byte.to_ascii_uppercase() - b'A') as u32 + 1;
-        col = col.checked_mul(26)?.checked_add(v)?;
-    }
-    let col0 = col - 1;
-    let row0 = row_1based - 1;
-
-    let new_row = if abs_row {
-        row0
-    } else {
-        (row0 as i64 + drow).max(0) as u32
-    };
-    let new_col = if abs_col {
-        col0
-    } else {
-        (col0 as i64 + dcol).max(0) as u32
-    };
-
-    let mut out = String::new();
-    if abs_col {
-        out.push('$');
-    }
-    out.push_str(&column_name(new_col));
-    if abs_row {
-        out.push('$');
-    }
-    out.push_str(&(new_row + 1).to_string());
-    Some(out)
+            .render(),
+        )
+    })
 }
 
 /// Detect a constant arithmetic step in a column of numbers.
