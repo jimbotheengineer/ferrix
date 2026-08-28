@@ -108,6 +108,40 @@ away the addend's low bits. Ferrix returns the exact value, and it is *faster*
 rather than arithmetic. Four tests pin this, including one that reproduces the
 original 200M-row drift in miniature.
 
+### Search that scales with cardinality, not size
+
+`Ctrl+F` over 1.6 billion cells (200M rows x 8 cols, 12 GB cache):
+
+```
+     needle          hits    pass 1   pass 2
+      north    33,343,436   4663 ms   478 ms
+ consulting    24,991,111    517 ms   432 ms
+  cancelled    49,988,488    605 ms   596 ms
+       4242           808    485 ms   319 ms   (numeric path)
+ zzz-absent             0      0 ms     0 ms   (nothing matched the arena)
+```
+
+Two passes are reported because the cache is larger than RAM. The first needle
+searched pays to fault ~12 GB off disk — 4663 ms for `north` is I/O, not search
+work, and the same needle costs 478 ms once resident. Steady-state cost tracks
+hit count as expected (`cancelled`, with 1.5x more hits, is the slowest). At
+40M rows, where the cache fits in memory, both passes are identical.
+
+The trick is inverting the problem. A naive search compares the needle against
+every cell — 1.6 billion string comparisons, each needing the value formatted
+first. But text cells don't store text; they store a 4-byte id into an arena
+holding each *distinct* string once. So Ferrix:
+
+1. Matches the needle against the arena — **18 comparisons** for this dataset,
+   not 1.6 billion — producing a bitset of matching ids.
+2. Scans the columns comparing 4-byte integers against that bitset, in
+   parallel across cores.
+
+Search cost therefore tracks the *cardinality* of the data, not its size. When
+nothing matches the arena the column scan is skipped entirely, which is why the
+absent-needle case costs 0 ms. Numbers are compared numerically against the
+parsed needle, never by formatting 200M values into strings.
+
 ### Editing without touching the base
 
 Edits live in a sparse copy-on-write overlay consulted before the base:

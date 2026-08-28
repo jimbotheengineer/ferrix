@@ -37,6 +37,7 @@ struct Progress {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Grid,
+    Search,
     /// Editing in-cell; the buffer holds what has been typed so far.
     Cell,
     FormulaBar,
@@ -58,6 +59,14 @@ pub struct FerrixApp {
 
     formula_input: String,
     formula_result: Option<String>,
+
+    /// Search state. `results` is kept sorted row-major so the grid can
+    /// binary-search the visible slice each frame.
+    search_open: bool,
+    search_input: String,
+    search_results: ferrix_core::SearchResults,
+    search_index: usize,
+    search_focus_pending: bool,
 
     status: String,
     loading: bool,
@@ -85,6 +94,11 @@ impl FerrixApp {
             just_started_edit: false,
             formula_input: String::new(),
             formula_result: None,
+            search_open: false,
+            search_input: String::new(),
+            search_results: ferrix_core::SearchResults::default(),
+            search_index: 0,
+            search_focus_pending: false,
             status: "Ready — open a CSV to begin".into(),
             loading: false,
             load_rx: None,
@@ -243,6 +257,66 @@ impl FerrixApp {
         self.recompute_formula();
     }
 
+    /// Re-run the search for the current input.
+    ///
+    /// Cheap enough to call on every keystroke even at 200M rows, because the
+    /// engine matches the needle against the string arena first and only then
+    /// scans columns as integers.
+    fn run_search(&mut self) {
+        const LIMIT: usize = 100_000;
+        let Some(query) = ferrix_core::Query::new(self.search_input.trim(), false, false) else {
+            self.search_results = ferrix_core::SearchResults::default();
+            self.search_index = 0;
+            return;
+        };
+        let view = self.wb.view();
+        self.search_results = view.search(&query, LIMIT);
+        // Resume from wherever the cursor is rather than jumping to the top.
+        self.search_index = self.search_results.index_at_or_after(self.selection);
+        self.jump_to_current_match();
+    }
+
+    /// Move the selection to the active match and scroll it into view.
+    fn jump_to_current_match(&mut self) {
+        if let Some(cell) = self.search_results.wrapped(self.search_index) {
+            self.selection = cell;
+            self.center_on_selection();
+            self.formula_input = self.wb.view().edit_text(cell);
+        }
+    }
+
+    fn next_match(&mut self) {
+        if self.search_results.matches.is_empty() {
+            return;
+        }
+        self.search_index = (self.search_index + 1) % self.search_results.matches.len();
+        self.jump_to_current_match();
+    }
+
+    fn prev_match(&mut self) {
+        if self.search_results.matches.is_empty() {
+            return;
+        }
+        let n = self.search_results.matches.len();
+        self.search_index = (self.search_index + n - 1) % n;
+        self.jump_to_current_match();
+    }
+
+    fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_results = ferrix_core::SearchResults::default();
+        self.search_index = 0;
+        self.focus = Focus::Grid;
+    }
+
+    /// Centre the viewport on the selection — used when jumping to a match, so
+    /// the hit lands mid-screen rather than scraping the edge.
+    fn center_on_selection(&mut self) {
+        let visible = (self.last_viewport_h / crate::grid::ROW_HEIGHT) as f64;
+        let target = self.selection.row as f64 - visible / 2.0;
+        self.scroll.row_offset = target.max(0.0);
+    }
+
     fn recompute_formula(&mut self) {
         let text = self.formula_input.trim().to_string();
         if !text.starts_with('=') {
@@ -270,7 +344,46 @@ impl FerrixApp {
 
     /// Keyboard handling for the grid. Returns true if a repaint is needed.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.focus != Focus::Grid {
+        // Ctrl+F works from anywhere, including while the search box has focus
+        // (where it re-focuses and selects, matching browser behaviour).
+        let (ctrl_f, escape, f3, shift_f3) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::F),
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::F3) && !i.modifiers.shift,
+                i.key_pressed(Key::F3) && i.modifiers.shift,
+            )
+        });
+        if ctrl_f {
+            self.search_open = true;
+            self.focus = Focus::Search;
+            self.search_focus_pending = true;
+            return;
+        }
+        if self.search_open {
+            if escape {
+                self.close_search();
+                return;
+            }
+            if f3 {
+                self.next_match();
+                return;
+            }
+            if shift_f3 {
+                self.prev_match();
+                return;
+            }
+        }
+
+        // Gate grid keys on egui's REAL keyboard focus, not our own flag.
+        //
+        // `self.focus` is app-level bookkeeping; egui separately tracks which
+        // widget owns the keyboard. When a TextEdit (search box, formula bar)
+        // holds focus, characters must not also reach the grid. Without this,
+        // typing "consulting" into the search box simultaneously drove the
+        // grid's type-to-edit path and cleared a cell — silent data loss.
+        let widget_has_keyboard = ctx.memory(|m| m.focused()).is_some();
+        if widget_has_keyboard || self.focus != Focus::Grid {
             return;
         }
         let (
@@ -520,6 +633,95 @@ impl eframe::App for FerrixApp {
                 });
             });
 
+        // --- search bar ---
+        if self.search_open {
+            egui::TopBottomPanel::top("search_bar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(Theme::HEADER_BG)
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🔍").size(13.0));
+                        let resp = ui.add_sized(
+                            [260.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.search_input)
+                                .hint_text("Find in sheet…")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if self.search_focus_pending {
+                            resp.request_focus();
+                            self.search_focus_pending = false;
+                        }
+                        if resp.gained_focus() {
+                            self.focus = Focus::Search;
+                        }
+                        // Live search as the user types.
+                        if resp.changed() {
+                            self.run_search();
+                        }
+                        // Enter advances; Shift+Enter goes back.
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            if ui.input(|i| i.modifiers.shift) {
+                                self.prev_match();
+                            } else {
+                                self.next_match();
+                            }
+                            resp.request_focus();
+                        }
+
+                        if ui
+                            .button("◀")
+                            .on_hover_text("Previous (Shift+Enter)")
+                            .clicked()
+                        {
+                            self.prev_match();
+                        }
+                        if ui.button("▶").on_hover_text("Next (Enter / F3)").clicked() {
+                            self.next_match();
+                        }
+
+                        let r = &self.search_results;
+                        if self.search_input.trim().is_empty() {
+                            ui.label(
+                                RichText::new("type to search")
+                                    .color(Theme::TEXT_DIM)
+                                    .size(11.5),
+                            );
+                        } else if r.total == 0 {
+                            ui.label(RichText::new("no matches").color(Theme::ERROR).size(11.5));
+                        } else {
+                            let shown = format!(
+                                "{} of {}{}",
+                                self.search_index + 1,
+                                fmt_int(r.total),
+                                if r.truncated { " (capped)" } else { "" }
+                            );
+                            ui.label(RichText::new(shown).color(Theme::TEXT).size(11.5));
+                            // Surfacing why it was fast: N distinct strings
+                            // matched, not N cells compared.
+                            ui.label(
+                                RichText::new(format!(
+                                    "· {} ms · {} distinct string{} matched",
+                                    r.millis,
+                                    r.matched_strings,
+                                    if r.matched_strings == 1 { "" } else { "s" }
+                                ))
+                                .color(Theme::TEXT_DIM)
+                                .size(11.0),
+                            );
+                        }
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                                self.close_search();
+                            }
+                        });
+                    });
+                });
+        }
+
         // --- status bar ---
         egui::TopBottomPanel::bottom("status")
             .frame(
@@ -586,6 +788,12 @@ impl eframe::App for FerrixApp {
                         col_widths: &self.col_widths,
                         scroll: &mut self.scroll,
                         editing: self.editing,
+                        matches: &self.search_results.matches,
+                        current_match: if self.search_open {
+                            self.search_results.wrapped(self.search_index)
+                        } else {
+                            None
+                        },
                     }
                     .show(ui)
                 };

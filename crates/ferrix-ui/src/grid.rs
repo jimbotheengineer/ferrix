@@ -78,6 +78,11 @@ pub struct Grid<'a> {
     /// Cell currently being edited, if any — painted by the caller as a
     /// TextEdit overlay, so the grid skips drawing its value.
     pub editing: Option<CellRef>,
+    /// Cells matching the active search, sorted row-major. Only the visible
+    /// slice is consulted per frame, via binary search.
+    pub matches: &'a [CellRef],
+    /// The match the user is currently parked on, drawn more prominently.
+    pub current_match: Option<CellRef>,
 }
 
 impl<'a> Grid<'a> {
@@ -191,6 +196,22 @@ impl<'a> Grid<'a> {
         let mut double_clicked = None;
         let mut painted_cells = 0usize;
 
+        // Narrow the match list to just the visible rows once per frame, so
+        // per-cell highlight testing is a small linear probe rather than a
+        // scan of a potentially enormous result set.
+        let vis_lo = self
+            .matches
+            .partition_point(|m| (m.row as usize) < first_row);
+        let vis_hi = self
+            .matches
+            .partition_point(|m| (m.row as usize) < last_row);
+        let visible_matches = &self.matches[vis_lo..vis_hi];
+        let is_match = |cell: CellRef| -> bool {
+            visible_matches
+                .binary_search_by(|m| (m.row, m.col).cmp(&(cell.row, cell.col)))
+                .is_ok()
+        };
+
         // --- paint body ---
         let painter = ui.painter_at(body_rect);
         painter.rect_filled(body_rect, 0.0, Theme::BG);
@@ -210,6 +231,17 @@ impl<'a> Grid<'a> {
                 let w = width_of(c);
                 let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
                 let cref = CellRef::new(r as u32, c as u32);
+
+                // Search highlight sits under the selection so both remain
+                // visible when the cursor is parked on a match.
+                if !visible_matches.is_empty() && is_match(cref) {
+                    if self.current_match == Some(cref) {
+                        painter.rect_filled(cell_rect, 0.0, Theme::MATCH_CURRENT);
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::MATCH_EDGE));
+                    } else {
+                        painter.rect_filled(cell_rect, 0.0, Theme::MATCH_BG);
+                    }
+                }
 
                 if self.selection == Some(cref) {
                     painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);

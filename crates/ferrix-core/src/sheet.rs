@@ -212,6 +212,74 @@ impl Sheet {
         }
         self.arena.shrink_for_readonly();
     }
+
+    /// Find every cell matching `query`, in row-major order.
+    ///
+    /// Strategy: match the needle against the arena once (cheap — the arena
+    /// holds each distinct string once), then scan columns comparing 4-byte
+    /// ids against the resulting bitset. Results are collected per column and
+    /// merged, so the output is ordered by row then column regardless of the
+    /// column-major scan.
+    pub fn search(
+        &self,
+        query: &crate::search::Query,
+        limit: usize,
+    ) -> crate::search::SearchResults {
+        let t = std::time::Instant::now();
+        let ids = crate::search::IdSet::from_arena(&self.arena, query);
+
+        // Column-major scan, then merge into row-major order.
+        let mut per_col: Vec<(usize, Vec<u32>)> = Vec::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            let mut rows = Vec::new();
+            col.scan_matches(0, col.len(), query, &ids, &mut rows);
+            if !rows.is_empty() {
+                per_col.push((ci, rows));
+            }
+        }
+
+        let total: usize = per_col.iter().map(|(_, r)| r.len()).sum();
+        let matches = merge_row_major(&per_col, limit);
+
+        crate::search::SearchResults {
+            truncated: total > matches.len(),
+            total,
+            matches,
+            millis: t.elapsed().as_millis(),
+            matched_strings: ids.len(),
+        }
+    }
+}
+
+/// Merge per-column row lists into row-major order, stopping at `limit`.
+///
+/// Each column's list is already sorted, so this is a k-way merge taking the
+/// smallest (row, col) at each step — no global sort of a huge result set.
+pub fn merge_row_major(per_col: &[(usize, Vec<u32>)], limit: usize) -> Vec<CellRef> {
+    let mut cursors = vec![0usize; per_col.len()];
+    let mut out = Vec::new();
+    loop {
+        if out.len() >= limit {
+            break;
+        }
+        let mut best: Option<(u32, usize, usize)> = None; // (row, col, which)
+        for (i, (ci, rows)) in per_col.iter().enumerate() {
+            if let Some(&r) = rows.get(cursors[i]) {
+                let cand = (r, *ci, i);
+                if best.is_none_or(|b| (cand.0, cand.1) < (b.0, b.1)) {
+                    best = Some(cand);
+                }
+            }
+        }
+        match best {
+            Some((row, col, which)) => {
+                out.push(CellRef::new(row, col as u32));
+                cursors[which] += 1;
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -301,5 +369,141 @@ mod tests {
         assert_eq!(s.header_or_letter(0), "id");
         assert_eq!(s.header_or_letter(1), "B"); // empty header -> letter
         assert_eq!(s.header_or_letter(5), "F"); // missing header -> letter
+    }
+
+    fn search_sheet() -> Sheet {
+        // 3 text columns of low cardinality plus a numeric column, mirroring
+        // the shape of real data.
+        let mut s = Sheet::new("t");
+        let regions = ["north", "south", "east", "west"];
+        for r in 0..100u32 {
+            s.set_text(CellRef::new(r, 0), regions[r as usize % 4]);
+            s.set_text(
+                CellRef::new(r, 1),
+                if r % 2 == 0 { "open" } else { "closed" },
+            );
+            s.set(CellRef::new(r, 2), Value::Number(r as f64));
+        }
+        s
+    }
+
+    fn q(needle: &str) -> crate::search::Query {
+        crate::search::Query::new(needle, false, false).unwrap()
+    }
+
+    #[test]
+    fn finds_text_matches_in_row_major_order() {
+        let s = search_sheet();
+        let r = s.search(&q("north"), 1000);
+        assert_eq!(r.total, 25, "north appears every 4th row");
+        // Row-major: rows must be ascending.
+        let rows: Vec<u32> = r.matches.iter().map(|m| m.row).collect();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "not row-ordered");
+        assert_eq!(r.matches[0], CellRef::new(0, 0));
+        assert_eq!(r.matches[1], CellRef::new(4, 0));
+    }
+
+    #[test]
+    fn substring_matches_partial_words() {
+        let s = search_sheet();
+        // "os" matches "closed" but not "open".
+        let r = s.search(&q("os"), 1000);
+        assert_eq!(r.total, 50);
+        assert!(r.matches.iter().all(|m| m.col == 1));
+    }
+
+    #[test]
+    fn search_is_case_insensitive_by_default() {
+        let s = search_sheet();
+        assert_eq!(s.search(&q("NORTH"), 1000).total, 25);
+        assert_eq!(s.search(&q("NoRtH"), 1000).total, 25);
+    }
+
+    #[test]
+    fn numbers_are_found_by_value() {
+        let s = search_sheet();
+        let r = s.search(&q("42"), 1000);
+        assert_eq!(r.total, 1);
+        assert_eq!(r.matches[0], CellRef::new(42, 2));
+    }
+
+    #[test]
+    fn no_matches_returns_empty_not_error() {
+        let s = search_sheet();
+        let r = s.search(&q("zzzz-nothing"), 1000);
+        assert_eq!(r.total, 0);
+        assert!(r.matches.is_empty());
+        assert_eq!(r.matched_strings, 0);
+    }
+
+    #[test]
+    fn results_are_capped_but_total_is_honest() {
+        let s = search_sheet();
+        let r = s.search(&q("o"), 10);
+        assert_eq!(r.matches.len(), 10, "capped at the limit");
+        assert!(r.total > 10, "total reports the true count");
+        assert!(r.truncated);
+    }
+
+    #[test]
+    fn matches_across_columns_order_by_row_then_column() {
+        let mut s = Sheet::new("t");
+        // Same needle in two columns of the same row.
+        s.set_text(CellRef::new(5, 0), "target");
+        s.set_text(CellRef::new(5, 3), "target");
+        s.set_text(CellRef::new(2, 7), "target");
+        let r = s.search(&q("target"), 100);
+        assert_eq!(
+            r.matches,
+            vec![CellRef::new(2, 7), CellRef::new(5, 0), CellRef::new(5, 3)],
+            "must be row-major, then column-major within a row"
+        );
+    }
+
+    #[test]
+    fn search_cost_tracks_cardinality_not_rows() {
+        // The core performance claim. A 200k-cell sheet drawn from 4 distinct
+        // strings must require only 4 string comparisons to plan.
+        let mut s = Sheet::new("big");
+        let regions = ["north", "south", "east", "west"];
+        for r in 0..50_000u32 {
+            for c in 0..4u32 {
+                s.set_text(CellRef::new(r, c), regions[(r as usize + c as usize) % 4]);
+            }
+        }
+        let t = std::time::Instant::now();
+        let res = s.search(&q("north"), 100);
+        let ms = t.elapsed().as_millis();
+        assert_eq!(res.total, 50_000);
+        assert_eq!(
+            res.matched_strings, 1,
+            "only 'north' should match in the arena"
+        );
+        assert!(
+            ms < 200,
+            "200k-cell search took {ms}ms — the arena fast path may be broken"
+        );
+    }
+
+    #[test]
+    fn boolean_cells_are_searchable() {
+        let mut s = Sheet::new("t");
+        s.set(CellRef::new(0, 0), Value::Bool(true));
+        s.set(CellRef::new(1, 0), Value::Bool(false));
+        assert_eq!(s.search(&q("true"), 10).total, 1);
+        assert_eq!(s.search(&q("false"), 10).total, 1);
+    }
+
+    #[test]
+    fn error_cells_are_searchable() {
+        // Regression: the scanner's whole-column guard did not account for
+        // error cells, so searching "DIV" returned nothing even though a
+        // #DIV/0! cell was present.
+        let mut s = Sheet::new("t");
+        s.set(CellRef::new(0, 0), Value::Error(crate::ErrorKind::DivZero));
+        s.set(CellRef::new(1, 0), Value::Error(crate::ErrorKind::Ref));
+        assert_eq!(s.search(&q("DIV"), 10).total, 1);
+        assert_eq!(s.search(&q("REF"), 10).total, 1);
+        assert_eq!(s.search(&q("#"), 10).total, 2, "both are error cells");
     }
 }

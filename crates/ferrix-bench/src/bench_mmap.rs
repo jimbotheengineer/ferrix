@@ -124,6 +124,43 @@ fn main() {
             );
         }
     }
+
+    // --- search ---
+    // Each needle is searched twice. A 12 GB cache exceeds RAM, so the first
+    // pass pays major page faults pulling columns off disk and the second
+    // measures steady-state cost. Reporting only the first pass would blame
+    // the needle for what is really I/O.
+    println!("\n--- search ---");
+    println!(
+        "{:>12}  {:>13}  {:>10}  {:>10}",
+        "needle", "hits", "pass 1", "pass 2"
+    );
+    let needles = ["north", "consulting", "cancelled", "zzz-absent", "4242"];
+    let mut first = Vec::new();
+    for needle in needles {
+        let Some(q) = ferrix_core::Query::new(needle, false, false) else {
+            first.push((0usize, 0.0));
+            continue;
+        };
+        let t = std::time::Instant::now();
+        let r = sheet.search(&q, 100_000);
+        first.push((r.total, t.elapsed().as_secs_f64() * 1000.0));
+    }
+    for (i, needle) in needles.iter().enumerate() {
+        let Some(q) = ferrix_core::Query::new(needle, false, false) else {
+            continue;
+        };
+        let t = std::time::Instant::now();
+        let r = sheet.search(&q, 100_000);
+        let second = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{:>12}  {:>13}  {:>7.0} ms  {:>7.0} ms",
+            needle,
+            fmt_int(r.total),
+            first[i].1,
+            second
+        );
+    }
 }
 
 fn fmt_int(n: usize) -> String {

@@ -259,6 +259,65 @@ impl Column {
             + self.present.heap_bytes()
     }
 
+    /// Append the rows in `[start, end)` whose value matches, to `out`.
+    ///
+    /// This is search's hot loop, and it never touches a string. Text cells
+    /// are matched by testing their 4-byte arena id against a precomputed
+    /// bitset; numeric cells are compared as `f64`. Both are integer/FP
+    /// operations over contiguous arrays, so the scan runs at memory
+    /// bandwidth rather than string-comparison speed.
+    pub fn scan_matches(
+        &self,
+        start: usize,
+        end: usize,
+        query: &crate::search::Query,
+        ids: &crate::search::IdSet,
+        out: &mut Vec<u32>,
+    ) {
+        let end = end.min(self.tags.len());
+        if start >= end {
+            return;
+        }
+
+        // Whole-column skips: if the query cannot match any value kind this
+        // column can hold, there is nothing to scan.
+        //
+        // Error cells must be considered here too. They are rare but they are
+        // real cells, and omitting them from this guard made `search("DIV")`
+        // silently return nothing while `search("true")` worked — the guard
+        // returned before the error branch could ever run.
+        let text_possible = !ids.is_empty() && self.has_strings;
+        let num_possible = query.can_match_numbers() && self.has_numbers;
+        let bool_possible = query.matches_bool(true) || query.matches_bool(false);
+        let err_possible = self.has_numbers && query.matches_any_error();
+        if !text_possible && !num_possible && !bool_possible && !err_possible {
+            return;
+        }
+
+        let t_num = ValueTag::Number as u8;
+        let t_bool = ValueTag::Bool as u8;
+        let t_text = ValueTag::Text as u8;
+        let t_err = ValueTag::Error as u8;
+
+        for i in start..end {
+            let tag = self.tags[i];
+            let hit = if tag == t_text {
+                text_possible && ids.contains(self.strings[i])
+            } else if tag == t_num {
+                num_possible && query.matches_number(self.numbers[i])
+            } else if tag == t_bool {
+                bool_possible && query.matches_bool(self.numbers[i] != 0.0)
+            } else if tag == t_err {
+                query.matches_str(decode_error(self.numbers[i] as u8).as_str())
+            } else {
+                false
+            };
+            if hit {
+                out.push(i as u32);
+            }
+        }
+    }
+
     /// Release excess capacity after ingest.
     pub fn shrink_to_fit(&mut self) {
         self.tags.shrink_to_fit();

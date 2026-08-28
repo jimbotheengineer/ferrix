@@ -12,8 +12,9 @@
 use std::fs::File;
 use std::path::Path;
 
-use ferrix_core::{CellRef, ErrorKind, StrId, Value, ValueTag};
+use ferrix_core::{CellRef, ErrorKind, IdSet, Query, SearchResults, StrId, Value, ValueTag};
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::format::{ColumnDesc, FormatError, Header, COL_DESC_BYTES};
 
@@ -303,6 +304,103 @@ impl MappedSheet {
     }
 }
 
+/// Search the mapped dataset for `query`, in row-major order.
+///
+/// Parallel across columns via rayon: each column is an independent
+/// contiguous scan, so there is no coordination beyond collecting the
+/// per-column row lists at the end.
+impl MappedSheet {
+    pub fn search(&self, query: &Query, limit: usize) -> SearchResults {
+        let t = std::time::Instant::now();
+
+        // Step 1: match the needle against the arena. This is the whole trick
+        // — the 200M-row benchmark has 18 distinct strings, so this is 18
+        // comparisons rather than 1.6 billion.
+        let ids = IdSet::from_pairs(
+            self.spans.len(),
+            (0..self.spans.len()).map(|i| (i as u32, self.resolve(StrId(i as u32)))),
+            query,
+        );
+        let matched_strings = ids.len();
+
+        let text_possible = !ids.is_empty();
+        let num_possible = query.can_match_numbers();
+        let bool_possible = query.matches_bool(true) || query.matches_bool(false);
+        // Error cells live in the numeric array; without this the whole-column
+        // guard below would skip them entirely (see Column::scan_matches).
+        let err_possible = query.matches_any_error();
+
+        // Step 2: integer scan over each column, in parallel.
+        let per_col: Vec<(usize, Vec<u32>)> = self
+            .columns
+            .par_iter()
+            .enumerate()
+            .map(|(ci, d)| {
+                let mut rows = Vec::new();
+                // Skip columns that cannot possibly contain a hit.
+                let scan_text = text_possible && d.has_strings();
+                let scan_num = num_possible && d.has_numbers();
+                if !scan_text && !scan_num && !bool_possible && !err_possible {
+                    return (ci, rows);
+                }
+
+                let len = d.len as usize;
+                let tags = &self.mmap[d.tags_off as usize..d.tags_off as usize + len];
+                let t_num = ValueTag::Number as u8;
+                let t_bool = ValueTag::Bool as u8;
+                let t_text = ValueTag::Text as u8;
+                let t_err = ValueTag::Error as u8;
+
+                for (i, &tag) in tags.iter().enumerate() {
+                    let hit = if tag == t_text {
+                        if !scan_text {
+                            false
+                        } else {
+                            let o = (d.strs_off + i as u64 * 4) as usize;
+                            let id = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap());
+                            ids.contains(id)
+                        }
+                    } else if tag == t_num {
+                        scan_num && {
+                            let o = (d.nums_off + i as u64 * 8) as usize;
+                            let v = f64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap());
+                            query.matches_number(v)
+                        }
+                    } else if tag == t_bool {
+                        bool_possible && {
+                            let o = (d.nums_off + i as u64 * 8) as usize;
+                            let v = f64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap());
+                            query.matches_bool(v != 0.0)
+                        }
+                    } else if tag == t_err {
+                        let o = (d.nums_off + i as u64 * 8) as usize;
+                        let v = f64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap());
+                        query.matches_str(decode_error(v as u8).as_str())
+                    } else {
+                        false
+                    };
+                    if hit {
+                        rows.push(i as u32);
+                    }
+                }
+                (ci, rows)
+            })
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect();
+
+        let total: usize = per_col.iter().map(|(_, r)| r.len()).sum();
+        let matches = ferrix_core::sheet::merge_row_major(&per_col, limit);
+
+        SearchResults {
+            truncated: total > matches.len(),
+            total,
+            matches,
+            millis: t.elapsed().as_millis(),
+            matched_strings,
+        }
+    }
+}
+
 #[inline]
 const fn decode_error(b: u8) -> ErrorKind {
     match b {
@@ -443,6 +541,91 @@ mod tests {
         let (m, s, d) = mapped("uni.csv", "t\nhéllo → 世界\nplain\n");
         assert_eq!(m.display(CellRef::new(0, 0)), "héllo → 世界");
         assert_eq!(m.display(CellRef::new(1, 0)), "plain");
+        cleanup(s, d);
+    }
+
+    fn q(needle: &str) -> Query {
+        Query::new(needle, false, false).unwrap()
+    }
+
+    #[test]
+    fn search_finds_text_in_row_major_order() {
+        let mut csv = String::from("region,status\n");
+        let regions = ["north", "south", "east", "west"];
+        for i in 0..1000 {
+            csv.push_str(regions[i % 4]);
+            csv.push(',');
+            csv.push_str(if i % 2 == 0 { "open" } else { "closed" });
+            csv.push('\n');
+        }
+        let (m, s, d) = mapped("search.csv", &csv);
+        let r = m.search(&q("north"), 10_000);
+        assert_eq!(r.total, 250);
+        assert_eq!(r.matched_strings, 1, "only 'north' matched in the arena");
+        let rows: Vec<u32> = r.matches.iter().map(|x| x.row).collect();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "not row-ordered");
+        assert_eq!(r.matches[0], CellRef::new(0, 0));
+        cleanup(s, d);
+    }
+
+    #[test]
+    fn search_matches_numbers_by_value() {
+        let mut csv = String::from("v\n");
+        for i in 0..1000 {
+            csv.push_str(&format!("{i}\n"));
+        }
+        let (m, s, d) = mapped("searchnum.csv", &csv);
+        let r = m.search(&q("500"), 100);
+        assert_eq!(r.total, 1);
+        assert_eq!(r.matches[0], CellRef::new(500, 0));
+        cleanup(s, d);
+    }
+
+    #[test]
+    fn search_over_many_rows_is_fast() {
+        // The core claim: search cost tracks distinct-string count, not cell
+        // count. 1M cells drawn from 4 strings must resolve in milliseconds.
+        let mut csv = String::from("a,b,c,d\n");
+        let regions = ["north", "south", "east", "west"];
+        for i in 0..250_000 {
+            for c in 0..4 {
+                csv.push_str(regions[(i + c) % 4]);
+                csv.push(if c == 3 { '\n' } else { ',' });
+            }
+        }
+        let (m, s, d) = mapped("searchbig.csv", &csv);
+        assert_eq!(m.row_count(), 250_000);
+
+        let t = std::time::Instant::now();
+        let r = m.search(&q("north"), 100);
+        let ms = t.elapsed().as_millis();
+
+        assert_eq!(r.total, 250_000, "north appears once per row");
+        assert_eq!(r.matched_strings, 1);
+        assert!(
+            ms < 500,
+            "1M-cell search took {ms}ms — the arena fast path may be broken"
+        );
+        cleanup(s, d);
+    }
+
+    #[test]
+    fn search_with_no_matches_scans_nothing() {
+        let mut csv = String::from("a\n");
+        for _ in 0..100_000 {
+            csv.push_str("alpha\n");
+        }
+        let (m, s, d) = mapped("searchnone.csv", &csv);
+        let t = std::time::Instant::now();
+        let r = m.search(&q("zzz-absent"), 100);
+        let ms = t.elapsed().as_millis();
+        assert_eq!(r.total, 0);
+        assert_eq!(r.matched_strings, 0);
+        // Nothing matched in the arena, so the column scan is skipped wholesale.
+        assert!(
+            ms < 50,
+            "empty-result search took {ms}ms; should be near-zero"
+        );
         cleanup(s, d);
     }
 

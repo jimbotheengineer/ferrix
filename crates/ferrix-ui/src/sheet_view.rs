@@ -230,6 +230,71 @@ impl<'a> SheetView<'a> {
     pub fn heap_bytes(&self) -> usize {
         self.base.bytes() + self.overlay.heap_bytes()
     }
+
+    /// Search base data plus edits.
+    ///
+    /// The base does the heavy lifting through its columnar fast path; edited
+    /// cells are then reconciled: an edit can create a match the base does not
+    /// have, or destroy one the base does. Because edits are sparse this stays
+    /// O(base scan + edits) rather than forcing a slow path.
+    pub fn search(&self, query: &ferrix_core::Query, limit: usize) -> ferrix_core::SearchResults {
+        let mut results = match self.base {
+            BaseData::Memory(s) => s.search(query, limit),
+            BaseData::Mapped(m) => m.search(query, limit),
+        };
+        if self.overlay.is_empty() {
+            return results;
+        }
+
+        // Reconcile: drop base matches the user has edited away, and add
+        // matches the user has edited in.
+        let mut removed = 0usize;
+        results.matches.retain(|cell| {
+            match self.overlay.value(*cell) {
+                // Cell was edited; keep it only if the new value still matches.
+                Some(v) => {
+                    let keep = self.value_matches(&v, query);
+                    if !keep {
+                        removed += 1;
+                    }
+                    keep
+                }
+                None => true,
+            }
+        });
+
+        let mut added: Vec<CellRef> = Vec::new();
+        for (cell, input) in self.overlay.edited_cells() {
+            let v = input.value();
+            if self.value_matches(&v, query) {
+                // Only add if the base did not already report it.
+                let base_matched = results
+                    .matches
+                    .binary_search_by(|m| (m.row, m.col).cmp(&(cell.row, cell.col)));
+                if base_matched.is_err() {
+                    added.push(*cell);
+                }
+            }
+        }
+
+        if !added.is_empty() {
+            results.matches.extend(added.iter().copied());
+            results.matches.sort_by_key(|c| (c.row, c.col));
+            results.matches.truncate(limit);
+        }
+        results.total = results.total + added.len() - removed;
+        results
+    }
+
+    fn value_matches(&self, v: &Value, query: &ferrix_core::Query) -> bool {
+        match v {
+            Value::Empty => false,
+            Value::Number(n) => query.matches_number(*n),
+            Value::Bool(b) => query.matches_bool(*b),
+            Value::Text(id) => query.matches_str(self.resolve(*id)),
+            Value::Error(e) => query.matches_str(e.as_str()),
+        }
+    }
 }
 
 /// Formulas evaluate against the composite view, so `=SUM(A1:A10)` sees edited
@@ -357,5 +422,70 @@ mod tests {
         ov.set(CellRef::new(0, 0), CellInput::Literal(Value::Text(id)));
         let v = SheetView::new(&base, &ov);
         assert_eq!(v.display(CellRef::new(0, 0)), "hello");
+    }
+
+    fn text_base() -> BaseData {
+        let mut s = Sheet::new("t");
+        for r in 0..10u32 {
+            s.set_text(
+                CellRef::new(r, 0),
+                if r % 2 == 0 { "north" } else { "south" },
+            );
+        }
+        BaseData::Memory(s)
+    }
+
+    fn q(needle: &str) -> ferrix_core::Query {
+        ferrix_core::Query::new(needle, false, false).unwrap()
+    }
+
+    #[test]
+    fn search_without_edits_matches_the_base() {
+        let base = text_base();
+        let ov = EditOverlay::new();
+        let v = SheetView::new(&base, &ov);
+        let r = v.search(&q("north"), 100);
+        assert_eq!(r.total, 5);
+        assert_eq!(r.matches[0], CellRef::new(0, 0));
+    }
+
+    #[test]
+    fn editing_a_cell_away_removes_it_from_results() {
+        let base = text_base();
+        let mut ov = EditOverlay::new();
+        // Row 0 was "north"; change it so it no longer matches.
+        let id = ov.intern("west");
+        ov.set(CellRef::new(0, 0), CellInput::Literal(Value::Text(id)));
+        let v = SheetView::new(&base, &ov);
+        let r = v.search(&q("north"), 100);
+        assert_eq!(r.total, 4, "the edited cell must drop out");
+        assert!(!r.matches.contains(&CellRef::new(0, 0)));
+    }
+
+    #[test]
+    fn editing_a_cell_in_adds_it_to_results() {
+        let base = text_base();
+        let mut ov = EditOverlay::new();
+        // Row 1 was "south"; make it match.
+        let id = ov.intern("north-east");
+        ov.set(CellRef::new(1, 0), CellInput::Literal(Value::Text(id)));
+        let v = SheetView::new(&base, &ov);
+        let r = v.search(&q("north"), 100);
+        assert_eq!(r.total, 6);
+        assert!(r.matches.contains(&CellRef::new(1, 0)));
+        // Results must stay row-major after the insertion.
+        let rows: Vec<u32> = r.matches.iter().map(|m| m.row).collect();
+        assert!(rows.windows(2).all(|w| w[0] <= w[1]), "order broken");
+    }
+
+    #[test]
+    fn edits_beyond_the_base_are_searchable() {
+        let base = text_base();
+        let mut ov = EditOverlay::new();
+        let id = ov.intern("northwest");
+        ov.set(CellRef::new(500, 3), CellInput::Literal(Value::Text(id)));
+        let v = SheetView::new(&base, &ov);
+        let r = v.search(&q("north"), 100);
+        assert!(r.matches.contains(&CellRef::new(500, 3)));
     }
 }

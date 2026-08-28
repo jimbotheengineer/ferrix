@@ -16,6 +16,11 @@ impl Theme {
     pub const NUMBER: Color32 = Color32::from_rgb(0x8f, 0xd0, 0xa8);
     pub const ERROR: Color32 = Color32::from_rgb(0xff, 0x7b, 0x72);
     pub const ROW_ALT: Color32 = Color32::from_rgb(0x15, 0x18, 0x1d);
+    /// Search-match fill: warm enough to read against the dark grid without
+    /// competing with the blue selection.
+    pub const MATCH_BG: Color32 = Color32::from_rgb(0x4a, 0x3d, 0x1a);
+    pub const MATCH_CURRENT: Color32 = Color32::from_rgb(0x7a, 0x5f, 0x1e);
+    pub const MATCH_EDGE: Color32 = Color32::from_rgb(0xf0, 0xc0, 0x50);
 
     pub fn apply(ctx: &egui::Context) {
         let mut v = Visuals::dark();
