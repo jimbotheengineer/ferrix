@@ -81,6 +81,9 @@ pub struct FerrixApp {
     search_case_sensitive: bool,
     search_whole_cell: bool,
 
+    /// Chart panel state: the built scene, its annotations, and the window.
+    chart: crate::chart_panel::ChartPanel,
+
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
     fill_target: Option<Selection>,
@@ -131,6 +134,7 @@ impl FerrixApp {
             search_focus_pending: false,
             search_case_sensitive: false,
             search_whole_cell: false,
+            chart: crate::chart_panel::ChartPanel::default(),
             fill_source: None,
             fill_target: None,
             edits_path: None,
@@ -547,6 +551,199 @@ impl FerrixApp {
         }
     }
 
+    /// Build a chart from the current selection and open the panel.
+    ///
+    /// A single cell is almost never what someone means by "chart this", so a
+    /// lone cursor is widened to the whole column — the common case being
+    /// "click a column header, chart it".
+    fn open_chart(&mut self) {
+        let sel = if self.selection.is_single() {
+            let c = self.selection.cursor;
+            let last = self.stats_rows.saturating_sub(1) as u32;
+            Selection::new(CellRef::new(0, c.col), CellRef::new(last, c.col))
+        } else {
+            self.selection
+        };
+
+        let kind = self.chart.kind;
+        {
+            let view = self.wb.view();
+            self.chart.build(&view, sel, kind);
+        }
+        self.chart.open = true;
+        self.status = self.chart.status.clone();
+    }
+
+    /// Rebuild the chart from its stored source range, after a kind change.
+    fn rebuild_chart(&mut self) {
+        if let Some(sel) = self.chart.source {
+            let kind = self.chart.kind;
+            {
+                let view = self.wb.view();
+                self.chart.build(&view, sel, kind);
+            }
+            self.status = self.chart.status.clone();
+        }
+    }
+
+    /// Write the current chart, annotations included, to an SVG file.
+    fn export_chart_svg(&mut self) {
+        let Some(svg) = self.chart.to_svg(1200.0, 600.0) else {
+            self.status = "No chart to export".to_string();
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SVG", &["svg"])
+            .set_file_name("chart.svg")
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match std::fs::write(&path, svg) {
+            Ok(()) => format!(
+                "Chart exported → {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(e) => format!("Chart export failed: {e}"),
+        };
+    }
+
+    /// The chart window: controls, canvas, annotation list.
+    fn show_chart_window(&mut self, ctx: &egui::Context) {
+        if !self.chart.open {
+            return;
+        }
+        let mut open = self.chart.open;
+        let mut rebuild = false;
+        let mut export = false;
+
+        egui::Window::new("Chart")
+            .open(&mut open)
+            .default_size([760.0, 480.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for k in crate::chart_panel::ChartKind::ALL {
+                        if ui
+                            .selectable_label(self.chart.kind == k, k.label())
+                            .clicked()
+                            && self.chart.kind != k
+                        {
+                            self.chart.kind = k;
+                            rebuild = true;
+                        }
+                    }
+                    ui.separator();
+                    let placing = self.chart.placing_note;
+                    if ui
+                        .selectable_label(placing, "📌 Note")
+                        .on_hover_text("Click the chart to place a note")
+                        .clicked()
+                    {
+                        self.chart.placing_note = !placing;
+                    }
+                    if ui
+                        .button("⬈ SVG…")
+                        .on_hover_text("Export as a resizable vector image")
+                        .clicked()
+                    {
+                        export = true;
+                    }
+                });
+
+                ui.label(
+                    egui::RichText::new(&self.chart.status)
+                        .size(11.0)
+                        .color(Theme::TEXT_DIM),
+                );
+                ui.separator();
+
+                let avail = ui.available_size();
+                let canvas = egui::vec2(avail.x, (avail.y - 60.0).max(160.0));
+                let (rect, _) = ui.allocate_exact_size(canvas, egui::Sense::hover());
+
+                if let Some(scene) = self.chart.scene.clone() {
+                    let (vp, resp) =
+                        crate::chart_panel::paint_scene(ui, &scene, &self.chart.annotations, rect);
+
+                    // Place a note where the user clicks, in DATA coordinates,
+                    // so it stays put when the window is resized.
+                    if self.chart.placing_note {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            if resp.clicked() {
+                                let n = crate::chart_panel::note_at(&vp, pos, "note");
+                                let i = self.chart.annotations.add(n);
+                                self.chart.editing_note = Some(i);
+                                self.chart.note_buffer = "note".to_string();
+                                self.chart.placing_note = false;
+                            }
+                        }
+                    }
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Select a range and choose a chart type")
+                                .color(Theme::TEXT_DIM),
+                        );
+                    });
+                }
+
+                // Annotation editor.
+                if let Some(i) = self.chart.editing_note {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Note:");
+                        let r = ui.text_edit_singleline(&mut self.chart.note_buffer);
+                        if r.changed() {
+                            if let Some(a) = self.chart.annotations.get_mut(i) {
+                                a.text = self.chart.note_buffer.clone();
+                            }
+                        }
+                        if ui.button("Done").clicked() {
+                            self.chart.editing_note = None;
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.chart.annotations.remove(i);
+                            self.chart.editing_note = None;
+                        }
+                    });
+                } else if !self.chart.annotations.is_empty() {
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} note(s):",
+                                self.chart.annotations.len()
+                            ))
+                            .size(11.0)
+                            .color(Theme::TEXT_DIM),
+                        );
+                        let texts: Vec<(usize, String)> = self
+                            .chart
+                            .annotations
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| (i, a.text.clone()))
+                            .collect();
+                        for (i, t) in texts {
+                            if ui.small_button(&t).clicked() {
+                                self.chart.editing_note = Some(i);
+                                self.chart.note_buffer = t;
+                            }
+                        }
+                    });
+                }
+            });
+
+        self.chart.open = open;
+        if rebuild {
+            self.rebuild_chart();
+        }
+        if export {
+            self.export_chart_svg();
+        }
+    }
+
     /// Export the current sheet — base plus edits — to a CSV the rest of the
     /// world can read.
     ///
@@ -910,6 +1107,8 @@ impl eframe::App for FerrixApp {
         if self.close_prompt {
             self.show_close_prompt(ctx);
         }
+        self.show_chart_window(ctx);
+        {}
 
         self.handle_keys(ctx);
 
@@ -934,6 +1133,13 @@ impl eframe::App for FerrixApp {
                         .clicked()
                     {
                         self.export_dialog();
+                    }
+                    if ui
+                        .button("📈 Chart…")
+                        .on_hover_text("Chart the selected range")
+                        .clicked()
+                    {
+                        self.open_chart();
                     }
                     ui.add_space(4.0);
                     let dirty = self.wb.is_dirty();

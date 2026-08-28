@@ -1,6 +1,7 @@
 //! Ferrix — a fast, open-source spreadsheet.
 
 mod app;
+mod chart_panel;
 mod grid;
 mod sheet_view;
 mod theme;

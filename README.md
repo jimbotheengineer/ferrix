@@ -227,6 +227,23 @@ point. Tests pin that a note maps to the same proportional position in a
 Annotation text is XML-escaped on export, so a label containing an ampersand
 or an angle bracket cannot produce an SVG no viewer will open.
 
+### Charting a range
+
+Select a range, press **Chart**, pick a kind. A lone cursor widens to the whole
+column. Line, bar, histogram and scatter all rebuild live from the source
+range, and the panel reports rows used, primitives drawn and build time.
+
+Charts cap at 2,000,000 rows per build. Aggregation is bounded by the canvas,
+but *reading* a column costs one `get` per row -- seconds at 200M, far too slow
+for the UI thread. When a range is larger the status line says `first N of M
+rows` rather than quietly charting a subset. Bar and scatter need two columns
+and say so instead of drawing something misleading from one.
+
+Click the canvas with **Note** active to place an annotation. It is stored in
+data coordinates, so resizing the window moves the pixels and leaves the note
+on its point. **SVG** exports the chart and its notes as a vector file at any
+size.
+
 ### Getting data back out
 
 Saving writes a `.fxedits` sidecar that only Ferrix reads, so **Export CSV**
@@ -375,7 +392,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 344 tests
+cargo test --workspace     # 346 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a
