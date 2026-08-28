@@ -11,6 +11,7 @@
 pub mod arena;
 pub mod bitmap;
 pub mod column;
+pub mod filter;
 pub mod overlay;
 pub mod search;
 pub mod selection;
@@ -21,6 +22,7 @@ pub mod value;
 pub use arena::{StrId, StringArena};
 pub use bitmap::Bitmap;
 pub use column::Column;
+pub use filter::RowFilter;
 pub use overlay::{CellInput, EditOverlay};
 pub use search::{IdSet, Query, SearchResults};
 pub use selection::Selection;
