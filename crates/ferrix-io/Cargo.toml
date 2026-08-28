@@ -8,7 +8,10 @@ repository.workspace = true
 description = "File format ingest/export for Ferrix (CSV now, xlsx next)"
 
 [dependencies]
+calamine = "0.36"
 ferrix-core.workspace = true
+ferrix-formula.workspace = true
 memmap2 = "0.9"
 rayon = "1.10"
+rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 thiserror = "2"
