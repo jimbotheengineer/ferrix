@@ -511,6 +511,8 @@ mod tests {
     }
 
     #[test]
+    // 3.14159 is a ROUND() input, not an attempt to spell PI.
+    #[allow(clippy::approx_constant)]
     fn math_functions() {
         let s = Sheet::new("t");
         assert_eq!(num("=ABS(-5)", &s), 5.0);

@@ -83,7 +83,10 @@ impl Workbook {
         self.dirty = false;
     }
 
+    /// Counterpart to `mark_saved`; kept so callers that mutate state outside
+    /// the normal edit path can flag the workbook. Unused today.
     #[inline]
+    #[allow(dead_code)]
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -146,6 +149,7 @@ impl Workbook {
 
     /// How many undo entries are stacked. Exposed so tests can assert that a
     /// bulk operation is one step rather than one per cell.
+    #[allow(dead_code)] // used by tests only; kept as workbook API
     pub fn undo_depth(&self) -> usize {
         self.undo.len()
     }
@@ -594,9 +598,9 @@ impl Workbook {
                     } else {
                         CellRef::new(src_tl.row, src_br.col)
                     }
-                } else if vertical {
-                    CellRef::new(src_tl.row, src_tl.col)
                 } else {
+                    // Growing backwards anchors on the top-left corner in both
+                    // orientations.
                     CellRef::new(src_tl.row, src_tl.col)
                 };
                 let base = match view.get(anchor) {

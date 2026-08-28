@@ -524,7 +524,7 @@ mod tests {
         // tiny ones. Naive summation loses every tiny value.
         let mut c = Column::new();
         let mut vals = vec![1e16];
-        vals.extend(std::iter::repeat(1.0).take(10_000));
+        vals.extend(std::iter::repeat_n(1.0, 10_000));
         c.extend_numbers(&vals);
         // Every 1.0 must survive.
         assert_eq!(c.sum_range(0, vals.len()), 1e16 + 10_000.0);

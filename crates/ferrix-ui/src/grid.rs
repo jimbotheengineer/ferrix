@@ -77,6 +77,9 @@ pub struct GridResponse {
     pub drag_to: Option<CellRef>,
     pub double_clicked: Option<CellRef>,
     pub painted_cells: usize,
+    /// Reported for callers that want to size scrollbars or prefetch; the app
+    /// does not consume it yet, but it is part of the Grid's public response.
+    #[allow(dead_code)]
     pub visible_rows: std::ops::Range<usize>,
 }
 
@@ -258,7 +261,11 @@ impl<'a> Grid<'a> {
                 if !visible_matches.is_empty() && is_match(cref) {
                     if self.current_match == Some(cref) {
                         painter.rect_filled(cell_rect, 0.0, Theme::MATCH_CURRENT);
-                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::MATCH_EDGE));
+                        painter.rect_stroke(
+                            cell_rect,
+                            0.0,
+                            Stroke::new(1.5_f32, Theme::MATCH_EDGE),
+                        );
                     } else {
                         painter.rect_filled(cell_rect, 0.0, Theme::MATCH_BG);
                     }
@@ -270,7 +277,7 @@ impl<'a> Grid<'a> {
                 if let Some(sel) = self.selection {
                     if sel.cursor == cref {
                         painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
-                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::ACCENT));
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5_f32, Theme::ACCENT));
                     } else if !sel.is_single() && sel.contains(cref) {
                         painter.rect_filled(cell_rect, 0.0, Theme::RANGE_FILL);
                     }
@@ -331,7 +338,7 @@ impl<'a> Grid<'a> {
         }
 
         // --- grid lines ---
-        let line = Stroke::new(1.0, Theme::GRID_LINE);
+        let line = Stroke::new(1.0_f32, Theme::GRID_LINE);
         for r in row_range.clone() {
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             painter.hline(body_rect.min.x..=body_rect.max.x, y, line);
@@ -402,7 +409,7 @@ impl<'a> Grid<'a> {
             let hr = hr.shrink(2.0);
             if body_rect.contains(hr.center()) {
                 painter.rect_filled(hr, 1.0, Theme::ACCENT);
-                painter.rect_stroke(hr, 1.0, Stroke::new(1.0, Theme::BG));
+                painter.rect_stroke(hr, 1.0, Stroke::new(1.0_f32, Theme::BG));
             }
         }
         if primary_pressed && on_handle {

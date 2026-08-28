@@ -1,5 +1,7 @@
 # Ferrix
 
+[![CI](https://github.com/jimbotheengineer/ferrix/actions/workflows/ci.yml/badge.svg)](https://github.com/jimbotheengineer/ferrix/actions/workflows/ci.yml)
+
 A source-available spreadsheet built in Rust for datasets that break Excel.
 Free for noncommercial use.
 
