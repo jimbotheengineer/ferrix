@@ -14,6 +14,7 @@ pub mod bitmap;
 pub mod chart;
 pub mod column;
 pub mod filter;
+pub mod format;
 pub mod overlay;
 pub mod scene;
 pub mod search;
@@ -27,6 +28,9 @@ pub use arena::{StrId, StringArena};
 pub use bitmap::Bitmap;
 pub use column::Column;
 pub use filter::RowFilter;
+pub use format::{
+    CellOverride, ColumnFormat, ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat,
+};
 pub use overlay::{CellInput, EditOverlay};
 pub use search::{IdSet, Query, SearchResults};
 pub use selection::Selection;

@@ -458,8 +458,73 @@ fn write_conditional(
                 .set_format(fmt);
             ws.add_conditional_format(r0, c, r1, c, &cf)?;
         }
+
+        // Sign colouring is two Excel cell rules: < 0 and > 0. Excel has no
+        // single "colour by sign" construct, so expressing it as the pair it
+        // already is keeps the meaning intact across the round trip rather
+        // than dropping it.
+        ConditionalRule::Sign {
+            negative,
+            positive,
+            zero,
+        } => {
+            if let Some(neg) = negative {
+                let cf = ConditionalFormatCell::new()
+                    .set_rule(ConditionalFormatCellRule::LessThan(0.0))
+                    .set_format(Format::new().set_background_color(to_color(*neg)));
+                ws.add_conditional_format(r0, c, r1, c, &cf)?;
+            }
+            if let Some(pos) = positive {
+                let cf = ConditionalFormatCell::new()
+                    .set_rule(ConditionalFormatCellRule::GreaterThan(0.0))
+                    .set_format(Format::new().set_background_color(to_color(*pos)));
+                ws.add_conditional_format(r0, c, r1, c, &cf)?;
+            }
+            if let Some(z) = zero {
+                let cf = ConditionalFormatCell::new()
+                    .set_rule(ConditionalFormatCellRule::EqualTo(0.0))
+                    .set_format(Format::new().set_background_color(to_color(*z)));
+                ws.add_conditional_format(r0, c, r1, c, &cf)?;
+            }
+        }
+
+        // A manual colour has no condition at all. Excel's nearest equivalent
+        // is a rule that always holds; "not equal to a sentinel no cell will
+        // hold" is the conventional spelling, and it survives round-tripping
+        // where a bare cell format on a table column does not.
+        ConditionalRule::Manual { fill, text } => {
+            let mut fmt = Format::new();
+            if let Some(f) = fill {
+                fmt = fmt.set_background_color(to_color(*f));
+            }
+            if let Some(t) = text {
+                fmt = fmt.set_font_color(to_color(*t));
+            }
+            let cf = ConditionalFormatCell::new()
+                .set_rule(ConditionalFormatCellRule::NotEqualTo(f64::MIN))
+                .set_format(fmt);
+            ws.add_conditional_format(r0, c, r1, c, &cf)?;
+        }
+
+        // Top/bottom N and text-contains have no lossless mapping through the
+        // conditional-format types this crate exposes. Skipping them SILENTLY
+        // would be the worst option -- the user would see a rule in Ferrix and
+        // not in Excel with no explanation -- so they are deliberately dropped
+        // here and reported by the caller instead. See
+        // `unsupported_rules_are_reported`.
+        ConditionalRule::TopBottom { .. } | ConditionalRule::TextContains { .. } => {}
     }
     Ok(())
+}
+
+/// True when a rule cannot be represented in xlsx and will be dropped on
+/// export, so the caller can tell the user which rules did not survive rather
+/// than letting them discover it in Excel.
+pub fn rule_survives_xlsx(rule: &ConditionalRule) -> bool {
+    !matches!(
+        rule,
+        ConditionalRule::TopBottom { .. } | ConditionalRule::TextContains { .. }
+    )
 }
 
 fn cell_rule(op: CmpOp, v: f64) -> ConditionalFormatCellRule<f64> {

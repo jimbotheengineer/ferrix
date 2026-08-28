@@ -15,6 +15,7 @@ pub mod csv;
 pub mod edits;
 pub mod export;
 pub mod format;
+pub mod format_sidecar;
 pub mod mapped;
 pub mod table_xlsx;
 pub mod xlsx;
@@ -22,6 +23,7 @@ pub mod xlsx;
 pub use convert::{cache_is_fresh, cache_path_for, convert_csv, ConvertError, ConvertStats};
 pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use format::FormatError;
+pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
 pub use table_xlsx::{import_tables, write_table, FerrixTag, ImportedTable};
 pub use xlsx::{
