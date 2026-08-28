@@ -212,6 +212,18 @@ impl CmpOp {
         }
     }
 
+    /// A compact operator glyph, for rule labels in the editor.
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "≠",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "≤",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => "≥",
+        }
+    }
+
     /// The spelling xlsx `dataValidation@operator` / `cfRule@operator` uses.
     pub const fn as_xlsx(self) -> &'static str {
         match self {
@@ -786,9 +798,25 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// A conditional formatting rule over a column.
+/// A conditional formatting rule over a column or range.
+///
+/// Rules are always evaluated as an ordered list and a later rule overrides an
+/// earlier one, which is Excel's own precedence and the reason the rules
+/// editor makes the order draggable rather than hiding it.
+///
+/// [`ConditionalRule::Manual`] is in here rather than in a parallel
+/// "static colours" mechanism on purpose: a hand-picked colour is just a rule
+/// whose condition is *true*. Unifying them means one ordered list, one
+/// precedence story, one persistence path, and one export path — and it means
+/// a manual colour and a value-driven rule interact in a way the user can
+/// predict from where they sit in the list.
 #[derive(Clone, PartialEq, Debug)]
 pub enum ConditionalRule {
+    /// An unconditional colour — the "paint it yellow" case.
+    Manual {
+        fill: Option<Rgb>,
+        text: Option<Rgb>,
+    },
     /// Two-colour scale between the column's min and max.
     ColorScale2 { min: Rgb, max: Rgb },
     /// Three-colour scale; the midpoint is the 50th percentile of the range.
@@ -799,6 +827,33 @@ pub enum ConditionalRule {
     Threshold {
         op: CmpOp,
         value: f64,
+        fill: Rgb,
+        text: Rgb,
+    },
+    /// Colour by sign — the negative-red / positive-green convention.
+    ///
+    /// Expressible as two [`ConditionalRule::Threshold`]s, but kept distinct
+    /// because it is the single most common thing a user wants, and because
+    /// one rule with three optional colours is far easier to present in an
+    /// editor than two rules that must be kept consistent.
+    Sign {
+        negative: Option<Rgb>,
+        positive: Option<Rgb>,
+        zero: Option<Rgb>,
+    },
+    /// The N largest (or smallest) values in the evaluated window.
+    ///
+    /// Rank cannot be answered from one cell, so this depends on
+    /// [`crate::format::RuleEval::cut`] and no-ops without it.
+    TopBottom {
+        top: bool,
+        n: u32,
+        fill: Rgb,
+        text: Rgb,
+    },
+    /// The cell's display text contains `needle`, compared case-insensitively.
+    TextContains {
+        needle: String,
         fill: Rgb,
         text: Rgb,
     },
@@ -820,14 +875,126 @@ impl CellStyle {
 }
 
 impl ConditionalRule {
+    /// Does this rule need the column's `(min, max)` over the evaluated
+    /// window? Colour scales and bars are meaningless without it.
+    #[inline]
+    pub fn needs_extent(&self) -> bool {
+        matches!(
+            self,
+            ConditionalRule::ColorScale2 { .. }
+                | ConditionalRule::ColorScale3 { .. }
+                | ConditionalRule::DataBar { .. }
+        )
+    }
+
+    /// Does this rule need the cell's *display text*?
+    ///
+    /// Resolving display text allocates, so callers ask this before paying for
+    /// it and pass `""` when the answer is no.
+    #[inline]
+    pub fn needs_text(&self) -> bool {
+        matches!(self, ConditionalRule::TextContains { .. })
+    }
+
+    /// Does this rule need a scan of the visible window before it can be
+    /// evaluated at all? `false` means the rule is answerable from one cell,
+    /// which is the case for every rule except scales, bars and top/bottom-N.
+    #[inline]
+    pub fn needs_window(&self) -> bool {
+        self.needs_extent() || matches!(self, ConditionalRule::TopBottom { .. })
+    }
+
+    /// A short human label for the rules editor.
+    pub fn label(&self) -> String {
+        match self {
+            ConditionalRule::Manual { fill, text } => match (fill, text) {
+                (Some(_), Some(_)) => "Fill + text colour".into(),
+                (Some(_), None) => "Fill colour".into(),
+                (None, Some(_)) => "Text colour".into(),
+                (None, None) => "Manual (no colour)".into(),
+            },
+            ConditionalRule::ColorScale2 { .. } => "2-colour scale".into(),
+            ConditionalRule::ColorScale3 { .. } => "3-colour scale".into(),
+            ConditionalRule::DataBar { .. } => "Data bar".into(),
+            ConditionalRule::Threshold { op, value, .. } => {
+                format!(
+                    "Value {} {}",
+                    op.symbol(),
+                    crate::value::format_number(*value)
+                )
+            }
+            ConditionalRule::Sign { .. } => "Colour by sign".into(),
+            ConditionalRule::TopBottom { top, n, .. } => {
+                format!("{} {}", if *top { "Top" } else { "Bottom" }, n)
+            }
+            ConditionalRule::TextContains { needle, .. } => {
+                format!("Text contains \"{needle}\"")
+            }
+        }
+    }
+
     /// Apply this rule to a numeric cell.
     ///
-    /// `extent` is the column's `(min, max)`, which the caller computes once
-    /// per repaint via `Column::min_max_range` over the *visible* rows. Scales
-    /// and bars are meaningless without it, so they no-op when it is `None`.
+    /// `extent` is the column's `(min, max)` over the visible rows. Scales and
+    /// bars are meaningless without it, so they no-op when it is `None`.
+    ///
+    /// This is the table-facing entry point and is kept for the rules a table
+    /// column can express; sheet-level formatting goes through
+    /// [`ConditionalRule::apply_cell`], which also handles text and rank.
     pub fn apply(&self, v: f64, extent: Option<(f64, f64)>, out: &mut CellStyle) {
+        self.apply_cell(
+            &Value::Number(v),
+            "",
+            crate::format::RuleEval { extent, cut: None },
+            out,
+        );
+    }
+
+    /// Apply this rule to any cell value.
+    ///
+    /// Allocates nothing. `text` is the cell's display text when
+    /// [`ConditionalRule::needs_text`] said it was wanted, and `""` otherwise —
+    /// a text rule handed an empty string simply does not match, which is the
+    /// right answer for an empty cell too.
+    pub fn apply_cell(
+        &self,
+        value: &Value,
+        text: &str,
+        eval: crate::format::RuleEval,
+        out: &mut CellStyle,
+    ) {
+        // A manual colour is unconditional and so is the only rule that
+        // applies to a non-numeric cell without further thought.
+        if let ConditionalRule::Manual { fill, text: tc } = self {
+            if let Some(f) = fill {
+                out.fill = Some(*f);
+            }
+            if let Some(t) = tc {
+                out.text = Some(*t);
+            }
+            return;
+        }
+
+        if let ConditionalRule::TextContains {
+            needle,
+            fill,
+            text: tc,
+        } = self
+        {
+            // Case-insensitive without allocating: `to_lowercase` on every
+            // painted cell would be a per-frame string churn for nothing.
+            if !needle.is_empty() && contains_ignore_ascii_case(text, needle) {
+                out.fill = Some(*fill);
+                out.text = Some(*tc);
+            }
+            return;
+        }
+
+        let Value::Number(v) = value else { return };
+        let v = *v;
+
         let frac = || -> Option<f32> {
-            let (lo, hi) = extent?;
+            let (lo, hi) = eval.extent?;
             // A degenerate or NaN extent has no meaningful position in it;
             // everything sits at the bottom rather than dividing by zero.
             if !(hi - lo).is_finite() || hi <= lo {
@@ -836,6 +1003,9 @@ impl ConditionalRule {
             Some((((v - lo) / (hi - lo)) as f32).clamp(0.0, 1.0))
         };
         match self {
+            ConditionalRule::Manual { .. } | ConditionalRule::TextContains { .. } => {
+                unreachable!("handled above")
+            }
             ConditionalRule::ColorScale2 { min, max } => {
                 if let Some(t) = frac() {
                     out.fill = Some(min.lerp(*max, t));
@@ -866,8 +1036,53 @@ impl ConditionalRule {
                     out.text = Some(*text);
                 }
             }
+            ConditionalRule::Sign {
+                negative,
+                positive,
+                zero,
+            } => {
+                // Only the TEXT colour is set. Sign colouring is a typographic
+                // convention (accountants' red), not a highlight, and filling
+                // every negative cell would drown the sheet in colour.
+                let pick = if v < 0.0 {
+                    *negative
+                } else if v > 0.0 {
+                    *positive
+                } else {
+                    *zero
+                };
+                if let Some(c) = pick {
+                    out.text = Some(c);
+                }
+            }
+            ConditionalRule::TopBottom {
+                top,
+                fill,
+                text,
+                n: _,
+            } => {
+                // No rank cut means the caller declined to scan a window; the
+                // rule then says nothing rather than guessing.
+                if let Some(cut) = eval.cut {
+                    let hit = if *top { v >= cut } else { v <= cut };
+                    if hit {
+                        out.fill = Some(*fill);
+                        out.text = Some(*text);
+                    }
+                }
+            }
         }
     }
+}
+
+/// `haystack.to_lowercase().contains(&needle.to_lowercase())` without the two
+/// allocations, which matters at ~1,500 calls per frame.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > h.len() {
+        return n.is_empty();
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 // ================================================================= filtering ==
