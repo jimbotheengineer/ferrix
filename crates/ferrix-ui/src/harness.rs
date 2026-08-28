@@ -479,6 +479,73 @@ mod tests {
     }
 
     #[test]
+    fn search_filter_mode_hides_non_matching_rows() {
+        // The merge of structured tables (#16) and search filter mode (#6)
+        // produced two independent row mappings resolved from the same screen
+        // index, so one silently won and the other was ignored — wrong records
+        // painted under correct row numbers. clippy caught it as an unused
+        // binding; no test in either branch could, because neither exercised
+        // both filters.
+        //
+        // This is the check I could not perform by hand: synthetic OS input
+        // could not reliably even open the search bar.
+        let p = write_csv(
+            "filtermode.csv",
+            "id,status\n1,open\n2,closed\n3,open\n4,closed\n5,open\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(h.app().row_count(), 5);
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+
+        assert!(h.app().search_is_open());
+        assert_eq!(
+            h.app().search_match_count(),
+            3,
+            "three rows contain 'open'; status: {}",
+            h.status()
+        );
+
+        // Underlying data must be untouched by filtering — a filter is a view,
+        // never an edit.
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "closed");
+        assert_eq!(
+            h.app().row_count(),
+            5,
+            "filtering must not change row_count"
+        );
+        assert!(
+            !h.app().is_dirty(),
+            "searching must never dirty the workbook"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn closing_search_leaves_the_sheet_fully_visible() {
+        // A filter that outlived its search bar would leave rows hidden with no
+        // visible way to bring them back.
+        let p = write_csv("closefilter.csv", "id,status\n1,open\n2,closed\n3,open\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        assert!(h.app().search_is_open());
+
+        h.press_key(Key::Escape).steps(2);
+        assert!(
+            !h.app().search_is_open(),
+            "Escape must close the search bar"
+        );
+        assert_eq!(h.app().row_count(), 3);
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "closed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn an_edit_marks_the_workbook_dirty() {
         // The dirty flag drives the unsaved-changes prompt, which is the last
         // guard against losing work on close.
