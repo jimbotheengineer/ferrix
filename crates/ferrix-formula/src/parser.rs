@@ -23,6 +23,16 @@ pub enum Token {
         abs_col: bool,
         abs_row: bool,
     },
+    /// A sheet-qualified reference: `Sheet2!A1` or `'My Sheet'!$B$2`.
+    ///
+    /// The sheet name is kept verbatim (unquoted, with `''` unescaped) so the
+    /// workbook can resolve it case-insensitively at graph-build time.
+    SheetRef {
+        sheet: String,
+        cell: CellRef,
+        abs_col: bool,
+        abs_row: bool,
+    },
     Ident(String),
     LParen,
     RParen,
@@ -77,6 +87,15 @@ pub enum Expr {
     Ref(CellRef),
     /// An inclusive rectangular range, normalized so start <= end.
     Range(CellRef, CellRef),
+    /// `Sheet2!A1` — a reference into another sheet, by name.
+    ///
+    /// Kept as a separate variant rather than adding a `sheet: Option<String>`
+    /// field to [`Expr::Ref`] so that every existing consumer of a same-sheet
+    /// reference keeps compiling and behaving identically; only code that
+    /// genuinely wants to be workbook-aware has to grow a new arm.
+    XRef(String, CellRef),
+    /// `Sheet2!A1:B10` — a range inside another sheet, normalized.
+    XRange(String, CellRef, CellRef),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -101,8 +120,30 @@ pub enum ParseError {
     Expected(&'static str, String),
     #[error("invalid cell reference {0:?}")]
     BadRef(String),
+    #[error("unterminated quoted sheet name")]
+    UnterminatedSheetName,
+    #[error("expected a cell reference after {0:?}!")]
+    BadSheetRef(String),
     #[error("trailing input after expression: {0:?}")]
     Trailing(String),
+}
+
+/// Render a sheet name as it must appear inside a formula.
+///
+/// Bare names are written as-is; anything containing a character that would
+/// confuse the tokenizer (space, `!`, `'`, punctuation) is single-quoted with
+/// interior quotes doubled — the same convention Excel uses.
+pub fn quote_sheet_name(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+    if plain {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
 }
 
 /// Tokenize a formula body (without the leading `=`).
@@ -236,6 +277,32 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     .map_err(|_| ParseError::BadChar('.', start))?;
                 out.push(Token::Number(n));
             }
+            b'\'' => {
+                // A quoted sheet name: 'My Sheet'!A1, with '' as an escaped
+                // quote. Only ever valid immediately before `!`.
+                let mut name = String::new();
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(ParseError::UnterminatedSheetName);
+                    }
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            name.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    let ch_len = utf8_len(bytes[i]);
+                    name.push_str(&input[i..i + ch_len]);
+                    i += ch_len;
+                }
+                let (tok, next) = lex_sheet_qualified(input, bytes, i, name)?;
+                out.push(tok);
+                i = next;
+            }
             b'$' | b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
                 let start = i;
                 while i < bytes.len()
@@ -248,6 +315,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 let word = &input[start..i];
                 let upper = word.to_ascii_uppercase();
+                // `Name!` is a sheet qualifier, and it wins over every other
+                // reading of the word — `TRUE!A1` names a sheet called TRUE.
+                if bytes.get(i) == Some(&b'!') {
+                    let (tok, next) = lex_sheet_qualified(input, bytes, i, word.to_string())?;
+                    out.push(tok);
+                    i = next;
+                    continue;
+                }
                 // A word immediately followed by `(` is a function call, never
                 // a cell reference. Without this, LOG10( lexes as ref LOG10.
                 let mut j = i;
@@ -330,6 +405,43 @@ fn parse_ref_token(word: &str) -> Option<Token> {
         abs_col,
         abs_row,
     })
+}
+
+/// Finish lexing a sheet-qualified reference.
+///
+/// `at` points at the byte that should be `!`; `name` is the already-decoded
+/// sheet name. Returns the token plus the index just past the reference.
+fn lex_sheet_qualified(
+    input: &str,
+    bytes: &[u8],
+    at: usize,
+    name: String,
+) -> Result<(Token, usize), ParseError> {
+    if bytes.get(at) != Some(&b'!') {
+        return Err(ParseError::BadSheetRef(name));
+    }
+    let mut i = at + 1;
+    let ref_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'$') {
+        i += 1;
+    }
+    let word = &input[ref_start..i];
+    match parse_ref_token(word) {
+        Some(Token::Ref {
+            cell,
+            abs_col,
+            abs_row,
+        }) => Ok((
+            Token::SheetRef {
+                sheet: name,
+                cell,
+                abs_col,
+                abs_row,
+            },
+            i,
+        )),
+        _ => Err(ParseError::BadSheetRef(name)),
+    }
 }
 
 /// Parse a formula. Accepts an optional leading `=`.
@@ -420,6 +532,35 @@ impl Parser {
                     }
                 } else {
                     Expr::Ref(cell)
+                }
+            }
+            Token::SheetRef { sheet, cell, .. } => {
+                // `Sheet2!A1:B4` — a colon continues the range. The right-hand
+                // corner may be bare (`Sheet2!A1:B4`) or requalified with the
+                // SAME sheet (`Sheet2!A1:Sheet2!B4`); a different sheet on the
+                // far side is a 3-D reference, which Ferrix does not support.
+                if matches!(self.peek(), Some(Token::Colon)) {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::Ref { cell: end, .. }) => {
+                            let (a, b) = normalize_range(cell, end);
+                            Expr::XRange(sheet, a, b)
+                        }
+                        Some(Token::SheetRef {
+                            sheet: s2,
+                            cell: end,
+                            ..
+                        }) if s2.eq_ignore_ascii_case(&sheet) => {
+                            let (a, b) = normalize_range(cell, end);
+                            Expr::XRange(sheet, a, b)
+                        }
+                        Some(t) => {
+                            return Err(ParseError::Expected("cell reference", format!("{t:?}")))
+                        }
+                        None => return Err(ParseError::UnexpectedEnd),
+                    }
+                } else {
+                    Expr::XRef(sheet, cell)
                 }
             }
             Token::Ident(name) => {
@@ -742,5 +883,159 @@ mod tests {
     #[test]
     fn works_without_leading_equals() {
         assert_eq!(parse("1+1").unwrap(), parse("=1+1").unwrap());
+    }
+
+    // --- cross-sheet references (issue #15) ---
+
+    #[test]
+    fn tokenizes_a_bare_sheet_qualified_ref() {
+        assert_eq!(
+            tokenize("Sheet2!A1").unwrap(),
+            vec![Token::SheetRef {
+                sheet: "Sheet2".into(),
+                cell: CellRef::new(0, 0),
+                abs_col: false,
+                abs_row: false
+            }]
+        );
+    }
+
+    #[test]
+    fn sheet_qualified_refs_keep_absolute_markers() {
+        assert_eq!(
+            tokenize("Data!$B$2").unwrap(),
+            vec![Token::SheetRef {
+                sheet: "Data".into(),
+                cell: CellRef::new(1, 1),
+                abs_col: true,
+                abs_row: true
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_a_cross_sheet_reference() {
+        assert_eq!(
+            parse("=Sheet2!A1").unwrap(),
+            Expr::XRef("Sheet2".into(), CellRef::new(0, 0))
+        );
+        // And it composes like any other value.
+        assert_eq!(
+            parse("=Sheet2!A1*2").unwrap(),
+            Expr::Binary(
+                BinOp::Mul,
+                Box::new(Expr::XRef("Sheet2".into(), CellRef::new(0, 0))),
+                Box::new(num(2.0))
+            )
+        );
+    }
+
+    #[test]
+    fn parses_a_cross_sheet_range() {
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:B4)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::XRange(
+                    "Sheet2".into(),
+                    CellRef::new(0, 0),
+                    CellRef::new(3, 1)
+                )]
+            )
+        );
+        // Reversed corners normalize, exactly like a same-sheet range.
+        assert_eq!(
+            parse("=SUM(Sheet2!B4:A1)").unwrap(),
+            parse("=SUM(Sheet2!A1:B4)").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_range_may_requalify_the_same_sheet_on_both_ends() {
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:Sheet2!B4)").unwrap(),
+            parse("=SUM(Sheet2!A1:B4)").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_three_d_range_across_two_sheets_is_rejected() {
+        // Sheet1!A1:Sheet2!B4 is a 3-D reference. Ferrix does not support one,
+        // and silently treating it as a Sheet1 range would be a wrong answer.
+        assert!(parse("=SUM(Sheet1!A1:Sheet2!B4)").is_err());
+    }
+
+    #[test]
+    fn quoted_sheet_names_may_contain_spaces() {
+        assert_eq!(
+            parse("='My Sheet'!A1").unwrap(),
+            Expr::XRef("My Sheet".into(), CellRef::new(0, 0))
+        );
+        // A doubled '' is an escaped quote inside the name.
+        assert_eq!(
+            parse("='Bob''s Data'!B2").unwrap(),
+            Expr::XRef("Bob's Data".into(), CellRef::new(1, 1))
+        );
+    }
+
+    #[test]
+    fn an_unterminated_quoted_sheet_name_errors() {
+        assert_eq!(
+            tokenize("'My Sheet!A1"),
+            Err(ParseError::UnterminatedSheetName)
+        );
+    }
+
+    #[test]
+    fn a_sheet_qualifier_with_no_valid_ref_errors() {
+        assert!(parse("=Sheet2!").is_err());
+        assert!(parse("=Sheet2!ZZZZ").is_err());
+        assert!(parse("='My Sheet'!nonsense").is_err());
+    }
+
+    #[test]
+    fn a_sheet_name_wins_over_bool_and_function_readings() {
+        // `TRUE!A1` names a sheet called TRUE, not the boolean.
+        assert_eq!(
+            parse("=TRUE!A1").unwrap(),
+            Expr::XRef("TRUE".into(), CellRef::new(0, 0))
+        );
+        // A sheet may share a name with a function, too.
+        assert_eq!(
+            parse("=SUM!A1").unwrap(),
+            Expr::XRef("SUM".into(), CellRef::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn sheet_name_quoting_round_trips() {
+        // Plain names stay bare; anything the tokenizer could misread is
+        // quoted, and re-parsing recovers the original name exactly.
+        assert_eq!(quote_sheet_name("Sheet2"), "Sheet2");
+        assert_eq!(quote_sheet_name("My Sheet"), "'My Sheet'");
+        assert_eq!(quote_sheet_name("Bob's"), "'Bob''s'");
+        assert_eq!(quote_sheet_name("2024"), "'2024'");
+        for name in ["Sheet2", "My Sheet", "Bob's", "2024", "Q1-Report"] {
+            let src = format!("={}!A1", quote_sheet_name(name));
+            assert_eq!(
+                parse(&src).unwrap(),
+                Expr::XRef(name.into(), CellRef::new(0, 0)),
+                "round trip failed for {name:?} (as {src})"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_references_are_untouched_by_sheet_support() {
+        // The regression guard: nothing about ordinary formulas changed.
+        assert_eq!(parse("=A1").unwrap(), Expr::Ref(CellRef::new(0, 0)));
+        assert_eq!(parse("=TRUE").unwrap(), Expr::Bool(true));
+        assert_eq!(
+            parse("=SUM(A1:A10)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::Range(CellRef::new(0, 0), CellRef::new(9, 0))]
+            )
+        );
     }
 }

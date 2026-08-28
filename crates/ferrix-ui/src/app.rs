@@ -17,6 +17,15 @@ use crate::workbook::Workbook;
 /// What a background load produced.
 struct Loaded {
     base: BaseData,
+    /// Name for the first sheet — the source's own sheet name for xlsx, or
+    /// the file stem otherwise.
+    sheet_name: String,
+    /// Every OTHER sheet in the source, in workbook order. Empty for CSV.
+    /// Each carries its own independent base and formula overlay, so a
+    /// workbook can mix a mmap'd sheet with small in-RAM ones.
+    extra_sheets: Vec<(String, BaseData, ferrix_core::EditOverlay)>,
+    /// Formulas belonging to the FIRST sheet, when the source had any.
+    first_formulas: Option<ferrix_core::EditOverlay>,
     rows: usize,
     cols: usize,
     /// Human-readable summary for the status bar.
@@ -107,6 +116,13 @@ pub struct FerrixApp {
     /// Set once the user has resolved the prompt, so the follow-up close
     /// request is allowed straight through rather than re-prompting forever.
     allow_close: bool,
+
+    /// Sheet currently being renamed inline, and the buffer being typed into.
+    renaming: Option<ferrix_core::SheetId>,
+    rename_buffer: String,
+    rename_focus_pending: bool,
+    /// Sheet being dragged along the tab strip, for reordering.
+    dragging_tab: Option<ferrix_core::SheetId>,
 }
 
 impl FerrixApp {
@@ -145,6 +161,10 @@ impl FerrixApp {
             last_viewport_h: 600.0,
             close_prompt: false,
             allow_close: false,
+            renaming: None,
+            rename_buffer: String::new(),
+            rename_focus_pending: false,
+            dragging_tab: None,
         };
         if let Some(p) = initial {
             app.start_load(p);
@@ -189,16 +209,13 @@ impl FerrixApp {
                 self.edits_path = loaded.edits_path;
                 self.fingerprint = loaded.fingerprint;
                 let restored_count = loaded.restored.as_ref().map(|o| o.len());
-                self.wb = match loaded.restored {
-                    Some(ov) => Workbook::new(loaded.base).with_overlay(ov),
-                    None => Workbook::new(loaded.base),
-                };
-                // Formula cells were saved with their source; rebuild the
-                // dependency graph and recompute so cached values cannot drift
-                // from a base that may have been recalculated elsewhere.
-                if restored_count.is_some() {
-                    self.wb.rebuild_graph_and_recalc();
-                }
+                self.wb = build_workbook(
+                    loaded.base,
+                    loaded.sheet_name,
+                    loaded.first_formulas,
+                    loaded.restored,
+                    loaded.extra_sheets,
+                );
                 if let Some(w) = loaded.edit_warning {
                     self.status = format!("Saved edits not applied — {w}");
                 } else if let Some(n) = restored_count {
@@ -229,7 +246,9 @@ impl FerrixApp {
 
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Spreadsheets", &["csv", "tsv", "txt", "xlsx"])
             .add_filter("CSV", &["csv", "tsv", "txt"])
+            .add_filter("Excel", &["xlsx"])
             .pick_file()
         {
             self.start_load(path);
@@ -603,6 +622,227 @@ impl FerrixApp {
         self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
     }
+
+    /// Save where the user is looking on the current sheet.
+    fn stash_view_state(&mut self) {
+        self.wb.set_view_state(crate::workbook::SheetViewState {
+            scroll: self.scroll,
+            selection: self.selection,
+        });
+    }
+
+    /// Switch tabs, preserving each sheet's scroll position and selection.
+    fn switch_sheet(&mut self, id: ferrix_core::SheetId) {
+        if id == self.wb.active_sheet() {
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        // Stash BEFORE activating, so the sheet we are leaving remembers where
+        // we were; then adopt whatever the sheet we are entering remembered.
+        self.stash_view_state();
+        if self.wb.activate(id).is_err() {
+            return;
+        }
+        let state = self.wb.view_state();
+        self.scroll = state.scroll;
+        self.selection = state.selection;
+        // Column widths and search hits belong to the sheet we just left.
+        self.col_widths = Vec::new();
+        self.search_results = ferrix_core::SearchResults::default();
+        self.search_index = 0;
+        let view = self.wb.view();
+        self.stats_rows = view.row_count();
+        self.stats_cols = view.col_count();
+        self.status = format!(
+            "{} · {} rows × {} cols",
+            self.wb.active_name(),
+            fmt_int(self.stats_rows),
+            self.stats_cols
+        );
+        self.sync_formula_bar();
+    }
+
+    /// Add a fresh, empty in-RAM sheet and switch to it.
+    ///
+    /// New sheets are always `Sheet::new` — small and in RAM. Only a FILE gets
+    /// the size check that decides mmap, and a blank sheet has no file, so
+    /// there is nothing to be out-of-core about. Opening a 12 GB CSV into a
+    /// sheet still takes the mmap path, per sheet.
+    fn add_sheet(&mut self) {
+        let name = self.wb.unique_sheet_name();
+        let base = BaseData::Memory(Sheet::new(&name));
+        match self.wb.add_sheet(&name, base) {
+            Ok(id) => {
+                self.switch_sheet(id);
+                self.status = format!("Added sheet {name}");
+            }
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    fn delete_sheet(&mut self, id: ferrix_core::SheetId) {
+        let name = self.wb.sheet_name(id).unwrap_or("").to_string();
+        match self.wb.delete_sheet(id) {
+            Ok(()) => {
+                // Deleting may have changed which sheet is active.
+                let state = self.wb.view_state();
+                self.scroll = state.scroll;
+                self.selection = state.selection;
+                self.col_widths = Vec::new();
+                let view = self.wb.view();
+                self.stats_rows = view.row_count();
+                self.stats_cols = view.col_count();
+                self.status = format!("Deleted sheet {name}");
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(id) = self.renaming.take() else {
+            return;
+        };
+        let name = std::mem::take(&mut self.rename_buffer);
+        match self.wb.rename_sheet(id, &name) {
+            Ok(()) => {
+                self.status = format!("Renamed sheet to {}", name.trim());
+                self.sync_formula_bar();
+            }
+            // Refused (blank or duplicate): say why and keep the old name.
+            Err(e) => self.status = format!("Rename refused — {e}"),
+        }
+    }
+
+    /// The sheet tab strip along the bottom of the window.
+    fn show_sheet_tabs(&mut self, ctx: &egui::Context) {
+        // Actions are collected here and applied after the UI closure, which
+        // borrows `self` immutably while every one of them needs `&mut self`.
+        let mut switch_to = None;
+        let mut delete = None;
+        let mut finish_rename: Option<bool> = None;
+        let mut add = false;
+        let mut reorder: Option<(ferrix_core::SheetId, usize)> = None;
+
+        let tabs: Vec<(ferrix_core::SheetId, String)> = self
+            .wb
+            .sheet_names()
+            .into_iter()
+            .map(|(id, n)| (id, n.to_string()))
+            .collect();
+        let active = self.wb.active_sheet();
+        let can_delete = tabs.len() > 1;
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+
+        egui::TopBottomPanel::bottom("sheet_tabs")
+            .frame(
+                egui::Frame::none()
+                    .fill(Theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(6.0, 3.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (idx, (id, name)) in tabs.iter().enumerate() {
+                                if self.renaming == Some(*id) {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.rename_buffer)
+                                            .desired_width(110.0)
+                                            .font(egui::TextStyle::Body),
+                                    );
+                                    if self.rename_focus_pending {
+                                        resp.request_focus();
+                                        self.rename_focus_pending = false;
+                                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                        finish_rename = Some(false);
+                                    } else if resp.lost_focus()
+                                        || ui.input(|i| i.key_pressed(Key::Enter))
+                                    {
+                                        finish_rename = Some(true);
+                                    }
+                                    continue;
+                                }
+
+                                let resp = ui
+                                    .selectable_label(*id == active, name.as_str())
+                                    .on_hover_text(
+                                        "Click to switch · double-click to rename · \
+                                         drag to reorder · right-click for more",
+                                    );
+                                if resp.clicked() {
+                                    switch_to = Some(*id);
+                                }
+                                if resp.double_clicked() {
+                                    self.renaming = Some(*id);
+                                    self.rename_buffer = name.clone();
+                                    self.rename_focus_pending = true;
+                                }
+                                // Drag to reorder: whichever tab the pointer is
+                                // over while a drag is live becomes the target.
+                                if resp.drag_started() {
+                                    self.dragging_tab = Some(*id);
+                                }
+                                if let Some(dragged) = self.dragging_tab {
+                                    if dragged != *id && resp.hovered() && pointer_down {
+                                        reorder = Some((dragged, idx));
+                                    }
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Rename…").clicked() {
+                                        self.renaming = Some(*id);
+                                        self.rename_buffer = name.clone();
+                                        self.rename_focus_pending = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .add_enabled(can_delete, egui::Button::new("Delete"))
+                                        .on_disabled_hover_text(
+                                            "A workbook must keep at least one sheet",
+                                        )
+                                        .clicked()
+                                    {
+                                        delete = Some(*id);
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                            if ui.button("+").on_hover_text("Add a sheet").clicked() {
+                                add = true;
+                            }
+                        });
+                    });
+            });
+
+        if !pointer_down {
+            self.dragging_tab = None;
+        }
+        match finish_rename {
+            Some(true) => self.commit_rename(),
+            Some(false) => {
+                // Cancelled: keep the existing name.
+                self.renaming = None;
+                self.rename_buffer.clear();
+            }
+            None => {}
+        }
+        if let Some((id, to)) = reorder {
+            let _ = self.wb.reorder_sheet(id, to);
+        }
+        if let Some(id) = switch_to {
+            self.switch_sheet(id);
+        }
+        if let Some(id) = delete {
+            self.delete_sheet(id);
+        }
+        if add {
+            self.add_sheet();
+        }
+    }
+
     /// Re-run the search for the current input.
     ///
     /// Cheap enough to call on every keystroke even at 200M rows, because the
@@ -676,13 +916,16 @@ impl FerrixApp {
         self.formula_result = Some(match parse(&text) {
             Ok(expr) => {
                 let t = std::time::Instant::now();
-                let view = self.wb.view();
-                let v = eval_view(&expr, &view);
+                // Evaluate through the WORKBOOK, not just this sheet, so the
+                // preview honours `Sheet2!A1` exactly as a committed formula
+                // would.
+                let source = crate::workbook::WorkbookSource::new(&self.wb, self.wb.active_sheet());
+                let v = eval_view(&expr, &source);
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 let shown = match v {
                     Value::Number(n) => ferrix_core::format_number(n),
                     Value::Bool(b) => if b { "TRUE" } else { "FALSE" }.to_string(),
-                    Value::Text(id) => view.resolve(id).to_string(),
+                    Value::Text(id) => ferrix_formula::CellSource::resolve(&source, id).to_string(),
                     Value::Error(e) => e.to_string(),
                     Value::Empty => String::new(),
                 };
@@ -1213,6 +1456,18 @@ impl eframe::App for FerrixApp {
                 });
             });
 
+        // Column widths belong to the sheet in front of us. Switching tabs
+        // clears them; recompute lazily here rather than on the switch, so a
+        // sheet's widths are sized from its own data.
+        if self.col_widths.is_empty() {
+            if let crate::sheet_view::BaseData::Memory(s) = &self.wb.base {
+                self.col_widths = compute_col_widths_mem(s);
+            }
+        }
+
+        // --- sheet tabs (below the status bar, like every spreadsheet) ---
+        self.show_sheet_tabs(ctx);
+
         // --- grid ---
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Theme::BG))
@@ -1401,6 +1656,10 @@ impl eframe::App for FerrixApp {
                 }
             });
 
+        // Keep the active sheet's remembered position current, so switching
+        // away at any moment restores exactly this view on the way back.
+        self.stash_view_state();
+
         let ms = frame_start.elapsed().as_secs_f64() as f32 * 1000.0;
         self.frame_ms = if self.frame_ms == 0.0 {
             ms
@@ -1430,6 +1689,56 @@ impl ferrix_io::export::ExportSource for crate::sheet_view::SheetView<'_> {
     }
 }
 
+/// Assemble a `Workbook` from what a load produced.
+///
+/// Split out of `poll_load` so the multi-sheet wiring — tab order, per-sheet
+/// formula overlays, and the cross-sheet graph build — is testable without an
+/// egui context.
+fn build_workbook(
+    base: BaseData,
+    sheet_name: String,
+    first_formulas: Option<ferrix_core::EditOverlay>,
+    restored: Option<ferrix_core::EditOverlay>,
+    extras: Vec<(String, BaseData, ferrix_core::EditOverlay)>,
+) -> Workbook {
+    let had_formulas = first_formulas.as_ref().is_some_and(|o| !o.is_empty());
+    let restored_any = restored.is_some();
+    // The first sheet's overlay is whichever we have: a restored sidecar
+    // (CSV path) or the xlsx's own formulas.
+    let first_overlay = restored.or(first_formulas);
+    let mut wb = Workbook::with_name(base, &sheet_name);
+    if let Some(ov) = first_overlay {
+        wb = wb.with_overlay(ov);
+    }
+    // Add the remaining sheets in source order. `add_sheet` inserts after the
+    // ACTIVE tab, so activating each one as we go keeps the workbook's tab
+    // order matching the file's.
+    let mut added = 0usize;
+    for (name, base, formulas) in extras {
+        // A duplicate name cannot come from a valid xlsx, but if one does,
+        // fall back to a generated name rather than dropping the sheet's data.
+        let name = if wb.sheet_id_by_name(&name).is_some() {
+            wb.unique_sheet_name()
+        } else {
+            name
+        };
+        if let Ok(id) = wb.add_sheet(&name, base) {
+            let _ = wb.activate(id);
+            wb.adopt_overlay(formulas);
+            added += 1;
+        }
+    }
+    let _ = wb.activate_index(0);
+    // Formula cells arrive with their source and a cached value computed
+    // elsewhere; rebuild the graph and recompute so nothing drifts. This is
+    // also what wires up cross-sheet references between the sheets just
+    // loaded — until every sheet exists, `Sheet2!A1` has nothing to resolve to.
+    if restored_any || had_formulas || added > 0 {
+        wb.rebuild_graph_and_recalc();
+    }
+    wb
+}
+
 /// Thousands separators for readability in the status bar.
 fn fmt_int(n: usize) -> String {
     let s = n.to_string();
@@ -1452,6 +1761,21 @@ fn load_any<F>(path: &Path, mut progress: F) -> LoadResult
 where
     F: FnMut(u64, u64),
 {
+    // xlsx is inherently multi-sheet, and every sheet lands as its own
+    // independently stored `BaseData`.
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
+    {
+        return load_xlsx(path);
+    }
+
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Sheet1".to_string());
+
     if !ferrix_io::should_use_mmap(path) {
         let (sheet, stats) = load_csv(path, CsvOptions::default()).map_err(|e| e.to_string())?;
         let widths = compute_col_widths_mem(&sheet);
@@ -1473,6 +1797,9 @@ where
             col_widths: widths,
             summary,
             base: BaseData::Memory(sheet),
+            sheet_name: stem,
+            extra_sheets: Vec::new(),
+            first_formulas: None,
             edits_path,
             fingerprint,
             restored,
@@ -1526,10 +1853,76 @@ where
         col_widths: widths,
         summary,
         base: BaseData::Mapped(Box::new(mapped)),
+        sheet_name: stem,
+        extra_sheets: Vec::new(),
+        first_formulas: None,
         edits_path,
         fingerprint,
         restored,
         edit_warning,
+    })
+}
+
+/// Open an .xlsx workbook, populating EVERY sheet.
+///
+/// Each worksheet becomes its own in-RAM `BaseData` plus its own formula
+/// overlay, so cross-sheet formulas resolve and each sheet's storage stays
+/// independent. Sheets always fit in RAM here because xlsx itself caps out at
+/// ~1M rows per sheet — the mmap path is for CSVs that dwarf that.
+fn load_xlsx(path: &Path) -> LoadResult {
+    let t = std::time::Instant::now();
+    let imported = ferrix_io::import_xlsx_full(path).map_err(|e| e.to_string())?;
+    let sheet_count = imported.len();
+    let total_cells: usize = imported.iter().map(|s| s.stats.cells).sum();
+    let kept: usize = imported.iter().map(|s| s.stats.formulas_kept).sum();
+    let dropped: usize = imported.iter().map(|s| s.stats.formulas_dropped).sum();
+
+    let mut it = imported.into_iter();
+    let first = it
+        .next()
+        .ok_or_else(|| "workbook has no sheets".to_string())?;
+    let widths = compute_col_widths_mem(&first.sheet);
+    let rows = first.sheet.row_count();
+    let cols = first.sheet.col_count();
+
+    let extra_sheets: Vec<(String, BaseData, ferrix_core::EditOverlay)> = it
+        .map(|s| (s.name, BaseData::Memory(s.sheet), s.formulas))
+        .collect();
+
+    let summary = format!(
+        "Loaded {} sheet{} · {} cells · {} formula{} in {:.0} ms{}",
+        sheet_count,
+        if sheet_count == 1 { "" } else { "s" },
+        fmt_int(total_cells),
+        fmt_int(kept),
+        if kept == 1 { "" } else { "s" },
+        t.elapsed().as_secs_f64() * 1000.0,
+        if dropped > 0 {
+            format!(
+                " · {} unsupported formula(s) kept as values",
+                fmt_int(dropped)
+            )
+        } else {
+            String::new()
+        }
+    );
+
+    Ok(Loaded {
+        rows,
+        cols,
+        col_widths: widths,
+        summary,
+        base: BaseData::Memory(first.sheet),
+        sheet_name: first.name,
+        extra_sheets,
+        first_formulas: Some(first.formulas),
+        // Sidecar edits are a CSV/mmap concept: an xlsx carries its own
+        // formulas, and pairing a sidecar with a re-saved workbook would be a
+        // silent mismatch waiting to happen.
+        edits_path: None,
+        fingerprint: None,
+        restored: None,
+        edit_warning: None,
     })
 }
 
@@ -1657,5 +2050,160 @@ mod tests {
         // push every other column off screen.
         assert_eq!(width_for(0), 64.0);
         assert_eq!(width_for(10_000), 320.0);
+    }
+
+    // --- multi-sheet loading (issue #15) ---
+
+    /// A temp .xlsx that deletes itself, so a failed assert cannot leave a
+    /// stray file behind for the next run to trip over.
+    struct TempXlsx(PathBuf);
+
+    impl TempXlsx {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "ferrix-ui-{tag}-{}-{:?}.xlsx",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&p);
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempXlsx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Write a real three-sheet workbook where the third sheet's formula
+    /// reaches across to the first.
+    fn write_three_sheet_xlsx(path: &Path) {
+        use ferrix_core::{CellInput, EditOverlay};
+        use ferrix_io::SheetExport;
+
+        let mut alpha = Sheet::new("Alpha");
+        for r in 0..4u32 {
+            alpha.set(CellRef::new(r, 0), Value::Number((r + 1) as f64));
+        }
+        let mut beta = Sheet::new("Beta");
+        beta.set_text(CellRef::new(0, 0), "beta text");
+        beta.set(CellRef::new(1, 0), Value::Number(99.0));
+
+        let mut gamma = Sheet::new("Gamma");
+        // Excel's cached result for the formula below. Deliberately WRONG so
+        // the test proves Ferrix recomputes rather than trusting the cache.
+        gamma.set(CellRef::new(0, 0), Value::Number(-1.0));
+        let mut gamma_fx = EditOverlay::new();
+        gamma_fx.set(
+            CellRef::new(0, 0),
+            CellInput::Formula {
+                src: "=SUM(Alpha!A1:A4)".into(),
+                cached: Value::Number(-1.0),
+            },
+        );
+
+        ferrix_io::export_workbook(
+            path,
+            &[
+                SheetExport::new("Alpha", &alpha),
+                SheetExport::new("Beta", &beta),
+                SheetExport::new("Gamma", &gamma).with_formulas(&gamma_fx),
+            ],
+        )
+        .expect("export fixture");
+    }
+
+    #[test]
+    fn importing_a_multi_sheet_xlsx_populates_every_sheet() {
+        let tmp = TempXlsx::new("multisheet");
+        write_three_sheet_xlsx(tmp.path());
+
+        let loaded = load_any(tmp.path(), |_, _| {}).expect("load");
+        assert_eq!(loaded.sheet_name, "Alpha");
+        assert_eq!(loaded.extra_sheets.len(), 2, "Beta and Gamma must load too");
+
+        let wb = build_workbook(
+            loaded.base,
+            loaded.sheet_name,
+            loaded.first_formulas,
+            loaded.restored,
+            loaded.extra_sheets,
+        );
+
+        // Every sheet is present, in the workbook's own order.
+        let names: Vec<String> = wb
+            .sheet_names()
+            .into_iter()
+            .map(|(_, n)| n.to_string())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "Beta", "Gamma"]);
+        // ...and the first tab is the one in front of the user.
+        assert_eq!(wb.active_name(), "Alpha");
+
+        let id_of = |n: &str| wb.sheet_id_by_name(n).expect("sheet");
+        let get = |n: &str, r: u32, c: u32| {
+            wb.sheet_view(id_of(n))
+                .expect("view")
+                .get(CellRef::new(r, c))
+        };
+
+        // Each sheet kept its OWN data, in its own storage.
+        assert_eq!(get("Alpha", 0, 0), Value::Number(1.0));
+        assert_eq!(get("Alpha", 3, 0), Value::Number(4.0));
+        assert_eq!(get("Beta", 1, 0), Value::Number(99.0));
+        assert_eq!(
+            wb.sheet_view(id_of("Beta"))
+                .unwrap()
+                .display(CellRef::new(0, 0)),
+            "beta text"
+        );
+
+        // The cross-sheet formula on Gamma was rebuilt and RECOMPUTED against
+        // the real Alpha data, not left at the bogus cached -1.
+        assert_eq!(
+            get("Gamma", 0, 0),
+            Value::Number(10.0),
+            "Gamma!A1 = SUM(Alpha!A1:A4) must recompute across sheets on load"
+        );
+    }
+
+    #[test]
+    fn a_loaded_cross_sheet_formula_recalculates_on_edit() {
+        let tmp = TempXlsx::new("recalc");
+        write_three_sheet_xlsx(tmp.path());
+        let loaded = load_any(tmp.path(), |_, _| {}).expect("load");
+        let mut wb = build_workbook(
+            loaded.base,
+            loaded.sheet_name,
+            loaded.first_formulas,
+            loaded.restored,
+            loaded.extra_sheets,
+        );
+        let gamma = wb.sheet_id_by_name("Gamma").unwrap();
+
+        // Editing Alpha must drive the Gamma formula, proving the graph built
+        // on load really does span sheets.
+        wb.commit_edit(CellRef::new(0, 0), "11"); // Alpha!A1: 1 -> 11
+        assert_eq!(
+            wb.sheet_view(gamma).unwrap().get(CellRef::new(0, 0)),
+            Value::Number(20.0),
+            "10 - 1 + 11"
+        );
+    }
+
+    #[test]
+    fn a_single_sheet_csv_load_still_makes_a_one_sheet_workbook() {
+        // Regression guard: the CSV path must not sprout phantom sheets.
+        let mut s = Sheet::new("t");
+        s.set(CellRef::new(0, 0), Value::Number(5.0));
+        let wb = build_workbook(BaseData::Memory(s), "data".into(), None, None, Vec::new());
+        assert_eq!(wb.sheet_count(), 1);
+        assert_eq!(wb.active_name(), "data");
+        assert_eq!(wb.view().get(CellRef::new(0, 0)), Value::Number(5.0));
     }
 }

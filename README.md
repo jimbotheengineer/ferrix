@@ -292,6 +292,51 @@ silently — the status bar reports it:
 Saved 12 edits (431 bytes) to sales.ferrix.fxedits in 0.9 ms · undo history cleared (7 steps)
 ```
 
+### Sheets
+
+A workbook holds any number of named sheets, shown as tabs along the bottom.
+Click a tab to switch, **+** to add, double-click (or right-click → Rename) to
+rename, drag to reorder, right-click → Delete to remove. Duplicate names are
+refused, case-insensitively, and the last sheet cannot be deleted.
+
+**Each sheet has its own storage.** One can be a 12GB memory-mapped file while
+its neighbour is a small in-RAM scratch sheet — the size check that chooses
+mmap runs per sheet, on the file behind it. Each sheet also remembers its own
+scroll position and selection, restored when you switch back to it.
+
+Importing a multi-sheet `.xlsx` populates every sheet.
+
+#### Cross-sheet references
+
+Formulas reach across sheets with `Sheet2!A1`, including ranges:
+`=SUM(Sheet2!A1:A100)`. Sheet names resolve **case-insensitively**, so
+`sheet2!A1` finds `Sheet2`.
+
+A name containing anything other than letters, digits, `_` or `.` — or one
+starting with a digit — must be **single-quoted**, with interior quotes
+doubled, exactly as Excel does it:
+
+```
+=Sheet2!A1          bare name
+='My Sheet'!A1      name with a space
+='Bob''s Data'!B2   escaped quote inside the name
+='2024'!A1          name that starts with a digit
+```
+
+A reference to a sheet that does not exist evaluates to `#REF!` rather than a
+silent zero, and **deleting a sheet turns formulas that referenced it into
+`#REF!`** instead of leaving them showing a stale value. Renaming a sheet does
+*not* rewrite formula text — references to the old name become `#REF!`, which
+is deliberate: silently rebinding them to whatever later takes that name would
+be worse than saying so.
+
+3-D references spanning two sheets (`Sheet1!A1:Sheet2!B4`) are **not**
+supported and are rejected at parse time rather than quietly misread.
+
+The dependency graph is workbook-wide, keyed by (sheet, cell), so recalculation
+order and cycle detection both span sheets: `Sheet1!A1 = Sheet2!A1` together
+with `Sheet2!A1 = Sheet1!A1` is detected as circular, not hung on.
+
 ### Closing with unsaved changes
 
 Closing the window while edits are unsaved is intercepted: the close is
@@ -316,6 +361,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 - [x] Formula parser and evaluator
 - [x] Cell editing, dependency graph, incremental recalc, undo/redo
 - [x] Out-of-core mmap storage — 200M rows / 10GB+ verified
+- [x] Multi-sheet workbooks with cross-sheet formulas
 - [ ] Save edits back to CSV / `.ferrix`
 - [ ] Native `.xlsx` import/export
 - [ ] Sort, filter, pivot
@@ -325,14 +371,15 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 272 tests
+cargo test --workspace     # 352 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a
 numeric column must stay under 12 bytes/cell, parallel chunking must preserve
 row order, embedded newlines must survive chunk splitting, mmap sections must
 be 8-byte aligned, a corrupt cache must be rejected, formulas must recalculate
-in dependency order, and cycles must be detected rather than hang.
+in dependency order, and cycles must be detected rather than hang — including
+a cycle that spans two sheets.
 
 ## License
 
