@@ -145,6 +145,33 @@ parsed needle, never by formatting 200M values into strings.
 
 ### Editing without touching the base
 
+Edits never modify the dataset. They live in a sparse copy-on-write overlay
+consulted ahead of the base, so editing costs O(edits) rather than O(rows) and
+the base can stay a read-only memory map.
+
+Saving follows from that design: only the overlay is written, to a `.fxedits`
+sidecar beside the data.
+
+```
+sales.csv                  the original
+sales.ferrix               columnar cache (12 GB, mmap'd)
+sales.ferrix.fxedits       edits only (bytes)
+```
+
+Measured on a 40M-row / 2.14 GB dataset: **5 edits saved to 181 bytes in
+1.07 ms**, reloaded in 4.78 ms, with the base file untouched. Save cost tracks
+the number of edits, not the size of the data.
+
+Formulas are stored as **source text**, not just their last computed value, and
+are re-evaluated in dependency order on load — a cached number can never
+outlive the data it was derived from.
+
+A sidecar records a fingerprint of the base it was written against (length,
+mtime, row and column counts). If the base changes, the sidecar is **rejected
+with a visible warning** rather than applied to cells that may now hold
+something entirely different. Silent misapplication is the failure mode that
+loses data, so it is the one case treated as fatal.
+
 Edits live in a sparse copy-on-write overlay consulted before the base:
 
 ```
@@ -206,7 +233,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 169 tests
+cargo test --workspace     # 215 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

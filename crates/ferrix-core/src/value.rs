@@ -29,6 +29,36 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// Stable on-disk code. These values are written into saved files, so they
+    /// must never be renumbered — only appended to.
+    pub const fn to_code(self) -> u8 {
+        match self {
+            ErrorKind::DivZero => 0,
+            ErrorKind::Value => 1,
+            ErrorKind::Ref => 2,
+            ErrorKind::Name => 3,
+            ErrorKind::Num => 4,
+            ErrorKind::NotAvailable => 5,
+            ErrorKind::Null => 6,
+            ErrorKind::Circular => 7,
+        }
+    }
+
+    /// Inverse of `to_code`. An unknown code degrades to `Circular` rather
+    /// than panicking, so a file from a newer version stays readable.
+    pub const fn from_code(b: u8) -> Self {
+        match b {
+            0 => ErrorKind::DivZero,
+            1 => ErrorKind::Value,
+            2 => ErrorKind::Ref,
+            3 => ErrorKind::Name,
+            4 => ErrorKind::Num,
+            5 => ErrorKind::NotAvailable,
+            6 => ErrorKind::Null,
+            _ => ErrorKind::Circular,
+        }
+    }
+
     /// The canonical spreadsheet spelling, used for display and .xlsx export.
     pub const fn as_str(self) -> &'static str {
         match self {

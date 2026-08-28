@@ -4,3 +4,5 @@ benchdata/
 !crates/**/testdata/*.csv
 *.ferrix
 *.ferrix-tmp/
+*.fxedits
+*.fxedits.tmp

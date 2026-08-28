@@ -36,6 +36,9 @@ pub struct Workbook {
     pub graph: DepGraph,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
+    /// Edits made since the last save. Drives the dirty indicator and the
+    /// close prompt; without it a user can lose work by closing the window.
+    dirty: bool,
 }
 
 impl Workbook {
@@ -46,7 +49,83 @@ impl Workbook {
             graph: DepGraph::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            dirty: false,
         }
+    }
+
+    /// Adopt edits loaded from a sidecar. Marks the workbook clean, since what
+    /// is in memory now matches what is on disk.
+    pub fn with_overlay(mut self, overlay: EditOverlay) -> Self {
+        self.overlay = overlay;
+        self.dirty = false;
+        self
+    }
+
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    #[inline]
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+    }
+
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Rebuild the dependency graph from every formula in the overlay and
+    /// recompute their values.
+    ///
+    /// Used after restoring saved edits: the sidecar stores formula *source*
+    /// plus a cached result, but that cache was computed against the base as
+    /// it stood at save time. Re-evaluating guarantees what the user sees
+    /// matches the data actually in front of them.
+    pub fn rebuild_graph_and_recalc(&mut self) {
+        self.graph = DepGraph::new();
+        let formulas: Vec<(CellRef, String)> = self
+            .overlay
+            .formula_cells()
+            .map(|(c, s)| (c, s.to_string()))
+            .collect();
+        for (cell, src) in &formulas {
+            if let Ok(expr) = parse(src) {
+                self.graph.set_formula(*cell, &expr);
+            }
+        }
+        // Evaluate in dependency order so a formula referencing another
+        // formula sees an up-to-date value rather than a stale cache.
+        // Cycles come back as Err; those cells get #CIRC! rather than a stale
+        // cached value silently surviving from the saved file.
+        let (order, circular) = match self.graph.full_order() {
+            Ok(o) => (o, Vec::new()),
+            Err(stuck) => (Vec::new(), stuck),
+        };
+        for cell in circular {
+            self.overlay
+                .update_cached(cell, Value::Error(ErrorKind::Circular));
+        }
+        for cell in order {
+            let Some(src) = self
+                .overlay
+                .get(cell)
+                .and_then(|i| i.formula_src())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            if let Ok(expr) = parse(&src) {
+                let value = {
+                    let view = SheetView::new(&self.base, &self.overlay);
+                    eval_view(&expr, &view)
+                };
+                self.overlay.update_cached(cell, value);
+            }
+        }
+        // Restoring is not an edit; the file on disk already matches.
+        self.dirty = false;
     }
 
     pub fn view(&self) -> SheetView<'_> {
@@ -96,6 +175,7 @@ impl Workbook {
     pub fn commit_edit(&mut self, cell: CellRef, raw: &str) -> CommitReport {
         let start = std::time::Instant::now();
         let mut report = CommitReport::default();
+        self.dirty = true;
 
         let new_input = self.classify(raw);
         let before = self.overlay.get(cell).cloned();
@@ -225,6 +305,7 @@ impl Workbook {
 
     pub fn undo(&mut self) -> Option<CellRef> {
         let entry = self.undo.pop()?;
+        self.dirty = true;
         self.overlay.restore(entry.cell, entry.before.clone());
         // Restore dependent caches captured at commit time.
         for (dep, prev) in &entry.side_effects {
@@ -238,6 +319,7 @@ impl Workbook {
 
     pub fn redo(&mut self) -> Option<CellRef> {
         let entry = self.redo.pop()?;
+        self.dirty = true;
         self.overlay.restore(entry.cell, entry.after.clone());
         self.resync_graph(entry.cell);
         let cell = entry.cell;
@@ -277,6 +359,15 @@ mod tests {
             s.set(CellRef::new(r, 0), Value::Number((r + 1) as f64));
         }
         Workbook::new(BaseData::Memory(s))
+    }
+
+    /// Same base as `wb()`, for tests that supply their own overlay.
+    fn base_for_test() -> BaseData {
+        let mut s = Sheet::new("t");
+        for r in 0..10u32 {
+            s.set(CellRef::new(r, 0), Value::Number((r + 1) as f64));
+        }
+        BaseData::Memory(s)
     }
 
     fn val(w: &Workbook, r: u32, c: u32) -> Value {
@@ -470,5 +561,69 @@ mod tests {
         assert_eq!(w.view().get(deep), Value::Number(42.0));
         assert_eq!(w.edit_count(), 1);
         assert!(w.view().row_count() >= 150_000_001);
+    }
+
+    #[test]
+    fn dirty_flag_tracks_edits_and_saves() {
+        let mut w = wb();
+        assert!(!w.is_dirty(), "a freshly opened workbook is clean");
+        w.commit_edit(CellRef::new(0, 1), "5");
+        assert!(w.is_dirty(), "an edit makes it dirty");
+        w.mark_saved();
+        assert!(!w.is_dirty());
+        w.undo();
+        assert!(w.is_dirty(), "undo changes the document too");
+    }
+
+    #[test]
+    fn restored_formulas_recalculate_against_the_base() {
+        // A sidecar stores formula SOURCE plus a cached value. Trusting the
+        // cache blindly would let a cell display a number that no longer
+        // matches the data underneath it.
+        let mut overlay = EditOverlay::new();
+        overlay.set(
+            CellRef::new(0, 1),
+            CellInput::Formula {
+                src: "=SUM(A1:A3)".into(),
+                cached: Value::Number(999.0),
+            },
+        );
+        let mut w = Workbook::new(base_for_test()).with_overlay(overlay);
+        w.rebuild_graph_and_recalc();
+        assert_eq!(
+            val(&w, 0, 1),
+            Value::Number(6.0),
+            "stale cached value must be recomputed, not trusted"
+        );
+        assert!(!w.is_dirty(), "restoring is not an edit");
+    }
+
+    #[test]
+    fn restored_formula_chain_evaluates_in_order() {
+        // C1 depends on B1, which is itself a formula. Evaluating out of
+        // order would leave C1 reading a stale value.
+        let mut overlay = EditOverlay::new();
+        overlay.set(
+            CellRef::new(0, 1),
+            CellInput::Formula {
+                src: "=A1*2".into(),
+                cached: Value::Number(0.0),
+            },
+        );
+        overlay.set(
+            CellRef::new(0, 2),
+            CellInput::Formula {
+                src: "=B1+5".into(),
+                cached: Value::Number(0.0),
+            },
+        );
+        let mut w = Workbook::new(base_for_test()).with_overlay(overlay);
+        w.rebuild_graph_and_recalc();
+        assert_eq!(val(&w, 0, 1), Value::Number(2.0), "A1 is 1, doubled");
+        assert_eq!(
+            val(&w, 0, 2),
+            Value::Number(7.0),
+            "C1 must see B1 recomputed, not its stale cache"
+        );
     }
 }

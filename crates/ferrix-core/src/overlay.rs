@@ -152,6 +152,28 @@ impl EditOverlay {
         (self.extra_rows, self.extra_cols)
     }
 
+    /// The overlay's own string arena, for serialization.
+    pub fn arena(&self) -> &StringArena {
+        &self.arena
+    }
+
+    /// Rebuild an overlay from saved parts. Used by the loader; the extent is
+    /// recomputed from the cells rather than trusted from the file.
+    pub fn from_parts(cells: HashMap<CellRef, CellInput>, arena: StringArena) -> Self {
+        let mut extra_rows = 0usize;
+        let mut extra_cols = 0usize;
+        for cell in cells.keys() {
+            extra_rows = extra_rows.max(cell.row as usize + 1);
+            extra_cols = extra_cols.max(cell.col as usize + 1);
+        }
+        Self {
+            cells,
+            arena,
+            extra_rows,
+            extra_cols,
+        }
+    }
+
     /// Approximate heap cost — surfaced in the status bar so the user can see
     /// that editing a huge file stays cheap.
     pub fn heap_bytes(&self) -> usize {

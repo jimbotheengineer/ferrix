@@ -22,6 +22,15 @@ struct Loaded {
     /// Human-readable summary for the status bar.
     summary: String,
     col_widths: Vec<f32>,
+    /// Where edits for this dataset are saved, and the identity of the base
+    /// they belong to. `None` when the source could not be fingerprinted.
+    edits_path: Option<PathBuf>,
+    fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+    /// Edits restored from a sidecar, if one was present and current.
+    restored: Option<ferrix_core::EditOverlay>,
+    /// Set when a sidecar existed but was rejected, so the UI can warn instead
+    /// of silently discarding the user's saved work.
+    edit_warning: Option<String>,
 }
 
 type LoadResult = Result<Loaded, String>;
@@ -68,6 +77,11 @@ pub struct FerrixApp {
     search_index: usize,
     search_focus_pending: bool,
 
+    /// Where to persist edits, and the base identity they belong to. Both are
+    /// None until a file is loaded.
+    edits_path: Option<PathBuf>,
+    fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+
     status: String,
     loading: bool,
     load_rx: Option<Receiver<LoadResult>>,
@@ -99,6 +113,8 @@ impl FerrixApp {
             search_results: ferrix_core::SearchResults::default(),
             search_index: 0,
             search_focus_pending: false,
+            edits_path: None,
+            fingerprint: None,
             status: "Ready — open a CSV to begin".into(),
             loading: false,
             load_rx: None,
@@ -148,7 +164,24 @@ impl FerrixApp {
                 self.status = loaded.summary;
                 self.stats_rows = loaded.rows;
                 self.stats_cols = loaded.cols;
-                self.wb = Workbook::new(loaded.base);
+                self.edits_path = loaded.edits_path;
+                self.fingerprint = loaded.fingerprint;
+                let restored_count = loaded.restored.as_ref().map(|o| o.len());
+                self.wb = match loaded.restored {
+                    Some(ov) => Workbook::new(loaded.base).with_overlay(ov),
+                    None => Workbook::new(loaded.base),
+                };
+                // Formula cells were saved with their source; rebuild the
+                // dependency graph and recompute so cached values cannot drift
+                // from a base that may have been recalculated elsewhere.
+                if restored_count.is_some() {
+                    self.wb.rebuild_graph_and_recalc();
+                }
+                if let Some(w) = loaded.edit_warning {
+                    self.status = format!("Saved edits not applied — {w}");
+                } else if let Some(n) = restored_count {
+                    self.status = format!("{} · restored {} saved edits", self.status, fmt_int(n));
+                }
                 self.selection = CellRef::new(0, 0);
                 self.scroll = ScrollState::default();
                 self.loading = false;
@@ -252,6 +285,41 @@ impl FerrixApp {
         ((self.last_viewport_h.max(200.0)) / crate::grid::ROW_HEIGHT) as usize
     }
 
+    /// Persist edits to the sidecar beside the base file.
+    ///
+    /// Cheap by construction: only the overlay is written, so saving a handful
+    /// of edits over a 200M-row dataset writes a handful of kilobytes and
+    /// never touches the base.
+    fn save_edits(&mut self) {
+        let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
+            self.status = "Nothing to save — no file is open".into();
+            return;
+        };
+        if self.wb.overlay.is_empty() && !self.wb.is_dirty() {
+            self.status = "No edits to save".into();
+            return;
+        }
+        let t = std::time::Instant::now();
+        match ferrix_io::edits::save_edits(&path, &self.wb.overlay, fp) {
+            Ok(bytes) => {
+                self.wb.mark_saved();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.status = format!(
+                    "Saved {} edit{} ({} bytes) to {} in {:.1} ms",
+                    fmt_int(self.wb.overlay.len()),
+                    if self.wb.overlay.len() == 1 { "" } else { "s" },
+                    fmt_int(bytes as usize),
+                    name,
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
     fn sync_formula_bar(&mut self) {
         self.formula_input = self.wb.view().edit_text(self.selection);
         self.recompute_formula();
@@ -346,14 +414,19 @@ impl FerrixApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // Ctrl+F works from anywhere, including while the search box has focus
         // (where it re-focuses and selects, matching browser behaviour).
-        let (ctrl_f, escape, f3, shift_f3) = ctx.input(|i| {
+        let (ctrl_f, ctrl_s, escape, f3, shift_f3) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::F),
+                i.modifiers.command && i.key_pressed(Key::S),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::F3) && !i.modifiers.shift,
                 i.key_pressed(Key::F3) && i.modifiers.shift,
             )
         });
+        if ctrl_s {
+            self.save_edits();
+            return;
+        }
         if ctrl_f {
             self.search_open = true;
             self.focus = Focus::Search;
@@ -515,6 +588,17 @@ impl eframe::App for FerrixApp {
                         self.open_dialog();
                     }
                     ui.add_space(4.0);
+                    let dirty = self.wb.is_dirty();
+                    if ui
+                        .add_enabled(
+                            dirty && self.edits_path.is_some(),
+                            egui::Button::new(if dirty { "💾 Save*" } else { "💾 Save" }),
+                        )
+                        .on_hover_text("Save edits (Ctrl+S)")
+                        .clicked()
+                    {
+                        self.save_edits();
+                    }
                     if ui
                         .add_enabled(self.wb.can_undo(), egui::Button::new("↶ Undo"))
                         .clicked()
@@ -904,12 +988,20 @@ where
             stats.throughput_mbps(),
             sheet.heap_bytes() as f64 / 1e9,
         );
+        let rows = sheet.row_count();
+        let cols = sheet.col_count();
+        let (edits_path, fingerprint, restored, edit_warning) =
+            restore_edits(path, rows as u64, cols as u32);
         return Ok(Loaded {
-            rows: sheet.row_count(),
-            cols: sheet.col_count(),
+            rows,
+            cols,
             col_widths: widths,
             summary,
             base: BaseData::Memory(sheet),
+            edits_path,
+            fingerprint,
+            restored,
+            edit_warning,
         });
     }
 
@@ -945,13 +1037,56 @@ where
         if reused { " (cached)" } else { "" }
     );
 
+    let rows = mapped.row_count();
+    let cols = mapped.col_count();
+    // Edits are keyed to the cache, not the CSV: the cache is what the grid
+    // actually reads, and regenerating it is exactly the event that should
+    // invalidate saved edits.
+    let (edits_path, fingerprint, restored, edit_warning) =
+        restore_edits(&cache, rows as u64, cols as u32);
+
     Ok(Loaded {
-        rows: mapped.row_count(),
-        cols: mapped.col_count(),
+        rows,
+        cols,
         col_widths: widths,
         summary,
         base: BaseData::Mapped(Box::new(mapped)),
+        edits_path,
+        fingerprint,
+        restored,
+        edit_warning,
     })
+}
+
+/// Look for a sidecar next to `base` and load it if it belongs to this data.
+///
+/// Returns the sidecar path and fingerprint regardless, so a later save knows
+/// where to write even when nothing was restored.
+fn restore_edits(
+    base: &Path,
+    rows: u64,
+    cols: u32,
+) -> (
+    Option<PathBuf>,
+    Option<ferrix_io::edits::BaseFingerprint>,
+    Option<ferrix_core::EditOverlay>,
+    Option<String>,
+) {
+    use ferrix_io::edits;
+    let fp = match edits::BaseFingerprint::of(base, rows, cols) {
+        Ok(f) => f,
+        // Cannot fingerprint (permissions, vanished file): saving would be
+        // unsafe, so report no path rather than risk a mismatched sidecar.
+        Err(_) => return (None, None, None, None),
+    };
+    let path = edits::edits_path_for(base);
+    match edits::load_edits(&path, fp) {
+        Ok(Some(ov)) => (Some(path), Some(fp), Some(ov), None),
+        Ok(None) => (Some(path), Some(fp), None, None),
+        // A rejected sidecar must be surfaced. Silently continuing would look
+        // like the user's saved edits simply vanished.
+        Err(e) => (Some(path), Some(fp), None, Some(e.to_string())),
+    }
 }
 
 /// Read just the first line of a CSV for column headers.

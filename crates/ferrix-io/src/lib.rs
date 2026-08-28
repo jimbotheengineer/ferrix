@@ -12,6 +12,7 @@
 
 pub mod convert;
 pub mod csv;
+pub mod edits;
 pub mod format;
 pub mod mapped;
 
