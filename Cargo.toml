@@ -26,13 +26,22 @@ ferrix-formula = { path = "crates/ferrix-formula" }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# NOT panic = "abort". Loading runs on a background thread, and the UI is
+# written to survive it dying (poll_load handles a disconnected channel and
+# reports "Load thread died"). Under abort a panic anywhere in that thread --
+# a malformed file, a parser edge case -- kills the whole process instead,
+# discarding unsaved edits and skipping the unsaved-changes prompt. Verified
+# with panic-probe: abort exits 127 and never reaches the recovery path;
+# unwind lets the main thread continue. The binary size and speed abort would
+# save is not worth silently losing a user's work.
+panic = "unwind"
 strip = "symbols"
 
-# Benchmarks need unwinding, and we want release-grade codegen.
+# Benchmarks want release-grade codegen. `panic` is inherited from release and
+# must NOT be set here -- Cargo ignores the setting on the bench profile and
+# warns about it on every build.
 [profile.bench]
 inherits = "release"
-panic = "unwind"
 strip = "none"
 debug = 1
 
