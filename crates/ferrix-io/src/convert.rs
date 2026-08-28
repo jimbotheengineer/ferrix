@@ -4,29 +4,59 @@
 //! need 10GB of RAM. So we never hold the whole dataset. Instead:
 //!
 //! 1. Read the CSV in fixed-size blocks (record-aligned, quote-aware).
-//! 2. Parse each block into per-column buffers.
-//! 3. Append those buffers straight to per-column spill files on disk.
+//! 2. Split each block into per-core sub-chunks at exact record boundaries and
+//!    parse them in parallel into per-column encoded buffers.
+//! 3. Merge the sub-chunks back in source order, appending straight to
+//!    per-column spill files on disk.
 //! 4. Concatenate the spills into the final `.ferrix` layout.
 //!
-//! Peak memory is one block plus the string arena — bounded and independent of
-//! file size. The arena is the one thing that must stay resident, which is
-//! fine because spreadsheet text is low-cardinality (the 10M-row benchmark has
-//! 18 distinct strings); a pathological all-unique-text column is the known
-//! worst case and is reported rather than silently OOMing.
+//! Peak memory is one block plus its parsed form plus the string arena —
+//! bounded and independent of file size. The arena is the one thing that must
+//! stay resident, which is fine because spreadsheet text is low-cardinality
+//! (the 10M-row benchmark has 18 distinct strings); a pathological
+//! all-unique-text column is the known worst case and is reported rather than
+//! silently OOMing.
+//!
+//! ## Why the parallelism is shaped this way
+//!
+//! Parsing is the bottleneck (field splitting and `f64` parsing dominate), and
+//! it is embarrassingly parallel *provided* chunks split on real record
+//! boundaries. We reuse `csv::chunk_bounds`, the exact single-pass quote-aware
+//! splitter, rather than any windowed heuristic — a previous 64KB quote-parity
+//! guess silently corrupted records containing embedded newlines.
+//!
+//! Two things must stay deterministic for the output to be byte-identical to
+//! the old serial converter:
+//!
+//! * **Row order.** `chunk_bounds` yields chunks in source order, rayon's
+//!   indexed `collect` preserves that order, and the merge walks them in
+//!   order. No row can overtake another.
+//! * **String ids.** The arena assigns ids by first appearance in row order.
+//!   Workers therefore intern into a *chunk-local* table (also first-appearance
+//!   order) and emit local ids; the serial merge replays each chunk's local
+//!   table into the global arena in order, producing exactly the id sequence a
+//!   single-threaded scan would. Cell ids are remapped through that table.
+//!   A concurrent map was considered and rejected: it would need a lock or CAS
+//!   on the hot path for every text cell, and it cannot reproduce
+//!   first-appearance ordering without extra synchronisation anyway.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use ferrix_core::{StringArena, ValueTag};
+use rayon::prelude::*;
 
+use crate::csv::chunk_bounds;
 use crate::format::{
     align8, ColumnDesc, FormatError, Header, ABSENT, COL_DESC_BYTES, HEADER_BYTES,
 };
 
-/// Bytes of CSV to parse at a time. 64MB keeps the parse cache-friendly while
-/// making per-block overhead negligible on multi-GB files.
-const BLOCK: usize = 64 << 20;
+/// Bytes of CSV to read at a time. 32MB is smaller than the old serial 64MB
+/// because a block now also holds its decoded form (up to ~13 bytes per cell)
+/// while it is merged; halving the block keeps total peak well inside budget
+/// and still gives every core a multi-MB sub-chunk to chew on.
+const BLOCK: usize = 32 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -304,6 +334,7 @@ where
     let mut carry: Vec<u8> = Vec::new();
     let mut consumed: u64 = 0;
     let mut first_record = true;
+    let mut peak_bytes = BLOCK;
 
     loop {
         let n = file.read(&mut buf)?;
@@ -323,7 +354,7 @@ where
         let (complete, tail) = chunk.split_at(split);
         carry.extend_from_slice(tail);
 
-        parse_block(
+        parse_block_parallel(
             complete,
             delimiter,
             has_headers,
@@ -333,6 +364,7 @@ where
             &mut spills,
             &mut rows,
             scratch,
+            &mut peak_bytes,
         )?;
 
         if arena.data_bytes() > ARENA_LIMIT {
@@ -345,7 +377,7 @@ where
 
     // Whatever is left in `carry` is a final record with no trailing newline.
     if !carry.is_empty() {
-        parse_block(
+        parse_block_parallel(
             &carry,
             delimiter,
             has_headers,
@@ -355,6 +387,7 @@ where
             &mut spills,
             &mut rows,
             scratch,
+            &mut peak_bytes,
         )?;
     }
 
@@ -380,7 +413,7 @@ where
         output_bytes,
         distinct_strings: arena.len(),
         millis: 0,
-        peak_block_bytes: BLOCK,
+        peak_block_bytes: peak_bytes,
     })
 }
 
@@ -398,18 +431,44 @@ fn last_record_end(data: &[u8]) -> usize {
     last
 }
 
-#[allow(clippy::too_many_arguments)]
-fn parse_block(
-    data: &[u8],
-    delim: u8,
-    has_headers: bool,
-    first_record: &mut bool,
-    headers: &mut Vec<String>,
-    arena: &mut StringArena,
-    spills: &mut Vec<Spill>,
-    rows: &mut u64,
-    scratch: &Path,
-) -> Result<(), ConvertError> {
+/// One parsed sub-chunk, held in source order.
+///
+/// Cells are stored flat (row-major) rather than per-column because a worker
+/// cannot know the final column count — that is only settled once every chunk
+/// has been seen. `row_widths` lets the serial merge replay the exact
+/// widen/pad decisions the old single-threaded loop made.
+#[derive(Default)]
+struct ChunkOut {
+    /// One tag byte per cell, row-major.
+    tags: Vec<u8>,
+    /// One payload per cell: `f64` bits for Number/Bool, chunk-local string
+    /// index for Text, 0 for Empty.
+    payloads: Vec<u64>,
+    /// Field count of each record, in order.
+    row_widths: Vec<u32>,
+    /// Chunk-local strings, in first-appearance order.
+    strings: Vec<String>,
+}
+
+impl ChunkOut {
+    /// Bytes this chunk occupies, for the peak-memory accounting.
+    fn heap_bytes(&self) -> usize {
+        self.tags.capacity()
+            + self.payloads.capacity() * 8
+            + self.row_widths.capacity() * 4
+            + self.strings.iter().map(|s| s.len() + 24).sum::<usize>()
+    }
+}
+
+/// Parse one sub-chunk with no shared state. Pure function of its bytes, which
+/// is what makes the parallel pass safe and the result deterministic.
+fn parse_chunk_cells(data: &[u8], delim: u8) -> ChunkOut {
+    use std::collections::HashMap;
+    let mut out = ChunkOut::default();
+    // Chunk-local interner. First-appearance order is what the merge replays
+    // into the global arena, so it must be an ordered Vec plus an index.
+    let mut local: HashMap<Box<str>, u32> = HashMap::new();
+
     let mut pos = 0usize;
     while pos < data.len() {
         let end = record_end(data, pos);
@@ -420,57 +479,173 @@ fn parse_block(
         }
 
         let fields = split_record(line, delim);
+        out.row_widths.push(fields.len() as u32);
 
-        if *first_record && has_headers {
-            *headers = fields
-                .iter()
-                .map(|f| String::from_utf8_lossy(f).trim().to_string())
-                .collect();
-            *first_record = false;
-            continue;
-        }
-        *first_record = false;
-
-        // Widen if this row has more columns than any seen so far.
-        while spills.len() < fields.len() {
-            let idx = spills.len();
-            let mut s = Spill::new(scratch, idx)?;
-            // Back-fill the rows that came before this column existed.
-            for _ in 0..*rows {
-                s.push_empty()?;
-            }
-            spills.push(s);
-        }
-
-        for (i, f) in fields.iter().enumerate() {
+        for f in &fields {
             let t = trim_ascii(f);
             if t.is_empty() {
-                spills[i].push_empty()?;
+                out.tags.push(ValueTag::Empty as u8);
+                out.payloads.push(0);
             } else if looks_numeric(t) {
                 match std::str::from_utf8(t)
                     .ok()
                     .and_then(|s| s.parse::<f64>().ok())
                 {
-                    Some(v) => spills[i].push_number(v)?,
+                    Some(v) => {
+                        out.tags.push(ValueTag::Number as u8);
+                        out.payloads.push(v.to_bits());
+                    }
                     None => {
-                        let id = arena.intern(&String::from_utf8_lossy(t));
-                        spills[i].push_text(id.0)?;
+                        let s = String::from_utf8_lossy(t);
+                        let id = match local.get(s.as_ref()) {
+                            Some(&i) => i,
+                            None => {
+                                let i = out.strings.len() as u32;
+                                local.insert(s.as_ref().into(), i);
+                                out.strings.push(s.into_owned());
+                                i
+                            }
+                        };
+                        out.tags.push(ValueTag::Text as u8);
+                        out.payloads.push(id as u64);
                     }
                 }
             } else if t == b"true" || t == b"TRUE" || t == b"True" {
-                spills[i].push_bool(true)?;
+                out.tags.push(ValueTag::Bool as u8);
+                out.payloads.push(1f64.to_bits());
             } else if t == b"false" || t == b"FALSE" || t == b"False" {
-                spills[i].push_bool(false)?;
+                out.tags.push(ValueTag::Bool as u8);
+                out.payloads.push(0f64.to_bits());
             } else {
-                let id = arena.intern(&String::from_utf8_lossy(t));
-                spills[i].push_text(id.0)?;
+                let s = String::from_utf8_lossy(t);
+                let id = match local.get(s.as_ref()) {
+                    Some(&i) => i,
+                    None => {
+                        let i = out.strings.len() as u32;
+                        local.insert(s.as_ref().into(), i);
+                        out.strings.push(s.into_owned());
+                        i
+                    }
+                };
+                out.tags.push(ValueTag::Text as u8);
+                out.payloads.push(id as u64);
             }
         }
-        // Narrower rows: pad the remaining columns.
-        for s in spills.iter_mut().skip(fields.len()) {
-            s.push_empty()?;
+    }
+    out
+}
+
+/// Split a block across cores, parse in parallel, then merge in source order.
+///
+/// The merge is deliberately serial: it owns the spill writers, the global
+/// arena, and the running row count, all of which are order-dependent. It is
+/// pure buffered `write_all` of already-decoded bytes, so it is far cheaper
+/// than the parse it follows.
+#[allow(clippy::too_many_arguments)]
+fn parse_block_parallel(
+    data: &[u8],
+    delim: u8,
+    has_headers: bool,
+    first_record: &mut bool,
+    headers: &mut Vec<String>,
+    arena: &mut StringArena,
+    spills: &mut Vec<Spill>,
+    rows: &mut u64,
+    scratch: &Path,
+    peak_bytes: &mut usize,
+) -> Result<(), ConvertError> {
+    let mut body = data;
+
+    // The header record is consumed on this thread before any chunking, so
+    // workers only ever see data rows.
+    if *first_record {
+        // Leading blank records are not the header — the serial parser skipped
+        // empty lines before considering the first record.
+        loop {
+            let end = record_end(body, 0);
+            if end != 0 {
+                break;
+            }
+            let next = skip_newline(body, end);
+            if next == 0 {
+                break;
+            }
+            body = &body[next..];
+            if body.is_empty() {
+                return Ok(());
+            }
         }
-        *rows += 1;
+        if has_headers {
+            let end = record_end(body, 0);
+            *headers = split_record(&body[..end], delim)
+                .iter()
+                .map(|f| String::from_utf8_lossy(f).trim().to_string())
+                .collect();
+            let next = skip_newline(body, end);
+            body = &body[next..];
+        }
+        *first_record = false;
+    }
+
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    // Exact, quote-aware boundaries — never a windowed heuristic.
+    let n_chunks = rayon::current_num_threads().max(1);
+    let bounds = chunk_bounds(body, n_chunks);
+
+    // `par_iter().collect()` on an indexed parallel iterator preserves order,
+    // so `parsed[i]` is always chunk `i` of the source.
+    let parsed: Vec<ChunkOut> = bounds
+        .par_iter()
+        .map(|&(s, e)| parse_chunk_cells(&body[s..e], delim))
+        .collect();
+
+    *peak_bytes = (*peak_bytes).max(BLOCK + parsed.iter().map(|c| c.heap_bytes()).sum::<usize>());
+
+    for chunk in &parsed {
+        // Replay this chunk's local strings into the global arena in
+        // first-appearance order. Because chunks are merged in source order,
+        // the resulting global ids match a single-threaded scan exactly.
+        let remap: Vec<u32> = chunk.strings.iter().map(|s| arena.intern(s).0).collect();
+
+        let mut cell = 0usize;
+        for &w in &chunk.row_widths {
+            let w = w as usize;
+
+            // Widen if this row has more columns than any seen so far.
+            while spills.len() < w {
+                let idx = spills.len();
+                let mut s = Spill::new(scratch, idx)?;
+                // Back-fill the rows that came before this column existed.
+                for _ in 0..*rows {
+                    s.push_empty()?;
+                }
+                spills.push(s);
+            }
+
+            for i in 0..w {
+                let tag = chunk.tags[cell + i];
+                let p = chunk.payloads[cell + i];
+                if tag == ValueTag::Number as u8 {
+                    spills[i].push_number(f64::from_bits(p))?;
+                } else if tag == ValueTag::Bool as u8 {
+                    spills[i].push_bool(f64::from_bits(p) != 0.0)?;
+                } else if tag == ValueTag::Text as u8 {
+                    spills[i].push_text(remap[p as usize])?;
+                } else {
+                    spills[i].push_empty()?;
+                }
+            }
+            cell += w;
+
+            // Narrower rows: pad the remaining columns.
+            for s in spills.iter_mut().skip(w) {
+                s.push_empty()?;
+            }
+            *rows += 1;
+        }
     }
     Ok(())
 }
@@ -865,4 +1040,223 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dst);
     }
+
+    // --- parallel-conversion invariants ---------------------------------
+
+    /// The serial reference implementation, kept in the test module so the
+    /// parallel converter can be diffed against it byte for byte. This is a
+    /// faithful copy of the pre-parallel `parse_block` loop.
+    fn convert_serial(src: &Path, dst: &Path, delim: u8, has_headers: bool) {
+        let scratch = dst.with_extension("ferrix-serial-tmp");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let data = std::fs::read(src).unwrap();
+        let mut arena = StringArena::new();
+        let mut spills: Vec<Spill> = Vec::new();
+        let mut rows: u64 = 0;
+        let mut first_record = true;
+
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let end = record_end(&data, pos);
+            let line = &data[pos..end];
+            pos = skip_newline(&data, end);
+            if line.is_empty() {
+                continue;
+            }
+            let fields = split_record(line, delim);
+            if first_record && has_headers {
+                first_record = false;
+                continue;
+            }
+            first_record = false;
+
+            while spills.len() < fields.len() {
+                let idx = spills.len();
+                let mut s = Spill::new(&scratch, idx).unwrap();
+                for _ in 0..rows {
+                    s.push_empty().unwrap();
+                }
+                spills.push(s);
+            }
+            for (i, f) in fields.iter().enumerate() {
+                let t = trim_ascii(f);
+                if t.is_empty() {
+                    spills[i].push_empty().unwrap();
+                } else if looks_numeric(t) {
+                    match std::str::from_utf8(t)
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        Some(v) => spills[i].push_number(v).unwrap(),
+                        None => {
+                            let id = arena.intern(&String::from_utf8_lossy(t));
+                            spills[i].push_text(id.0).unwrap();
+                        }
+                    }
+                } else if t == b"true" || t == b"TRUE" || t == b"True" {
+                    spills[i].push_bool(true).unwrap();
+                } else if t == b"false" || t == b"FALSE" || t == b"False" {
+                    spills[i].push_bool(false).unwrap();
+                } else {
+                    let id = arena.intern(&String::from_utf8_lossy(t));
+                    spills[i].push_text(id.0).unwrap();
+                }
+            }
+            for s in spills.iter_mut().skip(fields.len()) {
+                s.push_empty().unwrap();
+            }
+            rows += 1;
+        }
+        for s in &mut spills {
+            while s.len < rows {
+                s.push_empty().unwrap();
+            }
+        }
+        let finished: Vec<FinishedSpill> =
+            spills.into_iter().map(|s| s.finish().unwrap()).collect();
+        assemble(dst, &finished, &arena, rows, &[]).unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The core guarantee: parallel output must be byte-identical to serial.
+    fn assert_matches_serial(name: &str, content: &str) {
+        let src = write_csv(name, content);
+        let par = src.with_extension("par.ferrix");
+        let ser = src.with_extension("ser.ferrix");
+
+        convert_csv(&src, &par, b',', true, |_, _| {}).unwrap();
+        convert_serial(&src, &ser, b',', true);
+
+        let a = std::fs::read(&par).unwrap();
+        let b = std::fs::read(&ser).unwrap();
+        assert_eq!(
+            a, b,
+            "parallel output differs from serial for fixture `{name}`"
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&par);
+        let _ = std::fs::remove_file(&ser);
+    }
+
+    #[test]
+    fn parallel_matches_serial_basic() {
+        let mut c = String::from("id,name,val,flag\n");
+        for i in 0..20_000 {
+            c.push_str(&format!(
+                "{i},{},{}.{},{}\n",
+                ["alpha", "beta", "gamma", "delta"][i % 4],
+                i % 977,
+                i % 100,
+                if i % 2 == 0 { "true" } else { "false" }
+            ));
+        }
+        assert_matches_serial("par_basic.csv", &c);
+    }
+
+    #[test]
+    fn parallel_matches_serial_with_embedded_newlines() {
+        // The case the old windowed heuristic corrupted: quoted fields
+        // containing newlines, straddling chunk boundaries.
+        let mut c = String::from("id,note,n\n");
+        for i in 0..20_000 {
+            c.push_str(&format!(
+                "{i},\"line one\nline two, with comma\ncell {i}\",{i}\n"
+            ));
+        }
+        assert_matches_serial("par_newlines.csv", &c);
+    }
+
+    #[test]
+    fn parallel_matches_serial_ragged_and_crlf() {
+        let mut c = String::from("a,b,c\r\n");
+        for i in 0..20_000 {
+            match i % 4 {
+                0 => c.push_str(&format!("{i}\r\n")),
+                1 => c.push_str(&format!("{i},x{i}\r\n")),
+                2 => c.push_str(&format!("{i},y{i},{i}.5\r\n")),
+                _ => c.push_str(&format!("{i},,{i}\r\n")),
+            }
+        }
+        assert_matches_serial("par_ragged.csv", &c);
+    }
+
+    #[test]
+    fn parallel_matches_serial_high_cardinality_strings() {
+        // Every row introduces new strings, stressing the local->global
+        // arena replay ordering across many chunks.
+        let mut c = String::from("k,v\n");
+        for i in 0..30_000 {
+            c.push_str(&format!("key-{i},val-{}\n", i * 7 % 30_000));
+        }
+        assert_matches_serial("par_strings.csv", &c);
+    }
+
+    #[test]
+    fn parallel_matches_serial_column_widens_late() {
+        // A column that only appears near the end must back-fill exactly as
+        // the serial converter did.
+        let mut c = String::from("a\n");
+        for i in 0..20_000 {
+            c.push_str(&format!("{i}\n"));
+        }
+        for i in 0..100 {
+            c.push_str(&format!("{i},late{i},9.5\n"));
+        }
+        assert_matches_serial("par_widen.csv", &c);
+    }
+
+    #[test]
+    fn conversion_is_deterministic_across_runs() {
+        // Byte-identical run to run, or the arena merge is racing.
+        let mut c = String::from("id,cat,n\n");
+        for i in 0..40_000 {
+            c.push_str(&format!("{i},cat-{},{i}.25\n", i % 500));
+        }
+        let src = write_csv("par_determinism.csv", &c);
+
+        let mut hashes = Vec::new();
+        for run in 0..3 {
+            let dst = src.with_extension(format!("run{run}.ferrix"));
+            convert_csv(&src, &dst, b',', true, |_, _| {}).unwrap();
+            hashes.push(std::fs::read(&dst).unwrap());
+            let _ = std::fs::remove_file(&dst);
+        }
+        assert_eq!(hashes[0], hashes[1], "run 0 and 1 differ");
+        assert_eq!(hashes[1], hashes[2], "run 1 and 2 differ");
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn peak_buffer_stays_bounded_as_input_grows() {
+        // The property that lets a 10GB file convert on a 9GB machine: peak
+        // must not scale with file size.
+        let mut peaks = Vec::new();
+        for &n in &[20_000usize, 200_000] {
+            let mut c = String::from("a,b,c,d\n");
+            for i in 0..n {
+                c.push_str(&format!("{i},text-{},{i}.5,{}\n", i % 64, i % 2 == 0));
+            }
+            let src = write_csv(&format!("par_bound_{n}.csv"), &c);
+            let dst = src.with_extension("bound.ferrix");
+            let st = convert_csv(&src, &dst, b',', true, |_, _| {}).unwrap();
+            peaks.push(st.peak_block_bytes);
+            let _ = std::fs::remove_file(&src);
+            let _ = std::fs::remove_file(&dst);
+        }
+        // 10x the rows must not meaningfully move peak, and it must stay well
+        // under the 256MB budget.
+        assert!(
+            peaks[1] < 256 << 20,
+            "peak {} exceeds 256MB budget",
+            peaks[1]
+        );
+        assert!(
+            peaks[1] <= peaks[0] * 2,
+            "peak grew with input size: {peaks:?}"
+        );
+    }
+
 }
