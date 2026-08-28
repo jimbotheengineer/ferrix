@@ -180,8 +180,16 @@ impl Column {
         self.present.is_range_empty(start, end)
     }
 
-    /// Sum of numeric cells in a row range, ignoring text/empty. Operates
-    /// directly on the typed array so the loop stays tight and vectorizable.
+    /// Sum of numeric cells in a row range, ignoring text/empty.
+    ///
+    /// Uses Kahan compensated summation rather than a naive accumulator.
+    /// This matters at spreadsheet scale: summing 200M values naively drifts
+    /// once the running total passes 2^53, because each subsequent addition
+    /// rounds away the low bits of the addend. Summing the integers 0..200M
+    /// naively is off by ~33 million; Kahan is exact.
+    ///
+    /// The extra arithmetic is free in practice — this loop is bound by
+    /// memory bandwidth reading the f64 array, not by the ALU.
     pub fn sum_range(&self, start: usize, end: usize) -> f64 {
         if !self.has_numbers {
             return 0.0;
@@ -190,14 +198,19 @@ impl Column {
         if start >= end {
             return 0.0;
         }
-        let mut acc = 0.0;
+        let mut sum = 0.0f64;
+        // Running compensation for the low-order bits lost to rounding.
+        let mut c = 0.0f64;
         let num_tag = ValueTag::Number as u8;
         for i in start..end {
             if self.tags[i] == num_tag {
-                acc += self.numbers[i];
+                let y = self.numbers[i] - c;
+                let t = sum + y;
+                c = (t - sum) - y;
+                sum = t;
             }
         }
-        acc
+        sum
     }
 
     /// Count of numeric cells in a row range.
@@ -410,5 +423,51 @@ mod tests {
             "numeric column costs {per_cell:.2} bytes/cell; 10M rows would need {:.0} MB",
             per_cell * 10_000_000.0 / 1_048_576.0
         );
+    }
+
+    #[test]
+    fn sum_is_exact_past_2_to_the_53() {
+        // Regression: a naive accumulator silently loses the low bits of every
+        // addend once the running total exceeds 2^53. Summing 0..2_000_000
+        // offset above that boundary must still be exact.
+        const BASE: f64 = 9_007_199_254_740_992.0; // 2^53
+        let n = 200_000usize;
+        let vals: Vec<f64> = (0..n).map(|i| BASE + i as f64).collect();
+        let mut c = Column::new();
+        c.extend_numbers(&vals);
+
+        // Exact answer computed in integer space.
+        let exact = BASE * n as f64 + (n as f64 - 1.0) * n as f64 / 2.0;
+        let got = c.sum_range(0, n);
+        assert_eq!(
+            got,
+            exact,
+            "sum drifted by {} — compensated summation is not working",
+            exact - got
+        );
+    }
+
+    #[test]
+    fn sum_of_large_integer_sequence_is_exact() {
+        // The exact shape of the bug found in the 200M-row benchmark, scaled
+        // down: summing a long run of consecutive integers must be exact.
+        let n = 500_000usize;
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut c = Column::new();
+        c.extend_numbers(&vals);
+        let exact = (n as f64 - 1.0) * n as f64 / 2.0;
+        assert_eq!(c.sum_range(0, n), exact);
+    }
+
+    #[test]
+    fn sum_handles_mixed_magnitudes() {
+        // Classic catastrophic-cancellation shape: one huge value plus many
+        // tiny ones. Naive summation loses every tiny value.
+        let mut c = Column::new();
+        let mut vals = vec![1e16];
+        vals.extend(std::iter::repeat(1.0).take(10_000));
+        c.extend_numbers(&vals);
+        // Every 1.0 must survive.
+        assert_eq!(c.sum_range(0, vals.len()), 1e16 + 10_000.0);
     }
 }

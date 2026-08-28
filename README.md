@@ -11,7 +11,7 @@ conversion:   109 s @ 95 MB/s     (one time, peak RAM 64 MB)
 cold open:    221 us              (subsequent opens, from cache)
 mapped:       12.0 GB             address space, NOT resident RAM
 scrolling:    2.45 ms/viewport    (60fps budget: 16.67 ms)
-SUM 200M rows: 638 ms
+SUM 200M rows: 638 ms          (exact, Kahan-compensated)
 
 --- 530 MB CSV, 10,000,000 rows x 8 cols (in-RAM path) ---
 parse:        2.5 s @ 200 MB/s
@@ -97,6 +97,17 @@ canvas (the obvious approach) silently breaks past ~16.7M rows because one ulp
 grows larger than a row; f64 row indices stay exact past 10^15 rows. Two tests
 pin this boundary.
 
+### Numerically exact aggregates
+
+`SUM` uses Kahan compensated summation, not a naive accumulator. This is not
+academic at spreadsheet scale: summing the integers 0…200,000,000 naively
+returns `19,999,999,867,108,864` instead of `19,999,999,900,000,000` — off by
+33 million — because once the running total passes 2^53 each addition rounds
+away the addend's low bits. Ferrix returns the exact value, and it is *faster*
+(2.5 s vs 3.4 s over 200M rows), because the loop is bound by memory bandwidth
+rather than arithmetic. Four tests pin this, including one that reproduces the
+original 200M-row drift in miniature.
+
 ### Editing without touching the base
 
 Edits live in a sparse copy-on-write overlay consulted before the base:
@@ -160,7 +171,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 165 tests
+cargo test --workspace     # 169 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

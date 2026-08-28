@@ -189,10 +189,18 @@ impl MappedSheet {
         }
     }
 
-    /// Sum a rectangle. Reads the f64 array as a typed slice so the loop stays
-    /// tight and the kernel can prefetch sequentially — this is why a
-    /// full-column aggregate over 200M rows is a streaming disk read rather
-    /// than 200M random accesses.
+    /// Sum a rectangle.
+    ///
+    /// Reads the tag array as a slice so the kernel prefetches sequentially —
+    /// this is why a full-column aggregate over 200M rows is a streaming disk
+    /// read rather than 200M random accesses.
+    ///
+    /// Uses Kahan compensated summation. At this scale it is not optional:
+    /// summing the integers 0..200,000,000 with a naive accumulator returns
+    /// 19,999,999,867,108,864 instead of 19,999,999,900,000,000 — off by 33
+    /// million, because once the running total passes 2^53 each addition
+    /// rounds away the addend's low bits. Kahan carries those bits in a
+    /// compensation term and is exact here.
     pub fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
         let (r0, r1) = (
             start.row.min(end.row) as u64,
@@ -202,10 +210,11 @@ impl MappedSheet {
             start.col.min(end.col) as usize,
             start.col.max(end.col) as usize + 1,
         );
-        let mut acc = 0.0;
+        let mut sum = 0.0f64;
+        let mut c = 0.0f64;
         let num_tag = ValueTag::Number as u8;
-        for c in c0..c1.min(self.columns.len()) {
-            let d = &self.columns[c];
+        for col in c0..c1.min(self.columns.len()) {
+            let d = &self.columns[col];
             if !d.has_numbers() {
                 continue;
             }
@@ -218,11 +227,15 @@ impl MappedSheet {
             for (i, &t) in tags.iter().enumerate() {
                 if t == num_tag {
                     let o = (nums_base + i as u64 * 8) as usize;
-                    acc += f64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap());
+                    let v = f64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap());
+                    let y = v - c;
+                    let t2 = sum + y;
+                    c = (t2 - sum) - y;
+                    sum = t2;
                 }
             }
         }
-        acc
+        sum
     }
 
     pub fn count_rect(&self, start: CellRef, end: CellRef) -> usize {
@@ -379,6 +392,29 @@ mod tests {
         let r = (CellRef::new(0, 0), CellRef::new(3, 0));
         assert_eq!(m.sum_rect(r.0, r.1), 30.0);
         assert_eq!(m.count_rect(r.0, r.1), 2);
+        cleanup(s, d);
+    }
+
+    #[test]
+    fn sum_stays_exact_over_a_long_integer_column() {
+        // Regression from the 200M-row benchmark, which reported
+        // 19,999,999,867,108,864 for a sum whose exact value is
+        // 19,999,999,900,000,000 — naive f64 accumulation drifting once the
+        // running total passed 2^53. Compensated summation must be exact.
+        let n = 300_000usize;
+        let mut csv = String::from("v\n");
+        for i in 0..n {
+            csv.push_str(&format!("{}\n", 10_000_000_000u64 + i as u64));
+        }
+        let (m, s, d) = mapped("exactsum.csv", &csv);
+        let got = m.sum_rect(CellRef::new(0, 0), CellRef::new(n as u32 - 1, 0));
+        let exact = 10_000_000_000.0 * n as f64 + (n as f64 - 1.0) * n as f64 / 2.0;
+        assert_eq!(
+            got,
+            exact,
+            "mmap sum drifted by {} from the exact value",
+            exact - got
+        );
         cleanup(s, d);
     }
 

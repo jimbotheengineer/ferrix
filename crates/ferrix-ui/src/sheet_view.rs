@@ -170,30 +170,40 @@ impl<'a> SheetView<'a> {
         self.display(cell)
     }
 
-    /// Sum over a rectangle. Delegates to the base's columnar fast path, then
-    /// applies overlay corrections — so a 10M-row SUM stays a typed slice walk
-    /// even when a handful of cells in the range have been edited.
+    /// Sum over a rectangle. Delegates to the base's columnar fast path (which
+    /// uses compensated summation), then applies overlay corrections — so a
+    /// 200M-row SUM stays a streaming scan even when cells in the range have
+    /// been edited.
     pub fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
-        let mut total = self.base.sum_rect(start, end);
+        let base_total = self.base.sum_rect(start, end);
         if self.overlay.is_empty() {
-            return total;
+            return base_total;
         }
         let (r0, r1) = (start.row.min(end.row), start.row.max(end.row));
         let (c0, c1) = (start.col.min(end.col), start.col.max(end.col));
+
+        // Accumulate the correction separately and apply it once. Adding each
+        // delta straight onto a large base total would round it away.
+        let mut delta = 0.0f64;
+        let mut c = 0.0f64;
+        let mut add = |v: f64| {
+            let y = v - c;
+            let t = delta + y;
+            c = (t - delta) - y;
+            delta = t;
+        };
         for (cell, input) in self.overlay.edited_cells() {
             if cell.row >= r0 && cell.row <= r1 && cell.col >= c0 && cell.col <= c1 {
                 // Remove the base contribution, add the edited one.
-                if let Some(base_n) = self.base.get(*cell).as_number() {
-                    if matches!(self.base.get(*cell), Value::Number(_)) {
-                        total -= base_n;
-                    }
+                if let Value::Number(n) = self.base.get(*cell) {
+                    add(-n);
                 }
                 if let Value::Number(n) = input.value() {
-                    total += n;
+                    add(n);
                 }
             }
         }
-        total
+        base_total + delta
     }
 
     /// Count of numeric cells in a rectangle, overlay-corrected.
