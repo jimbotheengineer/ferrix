@@ -2,7 +2,9 @@
 
 mod app;
 mod grid;
+mod sheet_view;
 mod theme;
+mod workbook;
 
 use app::FerrixApp;
 

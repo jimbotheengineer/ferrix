@@ -1,9 +1,12 @@
 //! # ferrix-formula
 //!
-//! Tokenizer, Pratt parser, and evaluator for spreadsheet formulas.
+//! Tokenizer, Pratt parser, evaluator, and dependency graph for spreadsheet
+//! formulas.
 
+pub mod depgraph;
 pub mod eval;
 pub mod parser;
 
-pub use eval::eval;
+pub use depgraph::{DepGraph, Precedent};
+pub use eval::{eval, eval_view, CellSource};
 pub use parser::{parse, BinOp, Expr, ParseError, UnOp};

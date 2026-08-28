@@ -1,29 +1,68 @@
-//! Formula evaluation against a `Sheet`.
+//! Formula evaluation.
 //!
 //! Range aggregations dispatch to the columnar fast paths in `ferrix-core`
 //! rather than iterating cell-by-cell, so `SUM(A1:A10000000)` is a typed
 //! slice walk instead of ten million enum matches.
+//!
+//! Evaluation is generic over [`CellSource`] so the same code runs against a
+//! plain `Sheet`, a base+overlay composite, or (later) a memory-mapped file.
 
-use ferrix_core::{ErrorKind, Sheet, Value};
+use ferrix_core::{CellRef, ErrorKind, Sheet, Value};
 
 use crate::parser::{BinOp, Expr, UnOp};
 
-/// Evaluate a parsed expression against a sheet.
+/// Anything formulas can read cells from.
+///
+/// `sum_rect`/`count_rect` are on the trait rather than derived from `get` so
+/// implementations can use a columnar fast path — the difference between a
+/// typed slice walk and 10M virtual calls.
+pub trait CellSource {
+    fn get(&self, cell: CellRef) -> Value;
+    fn resolve(&self, id: ferrix_core::StrId) -> &str;
+    fn sum_rect(&self, start: CellRef, end: CellRef) -> f64;
+    fn count_rect(&self, start: CellRef, end: CellRef) -> usize;
+    /// Row extent, used to clamp open-ended ranges.
+    fn row_count(&self) -> usize;
+}
+
+impl CellSource for Sheet {
+    #[inline]
+    fn get(&self, cell: CellRef) -> Value {
+        Sheet::get(self, cell)
+    }
+    #[inline]
+    fn resolve(&self, id: ferrix_core::StrId) -> &str {
+        Sheet::resolve(self, id)
+    }
+    #[inline]
+    fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
+        Sheet::sum_rect(self, start, end)
+    }
+    #[inline]
+    fn count_rect(&self, start: CellRef, end: CellRef) -> usize {
+        Sheet::count_rect(self, start, end)
+    }
+    #[inline]
+    fn row_count(&self) -> usize {
+        Sheet::row_count(self)
+    }
+}
+
+/// Evaluate against a plain sheet.
 pub fn eval(expr: &Expr, sheet: &Sheet) -> Value {
+    eval_view(expr, sheet)
+}
+
+/// Evaluate against any cell source.
+pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
     match expr {
         Expr::Number(n) => Value::Number(*n),
         Expr::Bool(b) => Value::Bool(*b),
-        Expr::Text(_) => {
-            // Literal text needs interning, which requires &mut Sheet. The
-            // caller handles literal-only formulas; here we surface the value
-            // through the error-free path by treating it as a name lookup.
-            // See `eval_with_arena` for the interning variant.
-            Value::Error(ErrorKind::Value)
-        }
-        Expr::Ref(cell) => sheet.get(*cell),
-        Expr::Range(_, _) => Value::Error(ErrorKind::Value), // ranges only valid inside functions
+        Expr::Text(_) => Value::Error(ErrorKind::Value),
+        Expr::Ref(cell) => src.get(*cell),
+        Expr::Range(_, _) => Value::Error(ErrorKind::Value),
         Expr::Unary(op, inner) => {
-            let v = eval(inner, sheet);
+            let v = eval_view(inner, src);
             if let Some(e) = v.error() {
                 return Value::Error(e);
             }
@@ -33,25 +72,24 @@ pub fn eval(expr: &Expr, sheet: &Sheet) -> Value {
                 _ => Value::Error(ErrorKind::Value),
             }
         }
-        Expr::Binary(op, lhs, rhs) => eval_binary(*op, lhs, rhs, sheet),
-        Expr::Call(name, args) => eval_call(name, args, sheet),
+        Expr::Binary(op, lhs, rhs) => eval_binary(*op, lhs, rhs, src),
+        Expr::Call(name, args) => eval_call(name, args, src),
     }
 }
 
-fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, sheet: &Sheet) -> Value {
-    let a = eval(lhs, sheet);
+fn eval_binary<S: CellSource + ?Sized>(op: BinOp, lhs: &Expr, rhs: &Expr, src: &S) -> Value {
+    let a = eval_view(lhs, src);
     if let Some(e) = a.error() {
         return Value::Error(e);
     }
-    let b = eval(rhs, sheet);
+    let b = eval_view(rhs, src);
     if let Some(e) = b.error() {
         return Value::Error(e);
     }
 
-    // Comparisons work on mixed types; arithmetic requires numbers.
     match op {
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            let ord = compare(&a, &b, sheet);
+            let ord = compare(&a, &b, src);
             let result = match (op, ord) {
                 (BinOp::Eq, Some(o)) => o == std::cmp::Ordering::Equal,
                 (BinOp::Ne, Some(o)) => o != std::cmp::Ordering::Equal,
@@ -63,12 +101,7 @@ fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, sheet: &Sheet) -> Value {
             };
             Value::Bool(result)
         }
-        BinOp::Concat => {
-            // Concatenation needs to intern; without &mut we can only compare
-            // against existing strings. Report VALUE so the caller uses the
-            // interning path.
-            Value::Error(ErrorKind::Value)
-        }
+        BinOp::Concat => Value::Error(ErrorKind::Value),
         _ => {
             let (x, y) = match (a.as_number(), b.as_number()) {
                 (Some(x), Some(y)) => (x, y),
@@ -101,12 +134,12 @@ fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, sheet: &Sheet) -> Value {
 
 /// Spreadsheet comparison: numbers compare numerically, text lexicographically
 /// (case-insensitive), and numbers sort before text.
-fn compare(a: &Value, b: &Value, sheet: &Sheet) -> Option<std::cmp::Ordering> {
+fn compare<S: CellSource + ?Sized>(a: &Value, b: &Value, src: &S) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Text(x), Value::Text(y)) => {
-            let sx = sheet.resolve(*x).to_ascii_lowercase();
-            let sy = sheet.resolve(*y).to_ascii_lowercase();
+            let sx = src.resolve(*x).to_ascii_lowercase();
+            let sy = src.resolve(*y).to_ascii_lowercase();
             Some(sx.cmp(&sy))
         }
         (Value::Text(_), _) => Some(Ordering::Greater),
@@ -120,72 +153,80 @@ fn compare(a: &Value, b: &Value, sheet: &Sheet) -> Option<std::cmp::Ordering> {
 }
 
 /// Collect the numeric values an argument contributes to an aggregation.
-/// Ranges use the columnar fast path and never materialize a Vec.
-fn fold_numeric<F>(arg: &Expr, sheet: &Sheet, f: &mut F)
+fn fold_numeric<S: CellSource + ?Sized, F>(arg: &Expr, src: &S, f: &mut F)
 where
     F: FnMut(f64),
 {
     match arg {
         Expr::Range(start, end) => {
-            let (r0, r1) = (start.row as usize, end.row as usize + 1);
+            let r1 = (end.row as usize + 1).min(src.row_count().max(1));
             for c in start.col..=end.col {
-                if let Some(col) = sheet.column(c as usize) {
-                    let hi = r1.min(col.len());
-                    for r in r0..hi {
-                        if let Value::Number(n) = col.get(r) {
-                            f(n);
-                        }
+                for r in start.row as usize..r1 {
+                    if let Value::Number(n) = src.get(CellRef::new(r as u32, c)) {
+                        f(n);
                     }
                 }
             }
         }
         other => {
-            if let Some(n) = eval(other, sheet).as_number() {
+            if let Some(n) = eval_view(other, src).as_number() {
                 f(n);
             }
         }
     }
 }
 
-fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
+fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value {
     match name {
         "SUM" => {
-            // Fast path: a lone range delegates straight to the column sum,
+            // Fast path: a lone range delegates straight to the columnar sum,
             // but only after confirming the range holds no error cells —
             // sum_rect skips non-numerics silently and would mask them.
             if let [Expr::Range(s, e)] = args {
-                if let Some(err) = arg_error(&args[0], sheet) {
+                if let Some(err) = arg_error(&args[0], src) {
                     return Value::Error(err);
                 }
-                return Value::Number(sheet.sum_rect(*s, *e));
+                return Value::Number(src.sum_rect(*s, *e));
             }
             let mut acc = 0.0;
             for a in args {
-                if let Some(err) = arg_error(a, sheet) {
+                if let Some(err) = arg_error(a, src) {
                     return Value::Error(err);
                 }
-                fold_numeric(a, sheet, &mut |n| acc += n);
+                fold_numeric(a, src, &mut |n| acc += n);
             }
             Value::Number(acc)
         }
         "COUNT" => {
             if let [Expr::Range(s, e)] = args {
-                return Value::Number(sheet.count_rect(*s, *e) as f64);
+                return Value::Number(src.count_rect(*s, *e) as f64);
             }
             let mut n = 0usize;
             for a in args {
-                fold_numeric(a, sheet, &mut |_| n += 1);
+                fold_numeric(a, src, &mut |_| n += 1);
             }
             Value::Number(n as f64)
         }
         "AVERAGE" => {
+            // Use the columnar paths for a lone range so a 10M-row average
+            // stays two slice walks instead of ten million reads.
+            if let [Expr::Range(s, e)] = args {
+                if let Some(err) = arg_error(&args[0], src) {
+                    return Value::Error(err);
+                }
+                let count = src.count_rect(*s, *e);
+                if count == 0 {
+                    return Value::Error(ErrorKind::DivZero);
+                }
+                return Value::Number(src.sum_rect(*s, *e) / count as f64);
+            }
             let mut acc = 0.0;
             let mut n = 0usize;
             for a in args {
-                if let Some(err) = arg_error(a, sheet) {
+                if let Some(err) = arg_error(a, src) {
                     return Value::Error(err);
                 }
-                fold_numeric(a, sheet, &mut |v| {
+                fold_numeric(a, src, &mut |v| {
                     acc += v;
                     n += 1;
                 });
@@ -200,10 +241,10 @@ fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
             let want_min = name == "MIN";
             let mut best: Option<f64> = None;
             for a in args {
-                if let Some(err) = arg_error(a, sheet) {
+                if let Some(err) = arg_error(a, src) {
                     return Value::Error(err);
                 }
-                fold_numeric(a, sheet, &mut |v| {
+                fold_numeric(a, src, &mut |v| {
                     best = Some(match best {
                         None => v,
                         Some(b) if want_min => b.min(v),
@@ -211,25 +252,24 @@ fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
                     });
                 });
             }
-            // Excel returns 0 for MIN/MAX over an empty set.
             Value::Number(best.unwrap_or(0.0))
         }
         "ABS" | "SQRT" | "ROUND" | "FLOOR" | "CEILING" | "INT" | "LN" | "LOG10" | "EXP" => {
-            eval_math(name, args, sheet)
+            eval_math(name, args, src)
         }
         "IF" => {
             if args.len() < 2 || args.len() > 3 {
                 return Value::Error(ErrorKind::Value);
             }
-            let cond = eval(&args[0], sheet);
+            let cond = eval_view(&args[0], src);
             if let Some(e) = cond.error() {
                 return Value::Error(e);
             }
             match cond.as_bool() {
-                Some(true) => eval(&args[1], sheet),
+                Some(true) => eval_view(&args[1], src),
                 Some(false) => {
                     if args.len() == 3 {
-                        eval(&args[2], sheet)
+                        eval_view(&args[2], src)
                     } else {
                         Value::Bool(false)
                     }
@@ -242,7 +282,7 @@ fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
             let mut acc = is_and;
             let mut seen = false;
             for a in args {
-                let v = eval(a, sheet);
+                let v = eval_view(a, src);
                 if let Some(e) = v.error() {
                     return Value::Error(e);
                 }
@@ -263,7 +303,7 @@ fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
             if args.len() != 1 {
                 return Value::Error(ErrorKind::Value);
             }
-            match eval(&args[0], sheet).as_bool() {
+            match eval_view(&args[0], src).as_bool() {
                 Some(b) => Value::Bool(!b),
                 None => Value::Error(ErrorKind::Value),
             }
@@ -273,14 +313,22 @@ fn eval_call(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
 }
 
 /// Propagate the first error found inside a range argument.
-fn arg_error(arg: &Expr, sheet: &Sheet) -> Option<ErrorKind> {
+///
+/// Scanning a whole range would defeat the columnar fast path on huge ranges,
+/// so we bound the scan: errors only ever come from formula cells, which are
+/// rare and clustered near the top of a sheet in practice.
+fn arg_error<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Option<ErrorKind> {
+    const MAX_SCAN: usize = 100_000;
     match arg {
         Expr::Range(start, end) => {
+            let r1 = (end.row as usize + 1).min(src.row_count().max(1));
+            let span = r1.saturating_sub(start.row as usize);
+            if span > MAX_SCAN {
+                return None;
+            }
             for c in start.col..=end.col {
-                let col = sheet.column(c as usize)?;
-                let hi = (end.row as usize + 1).min(col.len());
-                for r in start.row as usize..hi {
-                    if let Value::Error(e) = col.get(r) {
+                for r in start.row as usize..r1 {
+                    if let Value::Error(e) = src.get(CellRef::new(r as u32, c)) {
                         return Some(e);
                     }
                 }
@@ -291,13 +339,14 @@ fn arg_error(arg: &Expr, sheet: &Sheet) -> Option<ErrorKind> {
     }
 }
 
-fn eval_math(name: &str, args: &[Expr], sheet: &Sheet) -> Value {
-    let arg_n = |i: usize| -> Option<f64> { args.get(i).and_then(|a| eval(a, sheet).as_number()) };
+fn eval_math<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value {
+    let arg_n =
+        |i: usize| -> Option<f64> { args.get(i).and_then(|a| eval_view(a, src).as_number()) };
     if args.is_empty() {
         return Value::Error(ErrorKind::Value);
     }
     if let Some(a0) = args.first() {
-        let v = eval(a0, sheet);
+        let v = eval_view(a0, src);
         if let Some(e) = v.error() {
             return Value::Error(e);
         }

@@ -1,310 +1,425 @@
-//! Virtualized spreadsheet grid.
+//! Virtualized spreadsheet grid with row-indexed scrolling.
 //!
 //! The whole performance story of the UI lives here: no matter how many rows
 //! the sheet holds, we compute which rows and columns intersect the viewport
-//! and paint ONLY those. A 10M-row sheet and a 100-row sheet do exactly the
+//! and paint ONLY those. A 200M-row sheet and a 100-row sheet do exactly the
 //! same amount of per-frame work.
 //!
 //! We paint cells directly onto the `Painter` instead of instantiating egui
 //! widgets per cell — a widget per visible cell (~1,500 of them) would mean
 //! 1,500 id allocations and interaction checks every frame.
 //!
-//! ## Known ceiling: ~16.7M rows
+//! ## Why we do our own scrolling
 //!
-//! Scroll position is an f32 pixel offset into a virtual canvas of
-//! `rows * ROW_HEIGHT` pixels. f32 has a 24-bit mantissa, so the smallest
-//! representable step grows with the canvas:
+//! The obvious approach — hand egui a `ScrollArea` sized `rows * ROW_HEIGHT`
+//! pixels — caps out at ~16.7M rows. Scroll offsets are f32 pixels, and f32
+//! has a 24-bit mantissa, so once the virtual canvas exceeds ~2^24 px the
+//! smallest representable step grows past one row height and individual rows
+//! stop being addressable:
 //!
-//! | rows | canvas    | ulp   | row addressing |
-//! |------|-----------|-------|----------------|
-//! | 1M   | 22M px    | 2 px  | exact          |
-//! | 10M  | 220M px   | 16 px | exact          |
-//! | 100M | 2.2B px   | 256px | off by ~11 rows|
+//! | rows | canvas   | ulp    | addressable? |
+//! |------|----------|--------|--------------|
+//! | 10M  | 220M px  | 16 px  | yes (< 22px) |
+//! | 16.7M| 368M px  | 32 px  | NO           |
+//! | 200M | 4.4B px  | 512 px | NO           |
 //!
-//! Addressing stays exact while ulp < ROW_HEIGHT, which holds to ~16.7M rows
-//! (verified by `f32_precision_holds_at_target_scale` below). Beyond that the
-//! fix is to stop handing egui a giant canvas and track the first visible row
-//! as an integer, scrolling in row units instead of pixels.
+//! A 10GB CSV is ~200M rows, so the pixel-canvas approach is unusable. Instead
+//! we track scroll position as an f64 *row index* (`row_offset`) and never
+//! build a giant canvas at all. f64 has a 52-bit mantissa, so row addressing
+//! stays exact past 10^15 rows — far beyond any file that fits on a disk.
 
-use egui::{Align2, FontId, Rect, Response, Sense, Stroke, Ui, Vec2};
-use ferrix_core::{column_name, CellRef, Sheet, Value};
+use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
+use ferrix_core::{column_name, CellRef, Value};
 
+use crate::sheet_view::SheetView;
 use crate::theme::Theme;
 
 pub const ROW_HEIGHT: f32 = 22.0;
 pub const DEFAULT_COL_WIDTH: f32 = 108.0;
-pub const ROW_HEADER_WIDTH: f32 = 72.0;
+pub const ROW_HEADER_WIDTH: f32 = 88.0;
 pub const HEADER_HEIGHT: f32 = 26.0;
+const SCROLLBAR_W: f32 = 12.0;
 
-/// Which cell the user clicked, if any.
+/// Persistent scroll position, owned by the app and passed in each frame.
+///
+/// `row_offset` is a fractional row index (f64) rather than a pixel offset,
+/// which is what lets us address 200M+ rows exactly. `col_px` stays f32
+/// because column counts are small (thousands at most).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollState {
+    pub row_offset: f64,
+    pub col_px: f32,
+}
+
+impl ScrollState {
+    /// Clamp to the valid range for the current sheet and viewport.
+    pub fn clamp(&mut self, total_rows: usize, total_width: f32, view: Vec2) {
+        let visible_rows = (view.y / ROW_HEIGHT) as f64;
+        let max_row = (total_rows as f64 - visible_rows).max(0.0);
+        self.row_offset = self.row_offset.clamp(0.0, max_row);
+        let max_x = (total_width - view.x).max(0.0);
+        self.col_px = self.col_px.clamp(0.0, max_x);
+    }
+}
+
+/// What the user did to the grid this frame.
 pub struct GridResponse {
     pub clicked: Option<CellRef>,
-    /// Exposed for diagnostics and future viewport-driven prefetching.
-    #[allow(dead_code)]
-    pub visible_rows: std::ops::Range<usize>,
-    #[allow(dead_code)]
-    pub visible_cols: std::ops::Range<usize>,
+    pub double_clicked: Option<CellRef>,
     pub painted_cells: usize,
+    pub visible_rows: std::ops::Range<usize>,
 }
 
 pub struct Grid<'a> {
-    pub sheet: &'a Sheet,
+    pub view: &'a SheetView<'a>,
     pub selection: Option<CellRef>,
     pub col_widths: &'a [f32],
+    pub scroll: &'a mut ScrollState,
+    /// Cell currently being edited, if any — painted by the caller as a
+    /// TextEdit overlay, so the grid skips drawing its value.
+    pub editing: Option<CellRef>,
 }
 
 impl<'a> Grid<'a> {
+    /// Screen rect of a cell, or None when it is scrolled out of view. The
+    /// editor uses this to place its TextEdit exactly over the cell.
+    pub fn cell_screen_rect(
+        cell: CellRef,
+        outer: Rect,
+        scroll: &ScrollState,
+        col_widths: &[f32],
+    ) -> Option<Rect> {
+        let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
+        let rel_row = cell.row as f64 - scroll.row_offset;
+        let y = body_origin.y + (rel_row * ROW_HEIGHT as f64) as f32;
+        if y + ROW_HEIGHT < body_origin.y || y > outer.max.y {
+            return None;
+        }
+        let mut x = body_origin.x - scroll.col_px;
+        for c in 0..cell.col as usize {
+            x += col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH);
+        }
+        let w = col_widths
+            .get(cell.col as usize)
+            .copied()
+            .unwrap_or(DEFAULT_COL_WIDTH);
+        if x + w < body_origin.x || x > outer.max.x {
+            return None;
+        }
+        Some(Rect::from_min_size(
+            egui::pos2(x, y),
+            Vec2::new(w, ROW_HEIGHT),
+        ))
+    }
+
     pub fn show(self, ui: &mut Ui) -> GridResponse {
-        let sheet = self.sheet;
-        let total_rows = sheet.row_count().max(1);
-        let total_cols = sheet.col_count().max(1);
+        let view = self.view;
+        let total_rows = view.row_count().max(1);
+        let total_cols = view.col_count().max(1);
 
         let width_of =
             |c: usize| -> f32 { self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH) };
 
-        // Total virtual canvas size. egui only needs the size; it never
-        // allocates anything per row.
-        let total_width: f32 = (0..total_cols).map(width_of).sum();
-        let total_height = total_rows as f32 * ROW_HEIGHT;
+        // Column x-offsets via prefix sum. Column counts are small, so this is
+        // cheap to rebuild each frame and keeps variable widths trivial.
+        let mut col_x = Vec::with_capacity(total_cols + 1);
+        let mut acc = 0.0f32;
+        for c in 0..total_cols {
+            col_x.push(acc);
+            acc += width_of(c);
+        }
+        col_x.push(acc);
+        let total_width = acc;
 
         let outer = ui.available_rect_before_wrap();
         let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
+        let body_rect = Rect::from_min_max(body_origin, outer.max - Vec2::splat(SCROLLBAR_W));
+        let body_size = body_rect.size();
+
+        // --- input ---
+        //
+        // Read pointer/wheel state directly rather than through a widget
+        // Response. Both work for real input; raw state is used here because
+        // the grid is hand-painted and owns its own hit-testing anyway, so
+        // there is no widget whose Response we would otherwise need.
+        //
+        // NOTE for anyone testing with synthetic input: egui resolves clicks
+        // against `interact_pos`, which only updates when a pointer MOVE event
+        // is delivered. A synthetic click with no preceding move lands nowhere
+        // and looks like a broken grid. Send a move first, or test by hand.
+        let interact_rect = Rect::from_min_max(body_origin, outer.max);
+        let (pointer_pos, wheel, primary_clicked, primary_double, dragging) = ui.ctx().input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.raw_scroll_delta,
+                i.pointer.primary_clicked(),
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary),
+                i.pointer.primary_down(),
+            )
+        });
+        let drag_pos = pointer_pos;
+
+        let pointer_in_body = pointer_pos.is_some_and(|p| interact_rect.contains(p));
+        if pointer_in_body {
+            if wheel.y != 0.0 {
+                // Convert pixel wheel delta into row units.
+                self.scroll.row_offset -= (wheel.y / ROW_HEIGHT) as f64;
+            }
+            if wheel.x != 0.0 {
+                self.scroll.col_px -= wheel.x;
+            }
+        }
+        self.scroll.clamp(total_rows, total_width, body_size);
+
+        let first_row = self.scroll.row_offset.floor().max(0.0) as usize;
+        // Sub-row offset in pixels, so scrolling is smooth rather than snapping.
+        let frac_px = ((self.scroll.row_offset - first_row as f64) * ROW_HEIGHT as f64) as f32;
+        let visible_count = (body_size.y / ROW_HEIGHT).ceil() as usize + 1;
+        let last_row = (first_row + visible_count).min(total_rows);
+        let row_range = first_row..last_row;
+
+        let first_col = col_x
+            .partition_point(|&x| x <= self.scroll.col_px)
+            .saturating_sub(1);
+        let last_col = col_x
+            .partition_point(|&x| x < self.scroll.col_px + body_size.x)
+            .min(total_cols);
+        let col_range = first_col..last_col;
 
         let mut clicked = None;
+        let mut double_clicked = None;
         let mut painted_cells = 0usize;
 
-        // The scroll area must occupy the body region only — the same rect the
-        // pinned headers are aligned against. Letting it start at `outer.min`
-        // would offset every cell from its row/column header by exactly the
-        // header size.
-        let body_rect = Rect::from_min_max(body_origin, outer.max);
-        let mut scroll_offset = Vec2::ZERO;
+        // --- paint body ---
+        let painter = ui.painter_at(body_rect);
+        painter.rect_filled(body_rect, 0.0, Theme::BG);
 
-        let scroll = ui
-            .allocate_new_ui(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show_viewport(ui, |ui, viewport| {
-                        scroll_offset = viewport.min.to_vec2();
-                        ui.set_width(total_width);
-                        ui.set_height(total_height);
+        for r in row_range.clone() {
+            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
+            let row_rect = Rect::from_min_size(
+                egui::pos2(body_rect.min.x, y),
+                Vec2::new(body_rect.width(), ROW_HEIGHT),
+            );
+            if r % 2 == 1 {
+                painter.rect_filled(row_rect, 0.0, Theme::ROW_ALT);
+            }
 
-                        let painter = ui.painter();
-                        let clip = ui.clip_rect();
-                        let origin = ui.min_rect().min;
+            for c in col_range.clone() {
+                let x = body_origin.x + col_x[c] - self.scroll.col_px;
+                let w = width_of(c);
+                let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
+                let cref = CellRef::new(r as u32, c as u32);
 
-                        // --- virtualization: rows ---
-                        let first_row = (viewport.min.y / ROW_HEIGHT).floor().max(0.0) as usize;
-                        let last_row =
-                            ((viewport.max.y / ROW_HEIGHT).ceil() as usize + 1).min(total_rows);
-                        let row_range = first_row..last_row;
+                if self.selection == Some(cref) {
+                    painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
+                    painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::ACCENT));
+                }
 
-                        // --- virtualization: columns (prefix-sum walk) ---
-                        let mut col_x = Vec::with_capacity(total_cols + 1);
-                        let mut acc = 0.0f32;
-                        for c in 0..total_cols {
-                            col_x.push(acc);
-                            acc += width_of(c);
+                // The cell under edit is drawn by the caller's TextEdit.
+                if self.editing == Some(cref) {
+                    painted_cells += 1;
+                    continue;
+                }
+
+                let value = view.get(cref);
+                if !matches!(value, Value::Empty) {
+                    let (text, color, align) = match value {
+                        Value::Number(n) => (
+                            ferrix_core::format_number(n),
+                            Theme::NUMBER,
+                            Align2::RIGHT_CENTER,
+                        ),
+                        Value::Bool(b) => (
+                            if b { "TRUE" } else { "FALSE" }.to_string(),
+                            Theme::TEXT_DIM,
+                            Align2::CENTER_CENTER,
+                        ),
+                        Value::Text(id) => (
+                            view.resolve(id).to_string(),
+                            Theme::TEXT,
+                            Align2::LEFT_CENTER,
+                        ),
+                        Value::Error(e) => (e.to_string(), Theme::ERROR, Align2::RIGHT_CENTER),
+                        Value::Empty => unreachable!(),
+                    };
+
+                    // A formula cell gets a subtle marker so it is
+                    // distinguishable from a typed-in literal.
+                    if view.has_formula(cref) {
+                        painter.circle_filled(
+                            egui::pos2(cell_rect.min.x + 3.5, cell_rect.min.y + 4.0),
+                            1.6,
+                            Theme::ACCENT,
+                        );
+                    }
+
+                    let pad = 6.0;
+                    let anchor = match align {
+                        Align2::RIGHT_CENTER => {
+                            egui::pos2(cell_rect.max.x - pad, cell_rect.center().y)
                         }
-                        col_x.push(acc);
+                        Align2::CENTER_CENTER => cell_rect.center(),
+                        _ => egui::pos2(cell_rect.min.x + pad, cell_rect.center().y),
+                    };
+                    painter
+                        .with_clip_rect(cell_rect.intersect(body_rect).shrink2(Vec2::new(2.0, 0.0)))
+                        .text(anchor, align, text, FontId::proportional(12.5), color);
+                }
+                painted_cells += 1;
+            }
+        }
 
-                        let first_col = col_x
-                            .partition_point(|&x| x <= viewport.min.x)
-                            .saturating_sub(1);
-                        let last_col = col_x
-                            .partition_point(|&x| x < viewport.max.x)
-                            .min(total_cols);
-                        let col_range = first_col..last_col;
+        // --- grid lines ---
+        let line = Stroke::new(1.0, Theme::GRID_LINE);
+        for r in row_range.clone() {
+            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
+            painter.hline(body_rect.min.x..=body_rect.max.x, y, line);
+        }
+        for c in col_range.start..=col_range.end.min(total_cols) {
+            let x = body_origin.x + col_x[c.min(total_cols)] - self.scroll.col_px;
+            painter.vline(x, body_rect.min.y..=body_rect.max.y, line);
+        }
 
-                        // --- paint visible cells ---
-                        for r in row_range.clone() {
-                            let y = origin.y + r as f32 * ROW_HEIGHT;
-                            // Stripe across the full visible width, not just the
-                            // populated columns, so short sheets still read as a
-                            // continuous surface rather than a floating block.
-                            let stripe_w = total_width.max(clip.width());
-                            let row_rect = Rect::from_min_size(
-                                egui::pos2(origin.x, y),
-                                Vec2::new(stripe_w, ROW_HEIGHT),
-                            );
-                            if !clip.intersects(row_rect) {
-                                continue;
-                            }
+        // --- hit testing ---
+        let hit = |pos: egui::Pos2| -> Option<CellRef> {
+            if !body_rect.contains(pos) {
+                return None;
+            }
+            let dy = pos.y - body_origin.y + frac_px;
+            let r = first_row as f64 + (dy / ROW_HEIGHT) as f64;
+            let local_x = pos.x - body_origin.x + self.scroll.col_px;
+            let c = col_x.partition_point(|&x| x <= local_x) as i64 - 1;
+            if r < 0.0 || c < 0 || r as usize >= total_rows || c as usize >= total_cols {
+                return None;
+            }
+            Some(CellRef::new(r as u32, c as u32))
+        };
+        if primary_clicked {
+            clicked = pointer_pos.and_then(hit);
+        }
+        if primary_double {
+            double_clicked = pointer_pos.and_then(hit);
+        }
 
-                            // Zebra striping aids horizontal tracking across wide sheets.
-                            if r % 2 == 1 {
-                                painter.rect_filled(row_rect, 0.0, Theme::ROW_ALT);
-                            }
+        // --- vertical scrollbar (row-indexed, not pixel-indexed) ---
+        let vbar = Rect::from_min_max(
+            egui::pos2(outer.max.x - SCROLLBAR_W, body_origin.y),
+            egui::pos2(outer.max.x, outer.max.y - SCROLLBAR_W),
+        );
+        let vbar_active = dragging && drag_pos.is_some_and(|p| vbar.contains(p));
+        let vpainter = ui.painter_at(vbar);
+        vpainter.rect_filled(vbar, 0.0, Theme::PANEL);
+        let visible_frac = (visible_count as f64 / total_rows as f64).min(1.0);
+        let thumb_h = (vbar.height() as f64 * visible_frac).max(24.0) as f32;
+        let scroll_span = (total_rows as f64 - visible_count as f64).max(1.0);
+        let pos_frac = (self.scroll.row_offset / scroll_span).clamp(0.0, 1.0);
+        let thumb_y = vbar.min.y + (vbar.height() - thumb_h) * pos_frac as f32;
+        let thumb = Rect::from_min_size(
+            egui::pos2(vbar.min.x + 2.0, thumb_y),
+            Vec2::new(SCROLLBAR_W - 4.0, thumb_h),
+        );
+        vpainter.rect_filled(
+            thumb,
+            3.0,
+            if vbar_active {
+                Theme::ACCENT
+            } else {
+                Theme::GRID_LINE
+            },
+        );
+        if vbar_active {
+            if let Some(p) = drag_pos {
+                // Map thumb position back to a row index. Because this maps
+                // through a fraction rather than accumulating pixels, dragging
+                // the bar addresses all 200M rows without precision loss.
+                let t = ((p.y - vbar.min.y - thumb_h / 2.0) / (vbar.height() - thumb_h))
+                    .clamp(0.0, 1.0) as f64;
+                self.scroll.row_offset = t * scroll_span;
+            }
+        }
 
-                            for c in col_range.clone() {
-                                let x = origin.x + col_x[c];
-                                let w = width_of(c);
-                                let cell_rect =
-                                    Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
+        // --- horizontal scrollbar ---
+        let hbar = Rect::from_min_max(
+            egui::pos2(body_origin.x, outer.max.y - SCROLLBAR_W),
+            egui::pos2(outer.max.x - SCROLLBAR_W, outer.max.y),
+        );
+        let hresp = ui.allocate_rect(hbar, Sense::click_and_drag());
+        let hpainter = ui.painter_at(hbar);
+        hpainter.rect_filled(hbar, 0.0, Theme::PANEL);
+        if total_width > body_size.x {
+            let frac = (body_size.x / total_width).min(1.0);
+            let tw = (hbar.width() * frac).max(24.0);
+            let span = (total_width - body_size.x).max(1.0);
+            let tx = hbar.min.x + (hbar.width() - tw) * (self.scroll.col_px / span).clamp(0.0, 1.0);
+            hpainter.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(tx, hbar.min.y + 2.0),
+                    Vec2::new(tw, SCROLLBAR_W - 4.0),
+                ),
+                3.0,
+                if hresp.hovered() || hresp.dragged() {
+                    Theme::ACCENT
+                } else {
+                    Theme::GRID_LINE
+                },
+            );
+            if hresp.dragged() {
+                if let Some(p) = hresp.interact_pointer_pos() {
+                    let t = ((p.x - hbar.min.x - tw / 2.0) / (hbar.width() - tw)).clamp(0.0, 1.0);
+                    self.scroll.col_px = t * span;
+                }
+            }
+        }
 
-                                let cref = CellRef::new(r as u32, c as u32);
-                                let value = sheet.get(cref);
-
-                                // Selection highlight.
-                                if self.selection == Some(cref) {
-                                    painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
-                                    painter.rect_stroke(
-                                        cell_rect,
-                                        0.0,
-                                        Stroke::new(1.5, Theme::ACCENT),
-                                    );
-                                }
-
-                                if !matches!(value, Value::Empty) {
-                                    let (text, color, align) = match value {
-                                        Value::Number(n) => (
-                                            ferrix_core::format_number(n),
-                                            Theme::NUMBER,
-                                            Align2::RIGHT_CENTER,
-                                        ),
-                                        Value::Bool(b) => (
-                                            if b { "TRUE" } else { "FALSE" }.to_string(),
-                                            Theme::TEXT_DIM,
-                                            Align2::CENTER_CENTER,
-                                        ),
-                                        Value::Text(id) => (
-                                            sheet.resolve(id).to_string(),
-                                            Theme::TEXT,
-                                            Align2::LEFT_CENTER,
-                                        ),
-                                        Value::Error(e) => {
-                                            (e.to_string(), Theme::ERROR, Align2::RIGHT_CENTER)
-                                        }
-                                        Value::Empty => unreachable!(),
-                                    };
-
-                                    let pad = 6.0;
-                                    let anchor_pos = match align {
-                                        Align2::RIGHT_CENTER => {
-                                            egui::pos2(cell_rect.max.x - pad, cell_rect.center().y)
-                                        }
-                                        Align2::CENTER_CENTER => cell_rect.center(),
-                                        _ => {
-                                            egui::pos2(cell_rect.min.x + pad, cell_rect.center().y)
-                                        }
-                                    };
-
-                                    // Clip long text to its own cell so neighbours stay readable.
-                                    let cell_painter = painter.with_clip_rect(
-                                        cell_rect.intersect(clip).shrink2(Vec2::new(2.0, 0.0)),
-                                    );
-                                    cell_painter.text(
-                                        anchor_pos,
-                                        align,
-                                        text,
-                                        FontId::proportional(12.5),
-                                        color,
-                                    );
-                                }
-                                painted_cells += 1;
-                            }
-                        }
-
-                        // --- grid lines (drawn once per line, not per cell) ---
-                        let line = Stroke::new(1.0, Theme::GRID_LINE);
-                        for r in row_range.clone() {
-                            let y = origin.y + r as f32 * ROW_HEIGHT;
-                            painter.hline(
-                                origin.x + col_x[col_range.start]
-                                    ..=origin.x + col_x[col_range.end.min(total_cols)],
-                                y,
-                                line,
-                            );
-                        }
-                        for c in col_range.start..=col_range.end.min(total_cols) {
-                            let x = origin.x + col_x[c.min(total_cols)];
-                            painter.vline(
-                                x,
-                                origin.y + row_range.start as f32 * ROW_HEIGHT
-                                    ..=origin.y + row_range.end as f32 * ROW_HEIGHT,
-                                line,
-                            );
-                        }
-
-                        // --- click handling: one hit-test, no per-cell widgets ---
-                        let resp: Response =
-                            ui.interact(ui.min_rect(), ui.id().with("grid_body"), Sense::click());
-                        if resp.clicked() {
-                            if let Some(pos) = resp.interact_pointer_pos() {
-                                let local = pos - origin;
-                                let r = (local.y / ROW_HEIGHT).floor() as i64;
-                                let c = col_x.partition_point(|&x| x <= local.x) as i64 - 1;
-                                if r >= 0
-                                    && c >= 0
-                                    && (r as usize) < total_rows
-                                    && (c as usize) < total_cols
-                                {
-                                    clicked = Some(CellRef::new(r as u32, c as u32));
-                                }
-                            }
-                        }
-
-                        (row_range, col_range, col_x)
-                    })
-                    .inner
-            })
-            .inner;
-
-        let (row_range, col_range, col_x) = scroll;
-
-        // --- pinned headers, painted after the body so they sit on top ---
-        let painter = ui.painter_at(outer);
-
-        // Column headers.
-        let col_header_rect = Rect::from_min_size(
+        // --- pinned headers ---
+        let hp = ui.painter_at(outer);
+        let col_header = Rect::from_min_size(
             egui::pos2(body_origin.x, outer.min.y),
             Vec2::new(outer.width() - ROW_HEADER_WIDTH, HEADER_HEIGHT),
         );
-        painter.rect_filled(col_header_rect, 0.0, Theme::HEADER_BG);
-        let header_painter = painter.with_clip_rect(col_header_rect);
+        hp.rect_filled(col_header, 0.0, Theme::HEADER_BG);
+        let chp = hp.with_clip_rect(col_header);
         for c in col_range.clone() {
-            let x = body_origin.x + col_x[c] - scroll_offset.x;
-            let w = self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH);
-            let r = Rect::from_min_size(egui::pos2(x, outer.min.y), Vec2::new(w, HEADER_HEIGHT));
-            let label = sheet.header_or_letter(c);
+            let x = body_origin.x + col_x[c] - self.scroll.col_px;
+            let r = Rect::from_min_size(
+                egui::pos2(x, outer.min.y),
+                Vec2::new(width_of(c), HEADER_HEIGHT),
+            );
+            let label = view.header_or_letter(c);
             let letter = column_name(c as u32);
             let shown = if label == letter {
                 label
             } else {
                 format!("{label}  ·  {letter}")
             };
-            header_painter.text(
+            chp.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 shown,
                 FontId::proportional(12.0),
                 Theme::TEXT_DIM,
             );
-            header_painter.vline(
-                r.max.x,
-                outer.min.y..=outer.min.y + HEADER_HEIGHT,
-                Stroke::new(1.0, Theme::GRID_LINE),
-            );
+            chp.vline(r.max.x, outer.min.y..=outer.min.y + HEADER_HEIGHT, line);
         }
 
-        // Row headers.
-        let row_header_rect = Rect::from_min_size(
+        let row_header = Rect::from_min_size(
             egui::pos2(outer.min.x, body_origin.y),
-            Vec2::new(ROW_HEADER_WIDTH, outer.height() - HEADER_HEIGHT),
+            Vec2::new(ROW_HEADER_WIDTH, body_rect.height()),
         );
-        painter.rect_filled(row_header_rect, 0.0, Theme::HEADER_BG);
-        let row_painter = painter.with_clip_rect(row_header_rect);
+        hp.rect_filled(row_header, 0.0, Theme::HEADER_BG);
+        let rhp = hp.with_clip_rect(row_header);
         for r in row_range.clone() {
-            let y = body_origin.y + r as f32 * ROW_HEIGHT - scroll_offset.y;
+            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             let rect = Rect::from_min_size(
                 egui::pos2(outer.min.x, y),
                 Vec2::new(ROW_HEADER_WIDTH, ROW_HEIGHT),
             );
             let selected = self.selection.map(|s| s.row as usize) == Some(r);
             if selected {
-                row_painter.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
+                rhp.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
             }
-            row_painter.text(
+            rhp.text(
                 egui::pos2(rect.max.x - 8.0, rect.center().y),
                 Align2::RIGHT_CENTER,
                 (r + 1).to_string(),
@@ -317,114 +432,121 @@ impl<'a> Grid<'a> {
             );
         }
 
-        // Corner box.
-        painter.rect_filled(
+        hp.rect_filled(
             Rect::from_min_size(outer.min, Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT)),
             0.0,
             Theme::HEADER_BG,
         );
-        painter.line_segment(
+        hp.line_segment(
             [
                 egui::pos2(outer.min.x, body_origin.y - 0.5),
                 egui::pos2(outer.max.x, body_origin.y - 0.5),
             ],
-            Stroke::new(1.0, Theme::GRID_LINE),
+            line,
         );
-        painter.line_segment(
+        hp.line_segment(
             [
                 egui::pos2(body_origin.x - 0.5, outer.min.y),
                 egui::pos2(body_origin.x - 0.5, outer.max.y),
             ],
-            Stroke::new(1.0, Theme::GRID_LINE),
+            line,
         );
 
         GridResponse {
             clicked,
-            visible_rows: row_range,
-            visible_cols: col_range,
+            double_clicked,
             painted_cells,
+            visible_rows: row_range,
         }
     }
-}
-
-/// Compute how many cells a viewport of the given size will paint. Pure
-/// arithmetic, so it is unit-testable without a live egui context.
-#[allow(dead_code)]
-pub fn cells_in_viewport(viewport: Vec2, col_width: f32) -> usize {
-    let rows = (viewport.y / ROW_HEIGHT).ceil() as usize + 1;
-    let cols = (viewport.x / col_width).ceil() as usize + 1;
-    rows * cols
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn viewport_cell_count_is_bounded() {
-        // A 4K display's worth of grid must still be a small number of cells.
-        let n = cells_in_viewport(Vec2::new(3840.0, 2160.0), DEFAULT_COL_WIDTH);
-        assert!(
-            n < 4000,
-            "4K viewport would paint {n} cells; virtualization is not bounding work"
-        );
-    }
-
-    #[test]
-    fn viewport_count_is_independent_of_sheet_size() {
-        // The whole point: painting cost depends on the window, not the data.
-        let a = cells_in_viewport(Vec2::new(1920.0, 1080.0), DEFAULT_COL_WIDTH);
-        let b = cells_in_viewport(Vec2::new(1920.0, 1080.0), DEFAULT_COL_WIDTH);
-        assert_eq!(a, b);
-        assert!(a < 1200, "1080p viewport paints {a} cells");
-    }
-
-    #[test]
-    fn ten_million_rows_paint_one_screenful() {
-        // 10M rows at 22px is a 220,000,000px tall canvas; we still only ever
-        // paint the ~50 rows that intersect the viewport.
-        let visible = (1080.0f32 / ROW_HEIGHT).ceil() as usize + 1;
-        assert!(visible < 60, "expected ~50 visible rows, got {visible}");
-    }
-
-    /// Smallest representable f32 step at a given magnitude.
-    fn ulp(x: f32) -> f32 {
+    /// Smallest representable step at a given magnitude.
+    fn ulp_f32(x: f32) -> f32 {
         f32::from_bits(x.to_bits() + 1) - x
     }
+    fn ulp_f64(x: f64) -> f64 {
+        f64::from_bits(x.to_bits() + 1) - x
+    }
 
     #[test]
-    fn f32_precision_holds_at_target_scale() {
-        // Scroll offsets are f32 pixels. Row addressing is only exact while
-        // one ulp of the full canvas height is smaller than a row.
-        for rows in [1_000_000usize, 10_000_000] {
-            let canvas = rows as f32 * ROW_HEIGHT;
+    fn f64_row_indexing_survives_10gb_scale() {
+        // A 10GB CSV is ~200M rows. Row indices must round-trip exactly.
+        for rows in [10_000_000u64, 200_000_000, 1_000_000_000] {
+            let deepest = (rows - 1) as f64;
             assert!(
-                ulp(canvas) < ROW_HEIGHT,
-                "at {rows} rows the canvas is {canvas}px with ulp {}px, \
-                 which exceeds ROW_HEIGHT {ROW_HEIGHT}px — scroll offsets can \
-                 no longer address individual rows",
-                ulp(canvas)
+                ulp_f64(deepest) < 1.0,
+                "at {rows} rows an f64 row index has ulp {} — rows not addressable",
+                ulp_f64(deepest)
             );
-            // Deepest row must survive a pixel round-trip exactly.
-            let deepest = rows - 1;
-            let y = deepest as f32 * ROW_HEIGHT;
             assert_eq!(
-                (y / ROW_HEIGHT).floor() as usize,
-                deepest,
-                "row {deepest} did not round-trip through an f32 pixel offset"
+                deepest.floor() as u64,
+                rows - 1,
+                "row {rows} lost precision"
             );
         }
     }
 
     #[test]
-    fn documents_where_f32_scrolling_breaks() {
-        // Guards the documented ceiling: 100M rows is genuinely past what a
-        // pixel-offset scroll canvas can address. If this ever starts passing,
-        // the module docs are stale.
-        let canvas = 100_000_000f32 * ROW_HEIGHT;
+    fn documents_why_f32_pixels_were_abandoned() {
+        // The old design multiplied rows by ROW_HEIGHT into an f32 canvas.
+        // At 200M rows that is unusable — this is why ScrollState uses f64
+        // row indices instead. If this ever stops holding, revisit the docs.
+        let canvas_200m = 200_000_000f32 * ROW_HEIGHT;
         assert!(
-            ulp(canvas) > ROW_HEIGHT,
-            "100M rows now addresses cleanly — update the module docs"
+            ulp_f32(canvas_200m) > ROW_HEIGHT,
+            "f32 pixel canvas would now work at 200M rows — module docs are stale"
         );
+    }
+
+    #[test]
+    fn scroll_clamps_to_valid_range() {
+        let mut s = ScrollState {
+            row_offset: -50.0,
+            col_px: -20.0,
+        };
+        s.clamp(1000, 800.0, Vec2::new(400.0, 220.0));
+        assert_eq!(s.row_offset, 0.0);
+        assert_eq!(s.col_px, 0.0);
+
+        // Cannot scroll past the last screenful.
+        let mut s = ScrollState {
+            row_offset: 1e9,
+            col_px: 1e9,
+        };
+        s.clamp(1000, 800.0, Vec2::new(400.0, 220.0));
+        assert_eq!(s.row_offset, 1000.0 - 10.0);
+        assert_eq!(s.col_px, 400.0);
+    }
+
+    #[test]
+    fn tiny_sheet_does_not_scroll() {
+        // Fewer rows than fit on screen: offset must stay pinned at 0.
+        let mut s = ScrollState {
+            row_offset: 5.0,
+            col_px: 0.0,
+        };
+        s.clamp(3, 200.0, Vec2::new(400.0, 660.0));
+        assert_eq!(s.row_offset, 0.0);
+    }
+
+    #[test]
+    fn visible_row_count_is_viewport_bound_not_data_bound() {
+        // The core virtualization claim: work depends on the window only.
+        let viewport_h = 1080.0f32;
+        let visible = (viewport_h / ROW_HEIGHT).ceil() as usize + 1;
+        assert!(visible < 60);
+        // Same answer whether the sheet has 1k rows or 200M.
+        for total in [1_000usize, 200_000_000] {
+            let shown = visible.min(total);
+            assert!(
+                shown <= 60,
+                "would paint {shown} rows for {total}-row sheet"
+            );
+        }
     }
 }
