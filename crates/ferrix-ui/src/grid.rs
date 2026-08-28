@@ -206,6 +206,25 @@ impl<'a> Grid<'a> {
             }
         };
 
+        // THE single row resolution, used by painting, row headers and
+        // hit-testing alike.
+        //
+        // Two filters can narrow the view at once and they compose in a fixed
+        // order: the table's header filter maps a screen row to a data row by
+        // rank, and search filter mode selects among data rows. Resolving them
+        // separately from the same screen index — which is what merging the two
+        // branches naively produced — lets whichever variable the caller
+        // happens to use win, silently ignoring the other filter and painting
+        // the wrong records under the right row numbers.
+        let resolve_row = |r: usize| -> Option<u32> {
+            match filter {
+                // Search filter active: it already indexes data rows.
+                Some(_) => Self::underlying_row(filter, r),
+                // Otherwise the table mapping (identity when there is no table).
+                None => to_data(r).map(|d| d as u32),
+            }
+        };
+
         let width_of =
             |c: usize| -> f32 { self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH) };
 
@@ -327,15 +346,11 @@ impl<'a> Grid<'a> {
         // filtered grid addresses exactly the same cells an unfiltered one
         // would.
         for r in row_range.clone() {
-            let Some(row) = Self::underlying_row(filter, r) else {
-                continue;
-            };
+            // Resolve the screen row to a data row through BOTH filters, in
+            // the order they narrow: the table first, then search. Resolving
+            // them independently would let one silently win.
+            let Some(row) = resolve_row(r) else { continue };
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
-            // The data row this screen row shows. A filter can leave a screen
-            // row with nothing behind it only past the end of the view, which
-            // the row_range clamp already excludes — but guard anyway rather
-            // than paint another row's values under the wrong row number.
-            let Some(dr) = to_data(r) else { continue };
             let row_rect = Rect::from_min_size(
                 egui::pos2(body_rect.min.x, y),
                 Vec2::new(body_rect.width(), ROW_HEIGHT),
@@ -522,10 +537,7 @@ impl<'a> Grid<'a> {
             // the user actually pointed at rather than its screen position.
             // Both mappings apply, in the same order the paint path uses: the
             // table's rank lookup first, then the search filter.
-            let row = match filter {
-                Some(_) => Self::underlying_row(filter, r as usize)?,
-                None => to_data(r as usize)? as u32,
-            };
+            let row = resolve_row(r as usize)?;
             Some(CellRef::new(row, c as u32))
         };
         if primary_clicked {
@@ -704,14 +716,11 @@ impl<'a> Grid<'a> {
         // misleading: the whole point of finding row 4,912,733 is knowing it
         // is row 4,912,733.
         for r in row_range.clone() {
-            let Some(row) = Self::underlying_row(filter, r) else {
-                continue;
-            };
+            let Some(row) = resolve_row(r) else { continue };
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             // Row numbers name the DATA row, so a filtered view shows the
             // original 1, 5, 9, ... rather than renumbering to 1, 2, 3 — the
             // user must always be able to tell which rows are hidden.
-            let Some(dr) = to_data(r) else { continue };
             let rect = Rect::from_min_size(
                 egui::pos2(outer.min.x, y),
                 Vec2::new(ROW_HEADER_WIDTH, ROW_HEIGHT),
