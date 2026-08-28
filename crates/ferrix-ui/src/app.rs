@@ -151,6 +151,11 @@ pub struct FerrixApp {
     dragging_tab: Option<ferrix_core::SheetId>,
 }
 
+// The observation API below (row_count, display, cursor, ...) is consumed only
+// by the test harness, so a release build sees it as dead. It is deliberately
+// part of the app rather than the harness: the harness must ask the REAL app
+// what happened, never keep its own copy of the state.
+#[allow(dead_code)]
 impl FerrixApp {
     pub fn new(initial: Option<PathBuf>) -> Self {
         let mut app = Self {
@@ -956,6 +961,69 @@ impl FerrixApp {
     /// Kept as the single entry point so the filter mask, the uniqueness
     /// indexes and the validation badge can never drift out of sync with the
     /// table definitions. Public so an xlsx import can hand its tables over.
+    ///
+    /// Observation API for the test harness (`harness.rs`).
+    ///
+    /// Deliberately READ-ONLY. The harness drives the app through real input
+    /// events and then asks what happened; if it could mutate state directly
+    /// it would be able to fake a passing test, and a harness that can lie is
+    /// worse than none. Everything here is a query with no side effects.
+    pub fn row_count(&self) -> usize {
+        self.stats_rows
+    }
+
+    /// Columns in the loaded sheet.
+    pub fn col_count(&self) -> usize {
+        self.stats_cols
+    }
+
+    /// Rendered contents of a cell, exactly as the grid would paint it —
+    /// base data with any edit applied.
+    pub fn display(&self, cell: CellRef) -> String {
+        self.wb.view().display(cell)
+    }
+
+    /// The cursor cell — where typing lands.
+    pub fn cursor(&self) -> CellRef {
+        self.selection.cursor
+    }
+
+    /// Selection extent as (top-left, bottom-right).
+    pub fn selection_bounds(&self) -> (CellRef, CellRef) {
+        self.selection.bounds()
+    }
+
+    /// The status line, the app's own account of what it last did.
+    pub fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    /// Whether the search bar is open.
+    pub fn search_is_open(&self) -> bool {
+        self.search_open
+    }
+
+    /// Number of matches from the last search.
+    pub fn search_match_count(&self) -> usize {
+        self.search_results.total
+    }
+
+    /// Whether the workbook has unsaved edits.
+    pub fn is_dirty(&self) -> bool {
+        self.wb.is_dirty()
+    }
+
+    /// Depth of the undo stack, for asserting that a bulk operation collapsed
+    /// into exactly one entry.
+    pub fn undo_depth(&self) -> usize {
+        self.wb.undo_depth()
+    }
+
+    /// Whether a load is still in flight.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
     pub fn set_tables(&mut self, tables: Vec<ferrix_core::Table>) {
         self.tables = tables;
         self.refresh_tables();
@@ -1602,6 +1670,18 @@ impl FerrixApp {
 
 impl eframe::App for FerrixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe's Frame is only a handle for viewport commands, which this
+        // app does not use here. Keeping the real work in `frame` lets the
+        // test harness drive the SAME code path without an eframe::Frame,
+        // which cannot be constructed outside eframe.
+        self.frame(ctx);
+    }
+}
+
+impl FerrixApp {
+    /// One frame of the app. This is the real update path; `eframe::App`
+    /// delegates to it, and the headless harness calls it directly.
+    pub fn frame(&mut self, ctx: &egui::Context) {
         self.poll_load();
         if self.loading {
             ctx.request_repaint();

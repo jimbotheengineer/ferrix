@@ -3,6 +3,8 @@
 mod app;
 mod chart_panel;
 mod grid;
+#[cfg(test)]
+mod harness;
 mod sheet_view;
 mod table_view;
 mod theme;
