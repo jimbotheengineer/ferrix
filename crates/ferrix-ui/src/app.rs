@@ -131,6 +131,24 @@ pub struct FerrixApp {
     load_rx: Option<Receiver<LoadResult>>,
     progress_rx: Option<Receiver<Progress>>,
     progress: Progress,
+    /// Stops the loader/converter. Cleared when the load finishes.
+    load_cancel: Option<ferrix_core::CancelToken>,
+
+    /// A CSV export running on a worker thread. There is at most one: a
+    /// second would compete for disk and confuse the progress bar.
+    exporting: bool,
+    export_rx: Option<Receiver<Result<ferrix_io::export::ExportStats, String>>>,
+    export_progress_rx: Option<Receiver<Progress>>,
+    export_progress: Progress,
+    export_cancel: Option<ferrix_core::CancelToken>,
+    export_path: Option<PathBuf>,
+    export_started: Option<std::time::Instant>,
+
+    /// Memory measurement shown in the status bar, refreshed once a second by
+    /// the frame loop rather than sampled per paint.
+    budget: ferrix_core::Budget,
+    /// Worker threads rayon is actually running, for the same status line.
+    worker_threads: usize,
     frame_ms: f32,
     last_painted: usize,
     /// Height of the grid body last frame, used for page-up/down sizing.
@@ -207,6 +225,16 @@ impl FerrixApp {
             load_rx: None,
             progress_rx: None,
             progress: Progress::default(),
+            load_cancel: None,
+            exporting: false,
+            export_rx: None,
+            export_progress_rx: None,
+            export_progress: Progress::default(),
+            export_cancel: None,
+            export_path: None,
+            export_started: None,
+            budget: ferrix_core::Budget::sample(),
+            worker_threads: ferrix_io::pool::configured_threads(),
             frame_ms: 0.0,
             last_painted: 0,
             last_viewport_h: 600.0,
@@ -235,18 +263,37 @@ impl FerrixApp {
     fn start_load(&mut self, path: PathBuf) {
         let (tx, rx) = channel();
         let (ptx, prx) = channel::<Progress>();
+        let cancel = ferrix_core::CancelToken::new();
+        let mut should_cancel = cancel.checker();
         self.loading = true;
         self.progress = Progress::default();
         self.status = format!("Opening {}…", path.display());
 
         std::thread::spawn(move || {
-            let result = load_any(&path, |done, total| {
-                let _ = ptx.send(Progress { done, total });
-            });
+            let result = load_any(
+                &path,
+                |done, total| {
+                    let _ = ptx.send(Progress { done, total });
+                },
+                &mut should_cancel,
+            );
             let _ = tx.send(result);
         });
         self.load_rx = Some(rx);
         self.progress_rx = Some(prx);
+        self.load_cancel = Some(cancel);
+    }
+
+    /// Ask a running load/conversion to stop.
+    ///
+    /// The converter polls between 32 MB blocks and deletes its scratch
+    /// directory and partial cache on the way out, so a cancelled conversion
+    /// leaves no half-written `.ferrix` that a later open could trust.
+    fn cancel_load(&mut self) {
+        if let Some(c) = &self.load_cancel {
+            c.cancel();
+            self.status = "Cancelling…".into();
+        }
     }
 
     fn poll_load(&mut self) {
@@ -284,13 +331,21 @@ impl FerrixApp {
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
+                self.load_cancel = None;
                 self.sync_formula_bar();
             }
             Ok(Err(e)) => {
-                self.status = format!("Load failed: {e}");
+                // A cancel is a normal outcome the user asked for, not a
+                // failure to apologise for.
+                self.status = if e.contains("cancelled") {
+                    "Load cancelled — nothing was written".to_string()
+                } else {
+                    format!("Load failed: {e}")
+                };
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
+                self.load_cancel = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -298,6 +353,7 @@ impl FerrixApp {
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
+                self.load_cancel = None;
             }
         }
     }
@@ -482,21 +538,42 @@ impl FerrixApp {
         self.move_selection_ext(drow, dcol, false);
     }
 
-    /// Largest block a clipboard or clear operation will touch.
+    /// Largest block a clipboard or clear operation will touch, derived from
+    /// the memory actually available right now.
     ///
     /// A user can select an entire 200M-row column; turning that into text
-    /// would exhaust memory long before it finished. The limit is generous
-    /// enough for any realistic paste and small enough to stay instant.
-    const MAX_BLOCK_CELLS: u64 = 1_000_000;
+    /// would exhaust memory long before it finished. This used to be a flat
+    /// one million cells — a number that was an OOM kill on a small machine
+    /// and an insult on a large one. It is now whatever fits the measured
+    /// budget at [`cost::CLIPBOARD_CELL`] per cell, which on a machine with
+    /// room comes to tens of millions and on a starved one falls back to the
+    /// budget floor rather than to zero.
+    ///
+    /// Sampled per call rather than cached: the answer legitimately changes
+    /// when the user opens something else, and a clipboard operation is not
+    /// hot enough for a syscall to matter.
+    fn max_block_cells(&self) -> u64 {
+        ferrix_core::Budget::sample().max_units(ferrix_core::budget::cost::CLIPBOARD_CELL)
+    }
+
+    /// Cap for operations that WRITE cells into the overlay (paste, fill).
+    ///
+    /// Distinct from [`Self::max_block_cells`] because an overlay cell is far
+    /// more expensive than a clipboard string: a hash-map entry, a
+    /// `CellInput`, and both before/after copies for undo.
+    fn max_overlay_cells(&self) -> u64 {
+        ferrix_core::Budget::sample().max_units(ferrix_core::budget::cost::OVERLAY_CELL)
+    }
 
     /// Copy the selection to the system clipboard as TSV.
     fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
         let sel = self.selection;
-        let Some(block) = self.wb.copy_block(sel, Self::MAX_BLOCK_CELLS) else {
+        let limit = self.max_block_cells();
+        let Some(block) = self.wb.copy_block(sel, limit) else {
             self.status = format!(
-                "{} cells is too many to copy (limit {})",
+                "{} cells is too many to copy — {} fit in the memory available now",
                 fmt_int(sel.cell_count() as usize),
-                fmt_int(Self::MAX_BLOCK_CELLS as usize)
+                fmt_int(limit as usize)
             );
             return;
         };
@@ -504,7 +581,8 @@ impl FerrixApp {
         let n = sel.cell_count();
         ctx.copy_text(tsv);
         if cut {
-            match self.wb.clear_range(sel, Self::MAX_BLOCK_CELLS) {
+            let write_limit = self.max_overlay_cells();
+            match self.wb.clear_range(sel, write_limit) {
                 Ok(cleared) => {
                     self.status = format!(
                         "Cut {} cells ({} cleared)",
@@ -528,7 +606,8 @@ impl FerrixApp {
             return;
         }
         let origin = self.selection.bounds().0;
-        match self.wb.paste_block(origin, &block, Self::MAX_BLOCK_CELLS) {
+        let limit = self.max_overlay_cells();
+        match self.wb.paste_block(origin, &block, limit) {
             Ok(n) => {
                 // Select what was pasted, so the user sees the affected region
                 // and can undo or overwrite it in one gesture.
@@ -551,7 +630,8 @@ impl FerrixApp {
     /// Clear every cell in the selection as one undo step.
     fn clear_selection(&mut self) {
         let sel = self.selection;
-        match self.wb.clear_range(sel, Self::MAX_BLOCK_CELLS) {
+        let limit = self.max_overlay_cells();
+        match self.wb.clear_range(sel, limit) {
             Ok(0) => self.status = "Nothing to clear".into(),
             Ok(n) => {
                 self.status = format!("Cleared {} cells · {}", fmt_int(n), sel.label());
@@ -934,22 +1014,32 @@ impl FerrixApp {
     /// Export the current sheet — base plus edits — to a CSV the rest of the
     /// world can read.
     ///
-    /// Runs synchronously against a snapshot bound by `MAX_SYNC_EXPORT_ROWS`;
-    /// larger sheets are refused with a message rather than freezing the UI
-    /// for minutes. Streaming a 200M-row export off-thread needs the exporter
-    /// to borrow the workbook across a thread boundary, which is the next step
-    /// and is tracked separately.
+    /// ## No row limit any more
+    ///
+    /// This used to refuse anything above five million rows, because the
+    /// export ran on the UI thread and a 200M-row job froze the window for
+    /// well over two minutes. The refusal was the right stopgap and the wrong
+    /// permanent answer: `export_csv` already streams with memory bounded by
+    /// the widest row rather than the row count, and already polls a cancel
+    /// closure. The only thing missing was a way to read the sheet off-thread.
+    ///
+    /// [`OwnedSheet`](crate::sheet_view::OwnedSheet) supplies that — the base
+    /// shared by `Arc`, the sparse overlay copied — so the export now runs on
+    /// a worker with live progress and a working Cancel button, and the row
+    /// cap is gone. What is still checked is the SNAPSHOT cost, which is the
+    /// only unbounded allocation on this path.
     fn export_dialog(&mut self) {
-        const MAX_SYNC_EXPORT_ROWS: usize = 5_000_000;
+        if self.exporting {
+            self.status = "An export is already running — cancel it first".into();
+            return;
+        }
 
-        let rows = self.wb.view().row_count();
-        if rows > MAX_SYNC_EXPORT_ROWS {
-            self.status = format!(
-                "Sheet has {} rows — exports above {} rows are not yet supported \
-                 (would block the UI). See issue #10.",
-                fmt_int(rows),
-                fmt_int(MAX_SYNC_EXPORT_ROWS)
-            );
+        // The one allocation an export makes that scales with user input: the
+        // overlay copy. The base is shared, and the writer's buffers are fixed.
+        let cost = crate::sheet_view::OwnedSheet::snapshot_cost_bytes(&self.wb.overlay);
+        let budget = ferrix_core::Budget::sample();
+        if let Err(msg) = budget.admit(cost, "Exporting this sheet's edits") {
+            self.status = msg;
             return;
         }
 
@@ -961,26 +1051,122 @@ impl FerrixApp {
             return;
         };
 
-        let t = std::time::Instant::now();
-        let view = self.wb.view();
-        let result = ferrix_io::export::export_csv(
-            &path,
-            &view,
-            ferrix_io::export::ExportOptions::default(),
-            |_, _| {},
-            || false,
+        let snapshot = crate::sheet_view::OwnedSheet::new(
+            std::sync::Arc::clone(&self.wb.base),
+            &self.wb.overlay,
         );
-        self.status = match result {
-            Ok(stats) => format!(
-                "Exported {} rows × {} cols ({:.1} MB) in {:.1}s → {}",
-                fmt_int(stats.rows),
-                stats.cols,
-                stats.bytes as f64 / 1e6,
-                t.elapsed().as_secs_f64(),
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ),
-            Err(e) => format!("Export failed: {e}"),
+        let rows = snapshot.row_count();
+
+        let (tx, rx) = channel::<Result<ferrix_io::export::ExportStats, String>>();
+        let (ptx, prx) = channel::<Progress>();
+        let cancel = ferrix_core::CancelToken::new();
+        let mut should_cancel = cancel.checker();
+        let target = path.clone();
+
+        std::thread::spawn(move || {
+            let result = ferrix_io::export::export_csv(
+                &target,
+                &snapshot,
+                ferrix_io::export::ExportOptions::default(),
+                |done, total| {
+                    let _ = ptx.send(Progress {
+                        done: done as u64,
+                        total: total as u64,
+                    });
+                },
+                &mut should_cancel,
+            )
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+
+        self.exporting = true;
+        self.export_cancel = Some(cancel);
+        self.export_rx = Some(rx);
+        self.export_progress_rx = Some(prx);
+        self.export_progress = Progress {
+            done: 0,
+            total: rows as u64,
         };
+        self.export_path = Some(path);
+        self.export_started = Some(std::time::Instant::now());
+        self.status = format!("Exporting {} rows…", fmt_int(rows));
+    }
+
+    /// Ask a running export to stop.
+    ///
+    /// The worker polls the token every 50,000 rows, deletes its temp file,
+    /// and returns `Cancelled` — so any pre-existing file at the destination
+    /// is left exactly as it was.
+    fn cancel_export(&mut self) {
+        if let Some(c) = &self.export_cancel {
+            c.cancel();
+            self.status = "Cancelling export…".into();
+        }
+    }
+
+    /// Drain export progress and completion. Mirrors `poll_load`.
+    fn poll_export(&mut self) {
+        if let Some(prx) = &self.export_progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                // The worker reports rows done against rows total; keep the
+                // total we computed if the worker has not sent one yet.
+                self.export_progress.done = p.done;
+                if p.total > 0 {
+                    self.export_progress.total = p.total;
+                }
+            }
+        }
+
+        let Some(rx) = &self.export_rx else { return };
+        let finished = match rx.try_recv() {
+            Ok(result) => Some(match result {
+                Ok(stats) => {
+                    let secs = self
+                        .export_started
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    let name = self
+                        .export_path
+                        .as_ref()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .unwrap_or_default();
+                    format!(
+                        "Exported {} rows × {} cols ({:.1} MB) in {:.1}s ({:.0} MB/s) → {}",
+                        fmt_int(stats.rows),
+                        stats.cols,
+                        stats.bytes as f64 / 1e6,
+                        secs,
+                        if secs > 0.0 {
+                            (stats.bytes as f64 / 1e6) / secs
+                        } else {
+                            0.0
+                        },
+                        name
+                    )
+                }
+                // Cancellation is a normal outcome, not a failure: say so
+                // plainly, and say that nothing was overwritten.
+                Err(e) if e.contains("cancelled") => {
+                    "Export cancelled — no file was written or overwritten".to_string()
+                }
+                Err(e) => format!("Export failed: {e}"),
+            }),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some("Export thread died — the destination file is unchanged".to_string())
+            }
+        };
+
+        if let Some(status) = finished {
+            self.status = status;
+            self.exporting = false;
+            self.export_rx = None;
+            self.export_progress_rx = None;
+            self.export_cancel = None;
+            self.export_path = None;
+            self.export_started = None;
+        }
     }
 
     /// Open an `.xlsx`, bringing across any Excel Tables defined in it.
@@ -1051,7 +1237,7 @@ impl FerrixApp {
         };
         // Only the in-RAM path can be handed to the writer; a mapped base has
         // no `Sheet` to give it.
-        let BaseData::Memory(sheet) = &self.wb.base else {
+        let BaseData::Memory(sheet) = &*self.wb.base else {
             self.status =
                 "xlsx export of memory-mapped data is not supported yet — export CSV instead"
                     .into();
@@ -1160,7 +1346,7 @@ impl FerrixApp {
         // exposes no per-column scan hook yet, and silently showing an
         // unfiltered view would be worse than showing no filter at all — so
         // the state stays empty and the status bar says why.
-        let BaseData::Memory(sheet) = &self.wb.base else {
+        let BaseData::Memory(sheet) = &*self.wb.base else {
             self.status = format!(
                 "Table {:?} loaded; filtering and validation are not yet available on \
                  memory-mapped data",
@@ -1412,7 +1598,17 @@ impl FerrixApp {
     /// engine matches the needle against the string arena first and only then
     /// scans columns as integers.
     fn run_search(&mut self) {
-        const LIMIT: usize = 100_000;
+        // Derived, not fixed: every hit costs a `CellRef` in the results
+        // vector plus a slot in the row-filter mapping built from them, and a
+        // query matching every cell of a 200M-row sheet would otherwise
+        // allocate without bound. The old flat 100k was safe on any machine
+        // and needlessly small on most.
+        let limit = ferrix_core::Budget::sample()
+            .max_units_usize(ferrix_core::budget::cost::SEARCH_HIT)
+            // Results are also scanned linearly to position the cursor, so
+            // keep the cap sane on a huge machine rather than letting it grow
+            // until the search itself becomes the slow part.
+            .min(5_000_000);
         let Some(query) = ferrix_core::Query::new(
             self.search_input.trim(),
             self.search_case_sensitive,
@@ -1424,7 +1620,7 @@ impl FerrixApp {
             return;
         };
         let view = self.wb.view();
-        self.search_results = view.search(&query, LIMIT);
+        self.search_results = view.search(&query, limit);
         // Resume from wherever the cursor is rather than jumping to the top.
         self.search_index = self.search_results.index_at_or_after(self.selection.cursor);
         // The mapping is derived ONCE here, not per frame.
@@ -1797,7 +1993,12 @@ impl FerrixApp {
     /// delegates to it, and the headless harness calls it directly.
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.poll_load();
-        if self.loading {
+        self.poll_export();
+        // Refresh the memory reading at most once a second. Sampling is a
+        // syscall; doing it per frame at 60fps would be measurable for no
+        // benefit, and the number does not move meaningfully faster than that.
+        self.budget = ferrix_core::budget::cached();
+        if self.loading || self.exporting {
             ctx.request_repaint();
         }
         let frame_start = std::time::Instant::now();
@@ -1961,6 +2162,32 @@ impl FerrixApp {
                         } else {
                             ui.label(RichText::new("opening…").color(th.text_dim));
                         }
+                        // Every operation over a second needs a way out that
+                        // is not killing the process.
+                        if ui.button("✖ Cancel").clicked() {
+                            self.cancel_load();
+                        }
+                    }
+
+                    if self.exporting {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        if self.export_progress.total > 0 {
+                            let frac = self.export_progress.done as f32
+                                / self.export_progress.total as f32;
+                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
+                                format!(
+                                    "export {:.0}%  ({}/{} rows)",
+                                    frac * 100.0,
+                                    fmt_int(self.export_progress.done as usize),
+                                    fmt_int(self.export_progress.total as usize)
+                                ),
+                            ));
+                        } else {
+                            ui.label(RichText::new("exporting…").color(Theme::TEXT_DIM));
+                        }
+                        if ui.button("✖ Cancel export").clicked() {
+                            self.cancel_export();
+                        }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.stats_rows > 0 {
@@ -1978,6 +2205,18 @@ impl FerrixApp {
                             }
                             ui.label(RichText::new(label).color(th.text_dim).size(12.0));
                         }
+                        // Say what the machine actually has and how much of it
+                        // we are willing to use. A cap the user cannot see is
+                        // indistinguishable from a bug.
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                self.budget.describe(),
+                                ferrix_io::pool::describe()
+                            ))
+                            .color(Theme::TEXT_DIM)
+                            .size(12.0),
+                        );
                     });
                 });
             });
@@ -2267,7 +2506,7 @@ impl FerrixApp {
         // clears them; recompute lazily here rather than on the switch, so a
         // sheet's widths are sized from its own data.
         if self.col_widths.is_empty() {
-            if let crate::sheet_view::BaseData::Memory(s) = &self.wb.base {
+            if let crate::sheet_view::BaseData::Memory(s) = &*self.wb.base {
                 self.col_widths = compute_col_widths_mem(s);
             }
         }
@@ -2421,7 +2660,8 @@ impl FerrixApp {
                 }
                 if resp.fill_released {
                     if let (Some(src), Some(tgt)) = (self.fill_source, self.fill_target) {
-                        match self.wb.fill_range(src, tgt, Self::MAX_BLOCK_CELLS) {
+                        let limit = self.max_overlay_cells();
+                        match self.wb.fill_range(src, tgt, limit) {
                             Ok((0, _)) => {}
                             Ok((n, kind)) => {
                                 self.status = format!(
@@ -2609,9 +2849,10 @@ fn fmt_int(n: usize) -> String {
 /// Small files parse straight into RAM. Large ones are converted once into the
 /// columnar `.ferrix` format beside the source and then memory-mapped, so the
 /// dataset is bounded by disk rather than memory and later opens are instant.
-fn load_any<F>(path: &Path, mut progress: F) -> LoadResult
+fn load_any<F, C>(path: &Path, mut progress: F, should_cancel: &mut C) -> LoadResult
 where
     F: FnMut(u64, u64),
+    C: FnMut() -> bool,
 {
     // xlsx is inherently multi-sheet, and every sheet lands as its own
     // independently stored `BaseData`.
@@ -2665,7 +2906,10 @@ where
     let mut convert_note = String::new();
 
     if !reused {
-        let stats = ferrix_io::convert_csv(path, &cache, b',', true, &mut progress)
+        let stats =
+            ferrix_io::convert_csv_cancellable(path, &cache, b',', true, &mut progress, || {
+                should_cancel()
+            })
             .map_err(|e| e.to_string())?;
         convert_note = format!(
             "converted in {:.0}s at {:.0} MB/s · ",
@@ -2975,7 +3219,7 @@ mod tests {
         let tmp = TempXlsx::new("multisheet");
         write_three_sheet_xlsx(tmp.path());
 
-        let loaded = load_any(tmp.path(), |_, _| {}).expect("load");
+        let loaded = load_any(tmp.path(), |_, _| {}, &mut || false).expect("load");
         assert_eq!(loaded.sheet_name, "Alpha");
         assert_eq!(loaded.extra_sheets.len(), 2, "Beta and Gamma must load too");
 
@@ -3028,7 +3272,7 @@ mod tests {
     fn a_loaded_cross_sheet_formula_recalculates_on_edit() {
         let tmp = TempXlsx::new("recalc");
         write_three_sheet_xlsx(tmp.path());
-        let loaded = load_any(tmp.path(), |_, _| {}).expect("load");
+        let loaded = load_any(tmp.path(), |_, _| {}, &mut || false).expect("load");
         let mut wb = build_workbook(
             loaded.base,
             loaded.sheet_name,

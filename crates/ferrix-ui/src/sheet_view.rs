@@ -469,6 +469,90 @@ impl<'a> ferrix_formula::CellSource for SheetView<'a> {
     }
 }
 
+/// An owned, `Send` snapshot of a sheet, for reading on a worker thread.
+///
+/// ## Why this exists
+///
+/// [`SheetView`] borrows the workbook, so it cannot cross a thread boundary —
+/// which is why exporting used to run on the UI thread and why sheets above
+/// five million rows were refused outright rather than freezing the window for
+/// minutes. This is the same composite view with both halves owned, so an
+/// export can be handed to `std::thread::spawn` and the user can keep working.
+///
+/// ## Memory implication
+///
+/// The two halves are treated very differently, on purpose:
+///
+/// * **Base** — shared via `Arc`, never copied. The base is immutable (every
+///   edit lands in the overlay), so sharing it needs no lock and a 12 GB
+///   memory-mapped sheet costs a refcount bump. This is what keeps a 200M-row
+///   export's peak memory flat.
+/// * **Overlay** — deep-copied, because the user must stay free to edit while
+///   the export runs and the export must write a consistent picture rather
+///   than a smear of two. Edits are sparse (a few thousand cells on a typical
+///   sheet), so the copy is normally kilobytes — but "normally" is not
+///   "always", so the caller admits `snapshot_cost_bytes` against the memory
+///   budget before taking one and refuses with a message if it will not fit.
+///
+/// The snapshot is a point-in-time picture: edits made after it is taken are
+/// not in the exported file. That is the correct semantics for "export what I
+/// am looking at now", and the status line says the export is running so the
+/// user knows which moment they got.
+pub struct OwnedSheet {
+    base: std::sync::Arc<BaseData>,
+    overlay: EditOverlay,
+}
+
+impl OwnedSheet {
+    /// Snapshot the base (shared) and the overlay (copied).
+    pub fn new(base: std::sync::Arc<BaseData>, overlay: &EditOverlay) -> Self {
+        Self {
+            base,
+            overlay: overlay.clone(),
+        }
+    }
+
+    /// What taking this snapshot will actually allocate.
+    ///
+    /// Only the overlay: the base is shared, not copied. Check this against
+    /// the memory budget BEFORE constructing the snapshot, so a pathological
+    /// overlay is refused rather than doubled.
+    pub fn snapshot_cost_bytes(overlay: &EditOverlay) -> u64 {
+        overlay.heap_bytes() as u64
+    }
+
+    /// Borrow as a normal composite view.
+    pub fn view(&self) -> SheetView<'_> {
+        SheetView::new(&self.base, &self.overlay)
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.view().row_count()
+    }
+}
+
+// SAFETY-free: both fields are `Send`. `Arc<BaseData>` is `Send + Sync`
+// because `BaseData` holds either an owned `Sheet` or a `memmap2::Mmap`, both
+// of which are `Send + Sync`, and the `Arc` is only ever read through. This is
+// a plain auto-derived bound, stated here only to record the reasoning.
+
+/// Exporting must write what the user *sees* — base plus edits — so the
+/// snapshot exports through the same composite view the grid renders from.
+impl ferrix_io::export::ExportSource for OwnedSheet {
+    fn row_count(&self) -> usize {
+        self.view().row_count()
+    }
+    fn col_count(&self) -> usize {
+        self.view().col_count()
+    }
+    fn display(&self, cell: CellRef) -> String {
+        self.view().display(cell)
+    }
+    fn header(&self, col: usize) -> String {
+        self.view().header_or_letter(col)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

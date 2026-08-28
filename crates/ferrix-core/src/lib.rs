@@ -11,6 +11,8 @@
 pub mod annotation;
 pub mod arena;
 pub mod bitmap;
+pub mod budget;
+pub mod cancel;
 pub mod chart;
 pub mod column;
 pub mod filter;
@@ -27,6 +29,8 @@ pub mod value;
 
 pub use arena::{StrId, StringArena};
 pub use bitmap::Bitmap;
+pub use budget::Budget;
+pub use cancel::CancelToken;
 pub use column::Column;
 pub use filter::RowFilter;
 pub use format::{

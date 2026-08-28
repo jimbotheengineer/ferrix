@@ -70,6 +70,8 @@ pub enum ConvertError {
         "string arena exceeded {limit_mb} MB — this CSV has too many distinct strings to convert"
     )]
     ArenaTooLarge { limit_mb: usize },
+    #[error("conversion cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -92,9 +94,25 @@ impl ConvertStats {
     }
 }
 
-/// Cap on arena growth. Beyond this we bail with a clear error instead of
-/// consuming all memory on a file that is pathologically string-heavy.
-const ARENA_LIMIT: usize = 2 << 30; // 2 GB
+/// Cap on arena growth, derived from measured available memory.
+///
+/// The arena is the one part of a conversion whose size is set by the *data*
+/// rather than by our block scheduling: a file of 200M distinct strings grows
+/// it without bound, and a fixed 2 GB ceiling was either far too generous on a
+/// 4 GB laptop or needlessly stingy on a workstation. So the ceiling is now
+/// whatever the machine can actually spare.
+///
+/// The arena is not the only live allocation during a conversion — block
+/// buffers and the per-chunk decoded output are too, and those are already
+/// bounded at roughly 108 MB — so the arena gets three quarters of the claim
+/// and the rest is headroom.
+fn arena_limit() -> usize {
+    let claim = ferrix_core::Budget::sample().claim_bytes();
+    let limit = (claim / 4) * 3;
+    // Never below 256 MB: a conversion that fails on an ordinary file because
+    // the machine was momentarily busy is worse than one that risks a little.
+    limit.max(256 << 20).min(usize::MAX as u64) as usize
+}
 
 /// The canonical cache path for a source file: `data.csv` -> `data.ferrix`.
 pub fn cache_path_for(source: &Path) -> PathBuf {
@@ -269,15 +287,40 @@ struct FinishedSpill {
 
 /// Convert a CSV into a `.ferrix` cache. Calls `progress` with (bytes_done,
 /// bytes_total) periodically so the UI can show a bar on a multi-minute job.
+///
+/// Uncancellable. Prefer [`convert_csv_cancellable`] anywhere a human is
+/// waiting; this shim exists for tests and batch tools where there is nobody
+/// to press the button.
 pub fn convert_csv<F>(
     source: &Path,
     dest: &Path,
     delimiter: u8,
     has_headers: bool,
-    mut progress: F,
+    progress: F,
 ) -> Result<ConvertStats, ConvertError>
 where
     F: FnMut(u64, u64),
+{
+    convert_csv_cancellable(source, dest, delimiter, has_headers, progress, || false)
+}
+
+/// Convert a CSV into a `.ferrix` cache, stoppable partway through.
+///
+/// `should_cancel` is polled once per 32 MB block — sub-second at any real
+/// disk speed — and a cancel unwinds immediately, removing the spill
+/// directory and the half-written destination. A cancelled conversion leaves
+/// nothing behind that a later run could mistake for a finished cache.
+pub fn convert_csv_cancellable<F, C>(
+    source: &Path,
+    dest: &Path,
+    delimiter: u8,
+    has_headers: bool,
+    mut progress: F,
+    mut should_cancel: C,
+) -> Result<ConvertStats, ConvertError>
+where
+    F: FnMut(u64, u64),
+    C: FnMut() -> bool,
 {
     let start = std::time::Instant::now();
     let source_bytes = source.metadata()?.len();
@@ -297,6 +340,7 @@ where
         has_headers,
         source_bytes,
         &mut progress,
+        &mut should_cancel,
     );
 
     // Always clean up scratch, success or failure — a failed conversion must
@@ -312,7 +356,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn convert_inner<F>(
+fn convert_inner<F, C>(
     source: &Path,
     dest: &Path,
     scratch: &Path,
@@ -320,15 +364,22 @@ fn convert_inner<F>(
     has_headers: bool,
     source_bytes: u64,
     progress: &mut F,
+    should_cancel: &mut C,
 ) -> Result<ConvertStats, ConvertError>
 where
     F: FnMut(u64, u64),
+    C: FnMut() -> bool,
 {
     let mut file = File::open(source)?;
     let mut arena = StringArena::new();
     let mut spills: Vec<Spill> = Vec::new();
     let mut headers: Vec<String> = Vec::new();
     let mut rows: u64 = 0;
+
+    // Measured once per conversion rather than per block: sampling is a
+    // syscall, and a limit that moved mid-file would make failures depend on
+    // what else the machine happened to be doing at byte 4,000,000,000.
+    let arena_limit = arena_limit();
 
     let mut buf = vec![0u8; BLOCK];
     let mut carry: Vec<u8> = Vec::new();
@@ -337,6 +388,11 @@ where
     let mut peak_bytes = BLOCK;
 
     loop {
+        // Poll before the read so a cancel issued while the previous block was
+        // parsing takes effect without waiting for another 32 MB of I/O.
+        if should_cancel() {
+            return Err(ConvertError::Cancelled);
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -367,9 +423,9 @@ where
             &mut peak_bytes,
         )?;
 
-        if arena.data_bytes() > ARENA_LIMIT {
+        if arena.data_bytes() > arena_limit {
             return Err(ConvertError::ArenaTooLarge {
-                limit_mb: ARENA_LIMIT >> 20,
+                limit_mb: arena_limit >> 20,
             });
         }
         progress(consumed, source_bytes);

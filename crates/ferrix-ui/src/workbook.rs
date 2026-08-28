@@ -120,7 +120,13 @@ impl std::fmt::Display for SheetError {
 /// [`SheetCell`], because a formula chain does not respect tabs.
 pub struct Workbook {
     /// The ACTIVE sheet's immutable base. Never present in `parked`.
-    pub base: BaseData,
+    ///
+    /// Behind an `Arc` so a long export can take a handle to the base and
+    /// stream it on a worker thread while the user keeps editing. The base is
+    /// immutable by construction — every edit lands in the overlay — so
+    /// sharing it needs no lock, and the clone is a refcount bump rather than
+    /// a copy of a 12 GB mapping.
+    pub base: std::sync::Arc<BaseData>,
     /// The ACTIVE sheet's edits. Never present in `parked`.
     pub overlay: EditOverlay,
     /// Workbook-wide dependency graph, spanning every sheet.
@@ -130,7 +136,7 @@ pub struct Workbook {
     /// Index into `sheets` of the sheet whose data is in `base`/`overlay`.
     active: usize,
     /// Storage for every INACTIVE sheet.
-    parked: std::collections::HashMap<SheetId, (BaseData, EditOverlay)>,
+    parked: std::collections::HashMap<SheetId, (std::sync::Arc<BaseData>, EditOverlay)>,
     /// Monotonic id source. Never reused, so a deleted sheet's id can never
     /// be mistaken for a live one by a stale graph edge.
     next_id: u32,
@@ -157,7 +163,7 @@ impl Workbook {
     /// A single-sheet workbook whose one sheet is called `name`.
     pub fn with_name(base: BaseData, name: &str) -> Self {
         Self {
-            base,
+            base: std::sync::Arc::new(base),
             overlay: EditOverlay::new(),
             graph: DepGraph::new(),
             sheets: vec![SheetMeta {
@@ -277,7 +283,8 @@ impl Workbook {
                 view: SheetViewState::default(),
             },
         );
-        self.parked.insert(id, (base, EditOverlay::new()));
+        self.parked
+            .insert(id, (std::sync::Arc::new(base), EditOverlay::new()));
         self.dirty = true;
         self.last_edit = None;
         Ok(id)
