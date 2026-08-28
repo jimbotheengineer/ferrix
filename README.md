@@ -10,7 +10,7 @@ rows — in 221 microseconds** and scrolls it at over 10,000 fps.
 
 ```
 --- 10.85 GB CSV, 200,000,000 rows x 8 cols ---
-conversion:   109 s @ 95 MB/s     (one time, peak RAM 64 MB)
+conversion:   42.2 s @ 245.5 MB/s     (one time, peak RAM 64 MB)
 cold open:    221 us              (subsequent opens, from cache)
 mapped:       12.0 GB             address space, NOT resident RAM
 scrolling:    2.45 ms/viewport    (60fps budget: 16.67 ms)

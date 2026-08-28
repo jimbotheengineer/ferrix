@@ -21,6 +21,10 @@ name = "bench-load"
 path = "src/bench_load.rs"
 
 [[bin]]
+name = "check-order"
+path = "src/check_order.rs"
+
+[[bin]]
 name = "panic-probe"
 path = "src/panic_probe.rs"
 
