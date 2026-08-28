@@ -8,11 +8,13 @@
 //! 2. Scrolling must never touch more than a viewport of cells -> O(1) reads.
 //! 3. Aggregations run over typed slices, not boxed values -> vectorizable.
 
+pub mod annotation;
 pub mod arena;
 pub mod bitmap;
 pub mod chart;
 pub mod column;
 pub mod overlay;
+pub mod scene;
 pub mod search;
 pub mod selection;
 pub mod sheet;

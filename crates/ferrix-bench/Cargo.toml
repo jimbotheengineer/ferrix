@@ -21,6 +21,10 @@ name = "bench-load"
 path = "src/bench_load.rs"
 
 [[bin]]
+name = "render-charts"
+path = "src/render_charts.rs"
+
+[[bin]]
 name = "bench-chart"
 path = "src/bench_chart.rs"
 

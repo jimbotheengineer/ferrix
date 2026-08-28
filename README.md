@@ -205,6 +205,28 @@ Gaps are gaps: an empty or non-numeric cell is skipped rather than plotted as
 zero, because inventing a data point the source never contained is worse than
 a break in the line.
 
+### Vector charts and annotations
+
+Charts are described as **geometry in data coordinates** -- polylines, rects,
+text with anchors -- and mapped to device pixels only at draw time. Nothing is
+rasterised, so the same `Scene` feeds the egui painter at any zoom and an SVG
+writer at any size. A 1,000,000-row line chart is **6 primitives in an 18 KB
+SVG**, and the identical scene emitted at 4x is the same geometry with
+different coordinates.
+
+Axis ticks land on 1/2/5 x 10^n values, so an axis over 0..97 reads
+0, 20, 40, 60, 80 rather than 19.4, 38.8, 58.2.
+
+**Annotations anchor to data, not pixels.** A note stored at pixel (412, 88)
+drifts the moment the chart is resized or the axis range changes -- and lands
+somewhere plausible but wrong, which a reader cannot detect. Storing the data
+coordinate instead means resizing moves the pixels while the note stays on its
+point. Tests pin that a note maps to the same proportional position in a
+100x100 and a 1000x800 viewport, and to the correct place after a zoom.
+
+Annotation text is XML-escaped on export, so a label containing an ampersand
+or an angle bracket cannot produce an SVG no viewer will open.
+
 ### Getting data back out
 
 Saving writes a `.fxedits` sidecar that only Ferrix reads, so **Export CSV**
@@ -353,7 +375,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 322 tests
+cargo test --workspace     # 344 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a
