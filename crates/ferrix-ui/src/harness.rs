@@ -61,7 +61,10 @@ impl Harness {
     /// Build a harness over a fresh app, optionally opening a file.
     pub fn new(initial: Option<&Path>) -> Self {
         let ctx = egui::Context::default();
-        crate::theme::Theme::apply(&ctx);
+        // Theme is now a value, not a set of consts. The harness pins DARK so
+        // a test never depends on the persisted user preference.
+        let theme = crate::theme::Theme::dark();
+        crate::theme::Theme::apply(&theme, &ctx);
         let app = FerrixApp::new(initial.map(|p| p.to_path_buf()));
         Self {
             ctx,

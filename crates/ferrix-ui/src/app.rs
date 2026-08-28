@@ -10,8 +10,9 @@ use ferrix_formula::{eval_view, parse};
 use ferrix_io::{load_csv, CsvOptions};
 
 use crate::grid::{Grid, ScrollState, DEFAULT_COL_WIDTH};
+use crate::prefs::Prefs;
 use crate::sheet_view::BaseData;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeMode};
 use crate::workbook::Workbook;
 
 /// What a background load produced.
@@ -149,6 +150,17 @@ pub struct FerrixApp {
     rename_focus_pending: bool,
     /// Sheet being dragged along the tab strip, for reordering.
     dragging_tab: Option<ferrix_core::SheetId>,
+
+    /// The active palette (issue #19). Held as a value and passed down to
+    /// every painter, so the toggle switches the entire UI at once.
+    theme: Theme,
+    /// Whether the user has ever picked a theme. Until they do we follow the
+    /// OS, and keep following it if it changes mid-session.
+    theme_chosen: bool,
+    /// Show empty rows past the end of the sheet (issue #20).
+    show_empty_rows: bool,
+    /// Persisted preferences, written back whenever a toggle flips.
+    prefs: Prefs,
 }
 
 // The observation API below (row_count, display, cursor, ...) is consumed only
@@ -158,6 +170,7 @@ pub struct FerrixApp {
 #[allow(dead_code)]
 impl FerrixApp {
     pub fn new(initial: Option<PathBuf>) -> Self {
+        let prefs = Prefs::load();
         let mut app = Self {
             wb: Workbook::new(BaseData::Memory(Sheet::new("Sheet1"))),
             stats_rows: 0,
@@ -203,6 +216,13 @@ impl FerrixApp {
             rename_buffer: String::new(),
             rename_focus_pending: false,
             dragging_tab: None,
+            // A saved preference wins. Without one we start dark and let the
+            // first frame adopt the OS preference — egui only knows it once a
+            // frame has run, so it cannot be read here.
+            theme: Theme::of(prefs.theme.unwrap_or_default()),
+            theme_chosen: prefs.theme.is_some(),
+            show_empty_rows: prefs.show_empty_rows,
+            prefs,
         };
         if let Some(p) = initial {
             app.start_load(p);
@@ -336,12 +356,96 @@ impl FerrixApp {
     ///
     /// `extend` is Shift held: the anchor stays put and only the cursor moves,
     /// growing the range. Otherwise the selection collapses to one cell.
+    /// The active palette, for the startup styling pass in `main`.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Switch theme and remember the choice.
+    ///
+    /// Persisting on the toggle rather than on exit means the preference
+    /// survives a crash or a kill, which "save on shutdown" does not.
+    fn set_theme(&mut self, mode: ThemeMode) {
+        self.theme = Theme::of(mode);
+        // An explicit choice stops the OS-following behaviour for good.
+        self.theme_chosen = true;
+        self.prefs.theme = Some(mode);
+        self.persist_prefs();
+        self.status = format!("{} theme", mode.as_str());
+    }
+
+    fn set_show_empty_rows(&mut self, on: bool) {
+        self.show_empty_rows = on;
+        self.prefs.show_empty_rows = on;
+        self.persist_prefs();
+        self.status = if on {
+            format!(
+                "Showing {} empty rows past the end — they are not counted as data \
+                 until you type in one",
+                crate::grid::EMPTY_ROW_PADDING
+            )
+        } else {
+            "Empty rows hidden".to_string()
+        };
+    }
+
+    /// Write preferences out, best effort. Failing to save a toggle is not
+    /// worth a modal; it goes to the status bar and nowhere else.
+    fn persist_prefs(&mut self) {
+        if let Err(e) = self.prefs.save() {
+            self.status = format!("Preference not saved: {e}");
+        }
+    }
+
+    /// The padding rows currently on offer, or `None` when the toggle is off.
+    ///
+    /// `first_pad_screen_row` is the count of rows the FILTERS resolve, so
+    /// padding always begins after the last row either filter kept, and
+    /// `first_pad_data_row` is one past the end of the whole sheet — never
+    /// past the filtered subset, which would alias onto hidden records.
+    fn pad_space(&self) -> Option<crate::grid::PadSpace> {
+        if !self.show_empty_rows {
+            return None;
+        }
+        let view = self.wb.view();
+        let data_rows = view.row_count().max(1);
+        let filtered = match &self.row_filter {
+            Some(f) => f.len(),
+            None => match (self.tables.first(), &self.table_mask) {
+                (Some(_), Some(m)) => m.visible_rows(),
+                _ => data_rows,
+            },
+        };
+        Some(crate::grid::PadSpace {
+            first_pad_screen_row: filtered,
+            first_pad_data_row: view.row_count(),
+        })
+    }
+
+    /// Last row the cursor may move to with the keyboard.
+    ///
+    /// With the toggle on this reaches into the padding, so arrowing down off
+    /// the end of a short file lands somewhere typeable. It is a NAVIGATION
+    /// bound only: `row_count` is untouched, so export, SUM and the status bar
+    /// still see the real sheet.
+    fn max_navigable_row(&self) -> i64 {
+        let rows = self.wb.view().row_count();
+        let pad = if self.show_empty_rows {
+            crate::grid::EMPTY_ROW_PADDING
+        } else {
+            0
+        };
+        (rows + pad).saturating_sub(1) as i64
+    }
+
     fn move_selection_ext(&mut self, drow: i64, dcol: i64, extend: bool) {
         if self.editing.is_some() {
             self.commit_edit();
         }
         let view = self.wb.view();
-        let max_row = view.row_count().saturating_sub(1) as i64;
+        // Navigation may reach into the empty padding when the toggle is on;
+        // the sheet's own extent is unchanged.
+        let max_row = self.max_navigable_row();
         let max_col = view.col_count().saturating_sub(1) as i64;
         // Vertical movement is in VISIBLE rows under a filter: pressing Down
         // must land on the next row the user can actually see, not on a hidden
@@ -555,6 +659,7 @@ impl FerrixApp {
     /// If saving fails, the close is NOT allowed to proceed: the status bar
     /// carries the error and the user keeps their data.
     fn show_close_prompt(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
         let mut save_and_close = false;
         let mut discard = false;
         let mut cancel = false;
@@ -593,7 +698,7 @@ impl FerrixApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("No file is open, so there is nowhere to save these edits.")
-                            .color(Theme::TEXT_DIM)
+                            .color(th.text_dim)
                             .size(11.5),
                     );
                 }
@@ -687,6 +792,7 @@ impl FerrixApp {
         if !self.chart.open {
             return;
         }
+        let th = self.theme;
         let mut open = self.chart.open;
         let mut rebuild = false;
         let mut export = false;
@@ -728,7 +834,7 @@ impl FerrixApp {
                 ui.label(
                     egui::RichText::new(&self.chart.status)
                         .size(11.0)
-                        .color(Theme::TEXT_DIM),
+                        .color(th.text_dim),
                 );
                 ui.separator();
 
@@ -737,8 +843,15 @@ impl FerrixApp {
                 let (rect, _) = ui.allocate_exact_size(canvas, egui::Sense::hover());
 
                 if let Some(scene) = self.chart.scene.clone() {
-                    let (vp, resp) =
-                        crate::chart_panel::paint_scene(ui, &scene, &self.chart.annotations, rect);
+                    // The chart's chrome follows the app theme; its exported
+                    // SVG deliberately does not. See SVG_FOLLOWS_APP_THEME.
+                    let (vp, resp) = crate::chart_panel::paint_scene(
+                        ui,
+                        &scene,
+                        &self.chart.annotations,
+                        rect,
+                        th,
+                    );
 
                     // Place a note where the user clicks, in DATA coordinates,
                     // so it stays put when the window is resized.
@@ -757,7 +870,7 @@ impl FerrixApp {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             egui::RichText::new("Select a range and choose a chart type")
-                                .color(Theme::TEXT_DIM),
+                                .color(th.text_dim),
                         );
                     });
                 }
@@ -790,7 +903,7 @@ impl FerrixApp {
                                 self.chart.annotations.len()
                             ))
                             .size(11.0)
-                            .color(Theme::TEXT_DIM),
+                            .color(th.text_dim),
                         );
                         let texts: Vec<(usize, String)> = self
                             .chart
@@ -1167,6 +1280,7 @@ impl FerrixApp {
 
     /// The sheet tab strip along the bottom of the window.
     fn show_sheet_tabs(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
         // Actions are collected here and applied after the UI closure, which
         // borrows `self` immutably while every one of them needs `&mut self`.
         let mut switch_to = None;
@@ -1188,7 +1302,7 @@ impl FerrixApp {
         egui::TopBottomPanel::bottom("sheet_tabs")
             .frame(
                 egui::Frame::none()
-                    .fill(Theme::PANEL)
+                    .fill(th.panel)
                     .inner_margin(egui::Margin::symmetric(6.0, 3.0)),
             )
             .show(ctx, |ui| {
@@ -1688,6 +1802,27 @@ impl FerrixApp {
         }
         let frame_start = std::time::Instant::now();
 
+        // Follow the OS preference until the user picks a theme themselves.
+        // egui only learns the system theme once a frame has run, so this
+        // cannot happen in `new`; and because it keeps running until the user
+        // chooses, flipping the OS theme mid-session follows along.
+        if !self.theme_chosen {
+            let os = match ctx.system_theme() {
+                Some(egui::Theme::Light) => ThemeMode::Light,
+                Some(egui::Theme::Dark) => ThemeMode::Dark,
+                // The platform does not expose one — stay on the default.
+                None => self.theme.mode,
+            };
+            if os != self.theme.mode {
+                self.theme = Theme::of(os);
+            }
+        }
+        // Push the palette into egui's own widget styling every frame: it is
+        // idempotent, and it means buttons, windows, scrollbars and text edits
+        // switch with the grid rather than a frame later.
+        self.theme.apply(ctx);
+        let th = self.theme;
+
         // --- unsaved-changes guard on window close ---
         //
         // egui 0.29 reports a close request as viewport state; cancelling it
@@ -1709,16 +1844,17 @@ impl FerrixApp {
         self.handle_keys(ctx);
 
         // --- toolbar ---
+        //
+        // The toggles are recorded and acted on after the panel closes: the
+        // closure holds `&mut self` fields, so mutating the theme in place
+        // here would conflict with the `th` the same frame is painting with.
+        let mut toggle_theme = false;
+        let mut toggle_empty = false;
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::none().fill(Theme::PANEL).inner_margin(8.0))
+            .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("FERRIX")
-                            .color(Theme::ACCENT)
-                            .strong()
-                            .size(15.0),
-                    );
+                    ui.label(RichText::new("FERRIX").color(th.accent).strong().size(15.0));
                     ui.add_space(12.0);
                     if ui.button("Open CSV…").clicked() {
                         self.open_dialog();
@@ -1787,6 +1923,27 @@ impl FerrixApp {
                             self.sync_formula_bar();
                         }
                     }
+                    ui.add_space(4.0);
+                    // --- theme toggle (issue #19) ---
+                    if ui
+                        .button(self.theme.mode.toggle_label())
+                        .on_hover_text("Switch between light and dark. Remembered between runs.")
+                        .clicked()
+                    {
+                        toggle_theme = true;
+                    }
+                    // --- empty rows toggle (issue #20) ---
+                    if ui
+                        .selectable_label(self.show_empty_rows, "⬓ Empty rows")
+                        .on_hover_text(
+                            "Show empty rows past the end of the sheet so there is \
+                             somewhere to type. They are not data: exports, SUM and \
+                             the row count ignore them until you type in one.",
+                        )
+                        .clicked()
+                    {
+                        toggle_empty = true;
+                    }
                     if self.loading {
                         ui.add(egui::Spinner::new().size(14.0));
                         // A 10GB conversion takes minutes, so show real
@@ -1802,7 +1959,7 @@ impl FerrixApp {
                                 ),
                             ));
                         } else {
-                            ui.label(RichText::new("opening…").color(Theme::TEXT_DIM));
+                            ui.label(RichText::new("opening…").color(th.text_dim));
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1819,29 +1976,36 @@ impl FerrixApp {
                             if edits > 0 {
                                 label.push_str(&format!(" · {edits} edits"));
                             }
-                            ui.label(RichText::new(label).color(Theme::TEXT_DIM).size(12.0));
+                            ui.label(RichText::new(label).color(th.text_dim).size(12.0));
                         }
                     });
                 });
             });
 
+        if toggle_theme {
+            self.set_theme(self.theme.mode.toggled());
+        }
+        if toggle_empty {
+            self.set_show_empty_rows(!self.show_empty_rows);
+        }
+
         // --- formula bar ---
         egui::TopBottomPanel::top("formula_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(Theme::HEADER_BG)
+                    .fill(th.header_bg)
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(self.selection.label())
-                            .color(Theme::ACCENT)
+                            .color(th.accent)
                             .monospace()
                             .size(13.0),
                     );
                     ui.separator();
-                    ui.label(RichText::new("fx").color(Theme::TEXT_DIM).italics());
+                    ui.label(RichText::new("fx").color(th.text_dim).italics());
 
                     let resp = ui.add_sized(
                         [ui.available_width() * 0.5, 22.0],
@@ -1878,9 +2042,9 @@ impl FerrixApp {
 
                     if let Some(r) = &self.formula_result {
                         let color = if r.starts_with("Parse error") || r.starts_with('#') {
-                            Theme::ERROR
+                            th.error
                         } else {
-                            Theme::NUMBER
+                            th.number
                         };
                         ui.label(RichText::new(format!("= {r}")).color(color).monospace());
                     }
@@ -1892,7 +2056,7 @@ impl FerrixApp {
             egui::TopBottomPanel::top("search_bar")
                 .frame(
                     egui::Frame::none()
-                        .fill(Theme::HEADER_BG)
+                        .fill(th.header_bg)
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
                 )
                 .show(ctx, |ui| {
@@ -1970,11 +2134,11 @@ impl FerrixApp {
                         if self.search_input.trim().is_empty() {
                             ui.label(
                                 RichText::new("type to search")
-                                    .color(Theme::TEXT_DIM)
+                                    .color(th.text_dim)
                                     .size(11.5),
                             );
                         } else if r.total == 0 {
-                            ui.label(RichText::new("no matches").color(Theme::ERROR).size(11.5));
+                            ui.label(RichText::new("no matches").color(th.error).size(11.5));
                         } else {
                             let shown = format!(
                                 "{} of {}{}",
@@ -1982,7 +2146,7 @@ impl FerrixApp {
                                 fmt_int(r.total),
                                 if r.truncated { " (capped)" } else { "" }
                             );
-                            ui.label(RichText::new(shown).color(Theme::TEXT).size(11.5));
+                            ui.label(RichText::new(shown).color(th.text).size(11.5));
                             // Filter mode changes what "capped" costs the
                             // user: unfiltered they can still step past the
                             // cap with F3, but a filtered view LOOKS complete
@@ -1995,7 +2159,7 @@ impl FerrixApp {
                                         fmt_int(f.len()),
                                         if f.len() == 1 { "" } else { "s" }
                                     ))
-                                    .color(Theme::TEXT_DIM)
+                                    .color(th.text_dim)
                                     .size(11.0),
                                 );
                                 if f.truncated() {
@@ -2006,7 +2170,7 @@ impl FerrixApp {
                                             fmt_int(self.search_results.matches.len()),
                                             fmt_int(f.total_matches())
                                         ))
-                                        .color(Theme::ERROR)
+                                        .color(th.error)
                                         .size(11.5)
                                         .strong(),
                                     )
@@ -2026,7 +2190,7 @@ impl FerrixApp {
                                     r.matched_strings,
                                     if r.matched_strings == 1 { "" } else { "s" }
                                 ))
-                                .color(Theme::TEXT_DIM)
+                                .color(th.text_dim)
                                 .size(11.0),
                             );
                         }
@@ -2044,16 +2208,12 @@ impl FerrixApp {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(Theme::HEADER_BG)
+                    .fill(th.header_bg)
                     .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&self.status)
-                            .color(Theme::TEXT_DIM)
-                            .size(11.5),
-                    );
+                    ui.label(RichText::new(&self.status).color(th.text_dim).size(11.5));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let fps = if self.frame_ms > 0.0 {
                             1000.0 / self.frame_ms
@@ -2061,11 +2221,11 @@ impl FerrixApp {
                             0.0
                         };
                         let color = if fps >= 55.0 {
-                            Theme::NUMBER
+                            th.number
                         } else if fps >= 30.0 {
-                            Theme::TEXT_DIM
+                            th.text_dim
                         } else {
-                            Theme::ERROR
+                            th.error
                         };
                         ui.label(
                             RichText::new(format!(
@@ -2082,7 +2242,7 @@ impl FerrixApp {
                         if self.table_report.total > 0 {
                             ui.label(
                                 RichText::new(format!("⚠ {} invalid", self.table_report.total))
-                                    .color(Theme::INVALID_FLAG)
+                                    .color(th.invalid_flag)
                                     .size(11.5)
                                     .monospace(),
                             );
@@ -2094,7 +2254,7 @@ impl FerrixApp {
                                     m.visible_rows(),
                                     m.total_rows()
                                 ))
-                                .color(Theme::ACCENT)
+                                .color(th.accent)
                                 .size(11.5)
                                 .monospace(),
                             );
@@ -2117,13 +2277,13 @@ impl FerrixApp {
 
         // --- grid ---
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Theme::BG))
+            .frame(egui::Frame::none().fill(th.bg))
             .show(ctx, |ui| {
                 if self.wb.view().row_count() == 0 {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("Open a CSV to get started")
-                                .color(Theme::TEXT_DIM)
+                                .color(th.text_dim)
                                 .size(16.0),
                         );
                     });
@@ -2139,7 +2299,7 @@ impl FerrixApp {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("No rows match — filter mode is hiding every row")
-                                .color(Theme::TEXT_DIM)
+                                .color(th.text_dim)
                                 .size(15.0),
                         );
                     });
@@ -2177,6 +2337,12 @@ impl FerrixApp {
                             self.search_results.wrapped(self.search_index)
                         } else {
                             None
+                        },
+                        theme: th,
+                        pad_rows: if self.show_empty_rows {
+                            crate::grid::EMPTY_ROW_PADDING
+                        } else {
+                            0
                         },
                     }
                     .show(ui)
@@ -2285,12 +2451,17 @@ impl FerrixApp {
 
                 // --- in-cell editor, overlaid exactly on the cell ---
                 if let Some(cell) = self.editing {
+                    // The editor must be placeable over a padding row too, and
+                    // a padding row is in no filter's mapping — so the pad
+                    // space is handed over alongside the filter.
+                    let pad = self.pad_space();
                     if let Some(rect) = Grid::cell_screen_rect(
                         cell,
                         outer,
                         &self.scroll,
                         &self.col_widths,
                         self.row_filter.as_ref(),
+                        pad,
                     ) {
                         let id = egui::Id::new("cell_editor");
                         let mut child = ui.new_child(

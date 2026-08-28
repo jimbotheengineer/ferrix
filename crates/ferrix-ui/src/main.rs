@@ -5,6 +5,7 @@ mod chart_panel;
 mod grid;
 #[cfg(test)]
 mod harness;
+mod prefs;
 mod sheet_view;
 mod table_view;
 mod theme;
@@ -28,8 +29,12 @@ fn main() -> eframe::Result<()> {
         "Ferrix",
         options,
         Box::new(move |cc| {
-            theme::Theme::apply(&cc.egui_ctx);
-            Ok(Box::new(FerrixApp::new(initial)))
+            // The app owns the palette from here on and re-applies it every
+            // frame (it may follow the OS on the first one, or be toggled).
+            // This first call just avoids a single unstyled frame.
+            let app = FerrixApp::new(initial);
+            app.theme().apply(&cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )
 }

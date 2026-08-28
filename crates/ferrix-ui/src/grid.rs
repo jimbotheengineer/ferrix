@@ -42,6 +42,74 @@ pub const ROW_HEADER_WIDTH: f32 = 88.0;
 pub const HEADER_HEIGHT: f32 = 26.0;
 const SCROLLBAR_W: f32 = 12.0;
 
+/// How far past the last data row "show empty rows" extends the scrollable
+/// area (issue #20).
+///
+/// Enough to type into without hunting for the end, and small enough that the
+/// scrollbar thumb on a short file does not collapse. These rows are PURE
+/// VIEWPORT: nothing is materialised, and `SheetView::row_count` — which is
+/// what export, SUM and the status bar read — never sees them.
+pub const EMPTY_ROW_PADDING: usize = 200;
+
+/// Where the padding rows start on screen, and which data row the first one
+/// names.
+///
+/// Padding rows sit AFTER every row the filters kept, so a padding row's
+/// screen index is past the end of both row mappings. Nothing here is ever
+/// fed to `RowFilter::underlying` or `TableDecor::data_row`: a padding row is
+/// not a filterable row, and indexing either mapping with one would either
+/// return `None` (blanking the row) or, worse, alias onto a real record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PadSpace {
+    /// First screen row that is padding. Anything below is a real row.
+    pub first_pad_screen_row: usize,
+    /// Data row the first padding row addresses — one past the sheet's end.
+    pub first_pad_data_row: usize,
+}
+
+impl PadSpace {
+    /// Data row for a padding screen row, or `None` if `r` is a real row.
+    #[inline]
+    pub fn data_row(&self, r: usize) -> Option<u32> {
+        r.checked_sub(self.first_pad_screen_row)
+            .map(|n| (self.first_pad_data_row + n) as u32)
+    }
+
+    /// Screen row for a data row that lies in the padding, or `None` if the
+    /// row is a real one the filters own.
+    #[inline]
+    pub fn screen_row(&self, row: u32) -> Option<usize> {
+        (row as usize)
+            .checked_sub(self.first_pad_data_row)
+            .map(|n| self.first_pad_screen_row + n)
+    }
+}
+
+/// What a screen row turned out to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenRow {
+    /// A real row, resolved through whichever filters are active.
+    Data(u32),
+    /// Empty padding past the end of the sheet. Addressable — typing here
+    /// extends the sheet through the overlay's own extent — but it holds no
+    /// data, is in no filter's mapping, and carries no table decoration.
+    Pad(u32),
+}
+
+impl ScreenRow {
+    #[inline]
+    fn row(self) -> u32 {
+        match self {
+            ScreenRow::Data(r) | ScreenRow::Pad(r) => r,
+        }
+    }
+
+    #[inline]
+    fn is_pad(self) -> bool {
+        matches!(self, ScreenRow::Pad(_))
+    }
+}
+
 /// Persistent scroll position, owned by the app and passed in each frame.
 ///
 /// `row_offset` is a fractional row index (f64) rather than a pixel offset,
@@ -114,6 +182,12 @@ pub struct Grid<'a> {
     /// formats, conditional styling, banding, validation flags, and — when a
     /// header filter is active — the view-row to data-row mapping.
     pub table: Option<&'a TableDecor<'a>>,
+    /// The active palette. Passed in rather than read from a constant, so the
+    /// whole grid follows the theme toggle (issue #19).
+    pub theme: Theme,
+    /// Empty rows to offer past the end of the sheet, or 0 when the "show
+    /// empty rows" toggle is off (issue #20).
+    pub pad_rows: usize,
 }
 
 impl<'a> Grid<'a> {
@@ -150,9 +224,16 @@ impl<'a> Grid<'a> {
         scroll: &ScrollState,
         col_widths: &[f32],
         filter: Option<&RowFilter>,
+        pad: Option<PadSpace>,
     ) -> Option<Rect> {
         let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
-        let visible = Self::visible_row(filter, cell.row)?;
+        // A padding row is not in the filter's mapping, so it is resolved from
+        // the pad space FIRST — asking the filter about it would return None
+        // and the in-cell editor would have nowhere to draw.
+        let visible = match pad.and_then(|p| p.screen_row(cell.row)) {
+            Some(v) => v,
+            None => Self::visible_row(filter, cell.row)?,
+        };
         let rel_row = visible as f64 - scroll.row_offset;
         let y = body_origin.y + (rel_row * ROW_HEIGHT as f64) as f32;
         if y + ROW_HEIGHT < body_origin.y || y > outer.max.y {
@@ -188,15 +269,30 @@ impl<'a> Grid<'a> {
         // applied FIRST and the search filter consulted second. Reversing them
         // would index the search filter with a table view-row and silently show
         // the wrong records.
+        let th = self.theme;
         let data_rows = view.row_count().max(1);
         let table_rows = self
             .table
             .map_or(data_rows, |t| t.visible_row_count(data_rows));
-        let total_rows = match filter {
+        // Rows the FILTERS resolve. Padding is added on top of this and is
+        // never part of it, which is what keeps padding out of both mappings.
+        let filtered_rows = match filter {
             Some(f) => f.len(),
             None => table_rows,
-        }
-        .max(1);
+        };
+        // Empty padding (issue #20) extends only the scrollable EXTENT. It is
+        // added after the filtered rows, so a padding screen index is by
+        // construction past the end of every mapping, and `view.row_count()`
+        // — which export, SUM and the status bar read — is untouched.
+        let pad = (self.pad_rows > 0).then_some(PadSpace {
+            first_pad_screen_row: filtered_rows,
+            // One past the sheet's real end, in DATA space. Under a filter the
+            // padding still addresses rows past the whole sheet, not past the
+            // filtered subset — typing there must extend the sheet, not
+            // overwrite a hidden record.
+            first_pad_data_row: view.row_count(),
+        });
+        let total_rows = (filtered_rows + self.pad_rows).max(1);
         let total_cols = view.col_count().max(1);
         // Map a view row to the underlying data row. Identity when unfiltered.
         let to_data = |r: usize| -> Option<usize> {
@@ -216,13 +312,22 @@ impl<'a> Grid<'a> {
         // branches naively produced — lets whichever variable the caller
         // happens to use win, silently ignoring the other filter and painting
         // the wrong records under the right row numbers.
-        let resolve_row = |r: usize| -> Option<u32> {
+        // Padding is checked FIRST and short-circuits both filters. A padding
+        // row is not a filterable row: feeding its screen index to
+        // `RowFilter::underlying` or `TableDecor::data_row` would run off the
+        // end of the mapping, and under a *shorter* filtered view could alias
+        // straight onto an unrelated record.
+        let resolve_row = |r: usize| -> Option<ScreenRow> {
+            if let Some(row) = pad.and_then(|p| p.data_row(r)) {
+                return Some(ScreenRow::Pad(row));
+            }
             match filter {
                 // Search filter active: it already indexes data rows.
                 Some(_) => Self::underlying_row(filter, r),
                 // Otherwise the table mapping (identity when there is no table).
                 None => to_data(r).map(|d| d as u32),
             }
+            .map(ScreenRow::Data)
         };
 
         let width_of =
@@ -312,16 +417,19 @@ impl<'a> Grid<'a> {
         // Under a filter the viewport spans visible rows, which are sparse in
         // underlying space, so the bounds come from the mapping's window —
         // still two binary searches, still no per-row allocation.
+        // Search matches only ever live in real rows, so the narrowing window
+        // is clamped to the filtered range before the mapping is consulted.
+        let match_last = last_row.min(filtered_rows);
         let (match_lo_row, match_hi_row) = match filter {
             Some(f) => {
-                let w = f.window(first_row, last_row);
+                let w = f.window(first_row.min(match_last), match_last);
                 match (w.first(), w.last()) {
                     // `last + 1` because the narrowing bound is exclusive.
                     (Some(&a), Some(&b)) => (a as usize, b as usize + 1),
                     _ => (0, 0),
                 }
             }
-            None => (first_row, last_row),
+            None => (first_row.min(match_last), match_last),
         };
         let vis_lo = self
             .matches
@@ -338,7 +446,7 @@ impl<'a> Grid<'a> {
 
         // --- paint body ---
         let painter = ui.painter_at(body_rect);
-        painter.rect_filled(body_rect, 0.0, Theme::BG);
+        painter.rect_filled(body_rect, 0.0, th.bg);
 
         // `r` walks VISIBLE rows; `row` is the underlying row it maps to.
         // Everything painted from here on — cell values, highlights, selection
@@ -349,14 +457,23 @@ impl<'a> Grid<'a> {
             // Resolve the screen row to a data row through BOTH filters, in
             // the order they narrow: the table first, then search. Resolving
             // them independently would let one silently win.
-            let Some(row) = resolve_row(r) else { continue };
+            let Some(resolved) = resolve_row(r) else {
+                continue;
+            };
+            let row = resolved.row();
+            let is_pad = resolved.is_pad();
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             let row_rect = Rect::from_min_size(
                 egui::pos2(body_rect.min.x, y),
                 Vec2::new(body_rect.width(), ROW_HEIGHT),
             );
-            if r % 2 == 1 {
-                painter.rect_filled(row_rect, 0.0, Theme::ROW_ALT);
+            if is_pad {
+                // Padding gets its own recessed fill and no zebra stripe, so
+                // "there is no row here" is visibly different from "this row
+                // exists and holds empty strings".
+                painter.rect_filled(row_rect, 0.0, th.pad_row);
+            } else if r % 2 == 1 {
+                painter.rect_filled(row_rect, 0.0, th.row_alt);
             }
 
             for c in col_range.clone() {
@@ -370,14 +487,17 @@ impl<'a> Grid<'a> {
                 // so a table over 200M rows costs exactly what one over 200
                 // does. A cell the table has nothing to say about is dropped
                 // here so the paint path below stays on its ordinary branch.
+                // A padding row is outside the table by definition, so it
+                // gets no banding, no conditional fill and no validation flag.
                 let decor = self
                     .table
+                    .filter(|_| !is_pad)
                     .map(|t| t.cell(view, cref))
                     .filter(|d| !d.is_plain());
 
                 if let Some(d) = &decor {
                     if d.banded {
-                        painter.rect_filled(cell_rect, 0.0, Theme::TABLE_BAND);
+                        painter.rect_filled(cell_rect, 0.0, th.table_band);
                     }
                     if let Some(fill) = d.fill {
                         painter.rect_filled(cell_rect, 0.0, fill);
@@ -396,16 +516,12 @@ impl<'a> Grid<'a> {
 
                 // Search highlight sits under the selection so both remain
                 // visible when the cursor is parked on a match.
-                if !visible_matches.is_empty() && is_match(cref) {
+                if !is_pad && !visible_matches.is_empty() && is_match(cref) {
                     if self.current_match == Some(cref) {
-                        painter.rect_filled(cell_rect, 0.0, Theme::MATCH_CURRENT);
-                        painter.rect_stroke(
-                            cell_rect,
-                            0.0,
-                            Stroke::new(1.5_f32, Theme::MATCH_EDGE),
-                        );
+                        painter.rect_filled(cell_rect, 0.0, th.match_current);
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5_f32, th.match_edge));
                     } else {
-                        painter.rect_filled(cell_rect, 0.0, Theme::MATCH_BG);
+                        painter.rect_filled(cell_rect, 0.0, th.match_bg);
                     }
                 }
 
@@ -414,10 +530,10 @@ impl<'a> Grid<'a> {
                 // see where typing will land.
                 if let Some(sel) = self.selection {
                     if sel.cursor == cref {
-                        painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
-                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5_f32, Theme::ACCENT));
+                        painter.rect_filled(cell_rect, 0.0, th.accent_soft);
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5_f32, th.accent));
                     } else if !sel.is_single() && sel.contains(cref) {
-                        painter.rect_filled(cell_rect, 0.0, Theme::RANGE_FILL);
+                        painter.rect_filled(cell_rect, 0.0, th.range_fill);
                     }
                 }
 
@@ -432,20 +548,18 @@ impl<'a> Grid<'a> {
                     let (mut text, mut color, align) = match value {
                         Value::Number(n) => (
                             ferrix_core::format_number(n),
-                            Theme::NUMBER,
+                            th.number,
                             Align2::RIGHT_CENTER,
                         ),
                         Value::Bool(b) => (
                             if b { "TRUE" } else { "FALSE" }.to_string(),
-                            Theme::TEXT_DIM,
+                            th.text_dim,
                             Align2::CENTER_CENTER,
                         ),
-                        Value::Text(id) => (
-                            view.resolve(id).to_string(),
-                            Theme::TEXT,
-                            Align2::LEFT_CENTER,
-                        ),
-                        Value::Error(e) => (e.to_string(), Theme::ERROR, Align2::RIGHT_CENTER),
+                        Value::Text(id) => {
+                            (view.resolve(id).to_string(), th.text, Align2::LEFT_CENTER)
+                        }
+                        Value::Error(e) => (e.to_string(), th.error, Align2::RIGHT_CENTER),
                         Value::Empty => unreachable!(),
                     };
 
@@ -466,7 +580,7 @@ impl<'a> Grid<'a> {
                         painter.circle_filled(
                             egui::pos2(cell_rect.min.x + 3.5, cell_rect.min.y + 4.0),
                             1.6,
-                            Theme::ACCENT,
+                            th.accent,
                         );
                     }
 
@@ -497,7 +611,7 @@ impl<'a> Grid<'a> {
                                 egui::pos2(tr.x - 7.0, tr.y),
                                 egui::pos2(tr.x, tr.y + 7.0),
                             ],
-                            Theme::INVALID_FLAG,
+                            th.invalid_flag,
                             Stroke::NONE,
                         ));
                     }
@@ -507,7 +621,7 @@ impl<'a> Grid<'a> {
         }
 
         // --- grid lines ---
-        let line = Stroke::new(1.0_f32, Theme::GRID_LINE);
+        let line = Stroke::new(1.0_f32, th.grid_line);
         for r in row_range.clone() {
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             painter.hline(body_rect.min.x..=body_rect.max.x, y, line);
@@ -537,7 +651,10 @@ impl<'a> Grid<'a> {
             // the user actually pointed at rather than its screen position.
             // Both mappings apply, in the same order the paint path uses: the
             // table's rank lookup first, then the search filter.
-            let row = resolve_row(r as usize)?;
+            // Padding rows are hit-testable — that is the whole point of the
+            // toggle: clicking one selects it so the user can type there, and
+            // the resulting edit extends the sheet through the overlay.
+            let row = resolve_row(r as usize)?.row();
             Some(CellRef::new(row, c as u32))
         };
         if primary_clicked {
@@ -562,9 +679,10 @@ impl<'a> Grid<'a> {
                 .filter(|_| self.editing.is_none())
                 .and_then(|sel| {
                     let (_, br) = sel.bounds();
-                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, filter).map(
-                        |r| Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0),
-                    )
+                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, filter, pad)
+                        .map(|r| {
+                            Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0)
+                        })
                 });
         let on_handle = pointer_pos
             .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && body_rect.contains(p)));
@@ -586,8 +704,8 @@ impl<'a> Grid<'a> {
         if let Some(hr) = handle_rect {
             let hr = hr.shrink(2.0);
             if body_rect.contains(hr.center()) {
-                painter.rect_filled(hr, 1.0, Theme::ACCENT);
-                painter.rect_stroke(hr, 1.0, Stroke::new(1.0_f32, Theme::BG));
+                painter.rect_filled(hr, 1.0, th.accent);
+                painter.rect_stroke(hr, 1.0, Stroke::new(1.0_f32, th.bg));
             }
         }
         if primary_pressed && on_handle {
@@ -611,7 +729,7 @@ impl<'a> Grid<'a> {
         );
         let vbar_active = dragging && drag_pos.is_some_and(|p| vbar.contains(p));
         let vpainter = ui.painter_at(vbar);
-        vpainter.rect_filled(vbar, 0.0, Theme::PANEL);
+        vpainter.rect_filled(vbar, 0.0, th.panel);
         let visible_frac = (visible_count as f64 / total_rows as f64).min(1.0);
         let thumb_h = (vbar.height() as f64 * visible_frac).max(24.0) as f32;
         let scroll_span = (total_rows as f64 - visible_count as f64).max(1.0);
@@ -624,11 +742,7 @@ impl<'a> Grid<'a> {
         vpainter.rect_filled(
             thumb,
             3.0,
-            if vbar_active {
-                Theme::ACCENT
-            } else {
-                Theme::GRID_LINE
-            },
+            if vbar_active { th.accent } else { th.grid_line },
         );
         if vbar_active {
             if let Some(p) = drag_pos {
@@ -648,7 +762,7 @@ impl<'a> Grid<'a> {
         );
         let hresp = ui.allocate_rect(hbar, Sense::click_and_drag());
         let hpainter = ui.painter_at(hbar);
-        hpainter.rect_filled(hbar, 0.0, Theme::PANEL);
+        hpainter.rect_filled(hbar, 0.0, th.panel);
         if total_width > body_size.x {
             let frac = (body_size.x / total_width).min(1.0);
             let tw = (hbar.width() * frac).max(24.0);
@@ -661,9 +775,9 @@ impl<'a> Grid<'a> {
                 ),
                 3.0,
                 if hresp.hovered() || hresp.dragged() {
-                    Theme::ACCENT
+                    th.accent
                 } else {
-                    Theme::GRID_LINE
+                    th.grid_line
                 },
             );
             if hresp.dragged() {
@@ -680,7 +794,7 @@ impl<'a> Grid<'a> {
             egui::pos2(body_origin.x, outer.min.y),
             Vec2::new(outer.width() - ROW_HEADER_WIDTH, HEADER_HEIGHT),
         );
-        hp.rect_filled(col_header, 0.0, Theme::HEADER_BG);
+        hp.rect_filled(col_header, 0.0, th.header_bg);
         let chp = hp.with_clip_rect(col_header);
         for c in col_range.clone() {
             let x = body_origin.x + col_x[c] - self.scroll.col_px;
@@ -700,7 +814,7 @@ impl<'a> Grid<'a> {
                 Align2::CENTER_CENTER,
                 shown,
                 FontId::proportional(12.0),
-                Theme::TEXT_DIM,
+                th.text_dim,
             );
             chp.vline(r.max.x, outer.min.y..=outer.min.y + HEADER_HEIGHT, line);
         }
@@ -709,14 +823,17 @@ impl<'a> Grid<'a> {
             egui::pos2(outer.min.x, body_origin.y),
             Vec2::new(ROW_HEADER_WIDTH, body_rect.height()),
         );
-        hp.rect_filled(row_header, 0.0, Theme::HEADER_BG);
+        hp.rect_filled(row_header, 0.0, th.header_bg);
         let rhp = hp.with_clip_rect(row_header);
         // Row headers carry the ORIGINAL row number even under a filter. A
         // filtered view that renumbered its rows 1..N would be actively
         // misleading: the whole point of finding row 4,912,733 is knowing it
         // is row 4,912,733.
         for r in row_range.clone() {
-            let Some(row) = resolve_row(r) else { continue };
+            let Some(resolved) = resolve_row(r) else {
+                continue;
+            };
+            let row = resolved.row();
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             // Row numbers name the DATA row, so a filtered view shows the
             // original 1, 5, 9, ... rather than renumbering to 1, 2, 3 — the
@@ -729,18 +846,26 @@ impl<'a> Grid<'a> {
                 let (a, b) = s.row_range();
                 row >= a && row <= b
             });
-            if selected {
-                rhp.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
+            if resolved.is_pad() {
+                rhp.rect_filled(rect, 0.0, th.pad_row);
             }
+            if selected {
+                rhp.rect_filled(rect, 0.0, th.accent_soft);
+            }
+            // A padding row still shows its would-be number, so the user can
+            // see where they are, but dimmed — it is not a row of the file
+            // yet. Typing into it is what makes it one.
             rhp.text(
                 egui::pos2(rect.max.x - 8.0, rect.center().y),
                 Align2::RIGHT_CENTER,
                 (row as u64 + 1).to_string(),
                 FontId::proportional(11.5),
                 if selected {
-                    Theme::ACCENT
+                    th.accent
+                } else if resolved.is_pad() {
+                    th.grid_line
                 } else {
-                    Theme::TEXT_DIM
+                    th.text_dim
                 },
             );
         }
@@ -748,7 +873,7 @@ impl<'a> Grid<'a> {
         hp.rect_filled(
             Rect::from_min_size(outer.min, Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT)),
             0.0,
-            Theme::HEADER_BG,
+            th.header_bg,
         );
         hp.line_segment(
             [
@@ -938,6 +1063,7 @@ mod tests {
             &scroll,
             &widths,
             Some(&f),
+            None,
         )
         .expect("kept row must have a rect");
         let expected_y = outer.min.y + HEADER_HEIGHT + 2.0 * ROW_HEIGHT;
@@ -945,15 +1071,26 @@ mod tests {
 
         // A row the filter hides has no rect at all, so the cell editor cannot
         // be painted over a row that is not on screen.
-        assert!(
-            Grid::cell_screen_rect(CellRef::new(7, 0), outer, &scroll, &widths, Some(&f)).is_none()
-        );
+        assert!(Grid::cell_screen_rect(
+            CellRef::new(7, 0),
+            outer,
+            &scroll,
+            &widths,
+            Some(&f),
+            None
+        )
+        .is_none());
 
         // Without the filter the same cell is a million rows below the fold.
-        assert!(
-            Grid::cell_screen_rect(CellRef::new(1_000_000, 0), outer, &scroll, &widths, None)
-                .is_none()
-        );
+        assert!(Grid::cell_screen_rect(
+            CellRef::new(1_000_000, 0),
+            outer,
+            &scroll,
+            &widths,
+            None,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -993,5 +1130,168 @@ mod tests {
         assert_eq!(resolved, 199_999_999);
         assert_eq!(Grid::visible_row(Some(&f), 199_999_998), Some(2));
         assert_eq!(Grid::visible_row(Some(&f), 199_999_999), Some(3));
+    }
+
+    // --- empty-row padding (issue #20) ---
+
+    /// The whole extent story: padding lengthens what the user can SCROLL to
+    /// without changing what the sheet CONTAINS. `row_count` is what export,
+    /// SUM and the status bar read, and it is not in this arithmetic at all.
+    #[test]
+    fn padding_extends_the_scrollable_extent_only() {
+        let data_rows = 3usize;
+        let off = data_rows + EMPTY_ROW_PADDING;
+        let on = data_rows;
+        assert!(off > on);
+        // The extent grows by exactly the padding, no more.
+        assert_eq!(off - on, EMPTY_ROW_PADDING);
+        // And a two-row file still gets somewhere to type: the acceptance
+        // criterion is that the toggle produces reachable empty rows.
+        assert!(EMPTY_ROW_PADDING > 0);
+    }
+
+    #[test]
+    fn pad_space_maps_screen_rows_to_rows_past_the_end() {
+        // 3 real rows on screen, sheet is 3 rows deep.
+        let p = PadSpace {
+            first_pad_screen_row: 3,
+            first_pad_data_row: 3,
+        };
+        assert_eq!(p.data_row(2), None, "row 2 is real, not padding");
+        assert_eq!(p.data_row(3), Some(3), "first padding row is row 4");
+        assert_eq!(p.data_row(10), Some(10));
+        // ...and back again, which is what places the in-cell editor.
+        assert_eq!(p.screen_row(3), Some(3));
+        assert_eq!(p.screen_row(2), None, "a real row is not in pad space");
+        assert_eq!(p.screen_row(10), Some(10));
+    }
+
+    /// Under a filter the two spaces come apart: 4 surviving rows on screen,
+    /// but the sheet is 200 rows deep. Padding must address rows past the
+    /// SHEET, not past the filtered subset — otherwise typing in the padding
+    /// would silently overwrite a hidden record.
+    #[test]
+    fn padding_under_a_filter_addresses_past_the_sheet_not_past_the_filter() {
+        let sheet_rows = 200usize;
+        let f = filter_of(&[3, 9, 40, 199]);
+        let p = PadSpace {
+            first_pad_screen_row: f.len(),
+            first_pad_data_row: sheet_rows,
+        };
+        // Screen row 4 is the first padding row and names row 200 — one past
+        // the end of the sheet, NOT the 5th filtered row (which does not
+        // exist) and not row 4 (which the filter is hiding).
+        assert_eq!(p.data_row(4), Some(200));
+        assert_eq!(p.data_row(3), None, "screen row 3 is the last kept row");
+        // Every kept row stays owned by the filter, untouched by pad space.
+        for v in 0..f.len() {
+            assert_eq!(p.data_row(v), None, "pad space stole a filtered row");
+            assert!(Grid::underlying_row(Some(&f), v).is_some());
+        }
+        // A padding row's data row is in NEITHER mapping — which is exactly
+        // why it must never be looked up in one.
+        assert_eq!(Grid::visible_row(Some(&f), 200), None);
+    }
+
+    /// The same for a table's header filter, whose mapping is a rank lookup.
+    /// A padding screen index handed to `nth_visible` would run off the end;
+    /// resolving padding first is what stops that.
+    #[test]
+    fn padding_screen_rows_are_past_the_end_of_the_table_mapping() {
+        let visible_rows = 4usize; // what a header filter kept
+        let sheet_rows = 500usize;
+        let p = PadSpace {
+            first_pad_screen_row: visible_rows,
+            first_pad_data_row: sheet_rows,
+        };
+        for r in 0..visible_rows {
+            assert_eq!(p.data_row(r), None, "a table row was claimed as padding");
+        }
+        assert_eq!(p.data_row(visible_rows), Some(sheet_rows as u32));
+    }
+
+    /// Padding must be reachable AND editable: the editor is positioned from
+    /// `cell_screen_rect`, which under a filter cannot ask the mapping about a
+    /// padding row. Passing the pad space is what gives it a rect.
+    #[test]
+    fn the_editor_can_be_placed_over_a_padding_row() {
+        let f = filter_of(&[5, 6, 7]);
+        let outer = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let scroll = ScrollState {
+            row_offset: 0.0,
+            col_px: 0.0,
+        };
+        let widths = [100.0f32; 4];
+        let p = PadSpace {
+            first_pad_screen_row: 3,
+            first_pad_data_row: 100,
+        };
+
+        // Without pad space the filter hides row 100 and there is nowhere to
+        // draw the editor — the bug this parameter exists to prevent.
+        assert!(Grid::cell_screen_rect(
+            CellRef::new(100, 0),
+            outer,
+            &scroll,
+            &widths,
+            Some(&f),
+            None
+        )
+        .is_none());
+        // With it, the first padding row sits directly under the last kept row.
+        let rect = Grid::cell_screen_rect(
+            CellRef::new(100, 0),
+            outer,
+            &scroll,
+            &widths,
+            Some(&f),
+            Some(p),
+        )
+        .expect("a padding row must be editable");
+        let expected_y = outer.min.y + HEADER_HEIGHT + 3.0 * ROW_HEIGHT;
+        assert!((rect.min.y - expected_y).abs() < 0.5, "got {rect:?}");
+        // A real filtered row still resolves through the FILTER, not the pad.
+        let real = Grid::cell_screen_rect(
+            CellRef::new(6, 0),
+            outer,
+            &scroll,
+            &widths,
+            Some(&f),
+            Some(p),
+        )
+        .expect("kept row");
+        let expect_real = outer.min.y + HEADER_HEIGHT + ROW_HEIGHT;
+        assert!((real.min.y - expect_real).abs() < 0.5);
+    }
+
+    /// Typing into padding extends the sheet through the overlay's own
+    /// extent — the mechanism the issue asked us to reuse rather than
+    /// materialising rows. Before the edit `row_count` is unchanged by
+    /// padding; after it, it grows by exactly what was typed into.
+    #[test]
+    fn typing_in_the_padding_extends_the_sheet_without_materialising_rows() {
+        use ferrix_core::{CellInput, EditOverlay, Value};
+
+        let base_rows = 3usize;
+        let mut ov = EditOverlay::new();
+        // Padding alone materialises nothing at all.
+        assert_eq!(ov.extent().0, 0);
+        assert_eq!(ov.len(), 0);
+
+        let p = PadSpace {
+            first_pad_screen_row: base_rows,
+            first_pad_data_row: base_rows,
+        };
+        // The user clicks the 6th padding row and types.
+        let target = CellRef::new(p.data_row(base_rows + 5).unwrap(), 0);
+        assert_eq!(target.row, 8);
+        ov.set(target, CellInput::Literal(Value::Number(42.0)));
+
+        // ONE cell exists — 200 padding rows did not become 200 rows of data.
+        assert_eq!(ov.len(), 1);
+        // ...and the sheet is now genuinely 9 rows deep, so export, SUM and
+        // the status bar all see the new row.
+        assert_eq!(ov.extent().0, 9);
+        assert_eq!(base_rows.max(ov.extent().0), 9);
     }
 }
