@@ -183,7 +183,7 @@ pub fn load_csv(path: &Path, opts: CsvOptions) -> Result<(Sheet, LoadStats), Csv
 /// ONE linear pass tracking exact quote parity and emit boundaries as we
 /// reach them. That pass is a simple byte loop (multiple GB/s) and is cheap
 /// relative to the parallel parse it enables.
-fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
+pub(crate) fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return vec![];
     }
