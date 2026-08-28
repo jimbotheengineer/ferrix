@@ -625,17 +625,20 @@ fn parse_block_parallel(
                 spills.push(s);
             }
 
-            for i in 0..w {
+            // Iterate the spill writers directly rather than by index: each
+            // column's writer is advanced once per row, in lockstep with the
+            // chunk's flat tag/payload arrays.
+            for (i, spill) in spills.iter_mut().enumerate().take(w) {
                 let tag = chunk.tags[cell + i];
                 let p = chunk.payloads[cell + i];
                 if tag == ValueTag::Number as u8 {
-                    spills[i].push_number(f64::from_bits(p))?;
+                    spill.push_number(f64::from_bits(p))?;
                 } else if tag == ValueTag::Bool as u8 {
-                    spills[i].push_bool(f64::from_bits(p) != 0.0)?;
+                    spill.push_bool(f64::from_bits(p) != 0.0)?;
                 } else if tag == ValueTag::Text as u8 {
-                    spills[i].push_text(remap[p as usize])?;
+                    spill.push_text(remap[p as usize])?;
                 } else {
-                    spills[i].push_empty()?;
+                    spill.push_empty()?;
                 }
             }
             cell += w;
@@ -1258,5 +1261,4 @@ mod tests {
             "peak grew with input size: {peaks:?}"
         );
     }
-
 }

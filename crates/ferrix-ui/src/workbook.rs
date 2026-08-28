@@ -93,12 +93,14 @@ impl Workbook {
 
     /// Override the undo depth cap. Mainly for tests and future configuration;
     /// a limit of 0 disables undo entirely.
+    #[allow(dead_code)]
     pub fn set_undo_limit(&mut self, limit: usize) {
         self.undo_limit = limit;
         self.enforce_undo_limit();
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn undo_limit(&self) -> usize {
         self.undo_limit
     }
@@ -148,7 +150,13 @@ impl Workbook {
         self.dirty
     }
 
+    /// Flag the workbook clean WITHOUT touching undo history.
+    ///
+    /// Superseded by `save_committed` on the normal save path, which also
+    /// clears history per the documented behaviour. Kept for callers that
+    /// need to mark clean without discarding a timeline.
     #[inline]
+    #[allow(dead_code)]
     pub fn mark_saved(&mut self) {
         self.dirty = false;
     }
