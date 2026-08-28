@@ -19,7 +19,7 @@ use ferrix_core::scene::{to_svg, Anchor, Primitive, Rgba, Scene, Viewport};
 use ferrix_core::{CellRef, Selection, Value};
 
 use crate::sheet_view::SheetView;
-use crate::theme::Theme;
+use crate::theme::{ChartChrome, Theme};
 
 /// How many rows a chart will pull from the sheet.
 ///
@@ -322,6 +322,9 @@ impl ChartPanel {
     }
 
     /// Export the current scene, annotations included, as SVG.
+    ///
+    /// See [`SVG_FOLLOWS_APP_THEME`]: the exported file is ALWAYS light,
+    /// whichever theme the app is in.
     pub fn to_svg(&self, width: f32, height: f32) -> Option<String> {
         let scene = self.scene.as_ref()?;
         // Annotations are drawn into a clone so the on-screen scene is not
@@ -344,6 +347,28 @@ fn fmt_count(n: usize) -> String {
     out
 }
 
+/// **Decision: an exported SVG is always light, and does not follow the app
+/// theme.**
+///
+/// The on-screen chart is chrome — it belongs to the window it is sitting in,
+/// so it follows the toggle like everything else. An exported SVG is an
+/// artefact that leaves the app: it gets pasted into a document, a slide, a
+/// README, a printed report. Those are overwhelmingly light, and a chart
+/// carrying a near-black background into one is both jarring and, on paper, a
+/// solid rectangle of ink. Exporting dark-on-dark also loses the chart
+/// entirely the moment someone drops it on a white page.
+///
+/// The scene's own DATA colours (the series blue, the bar orange) are chosen
+/// in `ferrix_core::scene` to read on a light background and are already
+/// theme-independent, so nothing has to be recoloured on the way out — the
+/// SVG writer's own `#ffffff` backdrop and grey gridlines are simply left
+/// alone. `to_svg` therefore takes no theme, and this constant exists so the
+/// choice is greppable and testable rather than implied by an absence.
+///
+/// If a dark export is ever wanted it should be an explicit export OPTION,
+/// not a side effect of what the window happened to look like at the time.
+pub const SVG_FOLLOWS_APP_THEME: bool = false;
+
 fn to_color(c: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(c.0, c.1, c.2, c.3)
 }
@@ -358,9 +383,15 @@ pub fn paint_scene(
     scene: &Scene,
     annotations: &Annotations,
     rect: Rect,
+    theme: Theme,
 ) -> (Viewport, egui::Response) {
+    // The chart's chrome — backdrop, gridlines, tick labels — follows the app
+    // theme. The scene's data colours do not: they are chosen once to read on
+    // either backdrop, which is also what lets the SVG export stay light. See
+    // `SVG_FOLLOWS_APP_THEME`.
+    let chrome = ChartChrome::from(theme);
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Theme::PANEL);
+    painter.rect_filled(rect, 2.0, chrome.bg);
 
     // Margins for axis labels; the plot area is what data maps into.
     let (ml, mr, mt, mb) = (58.0, 12.0, 10.0, 30.0);
@@ -388,14 +419,14 @@ pub fn paint_scene(
         let y = vp.map_y(*t);
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-            Stroke::new(1.0_f32, Theme::GRID_LINE),
+            Stroke::new(1.0_f32, chrome.grid),
         );
         painter.text(
             Pos2::new(plot.left() - 6.0, y),
             egui::Align2::RIGHT_CENTER,
             ferrix_core::scene::format_tick(*t, y_step),
             egui::FontId::proportional(10.0),
-            Theme::TEXT_DIM,
+            chrome.label,
         );
     }
     for t in &x_ticks {
@@ -405,7 +436,7 @@ pub fn paint_scene(
             egui::Align2::CENTER_TOP,
             ferrix_core::scene::format_tick(*t, x_step),
             egui::FontId::proportional(10.0),
-            Theme::TEXT_DIM,
+            chrome.label,
         );
     }
 
@@ -491,7 +522,7 @@ pub fn paint_scene(
             egui::Align2::CENTER_BOTTOM,
             l,
             egui::FontId::proportional(11.0),
-            Theme::TEXT_DIM,
+            chrome.label,
         );
     }
 
@@ -517,6 +548,40 @@ mod tests {
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1000), "1,000");
         assert_eq!(fmt_count(200_000_000), "200,000,000");
+    }
+
+    #[test]
+    fn exported_svg_is_always_light() {
+        // The documented decision, asserted rather than implied: a chart that
+        // leaves the app lands in a light document.
+        assert!(!SVG_FOLLOWS_APP_THEME);
+        let mut p = ChartPanel::default();
+        p.scene = Some({
+            let mut s = ferrix_core::scene::Scene::new(
+                ferrix_core::chart::Bounds::new(0.0, 10.0),
+                ferrix_core::chart::Bounds::new(0.0, 10.0),
+            );
+            s.push(Primitive::Polyline {
+                points: vec![DataPoint::new(0.0, 0.0), DataPoint::new(10.0, 10.0)],
+                color: Rgba::rgb(0x4a, 0x9e, 0xff),
+                width: 1.0,
+            });
+            s
+        });
+        // `to_svg` takes no theme at all, so there is no way for the app's
+        // palette to reach the file — and the backdrop is white either way.
+        let svg = p.to_svg(400.0, 300.0).expect("scene present");
+        assert!(svg.contains(r##"fill="#ffffff""##), "export went dark");
+    }
+
+    #[test]
+    fn chart_chrome_differs_between_themes() {
+        // The on-screen chart, unlike the export, does follow the toggle.
+        let d = ChartChrome::from(Theme::dark());
+        let l = ChartChrome::from(Theme::light());
+        assert_ne!(d.bg, l.bg);
+        assert_ne!(d.grid, l.grid);
+        assert_ne!(d.label, l.label);
     }
 
     #[test]

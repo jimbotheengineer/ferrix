@@ -1,0 +1,186 @@
+//! Tiny preferences file for settings that must survive a restart.
+//!
+//! Deliberately hand-rolled rather than pulling in a config crate: this is two
+//! booleans and an enum. The format is `key = value`, one per line, and an
+//! unreadable or half-written file is simply ignored — a corrupt preference
+//! must never stop the app from opening.
+//!
+//! ## Where it lives
+//!
+//! The platform's per-user config directory, resolved from environment
+//! variables so no extra dependency is needed:
+//!
+//! | platform | location                                  |
+//! |----------|-------------------------------------------|
+//! | Windows  | `%APPDATA%\ferrix\prefs.toml`             |
+//! | macOS    | `$HOME/Library/Application Support/ferrix` |
+//! | Linux    | `$XDG_CONFIG_HOME/ferrix`, else `~/.config/ferrix` |
+//!
+//! `FERRIX_CONFIG_DIR` overrides all of it, which is also what lets the tests
+//! exercise the real round-trip against a temp directory.
+
+use std::path::PathBuf;
+
+use crate::theme::ThemeMode;
+
+/// Everything persisted between runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Prefs {
+    /// `None` means "never chosen" — the caller then follows the OS.
+    pub theme: Option<ThemeMode>,
+    /// Issue #20: show empty padding rows past the end of the sheet.
+    pub show_empty_rows: bool,
+}
+
+const FILE: &str = "prefs.toml";
+
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("FERRIX_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library").join("Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    base.map(|b| b.join("ferrix"))
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(FILE))
+}
+
+impl Prefs {
+    /// Read preferences, falling back to defaults on any failure. A missing,
+    /// unreadable, or malformed file is not an error the user should see.
+    pub fn load() -> Self {
+        let Some(p) = prefs_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(p) else {
+            return Self::default();
+        };
+        Self::parse(&text)
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let v = v.trim().trim_matches('"');
+            match k.trim() {
+                // An unrecognised value leaves `theme` as None, so the app
+                // falls back to the OS preference rather than to a guess.
+                "theme" => out.theme = ThemeMode::parse(v),
+                "show_empty_rows" => out.show_empty_rows = v == "true",
+                _ => {}
+            }
+        }
+        out
+    }
+
+    pub fn to_text(self) -> String {
+        let mut s = String::from("# Ferrix preferences\n");
+        if let Some(t) = self.theme {
+            s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
+        }
+        s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
+        s
+    }
+
+    /// Best-effort write. A failure to persist a preference is not worth
+    /// interrupting the user over, so the error is returned for logging and
+    /// otherwise dropped by the caller.
+    pub fn save(self) -> std::io::Result<()> {
+        let Some(dir) = config_dir() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(FILE), self.to_text())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_through_text() {
+        for theme in [None, Some(ThemeMode::Dark), Some(ThemeMode::Light)] {
+            for show_empty_rows in [false, true] {
+                let p = Prefs {
+                    theme,
+                    show_empty_rows,
+                };
+                assert_eq!(Prefs::parse(&p.to_text()), p);
+            }
+        }
+    }
+
+    #[test]
+    fn garbage_never_panics_and_never_guesses() {
+        // An unreadable preference must degrade to "not chosen", which sends
+        // the app to the OS preference — not to a silently wrong theme.
+        for bad in [
+            "",
+            "theme",
+            "theme = ",
+            "theme = mauve\n",
+            "!!!\n\0\n= =\n",
+            "# only a comment\n",
+        ] {
+            let p = Prefs::parse(bad);
+            assert_eq!(p.theme, None, "parsed {bad:?} into a theme");
+            assert!(!p.show_empty_rows);
+        }
+    }
+
+    #[test]
+    fn a_truncated_file_still_yields_what_it_can() {
+        let full = Prefs {
+            theme: Some(ThemeMode::Light),
+            show_empty_rows: true,
+        }
+        .to_text();
+        let cut = &full[..full.len() - 8];
+        let p = Prefs::parse(cut);
+        assert_eq!(p.theme, Some(ThemeMode::Light), "lost a complete line");
+    }
+
+    /// The actual acceptance criterion: the preference survives a restart.
+    /// This does the real filesystem round-trip through `save`/`load`, with
+    /// the config dir redirected at a temp directory.
+    #[test]
+    fn theme_preference_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ferrix-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Set-and-restore rather than leaving it set: other tests in this
+        // binary share the process environment.
+        let prev = std::env::var_os("FERRIX_CONFIG_DIR");
+        std::env::set_var("FERRIX_CONFIG_DIR", &dir);
+
+        let want = Prefs {
+            theme: Some(ThemeMode::Light),
+            show_empty_rows: true,
+        };
+        want.save().expect("save");
+        // A fresh `load` is exactly what the next process run does.
+        assert_eq!(Prefs::load(), want);
+
+        match prev {
+            Some(v) => std::env::set_var("FERRIX_CONFIG_DIR", v),
+            None => std::env::remove_var("FERRIX_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
