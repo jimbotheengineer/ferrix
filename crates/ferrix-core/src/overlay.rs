@@ -55,7 +55,13 @@ impl CellInput {
 }
 
 /// Sparse edit layer over an immutable base.
-#[derive(Debug, Default)]
+///
+/// `Clone` is what lets a long export run off the UI thread: the exporter
+/// takes a snapshot of the overlay rather than borrowing the live workbook,
+/// so the user can keep editing while 200M rows stream to disk. The clone
+/// costs `heap_bytes()`, which the caller admits against the memory budget
+/// before taking it.
+#[derive(Clone, Debug, Default)]
 pub struct EditOverlay {
     cells: HashMap<CellRef, CellInput>,
     /// Strings interned by edits. Kept separate from the base arena so the

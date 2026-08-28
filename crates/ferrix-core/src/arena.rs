@@ -16,7 +16,12 @@ pub struct StrId(pub u32);
 
 /// Append-only interner. Strings are never removed during a session; a
 /// compaction pass on save reclaims space from deleted cells.
-#[derive(Debug, Default)]
+///
+/// `Clone` exists so an edit overlay can be snapshotted for a background
+/// export without the exporter borrowing live workbook state across a thread
+/// boundary. Cloning copies the byte buffer, so callers check the cost
+/// against the memory budget first — see `StringArena::heap_bytes`.
+#[derive(Clone, Debug, Default)]
 pub struct StringArena {
     /// All string bytes back to back.
     buf: Vec<u8>,

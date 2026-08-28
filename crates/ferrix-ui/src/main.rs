@@ -11,6 +11,18 @@ mod workbook;
 use app::FerrixApp;
 
 fn main() -> eframe::Result<()> {
+    // Size the worker pool BEFORE anything can touch rayon: the first
+    // `par_iter` in the process builds a default all-cores pool implicitly,
+    // and `build_global` can only be called once. Doing it here is what keeps
+    // the machine usable during a multi-minute conversion.
+    let threads = ferrix_io::pool::init();
+    eprintln!(
+        "ferrix: {} · {}",
+        ferrix_io::pool::describe(),
+        ferrix_core::Budget::sample().describe()
+    );
+    debug_assert!(threads >= 1);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 880.0])

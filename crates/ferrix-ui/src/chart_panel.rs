@@ -21,14 +21,32 @@ use ferrix_core::{CellRef, Selection, Value};
 use crate::sheet_view::SheetView;
 use crate::theme::Theme;
 
-/// How many rows a chart will pull from the sheet.
+/// Ceiling on how many rows a chart will pull from the sheet, whatever the
+/// machine's memory.
 ///
 /// Aggregation is bounded by the canvas, but *reading* the column still costs
 /// one `get` per row. At 200M rows that is seconds — too slow to do on every
 /// frame, and too slow to do synchronously on the UI thread at all. Charting
 /// the first slice keeps the panel responsive and is honest about it: the
 /// status line always says how many rows were used.
+///
+/// This is a TIME limit, not a memory one. A machine with 128 GB free still
+/// should not spend ten seconds of UI thread reading cells, so the memory
+/// budget can only make this number smaller, never larger.
 pub const MAX_CHART_ROWS: usize = 2_000_000;
+
+/// Rows this chart may actually read: the responsiveness ceiling above, capped
+/// again by what measured memory will hold at [`cost::CHART_ROW`] each.
+///
+/// On a healthy machine the memory term is far larger and
+/// [`MAX_CHART_ROWS`] binds. On a machine under pressure the memory term
+/// binds instead, and the panel says so rather than being OOM-killed
+/// mid-render.
+pub fn chart_row_budget() -> usize {
+    let by_memory =
+        ferrix_core::Budget::sample().max_units_usize(ferrix_core::budget::cost::CHART_ROW);
+    by_memory.min(MAX_CHART_ROWS)
+}
 
 /// Target number of decimation buckets. Two points per bucket (min and max),
 /// so ~1,600 points across a typical canvas — more than the pixels can
@@ -74,6 +92,9 @@ pub struct ChartPanel {
     /// the range is larger than MAX_CHART_ROWS, and the difference is shown.
     pub rows_used: usize,
     pub rows_available: usize,
+    /// True when the row cap came from memory pressure rather than the
+    /// standing responsiveness ceiling — a different thing to tell the user.
+    pub capped_by_memory: bool,
     pub build_ms: f32,
     pub status: String,
     /// Index of the annotation being edited, if any.
@@ -93,6 +114,7 @@ impl Default for ChartPanel {
             annotations: Annotations::new(),
             rows_used: 0,
             rows_available: 0,
+            capped_by_memory: false,
             build_ms: 0.0,
             status: String::new(),
             editing_note: None,
@@ -113,7 +135,13 @@ impl ChartPanel {
         let (r0, c0, r1, c1) = (tl.row, tl.col, br.row, br.col);
 
         let total_rows = (r1 as usize).saturating_sub(r0 as usize) + 1;
-        let capped = total_rows.min(MAX_CHART_ROWS);
+        let budget = chart_row_budget();
+        let capped = total_rows.min(budget);
+        // Record WHY the chart was capped, so the panel can distinguish "this
+        // is as much as we plot for responsiveness" from "your machine is out
+        // of memory". Conflating the two is how a user concludes the app is
+        // broken when it is actually protecting them.
+        self.capped_by_memory = capped < total_rows && budget < MAX_CHART_ROWS;
         let last_row = r0 as usize + capped;
 
         self.rows_available = total_rows;
@@ -175,10 +203,21 @@ impl ChartPanel {
         match scene {
             Some(s) => {
                 let truncated = if capped < total_rows {
+                    // Distinguish the two reasons a chart is short. "We only
+                    // ever plot 2M rows so the panel stays responsive" and
+                    // "your machine is low on memory right now" call for
+                    // completely different reactions from the user, and
+                    // reporting them with the same words is dishonest.
+                    let why = if self.capped_by_memory {
+                        " (limited by available memory)"
+                    } else {
+                        ""
+                    };
                     format!(
-                        " · first {} of {} rows",
+                        " · first {} of {} rows{}",
                         fmt_count(capped),
-                        fmt_count(total_rows)
+                        fmt_count(total_rows),
+                        why
                     )
                 } else {
                     String::new()
