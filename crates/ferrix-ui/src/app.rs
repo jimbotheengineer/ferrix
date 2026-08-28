@@ -78,6 +78,10 @@ pub struct FerrixApp {
     search_index: usize,
     search_focus_pending: bool,
 
+    /// Selection a fill drag started from, and the live target while dragging.
+    fill_source: Option<Selection>,
+    fill_target: Option<Selection>,
+
     /// Where to persist edits, and the base identity they belong to. Both are
     /// None until a file is loaded.
     edits_path: Option<PathBuf>,
@@ -114,6 +118,8 @@ impl FerrixApp {
             search_results: ferrix_core::SearchResults::default(),
             search_index: 0,
             search_focus_pending: false,
+            fill_source: None,
+            fill_target: None,
             edits_path: None,
             fingerprint: None,
             status: "Ready — open a CSV to begin".into(),
@@ -1021,6 +1027,7 @@ impl eframe::App for FerrixApp {
                         scroll: &mut self.scroll,
                         editing: self.editing,
                         matches: &self.search_results.matches,
+                        filling: self.fill_source.is_some(),
                         current_match: if self.search_open {
                             self.search_results.wrapped(self.search_index)
                         } else {
@@ -1059,6 +1066,74 @@ impl eframe::App for FerrixApp {
                         );
                     }
                 }
+                // --- fill handle ---
+                if resp.fill_started {
+                    self.fill_source = Some(self.selection);
+                    self.fill_target = Some(self.selection);
+                }
+                if let (Some(src), Some(cell)) = (self.fill_source, resp.fill_to) {
+                    // Grow along the dominant axis only, so a slightly
+                    // diagonal drag still does something predictable.
+                    let (tl, br) = src.bounds();
+                    let drow = if cell.row > br.row {
+                        cell.row as i64 - br.row as i64
+                    } else if cell.row < tl.row {
+                        cell.row as i64 - tl.row as i64
+                    } else {
+                        0
+                    };
+                    let dcol = if cell.col > br.col {
+                        cell.col as i64 - br.col as i64
+                    } else if cell.col < tl.col {
+                        cell.col as i64 - tl.col as i64
+                    } else {
+                        0
+                    };
+                    let target = match ferrix_formula::fill::fill_direction(drow, dcol) {
+                        Some(ferrix_formula::fill::FillDir::Down) => {
+                            Selection::new(tl, CellRef::new(cell.row, br.col))
+                        }
+                        Some(ferrix_formula::fill::FillDir::Up) => {
+                            Selection::new(CellRef::new(cell.row, tl.col), br)
+                        }
+                        Some(ferrix_formula::fill::FillDir::Right) => {
+                            Selection::new(tl, CellRef::new(br.row, cell.col))
+                        }
+                        Some(ferrix_formula::fill::FillDir::Left) => {
+                            Selection::new(CellRef::new(tl.row, cell.col), br)
+                        }
+                        None => src,
+                    };
+                    self.fill_target = Some(target);
+                    // Preview the region the fill will cover.
+                    self.selection = target;
+                }
+                if resp.fill_released {
+                    if let (Some(src), Some(tgt)) = (self.fill_source, self.fill_target) {
+                        match self.wb.fill_range(src, tgt, Self::MAX_BLOCK_CELLS) {
+                            Ok((0, _)) => {}
+                            Ok((n, kind)) => {
+                                self.status = format!(
+                                    "Filled {} cells ({}) · {}",
+                                    fmt_int(n),
+                                    match kind {
+                                        ferrix_formula::fill::FillKind::Series => "series",
+                                        ferrix_formula::fill::FillKind::Copy => "copy",
+                                    },
+                                    tgt.label()
+                                );
+                                self.sync_formula_bar();
+                            }
+                            Err(e) => {
+                                self.status = e;
+                                self.selection = src;
+                            }
+                        }
+                    }
+                    self.fill_source = None;
+                    self.fill_target = None;
+                }
+
                 if let Some(cell) = resp.double_clicked {
                     self.begin_edit(cell, None);
                 }

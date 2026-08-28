@@ -5,6 +5,7 @@
 
 pub mod depgraph;
 pub mod eval;
+pub mod fill;
 pub mod parser;
 
 pub use depgraph::{DepGraph, Precedent};

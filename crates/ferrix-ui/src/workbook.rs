@@ -6,6 +6,7 @@
 
 use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Selection, Value};
 use ferrix_formula::depgraph::DepGraph;
+use ferrix_formula::fill::FillKind;
 use ferrix_formula::{eval_view, parse};
 
 use crate::sheet_view::{BaseData, SheetView};
@@ -480,6 +481,193 @@ impl Workbook {
         Ok(n)
     }
 
+    /// Fill from a source selection into an extended target, as ONE undo step.
+    ///
+    /// `source` is what the user had selected; `target` is the larger range
+    /// after dragging the handle. Cells already inside `source` are untouched.
+    ///
+    /// Numeric sources of 2+ cells continue their arithmetic progression;
+    /// everything else tiles. Formulas have their relative references offset
+    /// so `=A1*2` filled down becomes `=A2*2`, while `$` anchors stay put.
+    pub fn fill_range(
+        &mut self,
+        source: Selection,
+        target: Selection,
+        max_cells: u64,
+    ) -> Result<(usize, FillKind), String> {
+        if target.cell_count() > max_cells {
+            return Err(format!(
+                "filling {} cells exceeds the {}-cell limit",
+                target.cell_count(),
+                max_cells
+            ));
+        }
+        let (src_tl, src_br) = source.bounds();
+        let (tgt_tl, tgt_br) = target.bounds();
+
+        // Which way is this growing? Only the axis that actually extended.
+        let down = tgt_br.row > src_br.row;
+        let up = tgt_tl.row < src_tl.row;
+        let right = tgt_br.col > src_br.col;
+        let left = tgt_tl.col < src_tl.col;
+        if !(down || up || right || left) {
+            return Ok((0, FillKind::Copy));
+        }
+
+        let vertical = down || up;
+        let src_len = if vertical {
+            source.row_count() as usize
+        } else {
+            source.col_count() as usize
+        };
+
+        // Series detection: read the source values along the fill axis. Only
+        // attempted for a single line of cells, since a 2-D series is
+        // ambiguous and Excel tiles those too.
+        let single_line = if vertical {
+            source.col_count() == 1
+        } else {
+            source.row_count() == 1
+        };
+        let mut step = None;
+        if single_line && src_len >= 2 {
+            let view = self.view();
+            let vals: Vec<Option<f64>> = if vertical {
+                (src_tl.row..=src_br.row)
+                    .map(|r| match view.get(CellRef::new(r, src_tl.col)) {
+                        Value::Number(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                (src_tl.col..=src_br.col)
+                    .map(|c| match view.get(CellRef::new(src_tl.row, c)) {
+                        Value::Number(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // A source containing formulas must offset them, not extrapolate
+            // their current values.
+            let has_formula = if vertical {
+                (src_tl.row..=src_br.row)
+                    .any(|r| self.overlay.has_formula(CellRef::new(r, src_tl.col)))
+            } else {
+                (src_tl.col..=src_br.col)
+                    .any(|c| self.overlay.has_formula(CellRef::new(src_tl.row, c)))
+            };
+            if !has_formula {
+                step = ferrix_formula::fill::detect_step(&vals);
+            }
+        }
+        let kind = if step.is_some() {
+            FillKind::Series
+        } else {
+            FillKind::Copy
+        };
+
+        let mut changes = Vec::new();
+        for cell in target.iter() {
+            if source.contains(cell) {
+                continue;
+            }
+            // Distance from the source block, along the fill axis.
+            let n = if vertical {
+                if down {
+                    (cell.row - src_br.row) as usize
+                } else {
+                    (src_tl.row - cell.row) as usize
+                }
+            } else if right {
+                (cell.col - src_br.col) as usize
+            } else {
+                (src_tl.col - cell.col) as usize
+            };
+            let forward = down || right;
+
+            let new_input = if let Some(stepv) = step {
+                // Continue the progression outward from whichever end we grew.
+                let view = self.view();
+                let anchor = if forward {
+                    if vertical {
+                        CellRef::new(src_br.row, src_tl.col)
+                    } else {
+                        CellRef::new(src_tl.row, src_br.col)
+                    }
+                } else if vertical {
+                    CellRef::new(src_tl.row, src_tl.col)
+                } else {
+                    CellRef::new(src_tl.row, src_tl.col)
+                };
+                let base = match view.get(anchor) {
+                    Value::Number(v) => v,
+                    _ => 0.0,
+                };
+                let dir = if forward { 1.0 } else { -1.0 };
+                Some(CellInput::Literal(Value::Number(
+                    base + stepv * dir * n as f64,
+                )))
+            } else {
+                // Tile: pick the corresponding source cell.
+                // `n` is 1-based distance from the block edge.
+                let idx = ferrix_formula::fill::tile_index(n - 1, src_len);
+                let src_cell = if vertical {
+                    let r = if forward {
+                        src_tl.row + idx as u32
+                    } else {
+                        src_br.row - idx as u32
+                    };
+                    CellRef::new(r, cell.col.clamp(src_tl.col, src_br.col))
+                } else {
+                    let c = if forward {
+                        src_tl.col + idx as u32
+                    } else {
+                        src_br.col - idx as u32
+                    };
+                    CellRef::new(cell.row.clamp(src_tl.row, src_br.row), c)
+                };
+                match self.overlay.get(src_cell) {
+                    Some(CellInput::Formula { src, .. }) => {
+                        let (dr, dc) = ferrix_formula::fill::delta(src_cell, cell);
+                        let rewritten = ferrix_formula::fill::offset_formula(src, dr, dc);
+                        Some(
+                            self.classify(&rewritten)
+                                .unwrap_or(CellInput::Literal(Value::Error(ErrorKind::Name))),
+                        )
+                    }
+                    _ => {
+                        let v = self.view().get(src_cell);
+                        Some(CellInput::Literal(v))
+                    }
+                }
+            };
+
+            let before = self.overlay.get(cell).cloned();
+            if let Some(input) = &new_input {
+                self.overlay.set(cell, input.clone());
+            }
+            self.resync_graph(cell);
+            changes.push(CellChange {
+                cell,
+                before,
+                after: new_input,
+            });
+        }
+
+        if changes.is_empty() {
+            return Ok((0, kind));
+        }
+        let n = changes.len();
+        self.dirty = true;
+        self.push_undo(UndoEntry {
+            cell: tgt_tl,
+            changes,
+            side_effects: Vec::new(),
+        });
+        self.recalc_all();
+        Ok((n, kind))
+    }
+
     /// Keep the graph consistent with whatever the overlay now holds at `cell`.
     fn resync_graph(&mut self, cell: CellRef) {
         match self.overlay.get(cell) {
@@ -875,5 +1063,118 @@ mod tests {
         let block = vec![vec!["x".to_string(); 100]; 100];
         let err = w.paste_block(CellRef::new(0, 0), &block, 500).unwrap_err();
         assert!(err.contains("exceeds"), "got: {err}");
+    }
+
+    #[test]
+    fn fill_down_continues_a_numeric_series() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "1");
+        w.commit_edit(CellRef::new(1, 1), "2");
+        let src = sel(0, 1, 1, 1);
+        let tgt = sel(0, 1, 4, 1);
+        let (n, kind) = w.fill_range(src, tgt, 1_000_000).unwrap();
+        assert_eq!(n, 3, "three new cells");
+        assert_eq!(kind, FillKind::Series);
+        assert_eq!(val(&w, 2, 1), Value::Number(3.0));
+        assert_eq!(val(&w, 3, 1), Value::Number(4.0));
+        assert_eq!(val(&w, 4, 1), Value::Number(5.0));
+    }
+
+    #[test]
+    fn fill_down_tiles_a_single_value() {
+        // One cell is ambiguous as a series, so Excel copies. So do we.
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "7");
+        let (n, kind) = w
+            .fill_range(sel(0, 1, 0, 1), sel(0, 1, 3, 1), 1_000_000)
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(kind, FillKind::Copy);
+        for r in 1..=3u32 {
+            assert_eq!(val(&w, r, 1), Value::Number(7.0), "row {r}");
+        }
+    }
+
+    #[test]
+    fn fill_offsets_relative_formula_refs() {
+        // The hard part of the issue: =A1*2 filled down must become =A2*2.
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "=A1*2");
+        assert_eq!(val(&w, 0, 1), Value::Number(2.0), "base A1 is 1");
+        let (n, _) = w
+            .fill_range(sel(0, 1, 0, 1), sel(0, 1, 2, 1), 1_000_000)
+            .unwrap();
+        assert_eq!(n, 2);
+        // Base column A is 1,2,3 -> doubled 2,4,6.
+        assert_eq!(val(&w, 1, 1), Value::Number(4.0));
+        assert_eq!(val(&w, 2, 1), Value::Number(6.0));
+        // And the stored source really was rewritten, not just the value.
+        assert_eq!(
+            w.overlay.get(CellRef::new(2, 1)).unwrap().formula_src(),
+            Some("=A3*2")
+        );
+    }
+
+    #[test]
+    fn fill_pins_absolute_formula_refs() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "=$A$1*2");
+        w.fill_range(sel(0, 1, 0, 1), sel(0, 1, 2, 1), 1_000_000)
+            .unwrap();
+        // $A$1 never moves, so every filled cell is 1*2.
+        assert_eq!(val(&w, 1, 1), Value::Number(2.0));
+        assert_eq!(val(&w, 2, 1), Value::Number(2.0));
+        assert_eq!(
+            w.overlay.get(CellRef::new(2, 1)).unwrap().formula_src(),
+            Some("=$A$1*2")
+        );
+    }
+
+    #[test]
+    fn fill_is_one_undo_step() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "1");
+        w.commit_edit(CellRef::new(1, 1), "2");
+        let before = w.undo_depth();
+        w.fill_range(sel(0, 1, 1, 1), sel(0, 1, 9, 1), 1_000_000)
+            .unwrap();
+        assert_eq!(w.undo_depth(), before + 1, "one entry for the whole fill");
+        w.undo();
+        for r in 2..=9u32 {
+            assert_eq!(val(&w, r, 1), Value::Empty, "row {r} restored by one undo");
+        }
+    }
+
+    #[test]
+    fn fill_right_continues_across_columns() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "10");
+        w.commit_edit(CellRef::new(0, 2), "20");
+        let (_, kind) = w
+            .fill_range(sel(0, 1, 0, 2), sel(0, 1, 0, 4), 1_000_000)
+            .unwrap();
+        assert_eq!(kind, FillKind::Series);
+        assert_eq!(val(&w, 0, 3), Value::Number(30.0));
+        assert_eq!(val(&w, 0, 4), Value::Number(40.0));
+    }
+
+    #[test]
+    fn fill_refuses_an_oversized_target() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "1");
+        let huge = sel(0, 1, 199_999_999, 1);
+        let err = w.fill_range(sel(0, 1, 0, 1), huge, 1_000_000).unwrap_err();
+        assert!(err.contains("exceeds"), "got: {err}");
+    }
+
+    #[test]
+    fn filling_text_tiles_it() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "north");
+        let (_, kind) = w
+            .fill_range(sel(0, 1, 0, 1), sel(0, 1, 2, 1), 1_000_000)
+            .unwrap();
+        assert_eq!(kind, FillKind::Copy);
+        assert_eq!(w.view().display(CellRef::new(2, 1)), "north");
     }
 }

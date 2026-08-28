@@ -159,6 +159,22 @@ block pushes a single entry, and one undo restores all 50. Clipboard and clear
 operations are capped at 1,000,000 cells and refused with a message beyond
 that — a whole-column select must not try to build 200M strings.
 
+### Fill
+
+Dragging the handle at a selection's corner fills. Two numeric cells continue
+their progression (`0,1` becomes `0,1,2,3,…`); anything else tiles.
+
+Formulas have their **relative references offset** — `=A1*2` filled down
+becomes `=A2*2` — while `$` anchors stay pinned, so `=$A$1*2` fills unchanged
+and the running-total idiom `=SUM($A$1:A1)` grows correctly to `=SUM($A$1:A2)`.
+
+That rewriting happens on the formula *text* rather than its parsed tree. The
+tokenizer records `$` as `abs_col`/`abs_row` flags, but `Expr::Ref` keeps only
+a `CellRef`, so an AST rewrite would silently drop absolute markers. Rewriting
+the source preserves `$`, the user's spacing, and anything the scanner does not
+recognise — including `"A1"` inside a string literal, which is text, not a
+reference.
+
 ### Editing without touching the base
 
 Edits never modify the dataset. They live in a sparse copy-on-write overlay
@@ -249,7 +265,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 238 tests
+cargo test --workspace     # 259 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

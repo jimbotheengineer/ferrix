@@ -34,6 +34,7 @@ use ferrix_core::{column_name, CellRef, Selection, Value};
 use crate::sheet_view::SheetView;
 use crate::theme::Theme;
 
+pub const FILL_HANDLE: f32 = 7.0;
 pub const ROW_HEIGHT: f32 = 22.0;
 pub const DEFAULT_COL_WIDTH: f32 = 108.0;
 pub const ROW_HEADER_WIDTH: f32 = 88.0;
@@ -65,6 +66,12 @@ impl ScrollState {
 /// What the user did to the grid this frame.
 pub struct GridResponse {
     pub clicked: Option<CellRef>,
+    /// Set on the frame the fill handle is pressed.
+    pub fill_started: bool,
+    /// Cell the fill handle is currently dragged over.
+    pub fill_to: Option<CellRef>,
+    /// Set on the frame the fill drag is released.
+    pub fill_released: bool,
     /// Set while the primary button is held and the pointer has moved to a new
     /// cell — the caller extends the selection to it.
     pub drag_to: Option<CellRef>,
@@ -88,6 +95,9 @@ pub struct Grid<'a> {
     pub matches: &'a [CellRef],
     /// The match the user is currently parked on, drawn more prominently.
     pub current_match: Option<CellRef>,
+    /// True while the user is dragging the fill handle, so the grid reports
+    /// fill targets rather than ordinary selection drags.
+    pub filling: bool,
 }
 
 impl<'a> Grid<'a> {
@@ -158,16 +168,18 @@ impl<'a> Grid<'a> {
         // is delivered. A synthetic click with no preceding move lands nowhere
         // and looks like a broken grid. Send a move first, or test by hand.
         let interact_rect = Rect::from_min_max(body_origin, outer.max);
-        let (pointer_pos, wheel, primary_clicked, primary_double, dragging) = ui.ctx().input(|i| {
-            (
-                i.pointer.interact_pos(),
-                i.raw_scroll_delta,
-                i.pointer.primary_clicked(),
-                i.pointer
-                    .button_double_clicked(egui::PointerButton::Primary),
-                i.pointer.primary_down(),
-            )
-        });
+        let (pointer_pos, wheel, primary_clicked, primary_pressed, primary_double, dragging) =
+            ui.ctx().input(|i| {
+                (
+                    i.pointer.interact_pos(),
+                    i.raw_scroll_delta,
+                    i.pointer.primary_clicked(),
+                    i.pointer.primary_pressed(),
+                    i.pointer
+                        .button_double_clicked(egui::PointerButton::Primary),
+                    i.pointer.primary_down(),
+                )
+            });
         let drag_pos = pointer_pos;
 
         let pointer_in_body = pointer_pos.is_some_and(|p| interact_rect.contains(p));
@@ -200,6 +212,9 @@ impl<'a> Grid<'a> {
         let mut clicked = None;
         let mut double_clicked = None;
         let mut drag_to = None;
+        let mut fill_started = false;
+        let mut fill_to = None;
+        let mut fill_released = false;
         let mut painted_cells = 0usize;
 
         // Narrow the match list to just the visible rows once per frame, so
@@ -355,8 +370,53 @@ impl<'a> Grid<'a> {
         // are always the right/bottom SCROLLBAR_W strip of the outer rect.
         let in_gutter = pointer_pos
             .is_some_and(|p| p.x >= outer.max.x - SCROLLBAR_W || p.y >= outer.max.y - SCROLLBAR_W);
-        if dragging && !primary_clicked && pointer_in_body && !in_gutter {
+        // The fill-handle rect, needed here so grabbing it is not also read as
+        // a selection drag. Painted further down.
+        let handle_rect: Option<Rect> =
+            self.selection
+                .filter(|_| self.editing.is_none())
+                .and_then(|sel| {
+                    let (_, br) = sel.bounds();
+                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths).map(|r| {
+                        Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0)
+                    })
+                });
+        let on_handle = pointer_pos
+            .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && body_rect.contains(p)));
+        if dragging
+            && !primary_clicked
+            && !on_handle
+            && !self.filling
+            && pointer_in_body
+            && !in_gutter
+        {
             drag_to = pointer_pos.and_then(hit);
+        }
+
+        // --- fill handle ---
+        //
+        // Painted at the bottom-right of the selection, and hit-tested BEFORE
+        // ordinary click handling so pressing it starts a fill rather than
+        // collapsing the selection.
+        if let Some(hr) = handle_rect {
+            let hr = hr.shrink(2.0);
+            if body_rect.contains(hr.center()) {
+                painter.rect_filled(hr, 1.0, Theme::ACCENT);
+                painter.rect_stroke(hr, 1.0, Stroke::new(1.0, Theme::BG));
+            }
+        }
+        if primary_pressed && on_handle {
+            fill_started = true;
+            clicked = None; // Do not also move the selection.
+        }
+        if self.filling {
+            if dragging {
+                fill_to = pointer_pos.and_then(hit);
+            } else {
+                fill_released = true;
+            }
+            // A fill drag must never be read as a selection drag.
+            drag_to = None;
         }
 
         // --- vertical scrollbar (row-indexed, not pixel-indexed) ---
@@ -515,6 +575,9 @@ impl<'a> Grid<'a> {
         GridResponse {
             clicked,
             drag_to,
+            fill_started,
+            fill_to,
+            fill_released,
             double_clicked,
             painted_cells,
             visible_rows: row_range,
