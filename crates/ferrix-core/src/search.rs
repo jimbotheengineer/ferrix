@@ -412,4 +412,40 @@ mod tests {
         // Must not panic; an unresolvable id is an empty string.
         assert!(!q("anything").matches_value(&v, &arena));
     }
+
+    #[test]
+    fn case_sensitive_toggle_changes_matching() {
+        // Acceptance criterion from issue #5: case-sensitive "North" must not
+        // match "north".
+        let insensitive = Query::new("North", false, false).unwrap();
+        assert!(insensitive.matches_str("north"));
+        assert!(insensitive.matches_str("NORTH"));
+
+        let sensitive = Query::new("North", true, false).unwrap();
+        assert!(sensitive.matches_str("North"));
+        assert!(!sensitive.matches_str("north"), "case must be respected");
+        assert!(!sensitive.matches_str("NORTH"));
+    }
+
+    #[test]
+    fn whole_cell_toggle_rejects_substrings() {
+        // Acceptance criterion: whole-cell "open" must not match "reopened".
+        let substring = Query::new("open", false, false).unwrap();
+        assert!(substring.matches_str("reopened"));
+        assert!(substring.matches_str("open"));
+
+        let whole = Query::new("open", false, true).unwrap();
+        assert!(whole.matches_str("open"));
+        assert!(!whole.matches_str("reopened"), "substring must not match");
+        assert!(!whole.matches_str("opened"));
+    }
+
+    #[test]
+    fn both_toggles_compose() {
+        let q = Query::new("Open", true, true).unwrap();
+        assert!(q.matches_str("Open"));
+        assert!(!q.matches_str("open"), "wrong case");
+        assert!(!q.matches_str("Opened"), "not the whole cell");
+        assert!(!q.matches_str("reOpen"), "not the whole cell");
+    }
 }

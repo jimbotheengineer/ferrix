@@ -265,7 +265,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 259 tests
+cargo test --workspace     # 262 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

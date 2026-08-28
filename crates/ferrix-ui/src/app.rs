@@ -77,6 +77,9 @@ pub struct FerrixApp {
     search_results: ferrix_core::SearchResults,
     search_index: usize,
     search_focus_pending: bool,
+    /// Match options. The engine has always supported both; these expose them.
+    search_case_sensitive: bool,
+    search_whole_cell: bool,
 
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
@@ -118,6 +121,8 @@ impl FerrixApp {
             search_results: ferrix_core::SearchResults::default(),
             search_index: 0,
             search_focus_pending: false,
+            search_case_sensitive: false,
+            search_whole_cell: false,
             fill_source: None,
             fill_target: None,
             edits_path: None,
@@ -443,7 +448,11 @@ impl FerrixApp {
     /// scans columns as integers.
     fn run_search(&mut self) {
         const LIMIT: usize = 100_000;
-        let Some(query) = ferrix_core::Query::new(self.search_input.trim(), false, false) else {
+        let Some(query) = ferrix_core::Query::new(
+            self.search_input.trim(),
+            self.search_case_sensitive,
+            self.search_whole_cell,
+        ) else {
             self.search_results = ferrix_core::SearchResults::default();
             self.search_index = 0;
             return;
@@ -907,6 +916,25 @@ impl eframe::App for FerrixApp {
                                 self.next_match();
                             }
                             resp.request_focus();
+                        }
+
+                        // Match options. Toggling either re-runs the search
+                        // immediately so the effect is visible.
+                        if ui
+                            .selectable_label(self.search_case_sensitive, "Aa")
+                            .on_hover_text("Match case")
+                            .clicked()
+                        {
+                            self.search_case_sensitive = !self.search_case_sensitive;
+                            self.run_search();
+                        }
+                        if ui
+                            .selectable_label(self.search_whole_cell, "[ab]")
+                            .on_hover_text("Match entire cell contents")
+                            .clicked()
+                        {
+                            self.search_whole_cell = !self.search_whole_cell;
+                            self.run_search();
                         }
 
                         if ui
