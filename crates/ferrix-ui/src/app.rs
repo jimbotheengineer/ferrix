@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use egui::{Align, Key, Layout, RichText};
-use ferrix_core::{CellRef, Sheet, Value};
+use ferrix_core::{CellRef, Selection, Sheet, Value};
 use ferrix_formula::{eval_view, parse};
 use ferrix_io::{load_csv, CsvOptions};
 
@@ -57,7 +57,8 @@ pub struct FerrixApp {
     stats_rows: usize,
     stats_cols: usize,
     col_widths: Vec<f32>,
-    selection: CellRef,
+    /// Active selection. `cursor` is the cell that typing lands in.
+    selection: Selection,
     scroll: ScrollState,
 
     focus: Focus,
@@ -100,7 +101,7 @@ impl FerrixApp {
             stats_rows: 0,
             stats_cols: 0,
             col_widths: Vec::new(),
-            selection: CellRef::new(0, 0),
+            selection: Selection::default(),
             scroll: ScrollState::default(),
             focus: Focus::Grid,
             editing: None,
@@ -182,7 +183,7 @@ impl FerrixApp {
                 } else if let Some(n) = restored_count {
                     self.status = format!("{} · restored {} saved edits", self.status, fmt_int(n));
                 }
-                self.selection = CellRef::new(0, 0);
+                self.selection.move_to(CellRef::new(0, 0));
                 self.scroll = ScrollState::default();
                 self.loading = false;
                 self.load_rx = None;
@@ -254,24 +255,128 @@ impl FerrixApp {
     }
 
     /// Move the selection, committing any in-progress edit first.
-    fn move_selection(&mut self, drow: i64, dcol: i64) {
+    ///
+    /// `extend` is Shift held: the anchor stays put and only the cursor moves,
+    /// growing the range. Otherwise the selection collapses to one cell.
+    fn move_selection_ext(&mut self, drow: i64, dcol: i64, extend: bool) {
         if self.editing.is_some() {
             self.commit_edit();
         }
         let view = self.wb.view();
         let max_row = view.row_count().saturating_sub(1) as i64;
         let max_col = view.col_count().saturating_sub(1) as i64;
-        let r = (self.selection.row as i64 + drow).clamp(0, max_row.max(0));
-        let c = (self.selection.col as i64 + dcol).clamp(0, max_col.max(0));
-        self.selection = CellRef::new(r as u32, c as u32);
+        let r = (self.selection.cursor.row as i64 + drow).clamp(0, max_row.max(0));
+        let c = (self.selection.cursor.col as i64 + dcol).clamp(0, max_col.max(0));
+        let target = CellRef::new(r as u32, c as u32);
+        if extend {
+            self.selection.extend_to(target);
+        } else {
+            self.selection.move_to(target);
+        }
         self.scroll_to_selection();
         self.sync_formula_bar();
+    }
+
+    fn move_selection(&mut self, drow: i64, dcol: i64) {
+        self.move_selection_ext(drow, dcol, false);
+    }
+
+    /// Largest block a clipboard or clear operation will touch.
+    ///
+    /// A user can select an entire 200M-row column; turning that into text
+    /// would exhaust memory long before it finished. The limit is generous
+    /// enough for any realistic paste and small enough to stay instant.
+    const MAX_BLOCK_CELLS: u64 = 1_000_000;
+
+    /// Copy the selection to the system clipboard as TSV.
+    fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
+        let sel = self.selection;
+        let Some(block) = self.wb.copy_block(sel, Self::MAX_BLOCK_CELLS) else {
+            self.status = format!(
+                "{} cells is too many to copy (limit {})",
+                fmt_int(sel.cell_count() as usize),
+                fmt_int(Self::MAX_BLOCK_CELLS as usize)
+            );
+            return;
+        };
+        let tsv = ferrix_core::tsv::to_tsv(&block);
+        let n = sel.cell_count();
+        ctx.copy_text(tsv);
+        if cut {
+            match self.wb.clear_range(sel, Self::MAX_BLOCK_CELLS) {
+                Ok(cleared) => {
+                    self.status = format!(
+                        "Cut {} cells ({} cleared)",
+                        fmt_int(n as usize),
+                        fmt_int(cleared)
+                    );
+                    self.sync_formula_bar();
+                }
+                Err(e) => self.status = e,
+            }
+        } else {
+            self.status = format!("Copied {} cells to clipboard", fmt_int(n as usize));
+        }
+    }
+
+    /// Paste TSV from the clipboard at the selection's top-left corner.
+    fn paste_clipboard(&mut self, text: &str) {
+        let block = ferrix_core::tsv::from_tsv(text);
+        if block.is_empty() {
+            self.status = "Clipboard is empty".into();
+            return;
+        }
+        let origin = self.selection.bounds().0;
+        match self.wb.paste_block(origin, &block, Self::MAX_BLOCK_CELLS) {
+            Ok(n) => {
+                // Select what was pasted, so the user sees the affected region
+                // and can undo or overwrite it in one gesture.
+                let rows = block.len() as u32;
+                let cols = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+                self.selection = Selection::new(
+                    origin,
+                    CellRef::new(
+                        origin.row + rows.saturating_sub(1),
+                        origin.col + cols.saturating_sub(1),
+                    ),
+                );
+                self.status = format!("Pasted {} cells", fmt_int(n));
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Clear every cell in the selection as one undo step.
+    fn clear_selection(&mut self) {
+        let sel = self.selection;
+        match self.wb.clear_range(sel, Self::MAX_BLOCK_CELLS) {
+            Ok(0) => self.status = "Nothing to clear".into(),
+            Ok(n) => {
+                self.status = format!("Cleared {} cells · {}", fmt_int(n), sel.label());
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Select the whole used range (Ctrl+A).
+    fn select_all(&mut self) {
+        let view = self.wb.view();
+        let rows = view.row_count().saturating_sub(1) as u32;
+        let cols = view.col_count().saturating_sub(1) as u32;
+        self.selection = Selection::new(CellRef::new(0, 0), CellRef::new(rows, cols));
+        self.status = format!(
+            "Selected {} · {} cells",
+            self.selection.label(),
+            fmt_int(self.selection.cell_count() as usize)
+        );
     }
 
     /// Keep the selected cell on screen after keyboard navigation.
     fn scroll_to_selection(&mut self) {
         let visible = (self.viewport_rows() as f64 - 1.0).max(1.0);
-        let row = self.selection.row as f64;
+        let row = self.selection.cursor.row as f64;
         if row < self.scroll.row_offset {
             self.scroll.row_offset = row;
         } else if row >= self.scroll.row_offset + visible {
@@ -321,7 +426,7 @@ impl FerrixApp {
     }
 
     fn sync_formula_bar(&mut self) {
-        self.formula_input = self.wb.view().edit_text(self.selection);
+        self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
     }
 
@@ -340,14 +445,14 @@ impl FerrixApp {
         let view = self.wb.view();
         self.search_results = view.search(&query, LIMIT);
         // Resume from wherever the cursor is rather than jumping to the top.
-        self.search_index = self.search_results.index_at_or_after(self.selection);
+        self.search_index = self.search_results.index_at_or_after(self.selection.cursor);
         self.jump_to_current_match();
     }
 
     /// Move the selection to the active match and scroll it into view.
     fn jump_to_current_match(&mut self) {
         if let Some(cell) = self.search_results.wrapped(self.search_index) {
-            self.selection = cell;
+            self.selection.move_to(cell);
             self.center_on_selection();
             self.formula_input = self.wb.view().edit_text(cell);
         }
@@ -381,7 +486,7 @@ impl FerrixApp {
     /// the hit lands mid-screen rather than scraping the edge.
     fn center_on_selection(&mut self) {
         let visible = (self.last_viewport_h / crate::grid::ROW_HEIGHT) as f64;
-        let target = self.selection.row as f64 - visible / 2.0;
+        let target = self.selection.cursor.row as f64 - visible / 2.0;
         self.scroll.row_offset = target.max(0.0);
     }
 
@@ -426,6 +531,42 @@ impl FerrixApp {
         if ctrl_s {
             self.save_edits();
             return;
+        }
+        // Clipboard and select-all only apply when the grid owns the keyboard;
+        // inside a text field the widget's own handling must win.
+        let grid_has_keys = ctx.memory(|m| m.focused()).is_none() && self.focus == Focus::Grid;
+        if grid_has_keys {
+            let (copy, cut, paste, select_all) = ctx.input(|i| {
+                let c = i.modifiers.command;
+                (
+                    c && i.key_pressed(Key::C),
+                    c && i.key_pressed(Key::X),
+                    c && i.key_pressed(Key::V),
+                    c && i.key_pressed(Key::A),
+                )
+            });
+            if select_all {
+                self.select_all();
+                return;
+            }
+            if copy || cut {
+                self.copy_selection(ctx, cut);
+                return;
+            }
+            if paste {
+                // egui delivers clipboard content as a Paste event rather than
+                // exposing a read API, so take whatever arrived this frame.
+                let text = ctx.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Paste(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                });
+                if let Some(t) = text {
+                    self.paste_clipboard(&t);
+                }
+                return;
+            }
         }
         if ctrl_f {
             self.search_open = true;
@@ -476,6 +617,7 @@ impl FerrixApp {
             undo,
             redo,
             typed,
+            shift_held,
         ) = ctx.input(|i| {
             let ctrl = i.modifiers.command;
             let shift = i.modifiers.shift;
@@ -501,6 +643,7 @@ impl FerrixApp {
                 ctrl && i.key_pressed(Key::Z) && !shift,
                 ctrl && (i.key_pressed(Key::Y) || (shift && i.key_pressed(Key::Z))),
                 typed,
+                shift,
             )
         });
 
@@ -508,7 +651,7 @@ impl FerrixApp {
 
         if undo {
             if let Some(cell) = self.wb.undo() {
-                self.selection = cell;
+                self.selection.move_to(cell);
                 self.scroll_to_selection();
                 self.status = format!("Undo {} · {} edits", cell.to_a1(), self.wb.edit_count());
                 self.sync_formula_bar();
@@ -517,7 +660,7 @@ impl FerrixApp {
         }
         if redo {
             if let Some(cell) = self.wb.redo() {
-                self.selection = cell;
+                self.selection.move_to(cell);
                 self.scroll_to_selection();
                 self.status = format!("Redo {} · {} edits", cell.to_a1(), self.wb.edit_count());
                 self.sync_formula_bar();
@@ -525,38 +668,43 @@ impl FerrixApp {
             return;
         }
 
+        // Shift+Arrow extends the selection from the anchor; a bare arrow
+        // collapses it. Tab/Enter always collapse, matching Excel.
+        let ext = shift_held;
         if up {
-            self.move_selection(-1, 0);
-        } else if down || enter {
+            self.move_selection_ext(-1, 0, ext);
+        } else if down {
+            self.move_selection_ext(1, 0, ext);
+        } else if enter {
             self.move_selection(1, 0);
         } else if left {
-            self.move_selection(0, -1);
-        } else if right || tab {
+            self.move_selection_ext(0, -1, ext);
+        } else if right {
+            self.move_selection_ext(0, 1, ext);
+        } else if tab {
             self.move_selection(0, 1);
         } else if shift_tab {
             self.move_selection(0, -1);
         } else if page_up {
-            self.move_selection(-page, 0);
+            self.move_selection_ext(-page, 0, ext);
         } else if page_down {
-            self.move_selection(page, 0);
+            self.move_selection_ext(page, 0, ext);
         } else if home {
-            let dc = -(self.selection.col as i64);
-            self.move_selection(0, dc);
+            let dc = -(self.selection.cursor.col as i64);
+            self.move_selection_ext(0, dc, ext);
         } else if end {
             let view = self.wb.view();
-            let dc = view.col_count().saturating_sub(1) as i64 - self.selection.col as i64;
-            self.move_selection(0, dc);
+            let dc = view.col_count().saturating_sub(1) as i64 - self.selection.cursor.col as i64;
+            self.move_selection_ext(0, dc, ext);
         } else if delete {
-            let cell = self.selection;
-            self.wb.commit_edit(cell, "");
-            self.status = format!("{} cleared", cell.to_a1());
-            self.sync_formula_bar();
+            // Deletes the whole selection as ONE undo step, not one per cell.
+            self.clear_selection();
         } else if f2 {
-            let cell = self.selection;
+            let cell = self.selection.cursor;
             self.begin_edit(cell, None);
         } else if let Some(t) = typed {
             // Typing replaces the cell, matching Excel.
-            let cell = self.selection;
+            let cell = self.selection.cursor;
             self.begin_edit(cell, Some(t));
         }
     }
@@ -604,7 +752,7 @@ impl eframe::App for FerrixApp {
                         .clicked()
                     {
                         if let Some(c) = self.wb.undo() {
-                            self.selection = c;
+                            self.selection.move_to(c);
                             self.sync_formula_bar();
                         }
                     }
@@ -613,7 +761,7 @@ impl eframe::App for FerrixApp {
                         .clicked()
                     {
                         if let Some(c) = self.wb.redo() {
-                            self.selection = c;
+                            self.selection.move_to(c);
                             self.sync_formula_bar();
                         }
                     }
@@ -665,7 +813,7 @@ impl eframe::App for FerrixApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(self.selection.to_a1())
+                        RichText::new(self.selection.label())
                             .color(Theme::ACCENT)
                             .monospace()
                             .size(13.0),
@@ -687,7 +835,7 @@ impl eframe::App for FerrixApp {
                     }
                     // Enter in the formula bar commits it to the selected cell.
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        let cell = self.selection;
+                        let cell = self.selection.cursor;
                         let text = self.formula_input.clone();
                         let report = self.wb.commit_edit(cell, &text);
                         self.status = if let Some(e) = &report.parse_error {
@@ -888,9 +1036,28 @@ impl eframe::App for FerrixApp {
                     if self.editing.is_some() && self.editing != Some(cell) {
                         self.commit_edit();
                     }
-                    self.selection = cell;
+                    // Shift+click extends from the existing anchor, like every
+                    // other spreadsheet and file list.
+                    if ui.input(|i| i.modifiers.shift) {
+                        self.selection.extend_to(cell);
+                    } else {
+                        self.selection.move_to(cell);
+                    }
                     self.focus = Focus::Grid;
                     self.sync_formula_bar();
+                }
+                // Drag extends without moving the anchor, so a press-and-sweep
+                // paints a range. Ignored while editing, where a drag is text
+                // selection inside the cell editor.
+                if let Some(cell) = resp.drag_to {
+                    if self.editing.is_none() && cell != self.selection.cursor {
+                        self.selection.extend_to(cell);
+                        self.status = format!(
+                            "{} · {} cells",
+                            self.selection.label(),
+                            fmt_int(self.selection.cell_count() as usize)
+                        );
+                    }
                 }
                 if let Some(cell) = resp.double_clicked {
                     self.begin_edit(cell, None);

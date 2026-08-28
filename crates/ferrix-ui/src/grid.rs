@@ -29,7 +29,7 @@
 //! stays exact past 10^15 rows — far beyond any file that fits on a disk.
 
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
-use ferrix_core::{column_name, CellRef, Value};
+use ferrix_core::{column_name, CellRef, Selection, Value};
 
 use crate::sheet_view::SheetView;
 use crate::theme::Theme;
@@ -65,6 +65,9 @@ impl ScrollState {
 /// What the user did to the grid this frame.
 pub struct GridResponse {
     pub clicked: Option<CellRef>,
+    /// Set while the primary button is held and the pointer has moved to a new
+    /// cell — the caller extends the selection to it.
+    pub drag_to: Option<CellRef>,
     pub double_clicked: Option<CellRef>,
     pub painted_cells: usize,
     pub visible_rows: std::ops::Range<usize>,
@@ -72,7 +75,9 @@ pub struct GridResponse {
 
 pub struct Grid<'a> {
     pub view: &'a SheetView<'a>,
-    pub selection: Option<CellRef>,
+    /// The active selection. Its cursor is drawn with a strong border, the
+    /// rest of the range with a translucent fill.
+    pub selection: Option<Selection>,
     pub col_widths: &'a [f32],
     pub scroll: &'a mut ScrollState,
     /// Cell currently being edited, if any — painted by the caller as a
@@ -194,6 +199,7 @@ impl<'a> Grid<'a> {
 
         let mut clicked = None;
         let mut double_clicked = None;
+        let mut drag_to = None;
         let mut painted_cells = 0usize;
 
         // Narrow the match list to just the visible rows once per frame, so
@@ -243,9 +249,16 @@ impl<'a> Grid<'a> {
                     }
                 }
 
-                if self.selection == Some(cref) {
-                    painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
-                    painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::ACCENT));
+                // Selection painting. A range gets a translucent fill; the
+                // cursor cell keeps the strong border so the user can always
+                // see where typing will land.
+                if let Some(sel) = self.selection {
+                    if sel.cursor == cref {
+                        painter.rect_filled(cell_rect, 0.0, Theme::ACCENT_SOFT);
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5, Theme::ACCENT));
+                    } else if !sel.is_single() && sel.contains(cref) {
+                        painter.rect_filled(cell_rect, 0.0, Theme::RANGE_FILL);
+                    }
                 }
 
                 // The cell under edit is drawn by the caller's TextEdit.
@@ -332,6 +345,18 @@ impl<'a> Grid<'a> {
         }
         if primary_double {
             double_clicked = pointer_pos.and_then(hit);
+        }
+        // Drag-to-extend: the button is held, the pointer is over the body,
+        // and this is not the initial press (which `clicked` already covers).
+        // Reported every frame the pointer is down so the range tracks the
+        // cursor continuously.
+        // Exclude the scrollbar gutters: dragging a scrollbar must scroll, not
+        // paint a selection. Their rects are computed below, but the gutters
+        // are always the right/bottom SCROLLBAR_W strip of the outer rect.
+        let in_gutter = pointer_pos
+            .is_some_and(|p| p.x >= outer.max.x - SCROLLBAR_W || p.y >= outer.max.y - SCROLLBAR_W);
+        if dragging && !primary_clicked && pointer_in_body && !in_gutter {
+            drag_to = pointer_pos.and_then(hit);
         }
 
         // --- vertical scrollbar (row-indexed, not pixel-indexed) ---
@@ -447,7 +472,10 @@ impl<'a> Grid<'a> {
                 egui::pos2(outer.min.x, y),
                 Vec2::new(ROW_HEADER_WIDTH, ROW_HEIGHT),
             );
-            let selected = self.selection.map(|s| s.row as usize) == Some(r);
+            let selected = self.selection.is_some_and(|s| {
+                let (a, b) = s.row_range();
+                r >= a as usize && r <= b as usize
+            });
             if selected {
                 rhp.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
             }
@@ -486,6 +514,7 @@ impl<'a> Grid<'a> {
 
         GridResponse {
             clicked,
+            drag_to,
             double_clicked,
             painted_cells,
             visible_rows: row_range,

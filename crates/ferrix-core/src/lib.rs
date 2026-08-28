@@ -13,7 +13,9 @@ pub mod bitmap;
 pub mod column;
 pub mod overlay;
 pub mod search;
+pub mod selection;
 pub mod sheet;
+pub mod tsv;
 pub mod value;
 
 pub use arena::{StrId, StringArena};
@@ -21,5 +23,6 @@ pub use bitmap::Bitmap;
 pub use column::Column;
 pub use overlay::{CellInput, EditOverlay};
 pub use search::{IdSet, Query, SearchResults};
+pub use selection::Selection;
 pub use sheet::{column_name, CellRef, Sheet};
 pub use value::{format_number, ErrorKind, Value, ValueTag};

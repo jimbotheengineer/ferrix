@@ -21,6 +21,9 @@ impl Theme {
     pub const MATCH_BG: Color32 = Color32::from_rgb(0x4a, 0x3d, 0x1a);
     pub const MATCH_CURRENT: Color32 = Color32::from_rgb(0x7a, 0x5f, 0x1e);
     pub const MATCH_EDGE: Color32 = Color32::from_rgb(0xf0, 0xc0, 0x50);
+    /// Fill for cells inside a multi-cell selection. Translucent so zebra
+    /// striping and search highlights stay visible underneath.
+    pub const RANGE_FILL: Color32 = Color32::from_rgba_premultiplied(0x2a, 0x3f, 0x5f, 0x90);
 
     pub fn apply(ctx: &egui::Context) {
         let mut v = Visuals::dark();

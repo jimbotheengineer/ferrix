@@ -4,21 +4,32 @@
 //! the overlay and the dependency graph and keeps them consistent, so the UI
 //! only has to say "the user typed X into A1".
 
-use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Value};
+use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Selection, Value};
 use ferrix_formula::depgraph::DepGraph;
 use ferrix_formula::{eval_view, parse};
 
 use crate::sheet_view::{BaseData, SheetView};
 
 /// One undoable action.
+///
+/// `changes` holds every cell the action touched, so a bulk operation (paste,
+/// clearing a selected range) is a single undo step rather than one per cell.
+/// A plain single-cell edit is just a one-element batch.
 #[derive(Debug)]
 pub struct UndoEntry {
+    /// Where to put the cursor when this entry is undone or redone.
     cell: CellRef,
-    before: Option<CellInput>,
-    after: Option<CellInput>,
+    changes: Vec<CellChange>,
     /// Formula cells whose cached values changed as a side effect, so undo
     /// restores the whole visible state rather than leaving stale results.
     side_effects: Vec<(CellRef, Value)>,
+}
+
+#[derive(Debug)]
+struct CellChange {
+    cell: CellRef,
+    before: Option<CellInput>,
+    after: Option<CellInput>,
 }
 
 /// Outcome of committing an edit, for status reporting.
@@ -130,6 +141,12 @@ impl Workbook {
 
     pub fn view(&self) -> SheetView<'_> {
         SheetView::new(&self.base, &self.overlay)
+    }
+
+    /// How many undo entries are stacked. Exposed so tests can assert that a
+    /// bulk operation is one step rather than one per cell.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -253,17 +270,26 @@ impl Workbook {
         }
 
         let after = self.overlay.get(cell).cloned();
-        self.undo.push(UndoEntry {
+        self.push_undo(UndoEntry {
             cell,
-            before,
-            after,
+            changes: vec![CellChange {
+                cell,
+                before,
+                after,
+            }],
             side_effects,
         });
-        // A fresh edit invalidates the redo branch.
-        self.redo.clear();
 
         report.micros = start.elapsed().as_micros();
         report
+    }
+
+    /// Record an undoable action. A new action always invalidates the redo
+    /// branch — redoing after an edit would replay a history that no longer
+    /// exists.
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo.push(entry);
+        self.redo.clear();
     }
 
     /// Evaluate a single formula cell and store its result.
@@ -306,12 +332,15 @@ impl Workbook {
     pub fn undo(&mut self) -> Option<CellRef> {
         let entry = self.undo.pop()?;
         self.dirty = true;
-        self.overlay.restore(entry.cell, entry.before.clone());
+        // Reverse order so overlapping writes unwind exactly as they were made.
+        for ch in entry.changes.iter().rev() {
+            self.overlay.restore(ch.cell, ch.before.clone());
+            self.resync_graph(ch.cell);
+        }
         // Restore dependent caches captured at commit time.
         for (dep, prev) in &entry.side_effects {
             self.overlay.update_cached(*dep, *prev);
         }
-        self.resync_graph(entry.cell);
         let cell = entry.cell;
         self.redo.push(entry);
         Some(cell)
@@ -320,17 +349,135 @@ impl Workbook {
     pub fn redo(&mut self) -> Option<CellRef> {
         let entry = self.redo.pop()?;
         self.dirty = true;
-        self.overlay.restore(entry.cell, entry.after.clone());
-        self.resync_graph(entry.cell);
-        let cell = entry.cell;
+        for ch in &entry.changes {
+            self.overlay.restore(ch.cell, ch.after.clone());
+            self.resync_graph(ch.cell);
+        }
         // Re-derive dependents rather than trusting stale caches.
-        if let Ok(order) = self.graph.recalc_order(cell) {
-            for dep in order {
-                self.eval_one(dep);
+        let touched: Vec<CellRef> = entry.changes.iter().map(|c| c.cell).collect();
+        for cell in touched {
+            if let Ok(order) = self.graph.recalc_order(cell) {
+                for dep in order {
+                    self.eval_one(dep);
+                }
             }
         }
+        let cell = entry.cell;
         self.undo.push(entry);
         Some(cell)
+    }
+
+    /// Read a rectangular block as display strings, for the clipboard.
+    ///
+    /// Bounded by `max_cells`: a user can select an entire 200M-row column,
+    /// and materializing that as text would exhaust memory. Returns `None`
+    /// when the selection is too large, so the caller can say so rather than
+    /// freeze.
+    pub fn copy_block(&self, sel: Selection, max_cells: u64) -> Option<Vec<Vec<String>>> {
+        if sel.cell_count() > max_cells {
+            return None;
+        }
+        let view = self.view();
+        let (tl, br) = sel.bounds();
+        let mut rows = Vec::with_capacity(sel.row_count() as usize);
+        for r in tl.row..=br.row {
+            let mut row = Vec::with_capacity(sel.col_count() as usize);
+            for c in tl.col..=br.col {
+                row.push(view.display(CellRef::new(r, c)));
+            }
+            rows.push(row);
+        }
+        Some(rows)
+    }
+
+    /// Clear every cell in a selection as ONE undo step.
+    pub fn clear_range(&mut self, sel: Selection, max_cells: u64) -> Result<usize, String> {
+        if sel.cell_count() > max_cells {
+            return Err(format!(
+                "{} cells is too many to clear at once (limit {})",
+                sel.cell_count(),
+                max_cells
+            ));
+        }
+        let mut changes = Vec::new();
+        for cell in sel.iter() {
+            let before = self.overlay.get(cell).cloned();
+            // Only record cells that actually change.
+            let is_empty_already = before.is_none() && self.view().get(cell) == Value::Empty;
+            if is_empty_already {
+                continue;
+            }
+            let after = Some(CellInput::Literal(Value::Empty));
+            self.overlay.set(cell, CellInput::Literal(Value::Empty));
+            self.graph.remove(cell);
+            changes.push(CellChange {
+                cell,
+                before,
+                after,
+            });
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let n = changes.len();
+        self.dirty = true;
+        self.push_undo(UndoEntry {
+            cell: sel.bounds().0,
+            changes,
+            side_effects: Vec::new(),
+        });
+        self.recalc_all();
+        Ok(n)
+    }
+
+    /// Paste a block of text with its top-left corner at `origin`, as ONE
+    /// undo step. Returns how many cells were written.
+    pub fn paste_block(
+        &mut self,
+        origin: CellRef,
+        block: &[Vec<String>],
+        max_cells: u64,
+    ) -> Result<usize, String> {
+        let cells = block.iter().map(|r| r.len() as u64).sum::<u64>();
+        if cells > max_cells {
+            return Err(format!(
+                "pasting {cells} cells exceeds the {max_cells}-cell limit"
+            ));
+        }
+        let mut changes = Vec::new();
+        for (dr, row) in block.iter().enumerate() {
+            for (dc, text) in row.iter().enumerate() {
+                let cell = CellRef::new(origin.row + dr as u32, origin.col + dc as u32);
+                let before = self.overlay.get(cell).cloned();
+                let after = self.classify(text);
+                match &after {
+                    Some(input) => {
+                        self.overlay.set(cell, input.clone());
+                    }
+                    None => {
+                        self.overlay.clear(cell);
+                    }
+                }
+                self.resync_graph(cell);
+                changes.push(CellChange {
+                    cell,
+                    before,
+                    after,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let n = changes.len();
+        self.dirty = true;
+        self.push_undo(UndoEntry {
+            cell: origin,
+            changes,
+            side_effects: Vec::new(),
+        });
+        self.recalc_all();
+        Ok(n)
     }
 
     /// Keep the graph consistent with whatever the overlay now holds at `cell`.
@@ -625,5 +772,108 @@ mod tests {
             Value::Number(7.0),
             "C1 must see B1 recomputed, not its stale cache"
         );
+    }
+
+    fn sel(r0: u32, c0: u32, r1: u32, c1: u32) -> Selection {
+        Selection::new(CellRef::new(r0, c0), CellRef::new(r1, c1))
+    }
+
+    #[test]
+    fn clearing_a_range_is_one_undo_step() {
+        // The acceptance criterion from the issue: deleting a block must be a
+        // single undo, not one per cell.
+        let mut w = wb();
+        for r in 0..5u32 {
+            w.commit_edit(CellRef::new(r, 1), &format!("{r}"));
+        }
+        let undos_before = w.undo_depth();
+
+        let cleared = w.clear_range(sel(0, 1, 4, 1), 1_000_000).unwrap();
+        assert_eq!(cleared, 5);
+        assert_eq!(
+            w.undo_depth(),
+            undos_before + 1,
+            "five cleared cells must push exactly one undo entry"
+        );
+
+        // One undo restores all five.
+        w.undo();
+        for r in 0..5u32 {
+            assert_eq!(
+                val(&w, r, 1),
+                Value::Number(r as f64),
+                "row {r} not restored by a single undo"
+            );
+        }
+        // And redo re-clears all five.
+        w.redo();
+        for r in 0..5u32 {
+            assert_eq!(val(&w, r, 1), Value::Empty);
+        }
+    }
+
+    #[test]
+    fn copy_block_reads_display_text() {
+        let mut w = wb();
+        w.commit_edit(CellRef::new(0, 1), "hello");
+        w.commit_edit(CellRef::new(1, 1), "42");
+        let block = w.copy_block(sel(0, 0, 1, 1), 1_000_000).unwrap();
+        assert_eq!(block.len(), 2);
+        assert_eq!(block[0][0], "1", "base column A survives");
+        assert_eq!(block[0][1], "hello");
+        assert_eq!(block[1][1], "42");
+    }
+
+    #[test]
+    fn copy_refuses_an_absurd_selection() {
+        // Selecting a whole 200M-row column must not try to build 200M strings.
+        let w = wb();
+        let huge = sel(0, 0, 199_999_999, 7);
+        assert!(huge.cell_count() > 1_000_000);
+        assert!(
+            w.copy_block(huge, 1_000_000).is_none(),
+            "an oversized copy must be refused, not attempted"
+        );
+    }
+
+    #[test]
+    fn paste_writes_a_block_as_one_undo_step() {
+        let mut w = wb();
+        let block = vec![
+            vec!["1".to_string(), "two".to_string()],
+            vec!["3".to_string(), "four".to_string()],
+        ];
+        let before = w.undo_depth();
+        let n = w
+            .paste_block(CellRef::new(0, 1), &block, 1_000_000)
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(w.undo_depth(), before + 1, "one undo entry for the paste");
+
+        assert_eq!(val(&w, 0, 1), Value::Number(1.0));
+        assert_eq!(w.view().display(CellRef::new(0, 2)), "two");
+        assert_eq!(val(&w, 1, 1), Value::Number(3.0));
+
+        w.undo();
+        assert_eq!(val(&w, 0, 1), Value::Empty, "paste fully undone");
+        assert_eq!(val(&w, 1, 1), Value::Empty);
+    }
+
+    #[test]
+    fn pasted_formulas_evaluate() {
+        let mut w = wb();
+        let block = vec![vec!["=A1+A2".to_string()]];
+        w.paste_block(CellRef::new(0, 1), &block, 1_000_000)
+            .unwrap();
+        // Base A1=1, A2=2.
+        assert_eq!(val(&w, 0, 1), Value::Number(3.0));
+    }
+
+    #[test]
+    fn paste_refuses_an_oversized_block() {
+        let mut w = wb();
+        let block = vec![vec!["x".to_string(); 100]; 100];
+        let err = w.paste_block(CellRef::new(0, 0), &block, 500).unwrap_err();
+        assert!(err.contains("exceeds"), "got: {err}");
     }
 }

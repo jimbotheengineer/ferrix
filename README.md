@@ -143,6 +143,22 @@ nothing matches the arena the column scan is skipped entirely, which is why the
 absent-needle case costs 0 ms. Numbers are compared numerically against the
 parsed needle, never by formatting 200M values into strings.
 
+### Selection that scales
+
+A selection is two corners — an anchor and a cursor — never a list of cells.
+Selecting an entire 200M-row column is therefore 16 bytes, not 1.6 GB, and
+`Selection` is asserted to stay exactly that size by a test.
+
+Drag, Shift+click, and Shift+Arrow extend a range; `Ctrl+A` takes the used
+range. Copy and paste speak **TSV**, the format Excel and Google Sheets put on
+the clipboard, so blocks move between applications rather than only within
+Ferrix.
+
+Bulk operations are **one undo step**, not one per cell: clearing a 50-cell
+block pushes a single entry, and one undo restores all 50. Clipboard and clear
+operations are capped at 1,000,000 cells and refused with a message beyond
+that — a whole-column select must not try to build 200M strings.
+
 ### Editing without touching the base
 
 Edits never modify the dataset. They live in a sparse copy-on-write overlay
@@ -233,7 +249,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 215 tests
+cargo test --workspace     # 238 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a
