@@ -98,6 +98,25 @@ impl StringArena {
         self.buf.shrink_to_fit();
         self.spans.shrink_to_fit();
     }
+
+    /// Raw contents for serialization: the byte buffer and the span table.
+    pub fn raw_parts(&self) -> (&[u8], &[(u32, u32)]) {
+        (&self.buf, &self.spans)
+    }
+
+    /// Rebuild an arena from previously serialized parts.
+    ///
+    /// The dedup index is deliberately NOT rebuilt — a 10GB file's arena can
+    /// hold millions of strings, and reconstructing a HashMap over them would
+    /// cost more memory than the strings themselves. Loaded arenas are for
+    /// reading; edits intern into the overlay's own arena instead.
+    pub fn from_raw_parts(buf: Vec<u8>, spans: Vec<(u32, u32)>) -> Self {
+        Self {
+            buf,
+            spans,
+            lookup: HashMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]

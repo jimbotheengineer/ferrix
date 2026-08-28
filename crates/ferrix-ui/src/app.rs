@@ -1,19 +1,37 @@
 //! Application state and top-level layout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use egui::{Align, Key, Layout, RichText};
 use ferrix_core::{CellRef, Sheet, Value};
 use ferrix_formula::{eval_view, parse};
-use ferrix_io::{load_csv, CsvOptions, LoadStats};
+use ferrix_io::{load_csv, CsvOptions};
 
 use crate::grid::{Grid, ScrollState, DEFAULT_COL_WIDTH};
+use crate::sheet_view::BaseData;
 use crate::theme::Theme;
 use crate::workbook::Workbook;
 
-type LoadResult = Result<(Sheet, LoadStats), String>;
+/// What a background load produced.
+struct Loaded {
+    base: BaseData,
+    rows: usize,
+    cols: usize,
+    /// Human-readable summary for the status bar.
+    summary: String,
+    col_widths: Vec<f32>,
+}
+
+type LoadResult = Result<Loaded, String>;
+
+/// Progress reported from the loader thread.
+#[derive(Clone, Copy, Default)]
+struct Progress {
+    done: u64,
+    total: u64,
+}
 
 /// Where keyboard input should go.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,7 +44,8 @@ enum Focus {
 
 pub struct FerrixApp {
     wb: Workbook,
-    stats: Option<LoadStats>,
+    stats_rows: usize,
+    stats_cols: usize,
     col_widths: Vec<f32>,
     selection: CellRef,
     scroll: ScrollState,
@@ -43,6 +62,8 @@ pub struct FerrixApp {
     status: String,
     loading: bool,
     load_rx: Option<Receiver<LoadResult>>,
+    progress_rx: Option<Receiver<Progress>>,
+    progress: Progress,
     frame_ms: f32,
     last_painted: usize,
     /// Height of the grid body last frame, used for page-up/down sizing.
@@ -52,8 +73,9 @@ pub struct FerrixApp {
 impl FerrixApp {
     pub fn new(initial: Option<PathBuf>) -> Self {
         let mut app = Self {
-            wb: Workbook::new(Sheet::new("Sheet1")),
-            stats: None,
+            wb: Workbook::new(BaseData::Memory(Sheet::new("Sheet1"))),
+            stats_rows: 0,
+            stats_cols: 0,
             col_widths: Vec::new(),
             selection: CellRef::new(0, 0),
             scroll: ScrollState::default(),
@@ -66,6 +88,8 @@ impl FerrixApp {
             status: "Ready — open a CSV to begin".into(),
             loading: false,
             load_rx: None,
+            progress_rx: None,
+            progress: Progress::default(),
             frame_ms: 0.0,
             last_painted: 0,
             last_viewport_h: 600.0,
@@ -76,47 +100,60 @@ impl FerrixApp {
         app
     }
 
+    /// Kick off a load on a worker thread so the UI never blocks — converting
+    /// a 10GB file takes minutes and the window must stay responsive.
     fn start_load(&mut self, path: PathBuf) {
         let (tx, rx) = channel();
+        let (ptx, prx) = channel::<Progress>();
         self.loading = true;
-        self.status = format!("Loading {}…", path.display());
+        self.progress = Progress::default();
+        self.status = format!("Opening {}…", path.display());
+
         std::thread::spawn(move || {
-            let result = load_csv(&path, CsvOptions::default()).map_err(|e| e.to_string());
+            let result = load_any(&path, |done, total| {
+                let _ = ptx.send(Progress { done, total });
+            });
             let _ = tx.send(result);
         });
         self.load_rx = Some(rx);
+        self.progress_rx = Some(prx);
     }
 
     fn poll_load(&mut self) {
+        // Drain progress first so the bar is current even on a slow frame.
+        if let Some(prx) = &self.progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                self.progress = p;
+            }
+        }
+
         let Some(rx) = &self.load_rx else { return };
         match rx.try_recv() {
-            Ok(Ok((sheet, stats))) => {
-                self.col_widths = compute_col_widths(&sheet);
-                self.status = format!(
-                    "Loaded {} rows × {} cols in {} ms ({:.0} MB/s) · {:.2} GB resident",
-                    fmt_int(stats.rows),
-                    stats.cols,
-                    stats.parse_millis,
-                    stats.throughput_mbps(),
-                    sheet.heap_bytes() as f64 / 1e9,
-                );
-                self.wb = Workbook::new(sheet);
-                self.stats = Some(stats);
+            Ok(Ok(loaded)) => {
+                self.col_widths = loaded.col_widths;
+                self.status = loaded.summary;
+                self.stats_rows = loaded.rows;
+                self.stats_cols = loaded.cols;
+                self.wb = Workbook::new(loaded.base);
                 self.selection = CellRef::new(0, 0);
                 self.scroll = ScrollState::default();
                 self.loading = false;
                 self.load_rx = None;
+                self.progress_rx = None;
+                self.sync_formula_bar();
             }
             Ok(Err(e)) => {
                 self.status = format!("Load failed: {e}");
                 self.loading = false;
                 self.load_rx = None;
+                self.progress_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.status = "Load thread died".into();
                 self.loading = false;
                 self.load_rx = None;
+                self.progress_rx = None;
             }
         }
     }
@@ -385,20 +422,36 @@ impl eframe::App for FerrixApp {
                     }
                     if self.loading {
                         ui.add(egui::Spinner::new().size(14.0));
-                        ui.label(RichText::new("parsing…").color(Theme::TEXT_DIM));
+                        // A 10GB conversion takes minutes, so show real
+                        // progress rather than an indefinite spinner.
+                        if self.progress.total > 0 {
+                            let frac = self.progress.done as f32 / self.progress.total as f32;
+                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
+                                format!(
+                                    "{:.0}%  ({:.1}/{:.1} GB)",
+                                    frac * 100.0,
+                                    self.progress.done as f64 / 1e9,
+                                    self.progress.total as f64 / 1e9
+                                ),
+                            ));
+                        } else {
+                            ui.label(RichText::new("opening…").color(Theme::TEXT_DIM));
+                        }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(s) = &self.stats {
+                        if self.stats_rows > 0 {
                             let edits = self.wb.edit_count();
-                            let label = if edits > 0 {
-                                format!(
-                                    "{} rows × {} cols · {edits} edits",
-                                    fmt_int(s.rows),
-                                    s.cols
-                                )
-                            } else {
-                                format!("{} rows × {} cols", fmt_int(s.rows), s.cols)
-                            };
+                            let mut label = format!(
+                                "{} rows × {} cols",
+                                fmt_int(self.stats_rows),
+                                self.stats_cols
+                            );
+                            if self.wb.base.is_mapped() {
+                                label.push_str(" · mmap");
+                            }
+                            if edits > 0 {
+                                label.push_str(&format!(" · {edits} edits"));
+                            }
                             ui.label(RichText::new(label).color(Theme::TEXT_DIM).size(12.0));
                         }
                     });
@@ -610,32 +663,6 @@ impl eframe::App for FerrixApp {
     }
 }
 
-/// Size each column from a sample of its contents. We sample rather than scan
-/// so opening a huge file stays instant.
-fn compute_col_widths(sheet: &Sheet) -> Vec<f32> {
-    const SAMPLE: usize = 200;
-    let rows = sheet.row_count();
-    let step = (rows / SAMPLE).max(1);
-
-    (0..sheet.col_count())
-        .map(|c| {
-            let mut widest = sheet.header_or_letter(c).len();
-            let mut r = 0;
-            while r < rows {
-                let len = sheet.display(CellRef::new(r as u32, c as u32)).len();
-                widest = widest.max(len);
-                r += step;
-            }
-            let w = widest as f32 * 7.2 + 20.0;
-            if w.is_finite() {
-                w.clamp(64.0, 320.0)
-            } else {
-                DEFAULT_COL_WIDTH
-            }
-        })
-        .collect()
-}
-
 /// Thousands separators for readability in the status bar.
 fn fmt_int(n: usize) -> String {
     let s = n.to_string();
@@ -649,10 +676,139 @@ fn fmt_int(n: usize) -> String {
     out
 }
 
+/// Open a file, choosing storage based on size.
+///
+/// Small files parse straight into RAM. Large ones are converted once into the
+/// columnar `.ferrix` format beside the source and then memory-mapped, so the
+/// dataset is bounded by disk rather than memory and later opens are instant.
+fn load_any<F>(path: &Path, mut progress: F) -> LoadResult
+where
+    F: FnMut(u64, u64),
+{
+    if !ferrix_io::should_use_mmap(path) {
+        let (sheet, stats) = load_csv(path, CsvOptions::default()).map_err(|e| e.to_string())?;
+        let widths = compute_col_widths_mem(&sheet);
+        let summary = format!(
+            "Loaded {} rows × {} cols in {} ms ({:.0} MB/s) · {:.2} GB resident",
+            fmt_int(stats.rows),
+            stats.cols,
+            stats.parse_millis,
+            stats.throughput_mbps(),
+            sheet.heap_bytes() as f64 / 1e9,
+        );
+        return Ok(Loaded {
+            rows: sheet.row_count(),
+            cols: sheet.col_count(),
+            col_widths: widths,
+            summary,
+            base: BaseData::Memory(sheet),
+        });
+    }
+
+    // Large file: use (or build) the columnar cache next to the source.
+    let cache = ferrix_io::cache_path_for(path);
+    let reused = ferrix_io::cache_is_fresh(path, &cache);
+    let mut convert_note = String::new();
+
+    if !reused {
+        let stats = ferrix_io::convert_csv(path, &cache, b',', true, &mut progress)
+            .map_err(|e| e.to_string())?;
+        convert_note = format!(
+            "converted in {:.0}s at {:.0} MB/s · ",
+            stats.millis as f64 / 1000.0,
+            stats.throughput_mbps()
+        );
+    }
+
+    let mut mapped = ferrix_io::MappedSheet::open(&cache).map_err(|e| e.to_string())?;
+    // Recover header names from the source's first line; the cache stores data
+    // only, and re-reading one line is instant even for a 10GB file.
+    if let Some(h) = read_header_line(path) {
+        mapped.set_headers(h);
+    }
+
+    let widths = compute_col_widths_mapped(&mapped);
+    let summary = format!(
+        "{}{} rows × {} cols · {:.1} GB mapped from disk{}",
+        convert_note,
+        fmt_int(mapped.row_count()),
+        mapped.col_count(),
+        mapped.mapped_bytes() as f64 / 1e9,
+        if reused { " (cached)" } else { "" }
+    );
+
+    Ok(Loaded {
+        rows: mapped.row_count(),
+        cols: mapped.col_count(),
+        col_widths: widths,
+        summary,
+        base: BaseData::Mapped(Box::new(mapped)),
+    })
+}
+
+/// Read just the first line of a CSV for column headers.
+fn read_header_line(path: &Path) -> Option<Vec<String>> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(f).read_line(&mut line).ok()?;
+    Some(
+        line.trim_end()
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect(),
+    )
+}
+
+/// Size columns from a sample. Sampling rather than scanning is what keeps
+/// opening a 200M-row file instant.
+fn compute_col_widths_mem(sheet: &Sheet) -> Vec<f32> {
+    const SAMPLE: usize = 200;
+    let rows = sheet.row_count();
+    let step = (rows / SAMPLE).max(1);
+    (0..sheet.col_count())
+        .map(|c| {
+            let mut widest = sheet.header_or_letter(c).len();
+            let mut r = 0;
+            while r < rows {
+                widest = widest.max(sheet.display(CellRef::new(r as u32, c as u32)).len());
+                r += step;
+            }
+            width_for(widest)
+        })
+        .collect()
+}
+
+fn compute_col_widths_mapped(m: &ferrix_io::MappedSheet) -> Vec<f32> {
+    const SAMPLE: usize = 200;
+    let rows = m.row_count();
+    let step = (rows / SAMPLE).max(1);
+    (0..m.col_count())
+        .map(|c| {
+            let mut widest = m.header_or_letter(c).len();
+            let mut r = 0;
+            while r < rows {
+                widest = widest.max(m.display(CellRef::new(r as u32, c as u32)).len());
+                r += step;
+            }
+            width_for(widest)
+        })
+        .collect()
+}
+
+fn width_for(chars: usize) -> f32 {
+    let w = chars as f32 * 7.2 + 20.0;
+    if w.is_finite() {
+        w.clamp(64.0, 320.0)
+    } else {
+        DEFAULT_COL_WIDTH
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrix_core::Value;
+    use ferrix_core::{Sheet, Value};
 
     #[test]
     fn int_formatting() {
@@ -669,11 +825,19 @@ mod tests {
             s.set(CellRef::new(r, 0), Value::Number(r as f64));
             s.set_text(CellRef::new(r, 1), "a-fairly-long-text-value-here");
         }
-        let w = compute_col_widths(&s);
+        let w = compute_col_widths_mem(&s);
         assert_eq!(w.len(), 2);
         for width in &w {
             assert!((64.0..=320.0).contains(width), "width {width} out of range");
         }
         assert!(w[1] > w[0]);
+    }
+
+    #[test]
+    fn width_is_clamped_at_both_ends() {
+        // A one-character column must not collapse; a huge one must not
+        // push every other column off screen.
+        assert_eq!(width_for(0), 64.0);
+        assert_eq!(width_for(10_000), 320.0);
     }
 }

@@ -4,11 +4,11 @@
 //! the overlay and the dependency graph and keeps them consistent, so the UI
 //! only has to say "the user typed X into A1".
 
-use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Sheet, Value};
+use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Value};
 use ferrix_formula::depgraph::DepGraph;
 use ferrix_formula::{eval_view, parse};
 
-use crate::sheet_view::SheetView;
+use crate::sheet_view::{BaseData, SheetView};
 
 /// One undoable action.
 #[derive(Debug)]
@@ -31,7 +31,7 @@ pub struct CommitReport {
 }
 
 pub struct Workbook {
-    pub base: Sheet,
+    pub base: BaseData,
     pub overlay: EditOverlay,
     pub graph: DepGraph,
     undo: Vec<UndoEntry>,
@@ -39,7 +39,7 @@ pub struct Workbook {
 }
 
 impl Workbook {
-    pub fn new(base: Sheet) -> Self {
+    pub fn new(base: BaseData) -> Self {
         Self {
             base,
             overlay: EditOverlay::new(),
@@ -269,13 +269,14 @@ impl Workbook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrix_core::Sheet;
 
     fn wb() -> Workbook {
         let mut s = Sheet::new("t");
         for r in 0..10u32 {
             s.set(CellRef::new(r, 0), Value::Number((r + 1) as f64));
         }
-        Workbook::new(s)
+        Workbook::new(BaseData::Memory(s))
     }
 
     fn val(w: &Workbook, r: u32, c: u32) -> Value {

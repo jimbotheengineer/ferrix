@@ -2,3 +2,5 @@
 benchdata/
 *.csv
 !crates/**/testdata/*.csv
+*.ferrix
+*.ferrix-tmp/

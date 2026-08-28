@@ -19,3 +19,7 @@ path = "src/gen_data.rs"
 [[bin]]
 name = "bench-load"
 path = "src/bench_load.rs"
+
+[[bin]]
+name = "bench-mmap"
+path = "src/bench_mmap.rs"

@@ -1,21 +1,107 @@
 //! `SheetView`: the single read surface over base data plus edits.
 //!
 //! Everything that reads cells — the renderer, the formula evaluator, the
-//! status bar — goes through this. It composes an immutable base (in-RAM
-//! `Sheet` today, memory-mapped columnar file next) with a sparse
-//! `EditOverlay`, so no consumer needs to know which layer a value came from
-//! or whether the base is resident in memory.
+//! status bar — goes through this. It composes an immutable base with a sparse
+//! [`EditOverlay`], so no consumer needs to know whether the base is an
+//! in-RAM `Sheet` or a memory-mapped 12GB file, or whether a given value came
+//! from disk or from an edit.
 
 use ferrix_core::{CellRef, EditOverlay, Sheet, StrId, Value};
+use ferrix_io::MappedSheet;
+
+/// The immutable data under the overlay.
+///
+/// Small files live in RAM; large ones are memory-mapped so the dataset is
+/// bounded by disk rather than memory. Both answer the same questions, which
+/// is what lets the entire UI and formula engine be storage-agnostic.
+pub enum BaseData {
+    Memory(Sheet),
+    Mapped(Box<MappedSheet>),
+}
+
+impl BaseData {
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        match self {
+            BaseData::Memory(s) => s.row_count(),
+            BaseData::Mapped(m) => m.row_count(),
+        }
+    }
+
+    #[inline]
+    pub fn col_count(&self) -> usize {
+        match self {
+            BaseData::Memory(s) => s.col_count(),
+            BaseData::Mapped(m) => m.col_count(),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, cell: CellRef) -> Value {
+        match self {
+            BaseData::Memory(s) => s.get(cell),
+            BaseData::Mapped(m) => m.get(cell),
+        }
+    }
+
+    #[inline]
+    pub fn resolve(&self, id: StrId) -> &str {
+        match self {
+            BaseData::Memory(s) => s.resolve(id),
+            BaseData::Mapped(m) => m.resolve(id),
+        }
+    }
+
+    pub fn display(&self, cell: CellRef) -> String {
+        match self {
+            BaseData::Memory(s) => s.display(cell),
+            BaseData::Mapped(m) => m.display(cell),
+        }
+    }
+
+    pub fn header_or_letter(&self, col: usize) -> String {
+        match self {
+            BaseData::Memory(s) => s.header_or_letter(col),
+            BaseData::Mapped(m) => m.header_or_letter(col),
+        }
+    }
+
+    pub fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
+        match self {
+            BaseData::Memory(s) => s.sum_rect(start, end),
+            BaseData::Mapped(m) => m.sum_rect(start, end),
+        }
+    }
+
+    pub fn count_rect(&self, start: CellRef, end: CellRef) -> usize {
+        match self {
+            BaseData::Memory(s) => s.count_rect(start, end),
+            BaseData::Mapped(m) => m.count_rect(start, end),
+        }
+    }
+
+    /// Resident cost. For a mapping this is address space, not RAM — the OS
+    /// pages in only what is touched.
+    pub fn bytes(&self) -> usize {
+        match self {
+            BaseData::Memory(s) => s.heap_bytes(),
+            BaseData::Mapped(m) => m.mapped_bytes(),
+        }
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, BaseData::Mapped(_))
+    }
+}
 
 /// Read-only composite view. Cheap to construct — it borrows both layers.
 pub struct SheetView<'a> {
-    pub base: &'a Sheet,
+    pub base: &'a BaseData,
     pub overlay: &'a EditOverlay,
 }
 
 impl<'a> SheetView<'a> {
-    pub fn new(base: &'a Sheet, overlay: &'a EditOverlay) -> Self {
+    pub fn new(base: &'a BaseData, overlay: &'a EditOverlay) -> Self {
         Self { base, overlay }
     }
 
@@ -132,7 +218,7 @@ impl<'a> SheetView<'a> {
     }
 
     pub fn heap_bytes(&self) -> usize {
-        self.base.heap_bytes() + self.overlay.heap_bytes()
+        self.base.bytes() + self.overlay.heap_bytes()
     }
 }
 
@@ -166,12 +252,12 @@ mod tests {
     use super::*;
     use ferrix_core::CellInput;
 
-    fn base_sheet() -> Sheet {
+    fn base_sheet() -> BaseData {
         let mut s = Sheet::new("t");
         for r in 0..10u32 {
             s.set(CellRef::new(r, 0), Value::Number((r + 1) as f64));
         }
-        s
+        BaseData::Memory(s)
     }
 
     #[test]
