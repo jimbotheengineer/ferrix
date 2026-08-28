@@ -1,0 +1,12 @@
+[package]
+name = "ferrix-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Columnar storage engine for the Ferrix spreadsheet"
+
+[dependencies]
+
+[dev-dependencies]

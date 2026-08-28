@@ -1,0 +1,217 @@
+//! The cell value type.
+//!
+//! Size is load-bearing: at 10M rows every extra byte is 10 MB of RAM and a
+//! worse cache-miss rate while scrolling. `Value` is kept to 16 bytes by
+//! interning strings down to a 4-byte id rather than inlining a `String`
+//! (which alone would be 24 bytes plus a heap allocation per cell).
+
+use crate::arena::StrId;
+
+/// Error kinds mirroring Excel's, so formula results round-trip on export.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ErrorKind {
+    /// #DIV/0!
+    DivZero,
+    /// #VALUE!
+    Value,
+    /// #REF!
+    Ref,
+    /// #NAME?
+    Name,
+    /// #NUM!
+    Num,
+    /// #N/A
+    NotAvailable,
+    /// #NULL!
+    Null,
+    /// Circular reference detected by the dependency graph.
+    Circular,
+}
+
+impl ErrorKind {
+    /// The canonical spreadsheet spelling, used for display and .xlsx export.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::DivZero => "#DIV/0!",
+            ErrorKind::Value => "#VALUE!",
+            ErrorKind::Ref => "#REF!",
+            ErrorKind::Name => "#NAME?",
+            ErrorKind::Num => "#NUM!",
+            ErrorKind::NotAvailable => "#N/A",
+            ErrorKind::Null => "#NULL!",
+            ErrorKind::Circular => "#CIRC!",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A single cell's value.
+///
+/// `Number` is f64 to match IEEE-754 spreadsheet semantics exactly.
+/// `Text` holds an arena id, not the bytes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Value {
+    Empty,
+    Number(f64),
+    Bool(bool),
+    Text(StrId),
+    Error(ErrorKind),
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Value::Empty
+    }
+}
+
+impl Value {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Value::Empty)
+    }
+
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        matches!(self, Value::Error(_))
+    }
+
+    /// Numeric coercion following spreadsheet rules: bools are 1/0, empty is 0,
+    /// text and errors do not coerce.
+    #[inline]
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::Empty => Some(0.0),
+            Value::Text(_) | Value::Error(_) => None,
+        }
+    }
+
+    /// Truthiness for IF() and friends: non-zero numbers are true.
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => Some(*n != 0.0),
+            Value::Empty => Some(false),
+            Value::Text(_) | Value::Error(_) => None,
+        }
+    }
+
+    /// The error carried by this value, if any. Lets evaluators propagate
+    /// the *first* error encountered rather than inventing a new one.
+    #[inline]
+    pub fn error(&self) -> Option<ErrorKind> {
+        match self {
+            Value::Error(e) => Some(*e),
+            _ => None,
+        }
+    }
+
+    /// A compact type tag, used to store values column-wise.
+    #[inline]
+    pub fn tag(&self) -> ValueTag {
+        match self {
+            Value::Empty => ValueTag::Empty,
+            Value::Number(_) => ValueTag::Number,
+            Value::Bool(_) => ValueTag::Bool,
+            Value::Text(_) => ValueTag::Text,
+            Value::Error(_) => ValueTag::Error,
+        }
+    }
+}
+
+/// One-byte discriminant for the columnar store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum ValueTag {
+    #[default]
+    Empty = 0,
+    Number = 1,
+    Bool = 2,
+    Text = 3,
+    Error = 4,
+}
+
+/// Format a number the way a spreadsheet does: no trailing `.0`, no scientific
+/// notation until the magnitude genuinely needs it.
+pub fn format_number(n: f64) -> String {
+    if n.is_nan() {
+        return "#NUM!".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "∞".into() } else { "-∞".into() };
+    }
+    if n == n.trunc() && n.abs() < 1e15 {
+        return format!("{}", n as i64);
+    }
+    let a = n.abs();
+    if a != 0.0 && (a < 1e-4 || a >= 1e11) {
+        let s = format!("{n:E}");
+        return s.replace('E', "E+").replace("E+-", "E-");
+    }
+    // Trim to 10 significant-ish decimals then strip trailing zeros.
+    let mut s = format!("{n:.10}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_stays_16_bytes() {
+        // Guardrail: this is the whole reason strings are interned.
+        assert!(
+            std::mem::size_of::<Value>() <= 16,
+            "Value grew to {} bytes; at 10M rows that is {} MB per column",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Value>() * 10_000_000 / 1_048_576
+        );
+    }
+
+    #[test]
+    fn numeric_coercion_rules() {
+        assert_eq!(Value::Number(3.5).as_number(), Some(3.5));
+        assert_eq!(Value::Bool(true).as_number(), Some(1.0));
+        assert_eq!(Value::Bool(false).as_number(), Some(0.0));
+        assert_eq!(Value::Empty.as_number(), Some(0.0));
+        assert_eq!(Value::Text(StrId(0)).as_number(), None);
+        assert_eq!(Value::Error(ErrorKind::DivZero).as_number(), None);
+    }
+
+    #[test]
+    fn bool_coercion_rules() {
+        assert_eq!(Value::Number(0.0).as_bool(), Some(false));
+        assert_eq!(Value::Number(-1.0).as_bool(), Some(true));
+        assert_eq!(Value::Empty.as_bool(), Some(false));
+        assert_eq!(Value::Error(ErrorKind::Num).as_bool(), None);
+    }
+
+    #[test]
+    fn error_display_matches_excel() {
+        assert_eq!(ErrorKind::DivZero.to_string(), "#DIV/0!");
+        assert_eq!(ErrorKind::NotAvailable.to_string(), "#N/A");
+        assert_eq!(ErrorKind::Name.to_string(), "#NAME?");
+    }
+
+    #[test]
+    fn number_formatting() {
+        assert_eq!(format_number(42.0), "42");
+        assert_eq!(format_number(-7.0), "-7");
+        assert_eq!(format_number(3.5), "3.5");
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(1.0 / 3.0), "0.3333333333");
+    }
+}

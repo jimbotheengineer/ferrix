@@ -1,0 +1,21 @@
+[package]
+name = "ferrix-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Benchmark harness and data generator for Ferrix"
+
+[dependencies]
+ferrix-core.workspace = true
+ferrix-io.workspace = true
+ferrix-formula.workspace = true
+
+[[bin]]
+name = "gen-data"
+path = "src/gen_data.rs"
+
+[[bin]]
+name = "bench-load"
+path = "src/bench_load.rs"

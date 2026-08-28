@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrix-core",
+    "crates/ferrix-io",
+    "crates/ferrix-formula",
+    "crates/ferrix-ui",
+    "crates/ferrix-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ferrix-sheets/ferrix"
+authors = ["Ferrix contributors"]
+
+[workspace.dependencies]
+ferrix-core = { path = "crates/ferrix-core" }
+ferrix-io = { path = "crates/ferrix-io" }
+ferrix-formula = { path = "crates/ferrix-formula" }
+
+# Release profile tuned for throughput on very large datasets.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Benchmarks need unwinding, and we want release-grade codegen.
+[profile.bench]
+inherits = "release"
+panic = "unwind"
+strip = "none"
+debug = 1
+
+# Dev builds are unusably slow on 10M-row data without optimized deps.
+[profile.dev.package."*"]
+opt-level = 3
