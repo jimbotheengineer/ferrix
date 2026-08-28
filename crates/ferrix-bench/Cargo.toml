@@ -51,3 +51,7 @@ path = "src/bench_mmap.rs"
 [[bin]]
 name = "bench-filter"
 path = "src/bench_filter.rs"
+
+[[bin]]
+name = "make-fixture"
+path = "src/make_fixture.rs"

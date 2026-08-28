@@ -30,7 +30,7 @@ pub use filter::RowFilter;
 pub use overlay::{CellInput, EditOverlay};
 pub use search::{IdSet, Query, SearchResults};
 pub use selection::Selection;
-pub use sheet::{column_name, CellRef, Sheet};
+pub use sheet::{column_name, CellRef, Sheet, SheetCell, SheetId};
 pub use table::{
     CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,
     Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,

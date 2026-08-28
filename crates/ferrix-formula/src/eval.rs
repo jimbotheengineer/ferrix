@@ -23,6 +23,38 @@ pub trait CellSource {
     fn count_rect(&self, start: CellRef, end: CellRef) -> usize;
     /// Row extent, used to clamp open-ended ranges.
     fn row_count(&self) -> usize;
+
+    // --- cross-sheet reads -----------------------------------------------
+    //
+    // These are on `CellSource` with defaults rather than in a second trait so
+    // that a lone `Sheet` — which genuinely has no siblings — stays usable
+    // everywhere it was before. A source with no workbook around it answers
+    // `#REF!`, which is exactly what `Sheet2!A1` means when there is no
+    // Sheet2.
+
+    /// Read a cell in a named sibling sheet.
+    fn get_in(&self, _sheet: &str, _cell: CellRef) -> Value {
+        Value::Error(ErrorKind::Ref)
+    }
+
+    /// Is `sheet` a name this source can resolve? Drives `#REF!` reporting for
+    /// ranges, which cannot signal an error through their return type.
+    fn has_sheet(&self, _sheet: &str) -> bool {
+        false
+    }
+
+    /// Columnar sum inside a named sibling sheet. `None` when unresolvable.
+    fn sum_rect_in(&self, _sheet: &str, _start: CellRef, _end: CellRef) -> Option<f64> {
+        None
+    }
+
+    fn count_rect_in(&self, _sheet: &str, _start: CellRef, _end: CellRef) -> Option<usize> {
+        None
+    }
+
+    fn row_count_in(&self, _sheet: &str) -> Option<usize> {
+        None
+    }
 }
 
 impl CellSource for Sheet {
@@ -61,6 +93,16 @@ pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
         Expr::Text(_) => Value::Error(ErrorKind::Value),
         Expr::Ref(cell) => src.get(*cell),
         Expr::Range(_, _) => Value::Error(ErrorKind::Value),
+        Expr::XRef(sheet, cell) => src.get_in(sheet, *cell),
+        // A bare range is not a value in either flavour, but an unknown sheet
+        // name is a #REF! and should say so rather than #VALUE!.
+        Expr::XRange(sheet, _, _) => {
+            if src.has_sheet(sheet) {
+                Value::Error(ErrorKind::Value)
+            } else {
+                Value::Error(ErrorKind::Ref)
+            }
+        }
         Expr::Unary(op, inner) => {
             let v = eval_view(inner, src);
             if let Some(e) = v.error() {
@@ -168,6 +210,19 @@ where
                 }
             }
         }
+        Expr::XRange(sheet, start, end) => {
+            let Some(rows) = src.row_count_in(sheet) else {
+                return;
+            };
+            let r1 = (end.row as usize + 1).min(rows.max(1));
+            for c in start.col..=end.col {
+                for r in start.row as usize..r1 {
+                    if let Value::Number(n) = src.get_in(sheet, CellRef::new(r as u32, c)) {
+                        f(n);
+                    }
+                }
+            }
+        }
         other => {
             if let Some(n) = eval_view(other, src).as_number() {
                 f(n);
@@ -188,6 +243,17 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                 }
                 return Value::Number(src.sum_rect(*s, *e));
             }
+            // Same fast path for a cross-sheet range: the sibling sheet's own
+            // columnar sum, not a cell-by-cell walk.
+            if let [Expr::XRange(sh, s, e)] = args {
+                if let Some(err) = arg_error(&args[0], src) {
+                    return Value::Error(err);
+                }
+                return match src.sum_rect_in(sh, *s, *e) {
+                    Some(v) => Value::Number(v),
+                    None => Value::Error(ErrorKind::Ref),
+                };
+            }
             let mut acc = 0.0;
             for a in args {
                 if let Some(err) = arg_error(a, src) {
@@ -200,6 +266,12 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
         "COUNT" => {
             if let [Expr::Range(s, e)] = args {
                 return Value::Number(src.count_rect(*s, *e) as f64);
+            }
+            if let [Expr::XRange(sh, s, e)] = args {
+                return match src.count_rect_in(sh, *s, *e) {
+                    Some(n) => Value::Number(n as f64),
+                    None => Value::Error(ErrorKind::Ref),
+                };
             }
             let mut n = 0usize;
             for a in args {
@@ -219,6 +291,20 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                     return Value::Error(ErrorKind::DivZero);
                 }
                 return Value::Number(src.sum_rect(*s, *e) / count as f64);
+            }
+            if let [Expr::XRange(sh, s, e)] = args {
+                if let Some(err) = arg_error(&args[0], src) {
+                    return Value::Error(err);
+                }
+                let (Some(total), Some(count)) =
+                    (src.sum_rect_in(sh, *s, *e), src.count_rect_in(sh, *s, *e))
+                else {
+                    return Value::Error(ErrorKind::Ref);
+                };
+                if count == 0 {
+                    return Value::Error(ErrorKind::DivZero);
+                }
+                return Value::Number(total / count as f64);
             }
             let mut acc = 0.0;
             let mut n = 0usize;
@@ -329,6 +415,26 @@ fn arg_error<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Option<ErrorKind> {
             for c in start.col..=end.col {
                 for r in start.row as usize..r1 {
                     if let Value::Error(e) = src.get(CellRef::new(r as u32, c)) {
+                        return Some(e);
+                    }
+                }
+            }
+            None
+        }
+        Expr::XRange(sheet, start, end) => {
+            // An unresolvable sheet name IS the error — report it rather than
+            // letting the aggregate quietly sum nothing.
+            let Some(rows) = src.row_count_in(sheet) else {
+                return Some(ErrorKind::Ref);
+            };
+            let r1 = (end.row as usize + 1).min(rows.max(1));
+            let span = r1.saturating_sub(start.row as usize);
+            if span > MAX_SCAN {
+                return None;
+            }
+            for c in start.col..=end.col {
+                for r in start.row as usize..r1 {
+                    if let Value::Error(e) = src.get_in(sheet, CellRef::new(r as u32, c)) {
                         return Some(e);
                     }
                 }

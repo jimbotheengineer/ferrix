@@ -110,6 +110,10 @@ fn calls_are_supported(e: &Expr) -> bool {
         Expr::Unary(_, a) => calls_are_supported(a),
         Expr::Binary(_, a, b) => calls_are_supported(a) && calls_are_supported(b),
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::Range(_, _) => true,
+        // Cross-sheet references are supported now that workbooks hold every
+        // sheet; whether the named sheet actually exists is resolved when the
+        // workbook builds its dependency graph, not here.
+        Expr::XRef(_, _) | Expr::XRange(_, _, _) => true,
     }
 }
 
@@ -251,9 +255,8 @@ fn build_sheet(
         // xlsx stores the body without the leading '='.
         let src = format!("={src}");
         if !formula_is_supported(&src) {
-            // An Excel function Ferrix does not implement, a cross-sheet
-            // reference, or a structured table reference. Keep the cached
-            // value, drop the formula.
+            // An Excel function Ferrix does not implement, or a structured
+            // table reference. Keep the cached value, drop the formula.
             stats.formulas_dropped += 1;
             continue;
         }

@@ -12,6 +12,44 @@ pub struct CellRef {
     pub col: u32,
 }
 
+/// Identity of a sheet inside a workbook.
+///
+/// Deliberately a stable opaque id rather than a tab position: sheets can be
+/// reordered and renamed, and a formula's dependencies must survive both. Only
+/// the workbook mints these, and it never reuses one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+pub struct SheetId(pub u32);
+
+impl SheetId {
+    /// The id every single-sheet code path implicitly works in. Keeping it at
+    /// 0 means a workbook that never grows a second sheet behaves — and keys
+    /// its dependency graph — exactly as it did before sheets existed.
+    pub const MAIN: SheetId = SheetId(0);
+}
+
+/// A cell addressed workbook-wide: which sheet, and where in it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+pub struct SheetCell {
+    pub sheet: SheetId,
+    pub cell: CellRef,
+}
+
+impl SheetCell {
+    #[inline]
+    pub const fn new(sheet: SheetId, cell: CellRef) -> Self {
+        Self { sheet, cell }
+    }
+
+    /// A cell in the implicit main sheet — the bridge for single-sheet code.
+    #[inline]
+    pub const fn main(cell: CellRef) -> Self {
+        Self {
+            sheet: SheetId::MAIN,
+            cell,
+        }
+    }
+}
+
 impl CellRef {
     pub const fn new(row: u32, col: u32) -> Self {
         Self { row, col }

@@ -64,6 +64,27 @@ pub fn offset_formula(src: &str, drow: i64, dcol: i64) -> String {
             continue;
         }
 
+        // Skip quoted sheet names wholesale: 'Q1 2024'!A1 contains the word
+        // Q1, which is a perfectly good cell reference and would otherwise be
+        // shifted, silently renaming the sheet the formula points at.
+        if ch == b'\'' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+
         // A word starts at $ or a letter.
         if ch == b'$' || ch.is_ascii_alphabetic() || ch == b'_' {
             let start = i;
@@ -73,6 +94,13 @@ pub fn offset_formula(src: &str, drow: i64, dcol: i64) -> String {
                 i += 1;
             }
             let word = &src[start..i];
+
+            // A bare word followed by `!` is a sheet qualifier, not a cell —
+            // `Sheet1!A1` filled down must stay Sheet1, and only A1 moves.
+            if b.get(i) == Some(&b'!') {
+                out.push_str(word);
+                continue;
+            }
 
             // A word immediately followed by '(' is a function call, never a
             // reference — the same disambiguation the tokenizer uses, which is
