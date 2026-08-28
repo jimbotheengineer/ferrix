@@ -82,6 +82,10 @@ impl BaseData {
 
     /// Resident cost. For a mapping this is address space, not RAM — the OS
     /// pages in only what is touched.
+    ///
+    /// Kept as public API for memory reporting/diagnostics; no UI surface
+    /// consumes it yet.
+    #[allow(dead_code)]
     pub fn bytes(&self) -> usize {
         match self {
             BaseData::Memory(s) => s.heap_bytes(),
@@ -227,6 +231,9 @@ impl<'a> SheetView<'a> {
         total.max(0) as usize
     }
 
+    /// Kept as public API for memory reporting/diagnostics; no UI surface
+    /// consumes it yet.
+    #[allow(dead_code)]
     pub fn heap_bytes(&self) -> usize {
         self.base.bytes() + self.overlay.heap_bytes()
     }
@@ -370,9 +377,11 @@ mod tests {
     fn count_is_overlay_corrected() {
         let base = base_sheet();
         let mut ov = EditOverlay::new();
-        let v0 = SheetView::new(&base, &ov);
-        assert_eq!(v0.count_rect(CellRef::new(0, 0), CellRef::new(9, 0)), 10);
-        drop(v0);
+        {
+            // Scoped so the immutable borrow of `ov` ends before we mutate it.
+            let v0 = SheetView::new(&base, &ov);
+            assert_eq!(v0.count_rect(CellRef::new(0, 0), CellRef::new(9, 0)), 10);
+        }
 
         // Blanking a numeric cell must drop the count.
         ov.set(CellRef::new(0, 0), CellInput::Literal(Value::Empty));

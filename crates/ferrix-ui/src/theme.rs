@@ -31,12 +31,12 @@ impl Theme {
         v.window_fill = Self::BG;
         v.extreme_bg_color = Self::BG;
         v.override_text_color = Some(Self::TEXT);
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Self::GRID_LINE);
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, Self::GRID_LINE);
         v.widgets.inactive.bg_fill = Self::HEADER_BG;
         v.widgets.hovered.bg_fill = Self::ACCENT_SOFT;
         v.widgets.active.bg_fill = Self::ACCENT_SOFT;
         v.selection.bg_fill = Self::ACCENT_SOFT;
-        v.selection.stroke = Stroke::new(1.0, Self::ACCENT);
+        v.selection.stroke = Stroke::new(1.0_f32, Self::ACCENT);
         v.widgets.noninteractive.rounding = Rounding::same(2.0);
         ctx.set_visuals(v);
 

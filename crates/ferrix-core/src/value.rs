@@ -84,19 +84,14 @@ impl std::fmt::Display for ErrorKind {
 ///
 /// `Number` is f64 to match IEEE-754 spreadsheet semantics exactly.
 /// `Text` holds an arena id, not the bytes.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Value {
+    #[default]
     Empty,
     Number(f64),
     Bool(bool),
     Text(StrId),
     Error(ErrorKind),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Value::Empty
-    }
 }
 
 impl Value {

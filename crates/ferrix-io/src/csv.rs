@@ -199,16 +199,16 @@ pub(crate) fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
     for (i, &b) in data.iter().enumerate() {
         match b {
             b'"' => in_quotes = !in_quotes,
-            b'\n' if !in_quotes => {
-                if i + 1 > next_target && i + 1 > start {
-                    bounds.push((start, i + 1));
-                    start = i + 1;
-                    while next_target <= start {
-                        next_target += target;
-                    }
-                    if bounds.len() + 1 >= n {
-                        break;
-                    }
+            // Guard collapsed into the match arm; a failed guard falls through
+            // to the `_` arm, which is the same no-op as before.
+            b'\n' if !in_quotes && i + 1 > next_target && i + 1 > start => {
+                bounds.push((start, i + 1));
+                start = i + 1;
+                while next_target <= start {
+                    next_target += target;
+                }
+                if bounds.len() + 1 >= n {
+                    break;
                 }
             }
             _ => {}
@@ -318,8 +318,8 @@ fn parse_chunk(data: &[u8], delim: u8) -> ChunkResult {
             fields[c].push(infer(cell));
         }
         // Rows narrower than the running width get padded.
-        for c in cells.len()..fields.len() {
-            fields[c].push(FieldValue::Empty);
+        for f in fields.iter_mut().skip(cells.len()) {
+            f.push(FieldValue::Empty);
         }
         rows += 1;
     }
