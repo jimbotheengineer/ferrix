@@ -1,19 +1,16 @@
 name: nightly
 
-# Every 12 hours, plus a manual trigger for testing.
+# Daily, plus a manual trigger for testing.
 #
 # BUDGET NOTE: this repo is private on the free plan, which grants 2,000
-# Actions minutes/month. Linux bills at 1x but **Windows bills at 2x**, so a
-# naive matrix build twice a day would cost roughly:
-#   (5 min Linux x 1) + (6 min Windows x 2) = 17 min per run
-#   17 x 60 runs/month = ~1,020 min/month
-# That is half the budget spent even on days when nothing changed. So the
-# `changes` job below checks whether any commit landed since the last nightly
-# tag and skips the whole build when the tree is identical. On an idle day the
-# cost is a few seconds of a Linux runner.
+# Actions minutes/month. Linux bills at 1x but **Windows bills at 2x**. The
+# first real run cost ~7 min Linux + ~9 min Windows, so a daily build is:
+#   (7 x 1) + (9 x 2) = 25 min per run, x 30 runs = ~750 min/month
+# Well inside budget. The `changes` job below still skips the build entirely
+# when no commit has landed since the last nightly, so idle days cost seconds.
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       force:
