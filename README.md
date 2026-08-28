@@ -177,6 +177,34 @@ the source preserves `$`, the user's spacing, and anything the scanner does not
 recognise — including `"A1"` inside a string literal, which is text, not a
 reference.
 
+### Charts: aggregating more data than there are pixels
+
+A chart canvas is ~1,000 pixels wide. A 200M-row column has ~200,000 points
+per pixel column, so building one primitive per row would allocate gigabytes
+to draw something the eye cannot resolve.
+
+Aggregation therefore happens in the columnar store, before any geometry
+exists. Measured over **20 million rows**:
+
+| Aggregation | Output | Time | Reduction |
+|---|---|---|---|
+| Line, 500 buckets | 1,000 points | 17 ms | 20,000x |
+| Histogram, 64 bins | 64 bars | 35 ms | — |
+| Scatter, 128x128 grid | 16,384 cells | 93 ms | 1,220x |
+| Group-by category | 6 bars | 308 ms | — |
+
+Output size tracks the canvas, never the input.
+
+**Line charts use min/max decimation, not sampling.** Sampling every 200,000th
+point would give a one-row spike a 1-in-200,000 chance of being drawn — it
+would silently delete the outliers a human is scanning for. Min/max emits both
+extremes of each pixel column, so a single anomalous row in a million always
+appears. A test pins exactly that.
+
+Gaps are gaps: an empty or non-numeric cell is skipped rather than plotted as
+zero, because inventing a data point the source never contained is worse than
+a break in the line.
+
 ### Getting data back out
 
 Saving writes a `.fxedits` sidecar that only Ferrix reads, so **Export CSV**
@@ -325,7 +353,7 @@ error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
 ## Testing
 
 ```bash
-cargo test --workspace     # 272 tests
+cargo test --workspace     # 322 tests
 ```
 
 Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a

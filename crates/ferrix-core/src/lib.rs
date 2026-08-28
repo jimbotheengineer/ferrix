@@ -10,6 +10,7 @@
 
 pub mod arena;
 pub mod bitmap;
+pub mod chart;
 pub mod column;
 pub mod overlay;
 pub mod search;
