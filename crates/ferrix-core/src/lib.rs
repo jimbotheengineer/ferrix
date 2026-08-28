@@ -15,6 +15,7 @@ pub mod overlay;
 pub mod search;
 pub mod selection;
 pub mod sheet;
+pub mod table;
 pub mod tsv;
 pub mod value;
 
@@ -25,4 +26,9 @@ pub use overlay::{CellInput, EditOverlay};
 pub use search::{IdSet, Query, SearchResults};
 pub use selection::Selection;
 pub use sheet::{column_name, CellRef, Sheet};
+pub use table::{
+    CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,
+    Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,
+    ValidationReport, ValidationRule, Violation,
+};
 pub use value::{format_number, ErrorKind, Value, ValueTag};

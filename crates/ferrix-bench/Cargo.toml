@@ -31,3 +31,7 @@ path = "src/check_persist.rs"
 [[bin]]
 name = "bench-mmap"
 path = "src/bench_mmap.rs"
+
+[[bin]]
+name = "bench-filter"
+path = "src/bench_filter.rs"

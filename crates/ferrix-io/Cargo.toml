@@ -12,6 +12,12 @@ calamine = "0.36"
 ferrix-core.workspace = true
 ferrix-formula.workspace = true
 memmap2 = "0.9"
+# Reading table/validation/conditional-format parts needs the raw OOXML:
+# calamine surfaces cell values, not the `xl/tables/*.xml` or `dataValidations`
+# elements, and rust_xlsxwriter only writes. So the importer opens the package
+# itself. Both crates are already in the tree via rust_xlsxwriter/calamine.
+quick-xml = "0.41"
 rayon = "1.10"
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 thiserror = "2"
+zip = { version = "8", default-features = false, features = ["deflate"] }

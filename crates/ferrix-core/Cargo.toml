@@ -8,5 +8,11 @@ repository.workspace = true
 description = "Columnar storage engine for the Ferrix spreadsheet"
 
 [dependencies]
+# A validation rule needs a regex engine. regex-lite is the one that does not
+# drag in aho-corasick/memchr and a multi-second build: this crate is on the
+# critical path for every workspace compile, and the rules people write in a
+# validation box (`\d{4}-\d{2}`, `[A-Z]{3}`) do not need the full engine's
+# throughput. Cells are validated for a viewport at a time, not 200M at once.
+regex-lite = "0.1"
 
 [dev-dependencies]

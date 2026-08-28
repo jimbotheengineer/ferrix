@@ -32,6 +32,7 @@ use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
 use ferrix_core::{column_name, CellRef, Selection, Value};
 
 use crate::sheet_view::SheetView;
+use crate::table_view::TableDecor;
 use crate::theme::Theme;
 
 pub const FILL_HANDLE: f32 = 7.0;
@@ -101,6 +102,10 @@ pub struct Grid<'a> {
     /// True while the user is dragging the fill handle, so the grid reports
     /// fill targets rather than ordinary selection drags.
     pub filling: bool,
+    /// Structured table covering part of the sheet, if any. Supplies number
+    /// formats, conditional styling, banding, validation flags, and — when a
+    /// header filter is active — the view-row to data-row mapping.
+    pub table: Option<&'a TableDecor<'a>>,
 }
 
 impl<'a> Grid<'a> {
@@ -137,8 +142,23 @@ impl<'a> Grid<'a> {
 
     pub fn show(self, ui: &mut Ui) -> GridResponse {
         let view = self.view;
-        let total_rows = view.row_count().max(1);
+        // With a header filter active the grid scrolls through the *surviving*
+        // rows, not the sheet's. Row `n` on screen is the nth row the filter
+        // kept, resolved by `data_row` below — a rank lookup, not a scan, so
+        // this stays O(1)-ish per painted row at any table height.
+        let data_rows = view.row_count().max(1);
+        let total_rows = self
+            .table
+            .map_or(data_rows, |t| t.visible_row_count(data_rows))
+            .max(1);
         let total_cols = view.col_count().max(1);
+        // Map a view row to the underlying data row. Identity when unfiltered.
+        let to_data = |r: usize| -> Option<usize> {
+            match self.table {
+                None => Some(r),
+                Some(t) => t.data_row(r),
+            }
+        };
 
         let width_of =
             |c: usize| -> f32 { self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH) };
@@ -242,6 +262,11 @@ impl<'a> Grid<'a> {
 
         for r in row_range.clone() {
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
+            // The data row this screen row shows. A filter can leave a screen
+            // row with nothing behind it only past the end of the view, which
+            // the row_range clamp already excludes — but guard anyway rather
+            // than paint another row's values under the wrong row number.
+            let Some(dr) = to_data(r) else { continue };
             let row_rect = Rect::from_min_size(
                 egui::pos2(body_rect.min.x, y),
                 Vec2::new(body_rect.width(), ROW_HEIGHT),
@@ -254,7 +279,36 @@ impl<'a> Grid<'a> {
                 let x = body_origin.x + col_x[c] - self.scroll.col_px;
                 let w = width_of(c);
                 let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
-                let cref = CellRef::new(r as u32, c as u32);
+                let cref = CellRef::new(dr as u32, c as u32);
+
+                // Table decoration: number format, conditional styling,
+                // banding, and the validation flag. Resolved per painted cell,
+                // so a table over 200M rows costs exactly what one over 200
+                // does. A cell the table has nothing to say about is dropped
+                // here so the paint path below stays on its ordinary branch.
+                let decor = self
+                    .table
+                    .map(|t| t.cell(view, cref))
+                    .filter(|d| !d.is_plain());
+
+                if let Some(d) = &decor {
+                    if d.banded {
+                        painter.rect_filled(cell_rect, 0.0, Theme::TABLE_BAND);
+                    }
+                    if let Some(fill) = d.fill {
+                        painter.rect_filled(cell_rect, 0.0, fill);
+                    }
+                    if let Some((frac, color)) = d.bar {
+                        // The bar is drawn behind the text, inset so grid
+                        // lines stay legible.
+                        let inner = cell_rect.shrink2(Vec2::new(1.5, 3.0));
+                        let bar = Rect::from_min_size(
+                            inner.min,
+                            Vec2::new(inner.width() * frac, inner.height()),
+                        );
+                        painter.rect_filled(bar, 1.0, color);
+                    }
+                }
 
                 // Search highlight sits under the selection so both remain
                 // visible when the cursor is parked on a match.
@@ -291,7 +345,7 @@ impl<'a> Grid<'a> {
 
                 let value = view.get(cref);
                 if !matches!(value, Value::Empty) {
-                    let (text, color, align) = match value {
+                    let (mut text, mut color, align) = match value {
                         Value::Number(n) => (
                             ferrix_core::format_number(n),
                             Theme::NUMBER,
@@ -310,6 +364,17 @@ impl<'a> Grid<'a> {
                         Value::Error(e) => (e.to_string(), Theme::ERROR, Align2::RIGHT_CENTER),
                         Value::Empty => unreachable!(),
                     };
+
+                    // A table column's number format replaces the default
+                    // rendering, and a conditional rule may recolour the text.
+                    if let Some(d) = &decor {
+                        if let Some(t) = &d.text {
+                            text.clone_from(t);
+                        }
+                        if let Some(c) = d.text_color {
+                            color = c;
+                        }
+                    }
 
                     // A formula cell gets a subtle marker so it is
                     // distinguishable from a typed-in literal.
@@ -332,6 +397,26 @@ impl<'a> Grid<'a> {
                     painter
                         .with_clip_rect(cell_rect.intersect(body_rect).shrink2(Vec2::new(2.0, 0.0)))
                         .text(anchor, align, text, FontId::proportional(12.5), color);
+                }
+
+                // The validation flag goes on LAST, over everything else. A
+                // cell that fails its column's rule is never rejected or
+                // rewritten — it keeps its value and gets a red triangle in the
+                // top-right corner, the way a spreadsheet marks a problem the
+                // user has to look at.
+                if let Some(d) = &decor {
+                    if d.violation.is_some() {
+                        let tr = egui::pos2(cell_rect.max.x, cell_rect.min.y);
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                tr,
+                                egui::pos2(tr.x - 7.0, tr.y),
+                                egui::pos2(tr.x, tr.y + 7.0),
+                            ],
+                            Theme::INVALID_FLAG,
+                            Stroke::NONE,
+                        ));
+                    }
                 }
                 painted_cells += 1;
             }
@@ -360,7 +445,10 @@ impl<'a> Grid<'a> {
             if r < 0.0 || c < 0 || r as usize >= total_rows || c as usize >= total_cols {
                 return None;
             }
-            Some(CellRef::new(r as u32, c as u32))
+            // Report the DATA row, so a click under a filter selects the cell
+            // the user actually pointed at rather than its screen position.
+            let dr = to_data(r as usize)?;
+            Some(CellRef::new(dr as u32, c as u32))
         };
         if primary_clicked {
             clicked = pointer_pos.and_then(hit);
@@ -535,13 +623,17 @@ impl<'a> Grid<'a> {
         let rhp = hp.with_clip_rect(row_header);
         for r in row_range.clone() {
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
+            // Row numbers name the DATA row, so a filtered view shows the
+            // original 1, 5, 9, ... rather than renumbering to 1, 2, 3 — the
+            // user must always be able to tell which rows are hidden.
+            let Some(dr) = to_data(r) else { continue };
             let rect = Rect::from_min_size(
                 egui::pos2(outer.min.x, y),
                 Vec2::new(ROW_HEADER_WIDTH, ROW_HEIGHT),
             );
             let selected = self.selection.is_some_and(|s| {
                 let (a, b) = s.row_range();
-                r >= a as usize && r <= b as usize
+                dr >= a as usize && dr <= b as usize
             });
             if selected {
                 rhp.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
@@ -549,7 +641,7 @@ impl<'a> Grid<'a> {
             rhp.text(
                 egui::pos2(rect.max.x - 8.0, rect.center().y),
                 Align2::RIGHT_CENTER,
-                (r + 1).to_string(),
+                (dr + 1).to_string(),
                 FontId::proportional(11.5),
                 if selected {
                     Theme::ACCENT

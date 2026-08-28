@@ -1,6 +1,7 @@
 //! Sheet: a collection of columns plus the shared string arena.
 
 use crate::arena::{StrId, StringArena};
+use crate::bitmap::Bitmap;
 use crate::column::Column;
 use crate::value::Value;
 
@@ -248,6 +249,167 @@ impl Sheet {
             millis: t.elapsed().as_millis(),
             matched_strings: ids.len(),
         }
+    }
+
+    // ------------------------------------------------------ structured tables
+
+    /// Apply a table's active header filters, producing a row mask.
+    ///
+    /// Every predicate is compiled against the arena *once* (see
+    /// [`CompiledPredicate`]), then each filtered column is scanned as
+    /// integers via [`Column::scan_filter`]. Columns with no filter are not
+    /// touched at all. The result is a bitmap plus a rank index — never a
+    /// materialised copy of the matching rows.
+    ///
+    /// `row_budget` caps how many rows are examined, so an interactive caller
+    /// can keep a 200M-row filter inside a frame budget and finish the rest in
+    /// the background; the returned mask reports `is_truncated()` when it bit.
+    /// Pass `usize::MAX` for a complete pass.
+    ///
+    /// # Measured cost
+    ///
+    /// `cargo run --release -p ferrix-bench --bin bench-filter` on 10M and 50M
+    /// rows of 4-distinct-string data:
+    ///
+    /// | stage                  | 10M rows | 50M rows | scaling      |
+    /// |------------------------|----------|----------|--------------|
+    /// | arena pass (step 1)    | 0.006 ms | 0.003 ms | independent  |
+    /// | text checklist scan    | 17 ms    | 92 ms    | ~540M rows/s |
+    /// | numeric comparison     | 21 ms    | 101 ms   | ~490M rows/s |
+    /// | two columns ANDed      | 34 ms    | 158 ms   | linear       |
+    /// | `nth_visible` lookup   | 789 ns   | 796 ns   | independent  |
+    ///
+    /// The arena pass is flat because it is one comparison per *distinct*
+    /// string, and the scan is flat per row because it compares 4-byte ids.
+    /// Extrapolating the measured 540M rows/s, a single-column filter over
+    /// 200M rows is ~370ms — not one frame, which is exactly why `row_budget`
+    /// exists. `nth_visible` staying at ~790ns regardless of height is what
+    /// keeps the *scrolling* of a filtered view free.
+    ///
+    /// Two honest caveats, both measured rather than assumed:
+    ///
+    /// * The bitmaps are sized by the sheet's total rows, not the budget, so a
+    ///   bounded scan still pays an allocation proportional to the table's
+    ///   height (31.9ms for a 1M-row budget over a 50M-row sheet, versus 7.2ms
+    ///   over a 10M-row one). Reusing a mask across calls would fix that; it is
+    ///   not done yet.
+    /// * This is the in-RAM path only. A 200M-row dataset in `Sheet` form would
+    ///   need ~7.8 GB (measured: 392 MB per 10M rows x 3 columns), so at that
+    ///   size it lives in `BaseData::Mapped` — and `MappedSheet` has no
+    ///   `filter_table` yet. The arena-first machinery is shared and
+    ///   [`CompiledPredicate::compile_with`] exists precisely so the mapped
+    ///   reader can adopt it, but that scan is not written.
+    ///
+    /// [`CompiledPredicate`]: crate::table::CompiledPredicate
+    pub fn filter_table(
+        &self,
+        table: &crate::table::Table,
+        row_budget: usize,
+    ) -> crate::table::RowMask {
+        let t = std::time::Instant::now();
+        let rows = table.data_rows();
+        let (r0, r1) = (rows.start as usize, rows.end as usize);
+        let scan_end = r1.min(r0.saturating_add(row_budget));
+        let truncated = scan_end < r1;
+
+        // Rows outside the table are not the filter's business; they stay
+        // visible so a table can sit inside a larger sheet.
+        let total = self.row_count.max(r1);
+        let mut mask = Bitmap::ones(total);
+        // Anything past the budget is hidden rather than guessed at — a
+        // partially-applied filter must not show rows it has not checked.
+        for r in scan_end..r1 {
+            mask.set(r, false);
+        }
+
+        for (i, tcol) in table.columns.iter().enumerate() {
+            let Some(pred) = &tcol.filter else { continue };
+            let compiled = crate::table::CompiledPredicate::compile(pred, &self.arena);
+            let sheet_col = table.sheet_col(i) as usize;
+            let mut accepted = Bitmap::zeros(total);
+            if let Some(col) = self.columns.get(sheet_col) {
+                col.scan_filter(r0, scan_end, &compiled, &mut accepted);
+            }
+            // AND into the running mask, restricted to the data rows.
+            for r in r0..scan_end {
+                if mask.get(r) && !accepted.get(r) {
+                    mask.set(r, false);
+                }
+            }
+        }
+
+        crate::table::RowMask::from_bits(mask).with_stats(
+            scan_end.saturating_sub(r0),
+            truncated,
+            t.elapsed().as_millis(),
+        )
+    }
+
+    /// Build the uniqueness index for one table column, or `None` when the
+    /// column does not need one.
+    pub fn uniqueness_index(
+        &self,
+        table: &crate::table::Table,
+        col_index: usize,
+    ) -> Option<crate::table::UniquenessIndex> {
+        let tcol = table.columns.get(col_index)?;
+        if !tcol.needs_uniqueness() {
+            return None;
+        }
+        let col = self.columns.get(table.sheet_col(col_index) as usize)?;
+        let mut idx = crate::table::UniquenessIndex::new(self.arena.len());
+        for r in table.data_rows() {
+            idx.observe(&col.get(r as usize));
+        }
+        Some(idx)
+    }
+
+    /// Validate every cell of a table, capping the reported list at `limit`.
+    ///
+    /// Bounded like [`Sheet::search`]: `total` is honest even when `invalid`
+    /// was cut short, so the UI can say "1,204,553 invalid cells" while only
+    /// holding the first few hundred.
+    pub fn validate_table(
+        &self,
+        table: &crate::table::Table,
+        limit: usize,
+    ) -> crate::table::ValidationReport {
+        let t = std::time::Instant::now();
+        let mut report = crate::table::ValidationReport::default();
+
+        // Uniqueness needs one whole-column pass; do it once per column
+        // instead of once per cell.
+        let uniques: Vec<Option<crate::table::UniquenessIndex>> = (0..table.columns.len())
+            .map(|i| self.uniqueness_index(table, i))
+            .collect();
+
+        for row in table.data_rows() {
+            for (i, tcol) in table.columns.iter().enumerate() {
+                if tcol.validation.is_vacuous() && tcol.ctype == crate::table::ColumnType::Any {
+                    continue;
+                }
+                let cell = CellRef::new(row, table.sheet_col(i));
+                let value = self.get(cell);
+                // Resolving display text is the one string cost here, so it is
+                // paid only for rules that actually need it.
+                let text = match &tcol.validation.rule {
+                    crate::table::ValidationRule::OneOf(_)
+                    | crate::table::ValidationRule::Regex(_)
+                    | crate::table::ValidationRule::TextLength { .. } => self.display(cell),
+                    _ => String::new(),
+                };
+                if let Some(v) = table.validate_cell(i, &value, &text, uniques[i].as_ref()) {
+                    report.total += 1;
+                    if report.invalid.len() < limit {
+                        report.invalid.push((cell, v));
+                    } else {
+                        report.truncated = true;
+                    }
+                }
+            }
+        }
+        report.millis = t.elapsed().as_millis();
+        report
     }
 }
 

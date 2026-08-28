@@ -318,6 +318,73 @@ impl Column {
         }
     }
 
+    /// Set a bit in `out` for every row in `[start, end)` matching `pred`.
+    ///
+    /// This is `scan_matches`'s sibling for filtering, and it is deliberately
+    /// the same shape: a tag-dispatched integer scan over contiguous arrays,
+    /// with text handled by testing the cell's 4-byte arena id against a
+    /// bitset the predicate compiled once. No string is touched per row, and
+    /// no per-row allocation happens — the output is a bitmap the caller
+    /// sized up front, so a filter that keeps 100M of 200M rows costs 25 MB
+    /// rather than 400 MB of row indices.
+    ///
+    /// Returns the number of rows accepted.
+    pub fn scan_filter(
+        &self,
+        start: usize,
+        end: usize,
+        pred: &crate::table::CompiledPredicate,
+        out: &mut Bitmap,
+    ) -> usize {
+        let end = end.min(self.tags.len());
+        if start >= end {
+            return 0;
+        }
+
+        // Whole-column skip, mirroring scan_matches. A numeric-only predicate
+        // over a column with no numbers, or a text predicate whose arena pass
+        // matched nothing, cannot produce a hit.
+        let text_possible = pred.can_match_text() && self.has_strings;
+        let num_possible = pred.can_match_numbers() && self.has_numbers;
+        let bool_possible = pred.matches_bool(true) || pred.matches_bool(false);
+        let err_possible = self.has_numbers;
+        if !text_possible
+            && !num_possible
+            && !bool_possible
+            && !err_possible
+            && !pred.matches_empty()
+        {
+            return 0;
+        }
+
+        let t_num = ValueTag::Number as u8;
+        let t_bool = ValueTag::Bool as u8;
+        let t_text = ValueTag::Text as u8;
+        let t_err = ValueTag::Error as u8;
+        let empty_ok = pred.matches_empty();
+
+        let mut kept = 0usize;
+        for i in start..end {
+            let tag = self.tags[i];
+            let hit = if tag == t_text {
+                text_possible && pred.matches_text_id(self.strings[i])
+            } else if tag == t_num {
+                num_possible && pred.matches_number(self.numbers[i])
+            } else if tag == t_bool {
+                bool_possible && pred.matches_bool(self.numbers[i] != 0.0)
+            } else if tag == t_err {
+                pred.matches_error(decode_error(self.numbers[i] as u8))
+            } else {
+                empty_ok
+            };
+            if hit {
+                out.set(i, true);
+                kept += 1;
+            }
+        }
+        kept
+    }
+
     /// Release excess capacity after ingest.
     pub fn shrink_to_fit(&mut self) {
         self.tags.shrink_to_fit();
