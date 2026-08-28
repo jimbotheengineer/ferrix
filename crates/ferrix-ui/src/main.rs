@@ -4,6 +4,7 @@ mod app;
 mod chart_panel;
 mod grid;
 mod sheet_view;
+mod table_view;
 mod theme;
 mod workbook;
 

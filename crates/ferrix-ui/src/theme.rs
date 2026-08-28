@@ -24,6 +24,13 @@ impl Theme {
     /// Fill for cells inside a multi-cell selection. Translucent so zebra
     /// striping and search highlights stay visible underneath.
     pub const RANGE_FILL: Color32 = Color32::from_rgba_premultiplied(0x2a, 0x3f, 0x5f, 0x90);
+    /// Banded-row fill inside a structured table. Distinct from `ROW_ALT` so
+    /// the table's own striping is visible against the sheet's.
+    pub const TABLE_BAND: Color32 = Color32::from_rgb(0x1a, 0x20, 0x2a);
+    /// The corner triangle marking a cell that fails its column's validation.
+    /// Deliberately loud: the whole point is that bad data is impossible to
+    /// miss rather than silently dropped.
+    pub const INVALID_FLAG: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4f);
 
     pub fn apply(ctx: &egui::Context) {
         let mut v = Visuals::dark();

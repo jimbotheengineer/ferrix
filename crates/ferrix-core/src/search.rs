@@ -193,6 +193,27 @@ impl IdSet {
         Self { words, count }
     }
 
+    /// Build from an arbitrary predicate over (id, string) pairs.
+    ///
+    /// Same arena-first economics as [`IdSet::from_arena`], but for callers
+    /// whose match test is not a [`Query`] — a filter's value checklist, for
+    /// instance. The predicate runs once per *distinct* string.
+    pub fn from_pairs_pred<'a, I, F>(len: usize, pairs: I, pred: F) -> Self
+    where
+        I: Iterator<Item = (usize, &'a String)>,
+        F: Fn(&str) -> bool,
+    {
+        let mut words = vec![0u64; len.div_ceil(64)];
+        let mut count = 0usize;
+        for (i, s) in pairs {
+            if i < len && pred(s) {
+                words[i >> 6] |= 1u64 << (i & 63);
+                count += 1;
+            }
+        }
+        Self { words, count }
+    }
+
     #[inline]
     pub fn contains(&self, id: u32) -> bool {
         let i = id as usize;

@@ -16,15 +16,18 @@ pub mod edits;
 pub mod export;
 pub mod format;
 pub mod mapped;
+pub mod table_xlsx;
 pub mod xlsx;
 
 pub use convert::{cache_is_fresh, cache_path_for, convert_csv, ConvertError, ConvertStats};
 pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use format::FormatError;
 pub use mapped::MappedSheet;
+pub use table_xlsx::{import_tables, write_table, FerrixTag, ImportedTable};
 pub use xlsx::{
-    export_workbook, export_xlsx, export_xlsx_with_formulas, import_xlsx, import_xlsx_full,
-    ImportStats, ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS, XLSX_MAX_ROWS,
+    export_workbook, export_xlsx, export_xlsx_with_formulas, export_xlsx_with_tables, import_xlsx,
+    import_xlsx_full, ImportStats, ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS,
+    XLSX_MAX_ROWS,
 };
 
 /// Files at or above this size are converted and memory-mapped rather than

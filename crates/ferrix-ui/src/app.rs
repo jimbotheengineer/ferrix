@@ -95,6 +95,22 @@ pub struct FerrixApp {
     fill_source: Option<Selection>,
     fill_target: Option<Selection>,
 
+    /// Structured tables defined over the current sheet.
+    ///
+    /// Only the first is decorated today — the grid takes one `TableDecor` —
+    /// but the vector is what xlsx import hands over and what export needs
+    /// back, so it is stored whole rather than collapsed to an Option.
+    tables: Vec<ferrix_core::Table>,
+    /// Row mask from the active header filters, recomputed only when a filter
+    /// changes rather than per frame.
+    table_mask: Option<ferrix_core::RowMask>,
+    /// Per-column uniqueness indexes, rebuilt alongside the mask. A `Unique`
+    /// rule cannot be judged from one cell, so this is the one thing the
+    /// renderer cannot compute locally.
+    table_uniques: Vec<Option<ferrix_core::UniquenessIndex>>,
+    /// Standing validation report for the badge in the status bar.
+    table_report: ferrix_core::ValidationReport,
+
     /// Where to persist edits, and the base identity they belong to. Both are
     /// None until a file is loaded.
     edits_path: Option<PathBuf>,
@@ -146,6 +162,10 @@ impl FerrixApp {
             row_filter: None,
             fill_source: None,
             fill_target: None,
+            tables: Vec::new(),
+            table_mask: None,
+            table_uniques: Vec::new(),
+            table_report: ferrix_core::ValidationReport::default(),
             edits_path: None,
             fingerprint: None,
             status: "Ready — open a CSV to begin".into(),
@@ -826,6 +846,140 @@ impl FerrixApp {
         };
     }
 
+    /// Open an `.xlsx`, bringing across any Excel Tables defined in it.
+    ///
+    /// Values and table definitions are read in separate passes because they
+    /// live in different parts of the package: calamine reads the cells,
+    /// [`ferrix_io::import_tables`] reads `xl/tables/*.xml` plus the
+    /// worksheet's validation and conditional-format elements.
+    fn open_xlsx_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel workbook", &["xlsx"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let sheets = match ferrix_io::import_xlsx(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+                return;
+            }
+        };
+        let Some((name, sheet)) = sheets.into_iter().next() else {
+            self.status = "Workbook has no worksheets".into();
+            return;
+        };
+        let rows = sheet.row_count();
+        let cols = sheet.col_count();
+
+        // A table part that will not parse must not cost the user their data:
+        // the sheet still opens, and the failure is reported.
+        let (tables, note) = match ferrix_io::import_tables(&path) {
+            Ok(t) => {
+                let n = t.len();
+                (
+                    t.into_iter()
+                        .filter(|t| t.sheet_index == 0)
+                        .map(|t| t.table)
+                        .collect::<Vec<_>>(),
+                    format!(", {n} table(s)"),
+                )
+            }
+            Err(e) => (Vec::new(), format!(" (table parts unreadable: {e})")),
+        };
+
+        self.wb = Workbook::new(BaseData::Memory(sheet));
+        self.stats_rows = rows;
+        self.stats_cols = cols;
+        self.col_widths = vec![crate::grid::DEFAULT_COL_WIDTH; cols];
+        self.selection = Selection::default();
+        self.scroll = ScrollState::default();
+        self.edits_path = None;
+        self.fingerprint = None;
+        self.set_tables(tables);
+        self.status = format!("Opened {name}: {} rows × {cols} cols{note}", fmt_int(rows));
+        self.sync_formula_bar();
+    }
+
+    /// Write this sheet and its tables as a real Excel workbook.
+    fn export_xlsx_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel workbook", &["xlsx"])
+            .set_file_name("export.xlsx")
+            .save_file()
+        else {
+            return;
+        };
+        // Only the in-RAM path can be handed to the writer; a mapped base has
+        // no `Sheet` to give it.
+        let BaseData::Memory(sheet) = &self.wb.base else {
+            self.status =
+                "xlsx export of memory-mapped data is not supported yet — export CSV instead"
+                    .into();
+            return;
+        };
+        self.status = match ferrix_io::export_xlsx_with_tables(&path, sheet, "Sheet1", &self.tables)
+        {
+            Ok(()) => format!(
+                "Exported {} table(s) → {}",
+                self.tables.len(),
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
+    /// Install structured tables over the current sheet and refresh everything
+    /// derived from them.
+    ///
+    /// Kept as the single entry point so the filter mask, the uniqueness
+    /// indexes and the validation badge can never drift out of sync with the
+    /// table definitions. Public so an xlsx import can hand its tables over.
+    pub fn set_tables(&mut self, tables: Vec<ferrix_core::Table>) {
+        self.tables = tables;
+        self.refresh_tables();
+    }
+
+    /// Recompute the filter mask, uniqueness indexes and validation report.
+    ///
+    /// Deliberately *not* per frame. Each of these needs a pass over the
+    /// table's rows, which is fine on a filter change and ruinous at 60 Hz, so
+    /// it runs when the definitions or the data change and the results are
+    /// cached until then.
+    fn refresh_tables(&mut self) {
+        self.table_mask = None;
+        self.table_uniques = Vec::new();
+        self.table_report = ferrix_core::ValidationReport::default();
+
+        let Some(table) = self.tables.first() else {
+            return;
+        };
+        // Only the in-RAM path can be filtered/validated today. A mapped base
+        // exposes no per-column scan hook yet, and silently showing an
+        // unfiltered view would be worse than showing no filter at all — so
+        // the state stays empty and the status bar says why.
+        let BaseData::Memory(sheet) = &self.wb.base else {
+            self.status = format!(
+                "Table {:?} loaded; filtering and validation are not yet available on \
+                 memory-mapped data",
+                table.name
+            );
+            return;
+        };
+
+        if table.columns.iter().any(|c| c.filter.is_some()) {
+            self.table_mask = Some(sheet.filter_table(table, usize::MAX));
+        }
+        self.table_uniques = (0..table.columns.len())
+            .map(|i| sheet.uniqueness_index(table, i))
+            .collect();
+        // Capped: a table where every row is bad must not build a 200M-entry
+        // list just to render a badge.
+        self.table_report = sheet.validate_table(table, 1000);
+    }
+
     fn sync_formula_bar(&mut self) {
         self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
@@ -1260,6 +1414,26 @@ impl eframe::App for FerrixApp {
                     {
                         self.open_chart();
                     }
+                    if ui
+                        .button("Open xlsx…")
+                        .on_hover_text(
+                            "Open a workbook, importing any Excel Tables with their \
+                             validation, formatting, and filters",
+                        )
+                        .clicked()
+                    {
+                        self.open_xlsx_dialog();
+                    }
+                    if ui
+                        .add_enabled(!self.tables.is_empty(), egui::Button::new("⬈ Export xlsx…"))
+                        .on_hover_text(
+                            "Write this sheet and its table as a real Excel Table, with \
+                             dataValidation, conditionalFormatting, and autoFilter parts",
+                        )
+                        .clicked()
+                    {
+                        self.export_xlsx_dialog();
+                    }
                     ui.add_space(4.0);
                     let dirty = self.wb.is_dirty();
                     if ui
@@ -1579,6 +1753,29 @@ impl eframe::App for FerrixApp {
                             .size(11.5)
                             .monospace(),
                         );
+                        // Invalid-cell badge. The count is honest even when
+                        // the report's list was capped, so a table with a
+                        // million bad rows says so instead of saying "1000".
+                        if self.table_report.total > 0 {
+                            ui.label(
+                                RichText::new(format!("⚠ {} invalid", self.table_report.total))
+                                    .color(Theme::INVALID_FLAG)
+                                    .size(11.5)
+                                    .monospace(),
+                            );
+                        }
+                        if let Some(m) = &self.table_mask {
+                            ui.label(
+                                RichText::new(format!(
+                                    "filtered {} / {}",
+                                    m.visible_rows(),
+                                    m.total_rows()
+                                ))
+                                .color(Theme::ACCENT)
+                                .size(11.5)
+                                .monospace(),
+                            );
+                        }
                     });
                 });
             });
@@ -1616,6 +1813,21 @@ impl eframe::App for FerrixApp {
 
                 let resp = {
                     let view = self.wb.view();
+                    // Table decoration is prepared once per frame for the
+                    // visible rows only, so its cost is independent of how
+                    // many rows the table covers.
+                    let decor = self.tables.first().map(|t| {
+                        let first = self.scroll.row_offset.floor().max(0.0) as u32;
+                        let count =
+                            (self.last_viewport_h / crate::grid::ROW_HEIGHT).ceil() as u32 + 1;
+                        crate::table_view::TableDecor::prepare(
+                            t,
+                            self.table_mask.as_ref(),
+                            &self.table_uniques,
+                            &view,
+                            first..first.saturating_add(count),
+                        )
+                    });
                     Grid {
                         view: &view,
                         selection: Some(self.selection),
@@ -1625,6 +1837,7 @@ impl eframe::App for FerrixApp {
                         matches: &self.search_results.matches,
                         filling: self.fill_source.is_some(),
                         filter: self.row_filter.as_ref(),
+                        table: decor.as_ref(),
                         current_match: if self.search_open {
                             self.search_results.wrapped(self.search_index)
                         } else {

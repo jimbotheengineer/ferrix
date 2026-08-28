@@ -177,6 +177,41 @@ impl Bitmap {
         Self::mask_tail(&mut self.words, new_len);
     }
 
+    /// Number of set bits in `[start, end)`.
+    ///
+    /// Word-at-a-time via `count_ones`, so a filter's rank index over 200M
+    /// rows is built at memory bandwidth rather than one bit at a time.
+    pub fn count_range(&self, start: usize, end: usize) -> usize {
+        let end = end.min(self.len);
+        if start >= end {
+            return 0;
+        }
+        let (w0, w1) = (start >> 6, (end - 1) >> 6);
+        if w0 == w1 {
+            let width = end - start;
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << width) - 1) << (start & 63)
+            };
+            return (self.words[w0] & mask).count_ones() as usize;
+        }
+        // Leading partial word.
+        let mut n = (self.words[w0] & (!0u64 << (start & 63))).count_ones() as usize;
+        // Whole words in between.
+        for w in &self.words[w0 + 1..w1] {
+            n += w.count_ones() as usize;
+        }
+        // Trailing partial word.
+        let rem = end & 63;
+        let tail = if rem == 0 {
+            self.words[w1]
+        } else {
+            self.words[w1] & ((1u64 << rem) - 1)
+        };
+        n + tail.count_ones() as usize
+    }
+
     /// True when every bit in `[start, end)` is clear. Used by the renderer to
     /// skip entirely-blank row bands without touching individual cells.
     pub fn is_range_empty(&self, start: usize, end: usize) -> bool {

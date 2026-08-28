@@ -150,6 +150,10 @@ pub enum XlsxError {
 
     #[error("workbook has no worksheets")]
     NoSheets,
+
+    /// A table part existed but could not be understood.
+    #[error("reading table parts of {path}: {detail}")]
+    TableParse { path: String, detail: String },
 }
 
 /// A worksheet as it came out of a workbook.
@@ -329,6 +333,10 @@ pub struct SheetExport<'a> {
     pub sheet: &'a Sheet,
     /// Formulas to write instead of the sheet's cached values.
     pub formulas: Option<&'a EditOverlay>,
+    /// Structured tables to define over this sheet. Each becomes a real
+    /// `xl/tables/tableN.xml` part plus its validation/conditional-format
+    /// elements — see [`crate::table_xlsx`].
+    pub tables: &'a [ferrix_core::Table],
 }
 
 impl<'a> SheetExport<'a> {
@@ -337,11 +345,17 @@ impl<'a> SheetExport<'a> {
             name,
             sheet,
             formulas: None,
+            tables: &[],
         }
     }
 
     pub fn with_formulas(mut self, overlay: &'a EditOverlay) -> Self {
         self.formulas = Some(overlay);
+        self
+    }
+
+    pub fn with_tables(mut self, tables: &'a [ferrix_core::Table]) -> Self {
+        self.tables = tables;
         self
     }
 }
@@ -393,12 +407,38 @@ pub fn export_workbook(path: impl AsRef<Path>, sheets: &[SheetExport]) -> Result
         // Constant-memory mode flushes each row as it is finished, so a
         // million-row export never holds a million rows in RAM. It requires
         // strictly increasing row order, which the loop below guarantees.
-        let ws = wb.add_worksheet_with_constant_memory();
+        //
+        // A sheet carrying tables uses an ordinary worksheet instead: a table
+        // part is attached after the cells are written, which a flushed-as-you-
+        // go worksheet cannot support. Tables are capped by Excel's own row
+        // limit anyway, and `check_limits` has already refused anything above
+        // it, so the memory exposure is bounded.
+        let ws = if s.tables.is_empty() {
+            wb.add_worksheet_with_constant_memory()
+        } else {
+            wb.add_worksheet()
+        };
         ws.set_name(s.name).map_err(write_err)?;
         write_sheet(ws, s).map_err(write_err)?;
+        for table in s.tables {
+            crate::table_xlsx::write_table(ws, table).map_err(write_err)?;
+        }
     }
     wb.save(path).map_err(write_err)?;
     Ok(())
+}
+
+/// Export a sheet with structured tables defined over it.
+pub fn export_xlsx_with_tables(
+    path: impl AsRef<Path>,
+    sheet: &Sheet,
+    sheet_name: &str,
+    tables: &[ferrix_core::Table],
+) -> Result<(), XlsxError> {
+    export_workbook(
+        path,
+        &[SheetExport::new(sheet_name, sheet).with_tables(tables)],
+    )
 }
 
 /// The row/column extent that would actually be written, overlay included.
