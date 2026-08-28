@@ -80,6 +80,13 @@ pub struct FerrixApp {
     /// Match options. The engine has always supported both; these expose them.
     search_case_sensitive: bool,
     search_whole_cell: bool,
+    /// Filter mode: when on, the grid renders only rows containing a match.
+    search_filter_mode: bool,
+    /// The visible-row -> underlying-row mapping backing filter mode.
+    ///
+    /// Rebuilt once per search (and once when the toggle flips), never per
+    /// frame. `None` whenever filter mode is off.
+    row_filter: Option<ferrix_core::RowFilter>,
 
     /// Chart panel state: the built scene, its annotations, and the window.
     chart: crate::chart_panel::ChartPanel,
@@ -135,6 +142,8 @@ impl FerrixApp {
             search_case_sensitive: false,
             search_whole_cell: false,
             chart: crate::chart_panel::ChartPanel::default(),
+            search_filter_mode: false,
+            row_filter: None,
             fill_source: None,
             fill_target: None,
             edits_path: None,
@@ -290,7 +299,21 @@ impl FerrixApp {
         let view = self.wb.view();
         let max_row = view.row_count().saturating_sub(1) as i64;
         let max_col = view.col_count().saturating_sub(1) as i64;
-        let r = (self.selection.cursor.row as i64 + drow).clamp(0, max_row.max(0));
+        // Vertical movement is in VISIBLE rows under a filter: pressing Down
+        // must land on the next row the user can actually see, not on a hidden
+        // neighbour. The result is converted straight back to an underlying
+        // row, so every downstream consumer keeps working in real addresses.
+        let r = match (&self.row_filter, drow) {
+            (Some(f), d) if d != 0 && !f.is_empty() => {
+                let here = f
+                    .visible_of(self.selection.cursor.row)
+                    .unwrap_or_else(|| f.visible_at_or_after(self.selection.cursor.row))
+                    as i64;
+                let target = (here + d).clamp(0, f.len() as i64 - 1);
+                f.underlying(target as usize).unwrap_or(0) as i64
+            }
+            _ => (self.selection.cursor.row as i64 + drow).clamp(0, max_row.max(0)),
+        };
         let c = (self.selection.cursor.col as i64 + dcol).clamp(0, max_col.max(0));
         let target = CellRef::new(r as u32, c as u32);
         if target != self.selection.cursor {
@@ -404,9 +427,16 @@ impl FerrixApp {
     }
 
     /// Keep the selected cell on screen after keyboard navigation.
+    ///
+    /// `scroll.row_offset` counts VISIBLE rows, which under a filter are not
+    /// the same as underlying rows — so the cursor's row is mapped first. A
+    /// cursor on a filtered-out row has no visible position and the viewport
+    /// is left alone rather than jumping somewhere arbitrary.
     fn scroll_to_selection(&mut self) {
         let visible = (self.viewport_rows() as f64 - 1.0).max(1.0);
-        let row = self.selection.cursor.row as f64;
+        let Some(row) = self.visible_row_of(self.selection.cursor.row) else {
+            return;
+        };
         if row < self.scroll.row_offset {
             self.scroll.row_offset = row;
         } else if row >= self.scroll.row_offset + visible {
@@ -814,13 +844,94 @@ impl FerrixApp {
         ) else {
             self.search_results = ferrix_core::SearchResults::default();
             self.search_index = 0;
+            self.rebuild_row_filter();
             return;
         };
         let view = self.wb.view();
         self.search_results = view.search(&query, LIMIT);
         // Resume from wherever the cursor is rather than jumping to the top.
         self.search_index = self.search_results.index_at_or_after(self.selection.cursor);
+        // The mapping is derived ONCE here, not per frame.
+        self.rebuild_row_filter();
         self.jump_to_current_match();
+    }
+
+    /// Rebuild the filter mapping from the current results.
+    ///
+    /// Called when a search runs and when the toggle flips — never from the
+    /// paint path, which only ever borrows the finished mapping.
+    fn rebuild_row_filter(&mut self) {
+        self.row_filter = if self.search_filter_mode && self.search_open {
+            Some(ferrix_core::RowFilter::from_results(&self.search_results))
+        } else {
+            None
+        };
+    }
+
+    /// Turn filter mode on or off, keeping the viewport and selection anchored
+    /// to the row the user was looking at.
+    fn toggle_filter_mode(&mut self) {
+        self.search_filter_mode = !self.search_filter_mode;
+        // An in-progress edit belongs to a row whose screen position is about
+        // to change underneath it; commit rather than let it land elsewhere.
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        self.rebuild_row_filter();
+
+        // Pull everything needed out of the mapping first: the borrow must not
+        // still be live when the selection/status are updated.
+        let plan = self.row_filter.as_ref().map(|f| {
+            let row = if f.is_empty() {
+                None
+            } else {
+                let want = f
+                    .visible_at_or_after(self.selection.cursor.row)
+                    .min(f.len() - 1);
+                f.underlying(want)
+            };
+            (row, f.len(), f.truncated())
+        });
+
+        match plan {
+            Some((None, _, _)) => {
+                self.scroll.row_offset = 0.0;
+                self.status = "Filter mode: no matching rows to show".into();
+            }
+            Some((Some(row), kept, truncated)) => {
+                // Park on the first kept row at or after the cursor, so
+                // switching the filter on does not silently strand the
+                // selection on a row that is no longer rendered.
+                self.selection
+                    .move_to(CellRef::new(row, self.selection.cursor.col));
+                self.sync_formula_bar();
+                self.status = format!(
+                    "Filter mode on — {} of {} row{} shown{}",
+                    fmt_int(kept),
+                    fmt_int(self.wb.view().row_count()),
+                    if kept == 1 { "" } else { "s" },
+                    if truncated {
+                        " (capped — not all matches)"
+                    } else {
+                        ""
+                    }
+                );
+                self.scroll_to_selection();
+            }
+            None => {
+                self.status = "Filter mode off".into();
+                self.scroll_to_selection();
+            }
+        }
+    }
+
+    /// Scroll offset space is VISIBLE rows, so an underlying row has to be
+    /// mapped before it can be compared against `scroll.row_offset`.
+    fn visible_row_of(&self, row: u32) -> Option<f64> {
+        match &self.row_filter {
+            Some(f) => f.visible_of(row).map(|v| v as f64),
+            None => Some(row as f64),
+        }
     }
 
     /// Move the selection to the active match and scroll it into view.
@@ -853,6 +964,11 @@ impl FerrixApp {
         self.search_open = false;
         self.search_results = ferrix_core::SearchResults::default();
         self.search_index = 0;
+        // Closing search must restore the full sheet: leaving rows hidden with
+        // no visible search bar would look like data loss.
+        self.row_filter = None;
+        // Re-anchor the viewport in unfiltered row space.
+        self.scroll_to_selection();
         self.focus = Focus::Grid;
     }
 
@@ -860,7 +976,10 @@ impl FerrixApp {
     /// the hit lands mid-screen rather than scraping the edge.
     fn center_on_selection(&mut self) {
         let visible = (self.last_viewport_h / crate::grid::ROW_HEIGHT) as f64;
-        let target = self.selection.cursor.row as f64 - visible / 2.0;
+        let Some(row) = self.visible_row_of(self.selection.cursor.row) else {
+            return;
+        };
+        let target = row - visible / 2.0;
         self.scroll.row_offset = target.max(0.0);
     }
 
@@ -1327,6 +1446,17 @@ impl eframe::App for FerrixApp {
                             self.search_whole_cell = !self.search_whole_cell;
                             self.run_search();
                         }
+                        // Filter mode: hide every row without a match.
+                        if ui
+                            .selectable_label(self.search_filter_mode, "⬍ Filter")
+                            .on_hover_text(
+                                "Filter rows: show only rows containing a match. \
+                                 Row numbers stay original.",
+                            )
+                            .clicked()
+                        {
+                            self.toggle_filter_mode();
+                        }
 
                         if ui
                             .button("◀")
@@ -1356,6 +1486,40 @@ impl eframe::App for FerrixApp {
                                 if r.truncated { " (capped)" } else { "" }
                             );
                             ui.label(RichText::new(shown).color(Theme::TEXT).size(11.5));
+                            // Filter mode changes what "capped" costs the
+                            // user: unfiltered they can still step past the
+                            // cap with F3, but a filtered view LOOKS complete
+                            // — you scroll to the bottom and it ends. Say so
+                            // loudly rather than let them conclude wrongly.
+                            if let Some(f) = &self.row_filter {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "· showing {} row{}",
+                                        fmt_int(f.len()),
+                                        if f.len() == 1 { "" } else { "s" }
+                                    ))
+                                    .color(Theme::TEXT_DIM)
+                                    .size(11.0),
+                                );
+                                if f.truncated() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "⚠ INCOMPLETE — first {} of {} matches only; \
+                                             more matching rows are NOT shown",
+                                            fmt_int(self.search_results.matches.len()),
+                                            fmt_int(f.total_matches())
+                                        ))
+                                        .color(Theme::ERROR)
+                                        .size(11.5)
+                                        .strong(),
+                                    )
+                                    .on_hover_text(
+                                        "Search stops collecting at 100,000 matches, so this \
+                                         filtered view is a prefix of the matching rows. \
+                                         Narrow the search to see a complete set.",
+                                    );
+                                }
+                            }
                             // Surfacing why it was fast: N distinct strings
                             // matched, not N cells compared.
                             ui.label(
@@ -1437,6 +1601,19 @@ impl eframe::App for FerrixApp {
                 let outer = ui.available_rect_before_wrap();
                 self.last_viewport_h = outer.height() - crate::grid::HEADER_HEIGHT;
 
+                // Filter mode with nothing to show: say so instead of painting
+                // an empty grid that looks like an empty file.
+                if self.row_filter.as_ref().is_some_and(|f| f.is_empty()) {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("No rows match — filter mode is hiding every row")
+                                .color(Theme::TEXT_DIM)
+                                .size(15.0),
+                        );
+                    });
+                    return;
+                }
+
                 let resp = {
                     let view = self.wb.view();
                     Grid {
@@ -1447,6 +1624,7 @@ impl eframe::App for FerrixApp {
                         editing: self.editing,
                         matches: &self.search_results.matches,
                         filling: self.fill_source.is_some(),
+                        filter: self.row_filter.as_ref(),
                         current_match: if self.search_open {
                             self.search_results.wrapped(self.search_index)
                         } else {
@@ -1559,9 +1737,13 @@ impl eframe::App for FerrixApp {
 
                 // --- in-cell editor, overlaid exactly on the cell ---
                 if let Some(cell) = self.editing {
-                    if let Some(rect) =
-                        Grid::cell_screen_rect(cell, outer, &self.scroll, &self.col_widths)
-                    {
+                    if let Some(rect) = Grid::cell_screen_rect(
+                        cell,
+                        outer,
+                        &self.scroll,
+                        &self.col_widths,
+                        self.row_filter.as_ref(),
+                    ) {
                         let id = egui::Id::new("cell_editor");
                         let mut child = ui.new_child(
                             egui::UiBuilder::new()

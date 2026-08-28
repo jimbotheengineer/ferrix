@@ -29,7 +29,7 @@
 //! stays exact past 10^15 rows — far beyond any file that fits on a disk.
 
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
-use ferrix_core::{column_name, CellRef, Selection, Value};
+use ferrix_core::{column_name, CellRef, RowFilter, Selection, Value};
 
 use crate::sheet_view::SheetView;
 use crate::theme::Theme;
@@ -101,19 +101,54 @@ pub struct Grid<'a> {
     /// True while the user is dragging the fill handle, so the grid reports
     /// fill targets rather than ordinary selection drags.
     pub filling: bool,
+    /// Active row filter, when filter mode is on.
+    ///
+    /// The grid then paints VISIBLE rows 0..filter.len() and looks up each
+    /// one's underlying row through the mapping. Row headers, cell addresses,
+    /// hit-testing and the returned `CellRef`s all stay in UNDERLYING row
+    /// space, so a click or an edit on a filtered row addresses the real row
+    /// in the sheet. `None` means the ordinary unfiltered range.
+    pub filter: Option<&'a RowFilter>,
+}
+
+impl<'a> Grid<'a> {
+    /// Underlying row for a visible row index, honouring the active filter.
+    #[inline]
+    fn underlying_row(filter: Option<&RowFilter>, visible: usize) -> Option<u32> {
+        match filter {
+            Some(f) => f.underlying(visible),
+            None => Some(visible as u32),
+        }
+    }
+
+    /// Visible row index for an underlying row, or `None` when the filter
+    /// hides it.
+    #[inline]
+    fn visible_row(filter: Option<&RowFilter>, underlying: u32) -> Option<usize> {
+        match filter {
+            Some(f) => f.visible_of(underlying),
+            None => Some(underlying as usize),
+        }
+    }
 }
 
 impl<'a> Grid<'a> {
     /// Screen rect of a cell, or None when it is scrolled out of view. The
     /// editor uses this to place its TextEdit exactly over the cell.
+    ///
+    /// `cell.row` is an UNDERLYING row. Under an active filter it is mapped
+    /// into visible-row space before positioning, and a row the filter hides
+    /// has no rect at all.
     pub fn cell_screen_rect(
         cell: CellRef,
         outer: Rect,
         scroll: &ScrollState,
         col_widths: &[f32],
+        filter: Option<&RowFilter>,
     ) -> Option<Rect> {
         let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
-        let rel_row = cell.row as f64 - scroll.row_offset;
+        let visible = Self::visible_row(filter, cell.row)?;
+        let rel_row = visible as f64 - scroll.row_offset;
         let y = body_origin.y + (rel_row * ROW_HEIGHT as f64) as f32;
         if y + ROW_HEIGHT < body_origin.y || y > outer.max.y {
             return None;
@@ -137,7 +172,15 @@ impl<'a> Grid<'a> {
 
     pub fn show(self, ui: &mut Ui) -> GridResponse {
         let view = self.view;
-        let total_rows = view.row_count().max(1);
+        let filter = self.filter;
+        // Under a filter the scrollable extent is the number of KEPT rows, not
+        // the sheet's row count — that is what makes non-matching rows vanish
+        // rather than merely being skipped over.
+        let total_rows = match filter {
+            Some(f) => f.len(),
+            None => view.row_count(),
+        }
+        .max(1);
         let total_cols = view.col_count().max(1);
 
         let width_of =
@@ -223,12 +266,27 @@ impl<'a> Grid<'a> {
         // Narrow the match list to just the visible rows once per frame, so
         // per-cell highlight testing is a small linear probe rather than a
         // scan of a potentially enormous result set.
+        //
+        // Under a filter the viewport spans visible rows, which are sparse in
+        // underlying space, so the bounds come from the mapping's window —
+        // still two binary searches, still no per-row allocation.
+        let (match_lo_row, match_hi_row) = match filter {
+            Some(f) => {
+                let w = f.window(first_row, last_row);
+                match (w.first(), w.last()) {
+                    // `last + 1` because the narrowing bound is exclusive.
+                    (Some(&a), Some(&b)) => (a as usize, b as usize + 1),
+                    _ => (0, 0),
+                }
+            }
+            None => (first_row, last_row),
+        };
         let vis_lo = self
             .matches
-            .partition_point(|m| (m.row as usize) < first_row);
+            .partition_point(|m| (m.row as usize) < match_lo_row);
         let vis_hi = self
             .matches
-            .partition_point(|m| (m.row as usize) < last_row);
+            .partition_point(|m| (m.row as usize) < match_hi_row);
         let visible_matches = &self.matches[vis_lo..vis_hi];
         let is_match = |cell: CellRef| -> bool {
             visible_matches
@@ -240,7 +298,15 @@ impl<'a> Grid<'a> {
         let painter = ui.painter_at(body_rect);
         painter.rect_filled(body_rect, 0.0, Theme::BG);
 
+        // `r` walks VISIBLE rows; `row` is the underlying row it maps to.
+        // Everything painted from here on — cell values, highlights, selection
+        // tests, the CellRefs handed back to the caller — uses `row`, so a
+        // filtered grid addresses exactly the same cells an unfiltered one
+        // would.
         for r in row_range.clone() {
+            let Some(row) = Self::underlying_row(filter, r) else {
+                continue;
+            };
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             let row_rect = Rect::from_min_size(
                 egui::pos2(body_rect.min.x, y),
@@ -254,7 +320,7 @@ impl<'a> Grid<'a> {
                 let x = body_origin.x + col_x[c] - self.scroll.col_px;
                 let w = width_of(c);
                 let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
-                let cref = CellRef::new(r as u32, c as u32);
+                let cref = CellRef::new(row, c as u32);
 
                 // Search highlight sits under the selection so both remain
                 // visible when the cursor is parked on a match.
@@ -349,6 +415,10 @@ impl<'a> Grid<'a> {
         }
 
         // --- hit testing ---
+        //
+        // Pixels map to a VISIBLE row, which is then translated back through
+        // the filter so the CellRef the caller receives — and therefore any
+        // click, drag, or edit built from it — names the underlying row.
         let hit = |pos: egui::Pos2| -> Option<CellRef> {
             if !body_rect.contains(pos) {
                 return None;
@@ -360,7 +430,8 @@ impl<'a> Grid<'a> {
             if r < 0.0 || c < 0 || r as usize >= total_rows || c as usize >= total_cols {
                 return None;
             }
-            Some(CellRef::new(r as u32, c as u32))
+            let row = Self::underlying_row(filter, r as usize)?;
+            Some(CellRef::new(row, c as u32))
         };
         if primary_clicked {
             clicked = pointer_pos.and_then(hit);
@@ -384,9 +455,9 @@ impl<'a> Grid<'a> {
                 .filter(|_| self.editing.is_none())
                 .and_then(|sel| {
                     let (_, br) = sel.bounds();
-                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths).map(|r| {
-                        Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0)
-                    })
+                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, filter).map(
+                        |r| Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0),
+                    )
                 });
         let on_handle = pointer_pos
             .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && body_rect.contains(p)));
@@ -533,7 +604,14 @@ impl<'a> Grid<'a> {
         );
         hp.rect_filled(row_header, 0.0, Theme::HEADER_BG);
         let rhp = hp.with_clip_rect(row_header);
+        // Row headers carry the ORIGINAL row number even under a filter. A
+        // filtered view that renumbered its rows 1..N would be actively
+        // misleading: the whole point of finding row 4,912,733 is knowing it
+        // is row 4,912,733.
         for r in row_range.clone() {
+            let Some(row) = Self::underlying_row(filter, r) else {
+                continue;
+            };
             let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             let rect = Rect::from_min_size(
                 egui::pos2(outer.min.x, y),
@@ -541,7 +619,7 @@ impl<'a> Grid<'a> {
             );
             let selected = self.selection.is_some_and(|s| {
                 let (a, b) = s.row_range();
-                r >= a as usize && r <= b as usize
+                row >= a && row <= b
             });
             if selected {
                 rhp.rect_filled(rect, 0.0, Theme::ACCENT_SOFT);
@@ -549,7 +627,7 @@ impl<'a> Grid<'a> {
             rhp.text(
                 egui::pos2(rect.max.x - 8.0, rect.center().y),
                 Align2::RIGHT_CENTER,
-                (r + 1).to_string(),
+                (row as u64 + 1).to_string(),
                 FontId::proportional(11.5),
                 if selected {
                     Theme::ACCENT
@@ -679,5 +757,133 @@ mod tests {
                 "would paint {shown} rows for {total}-row sheet"
             );
         }
+    }
+
+    // --- filter mode ---
+
+    fn filter_of(rows: &[u32]) -> RowFilter {
+        let cells: Vec<CellRef> = rows.iter().map(|&r| CellRef::new(r, 0)).collect();
+        RowFilter::from_matches(&cells, false, cells.len())
+    }
+
+    #[test]
+    fn unfiltered_row_lookup_is_the_identity() {
+        assert_eq!(Grid::underlying_row(None, 0), Some(0));
+        assert_eq!(Grid::underlying_row(None, 199_999_999), Some(199_999_999));
+        assert_eq!(Grid::visible_row(None, 4_912_733), Some(4_912_733));
+    }
+
+    #[test]
+    fn filtered_row_lookup_uses_the_mapping_both_ways() {
+        let f = filter_of(&[3, 9, 4_912_733]);
+        assert_eq!(Grid::underlying_row(Some(&f), 0), Some(3));
+        assert_eq!(Grid::underlying_row(Some(&f), 2), Some(4_912_733));
+        assert_eq!(Grid::underlying_row(Some(&f), 3), None, "past the end");
+        assert_eq!(Grid::visible_row(Some(&f), 4_912_733), Some(2));
+        assert_eq!(Grid::visible_row(Some(&f), 4), None, "hidden row");
+    }
+
+    #[test]
+    fn row_header_text_is_the_original_one_based_row() {
+        // Acceptance criterion: headers keep original numbers under a filter.
+        // This mirrors exactly what the header loop paints.
+        let f = filter_of(&[0, 41, 199_999_999]);
+        let painted: Vec<String> = (0..f.len())
+            .map(|r| {
+                let row = Grid::underlying_row(Some(&f), r).unwrap();
+                (row as u64 + 1).to_string()
+            })
+            .collect();
+        assert_eq!(painted, vec!["1", "42", "200000000"]);
+    }
+
+    #[test]
+    fn hit_test_row_math_addresses_the_underlying_row() {
+        // Reproduces the hit-test arithmetic: pixels -> visible row -> real
+        // row. A click three rows down a filtered view must name the third
+        // KEPT row, which is what makes an edit write through correctly.
+        let f = filter_of(&[10, 250, 999_000, 199_999_999]);
+        let first_row = 0usize;
+        let frac_px = 0.0f32;
+        let click_y_offset = ROW_HEIGHT * 3.0 + 4.0;
+        let visible = first_row as f64 + ((click_y_offset + frac_px) / ROW_HEIGHT) as f64;
+        let cell = CellRef::new(Grid::underlying_row(Some(&f), visible as usize).unwrap(), 2);
+        assert_eq!(cell.row, 199_999_999, "edit would hit the wrong row");
+        assert_eq!(cell.col, 2);
+    }
+
+    #[test]
+    fn cell_screen_rect_positions_by_visible_row_and_hides_filtered_rows() {
+        let f = filter_of(&[5, 6, 1_000_000]);
+        let outer = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let scroll = ScrollState {
+            row_offset: 0.0,
+            col_px: 0.0,
+        };
+        let widths = [100.0f32; 4];
+
+        // Underlying row 1,000,000 is visible row 2, so it sits two rows down
+        // — not a million rows off screen.
+        let rect = Grid::cell_screen_rect(
+            CellRef::new(1_000_000, 0),
+            outer,
+            &scroll,
+            &widths,
+            Some(&f),
+        )
+        .expect("kept row must have a rect");
+        let expected_y = outer.min.y + HEADER_HEIGHT + 2.0 * ROW_HEIGHT;
+        assert!((rect.min.y - expected_y).abs() < 0.5, "got {rect:?}");
+
+        // A row the filter hides has no rect at all, so the cell editor cannot
+        // be painted over a row that is not on screen.
+        assert!(
+            Grid::cell_screen_rect(CellRef::new(7, 0), outer, &scroll, &widths, Some(&f)).is_none()
+        );
+
+        // Without the filter the same cell is a million rows below the fold.
+        assert!(
+            Grid::cell_screen_rect(CellRef::new(1_000_000, 0), outer, &scroll, &widths, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filtered_viewport_work_is_constant_at_200m_rows() {
+        // 100k matches (the search cap) scattered through a 200M-row sheet.
+        // A frame must touch only a viewport's worth of the mapping — this is
+        // the 16.67 ms budget claim reduced to its algorithmic core.
+        let matches: Vec<CellRef> = (0..100_000u32)
+            .map(|i| CellRef::new(i.saturating_mul(2000), 0))
+            .collect();
+        let f = RowFilter::from_matches(&matches, true, 100_000);
+
+        let visible_count = (1080.0f32 / ROW_HEIGHT).ceil() as usize + 1;
+        for first in [0usize, 12_345, 99_000] {
+            let last = (first + visible_count).min(f.len());
+            let w = f.window(first, last);
+            assert!(
+                w.len() <= visible_count,
+                "a frame read {} rows; the viewport holds {visible_count}",
+                w.len()
+            );
+            // And the narrowing bounds the paint loop derives are O(1) to get.
+            if let (Some(&a), Some(&b)) = (w.first(), w.last()) {
+                assert!(a <= b);
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_scroll_offset_stays_exact_at_the_deep_end() {
+        // Scrolling to the last visible row of a filtered 200M-row sheet must
+        // still resolve to the exact underlying row, through f64.
+        let f = filter_of(&[0, 100_000_000, 199_999_998, 199_999_999]);
+        let last_visible = f.len() - 1;
+        let offset = last_visible as f64;
+        let resolved = Grid::underlying_row(Some(&f), offset.floor() as usize).unwrap();
+        assert_eq!(resolved, 199_999_999);
+        assert_eq!(Grid::visible_row(Some(&f), 199_999_998), Some(2));
+        assert_eq!(Grid::visible_row(Some(&f), 199_999_999), Some(3));
     }
 }

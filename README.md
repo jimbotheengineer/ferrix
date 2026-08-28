@@ -145,6 +145,34 @@ nothing matches the arena the column scan is skipped entirely, which is why the
 absent-needle case costs 0 ms. Numbers are compared numerically against the
 parsed needle, never by formatting 200M values into strings.
 
+### Filter mode
+
+`Ctrl+F` also filters. The **⬍ Filter** toggle in the search bar hides every row
+without a match, and the grid renders over a **row-index mapping** — a sorted
+`Vec<u32>` of the matching rows — instead of the raw row range. Visible row *i*
+resolves to underlying row `rows[i]`; the reverse direction is a binary search.
+
+The mapping is built **once per search**, never per frame. A frame takes a
+borrowed subslice of it (`RowFilter::window`) covering just the ~50 rows on
+screen, so filtering allocates nothing per row per frame and scrolling a
+filtered 200M-row sheet costs the same as scrolling an unfiltered one. The
+worst measured frame in `cargo run --release --bin bench-filter` is **0.7 µs**
+against the 16.67 ms budget.
+
+Two things filter mode must not get wrong:
+
+* **Row numbers stay original.** A filtered view showing rows renumbered 1..N
+  would be actively misleading — the point of finding row 4,912,733 is knowing
+  it *is* row 4,912,733. Headers, hit-testing, the address box, and the cell
+  editor all work in underlying row space, so clicking and editing a filtered
+  row writes through to the real row.
+* **A capped result set says so.** Search stops collecting at 100,000 matches.
+  Unfiltered that is survivable — `F3` still steps forward. Filtered it is
+  dangerous, because the view *looks* complete: you scroll to the bottom and it
+  ends. So a truncated filter is labelled in red, in the search bar:
+  `⚠ INCOMPLETE — first 100,000 of 400,000 matches only; more matching rows are
+  NOT shown`.
+
 ### Selection that scales
 
 A selection is two corners — an anchor and a cursor — never a list of cells.
