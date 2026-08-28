@@ -148,6 +148,9 @@ pub struct FerrixApp {
     /// the frame loop rather than sampled per paint.
     budget: ferrix_core::Budget,
     /// Worker threads rayon is actually running, for the same status line.
+    /// Configured rayon worker count. Read at startup to size the pool;
+    /// kept so a future settings UI can show and change it.
+    #[allow(dead_code)]
     worker_threads: usize,
     frame_ms: f32,
     last_painted: usize,
@@ -2183,7 +2186,7 @@ impl FerrixApp {
                                 ),
                             ));
                         } else {
-                            ui.label(RichText::new("exporting…").color(Theme::TEXT_DIM));
+                            ui.label(RichText::new("exporting…").color(self.theme.text_dim));
                         }
                         if ui.button("✖ Cancel export").clicked() {
                             self.cancel_export();
@@ -2214,7 +2217,7 @@ impl FerrixApp {
                                 self.budget.describe(),
                                 ferrix_io::pool::describe()
                             ))
-                            .color(Theme::TEXT_DIM)
+                            .color(self.theme.text_dim)
                             .size(12.0),
                         );
                     });

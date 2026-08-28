@@ -220,6 +220,7 @@ impl Theme {
 
     /// True when every overlay colour still lets what is underneath show
     /// through. Asserted by a test in both themes — see the module docs.
+    #[allow(dead_code)] // used by the contrast tests below
     pub fn overlays_are_translucent(&self) -> bool {
         [self.range_fill, self.match_bg, self.match_current]
             .iter()

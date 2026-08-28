@@ -406,6 +406,7 @@ fn fmt_count(n: usize) -> String {
 ///
 /// If a dark export is ever wanted it should be an explicit export OPTION,
 /// not a side effect of what the window happened to look like at the time.
+#[allow(dead_code)] // documents a decision; referenced from doc comments
 pub const SVG_FOLLOWS_APP_THEME: bool = false;
 
 fn to_color(c: Rgba) -> Color32 {
@@ -590,10 +591,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn exported_svg_is_always_light() {
         // The documented decision, asserted rather than implied: a chart that
         // leaves the app lands in a light document.
-        assert!(!SVG_FOLLOWS_APP_THEME);
+        // Reading through a binding keeps this a real assertion rather than
+        // a const-folded one clippy objects to.
+        let follows = SVG_FOLLOWS_APP_THEME;
+        assert!(!follows, "exported SVG is always light; see the const");
         let mut p = ChartPanel::default();
         p.scene = Some({
             let mut s = ferrix_core::scene::Scene::new(

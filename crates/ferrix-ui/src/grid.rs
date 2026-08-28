@@ -1147,7 +1147,8 @@ mod tests {
         assert_eq!(off - on, EMPTY_ROW_PADDING);
         // And a two-row file still gets somewhere to type: the acceptance
         // criterion is that the toggle produces reachable empty rows.
-        assert!(EMPTY_ROW_PADDING > 0);
+        let pad = EMPTY_ROW_PADDING;
+        assert!(pad > 0, "padding must give the user somewhere to type");
     }
 
     #[test]
