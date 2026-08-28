@@ -1,6 +1,7 @@
 # Ferrix
 
-An open-source spreadsheet built in Rust for datasets that break Excel.
+A source-available spreadsheet built in Rust for datasets that break Excel.
+Free for noncommercial use.
 
 Excel stops at 1,048,576 rows. Ferrix opens a **10.85 GB CSV — 200 million
 rows — in 221 microseconds** and scrolls it at over 10,000 fps.
@@ -216,4 +217,10 @@ in dependency order, and cycles must be detected rather than hang.
 
 ## License
 
-MIT OR Apache-2.0
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — free for any noncommercial
+purpose: personal projects, research, education, and use by charitable,
+educational, public research, public safety, environmental, or government
+organizations. Commercial use requires a separate license.
+
+This is source-available rather than OSI open-source; the noncommercial
+restriction is deliberate for now and can be relaxed later.

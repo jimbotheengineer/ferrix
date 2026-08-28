@@ -12,8 +12,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ferrix-sheets/ferrix"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/jimbotheengineer/ferrix"
 authors = ["Ferrix contributors"]
 
 [workspace.dependencies]
