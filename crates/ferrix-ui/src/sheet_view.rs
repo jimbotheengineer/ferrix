@@ -126,6 +126,14 @@ impl<'a> SheetView<'a> {
     }
 
     /// A view whose base reads are permuted by `order`.
+    /// Build a view that reads through a display-order permutation.
+    ///
+    /// NOT YET WIRED TO THE UI. The reordering model (`ferrix_core::order`,
+    /// 26 tests) and the formula-reference remapping (`ferrix_formula::remap`)
+    /// are complete and tested, but app.rs and grid.rs do not yet construct a
+    /// SheetOrder or expose header drag-to-reorder. Issue #17 stays open for
+    /// that wiring; this is the seam it will attach to.
+    #[allow(dead_code)]
     pub fn with_order(base: &'a BaseData, overlay: &'a EditOverlay, order: &'a SheetOrder) -> Self {
         Self {
             base,
