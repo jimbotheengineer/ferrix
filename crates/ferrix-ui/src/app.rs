@@ -612,6 +612,16 @@ pub struct FerrixApp {
     /// Show the start screen instead of the grid. True on a cold start with
     /// no file argument; any choice on that screen turns it off.
     show_start: bool,
+    /// Whether the user has a workbook in front of them yet (issue #52).
+    ///
+    /// Set the moment anything produces one — a file load, "Blank workbook",
+    /// a template, or adding a sheet — and never cleared except by returning
+    /// to the start screen. It is what separates "nothing opened yet", which
+    /// gets the "Open a CSV" placeholder, from "an empty workbook the user
+    /// asked for", which must be a typeable grid. Deriving that from
+    /// `row_count == 0` instead is exactly the conflation that made a new
+    /// sheet swallow every keystroke.
+    workbook_started: bool,
 
     /// The import wizard (issue #31), when a file did not parse cleanly and
     /// the user has not yet chosen settings for it.
@@ -826,6 +836,7 @@ impl FerrixApp {
             // A file on the command line goes straight to the grid; only a
             // bare launch has nothing to show yet.
             show_start: false,
+            workbook_started: false,
             import_wizard: None,
         };
         if let Some(p) = initial {
@@ -1032,6 +1043,7 @@ impl FerrixApp {
                     self.persist_prefs();
                 }
                 self.show_start = false;
+                self.workbook_started = true;
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
@@ -1490,6 +1502,9 @@ impl FerrixApp {
         self.source_path = None;
         self.pending_path = None;
         self.show_start = false;
+        // The user asked for a workbook, so this is no longer a cold start:
+        // the grid must be typeable even when it holds nothing (issue #52).
+        self.workbook_started = true;
         self.edits_path = None;
         self.fingerprint = None;
         self.comments_path = None;
@@ -1639,14 +1654,71 @@ impl FerrixApp {
         }
     }
 
-    /// The padding rows currently on offer, or `None` when the toggle is off.
+    /// Padding rows the viewport offers past the last data row.
+    ///
+    /// Two sources, one number, so the pad the grid PAINTS and the pad
+    /// `pad_space` HIT-TESTS can never disagree:
+    ///
+    /// - the "show empty rows" preference (issue #20), and
+    /// - a sheet with NO BASE DATA, which gets the padding unconditionally
+    ///   (issue #52).
+    ///
+    /// The second condition is on the BASE, not on the view. A sheet the user
+    /// created holds no file data ever — its whole extent comes from the
+    /// overlay — so "past the end of the sheet" is not a place the toggle
+    /// should be able to take away: with zero rows there is nothing to click,
+    /// nothing to put a cursor in, and a typed value has nowhere to go, which
+    /// is exactly how a new sheet came to swallow edits in silence. Keying it
+    /// on `view.row_count()` instead would hand the user one row of padding,
+    /// let them type in it, and then take the padding away again — a sheet
+    /// you can type into exactly once.
+    ///
+    /// A LOADED sheet keeps the old behaviour precisely, because its base has
+    /// rows: the toggle alone decides.
+    ///
+    /// Viewport only, both ways: `view.row_count()` is untouched, so export,
+    /// SUM and the status bar still see the real sheet.
+    fn pad_rows(&self) -> usize {
+        if self.wb.base.row_count() == 0 {
+            return crate::grid::EMPTY_ROW_PADDING;
+        }
+        if self.show_empty_rows {
+            crate::grid::EMPTY_ROW_PADDING
+        } else {
+            0
+        }
+    }
+
+    /// Columns the cursor may reach. A sheet with no base columns offers a
+    /// blank page's worth (issue #52) — the column mirror of
+    /// [`Self::pad_rows`], and on the base for the same reason.
+    fn navigable_cols(&self) -> usize {
+        let view = self.wb.view().col_count();
+        if self.wb.base.col_count() == 0 {
+            return view.max(crate::grid::BLANK_SHEET_COLS);
+        }
+        view
+    }
+
+    /// True only for the launch state that has no workbook to show: nothing
+    /// opened, nothing created, nothing typed.
+    ///
+    /// The distinction issue #52 turns on. "Zero rows" alone is NOT this
+    /// state — a sheet the user just added, and a workbook they explicitly
+    /// asked to start blank, also have zero rows, and both must be usable
+    /// grids rather than a placeholder telling them to open a file.
+    fn is_cold_start(&self) -> bool {
+        !self.workbook_started && self.wb.view().row_count() == 0
+    }
+
+    /// The padding rows currently on offer, or `None` when there are none.
     ///
     /// `first_pad_screen_row` is the count of rows the FILTERS resolve, so
     /// padding always begins after the last row either filter kept, and
     /// `first_pad_data_row` is one past the end of the whole sheet — never
     /// past the filtered subset, which would alias onto hidden records.
     fn pad_space(&self) -> Option<crate::grid::PadSpace> {
-        if !self.show_empty_rows {
+        if self.pad_rows() == 0 {
             return None;
         }
         let view = self.wb.view();
@@ -1676,23 +1748,18 @@ impl FerrixApp {
     /// still see the real sheet.
     fn max_navigable_row(&self) -> i64 {
         let rows = self.wb.view().row_count();
-        let pad = if self.show_empty_rows {
-            crate::grid::EMPTY_ROW_PADDING
-        } else {
-            0
-        };
-        (rows + pad).saturating_sub(1) as i64
+        (rows + self.pad_rows()).saturating_sub(1) as i64
     }
 
     fn move_selection_ext(&mut self, drow: i64, dcol: i64, extend: bool) {
         if self.editing.is_some() {
             self.commit_edit();
         }
-        let view = self.wb.view();
-        // Navigation may reach into the empty padding when the toggle is on;
-        // the sheet's own extent is unchanged.
+        // Navigation may reach into the empty padding when the toggle is on,
+        // and ALWAYS on an empty sheet (issue #52); the sheet's own extent is
+        // unchanged either way.
         let max_row = self.max_navigable_row();
-        let max_col = view.col_count().saturating_sub(1) as i64;
+        let max_col = self.navigable_cols().saturating_sub(1) as i64;
         // Vertical movement is in VISIBLE rows under a filter: pressing Down
         // must land on the next row the user can actually see, not on a hidden
         // neighbour. The result is converted straight back to an underlying
@@ -2518,6 +2585,7 @@ impl FerrixApp {
         // the whole frame and the grid would never run behind it (issue #45).
         self.source_path = Some(cache.to_path_buf());
         self.show_start = false;
+        self.workbook_started = true;
         Ok(())
     }
 
@@ -5902,6 +5970,12 @@ impl FerrixApp {
         self.add_sheet();
     }
 
+    /// Leave the start screen without choosing anything, so a test can see
+    /// the empty-state grid the cold-start path paints behind it.
+    pub fn dismiss_start_screen_for_test(&mut self) {
+        self.show_start = false;
+    }
+
     /// Switch to a sheet by tab position, as clicking its tab does.
     ///
     /// Goes through `switch_sheet` rather than straight to the workbook, so a
@@ -6334,6 +6408,9 @@ impl FerrixApp {
         let base = BaseData::Memory(Sheet::new(&name));
         match self.wb.add_sheet(&name, base) {
             Ok(id) => {
+                // A sheet the user created is a workbook in front of them,
+                // empty or not — it must be typeable (issue #52).
+                self.workbook_started = true;
                 self.switch_sheet(id);
                 self.status = format!("Added sheet {name}");
             }
@@ -7022,7 +7099,7 @@ impl FerrixApp {
     fn cell_at_point(&self, p: egui::Pos2, outer: egui::Rect) -> Option<CellRef> {
         let resolver = self.row_resolver(self.pad_space());
         let metrics = crate::grid::Metrics::new(self.zoom);
-        let cols = self.col_widths.len().max(self.wb.view().col_count());
+        let cols = self.col_widths.len().max(self.navigable_cols());
         // Through the SAME heights the grid painted with, so a wrapped row is
         // as tall here as it looks (issue #28).
         let view = self.wb.view();
@@ -8167,6 +8244,9 @@ impl FerrixApp {
             C::FileOpenRecent | C::FileStartScreen => {
                 self.persist_session();
                 self.show_start = true;
+                // Back to the launch state: the next frame behind the start
+                // screen is a cold start again (issue #52).
+                self.workbook_started = false;
             }
             C::FileExportCsv => self.export_dialog(),
             C::FileExportXlsx => self.export_xlsx_dialog(),
@@ -9298,7 +9378,13 @@ impl FerrixApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(th.bg))
             .show(ctx, |ui| {
-                if self.wb.view().row_count() == 0 {
+                // NOTHING to open, and nothing to type into either — this is
+                // the cold-start state, before any workbook exists. A sheet
+                // the user CREATED is a different thing: it has no rows but
+                // it must still be a usable grid, so it goes to the grid
+                // below with viewport padding (issue #52). Returning early
+                // for it is what made a new sheet un-typeable.
+                if self.is_cold_start() {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("Open a CSV to get started")
@@ -9330,6 +9416,8 @@ impl FerrixApp {
                 // Read before the view borrow: `showing_formulas` needs
                 // `&self`, and the Grid below holds `&mut self.scroll`.
                 let show_formulas_now = self.showing_formulas();
+                let pad_rows_now = self.pad_rows();
+                let blank_cols_now = self.navigable_cols();
                 let resp = {
                     let view = self.wb.view();
                     // The conditional-formatting editor's LIVE PREVIEW. `None`
@@ -9377,11 +9465,8 @@ impl FerrixApp {
                         format: Some(preview_fmt.as_ref().unwrap_or(&self.wb.format)),
                         merges: Some(&self.wb.merges),
                         comments: Some(&self.wb.comments),
-                        pad_rows: if self.show_empty_rows {
-                            crate::grid::EMPTY_ROW_PADDING
-                        } else {
-                            0
-                        },
+                        pad_rows: pad_rows_now,
+                        blank_cols: blank_cols_now,
                         metrics: crate::grid::Metrics::new(self.zoom),
                         panes: &mut self.panes,
                         hidden_cols: Some(&self.hidden_cols),

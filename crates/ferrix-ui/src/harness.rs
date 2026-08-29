@@ -9687,17 +9687,19 @@ xxx,yyy,zzz
         // user would use, so the fixture cannot diverge from real data.
         h.app_mut().add_sheet_for_test();
         h.steps(2);
-        // Written through the workbook's commit API rather than by typing.
-        // A freshly added sheet reports 0 rows x 0 columns, and typing into it
-        // is silently swallowed — the click lands and the edit never commits.
-        // That is a real product bug (filed separately); driving the fixture
-        // by keystroke here would test THAT bug instead of consolidation.
+        // Built by TYPING, through the same commit path a user would use, so
+        // the fixture cannot diverge from real data. This used to go through
+        // `commit_edit_for_test` because a new sheet swallowed typed edits
+        // (issue #52); with that fixed, the real keyboard is used and this
+        // test covers both consolidation and a new sheet being typeable.
         for (cell, text) in [
             (CellRef::new(0, 1), "Widgets"),
             (CellRef::new(1, 0), "East"),
             (CellRef::new(1, 1), "100"),
         ] {
-            h.app_mut().commit_edit_for_test(cell, text);
+            assert!(h.click_cell(cell), "{cell:?} must be reachable");
+            h.type_text(text).step();
+            h.press_key(egui::Key::Enter).steps(2);
         }
         h.steps(2);
         assert!(
@@ -9758,6 +9760,231 @@ xxx,yyy,zzz
             "the same four rows are on screen after a sort, so the same number \
              of bars must be drawn — a sparkline that read the screen row as a \
              data row would address rows past the end and draw fewer"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- issue #52: a new sheet must be typeable ----
+
+    /// Typing into a freshly added sheet must COMMIT, through the real key
+    /// path, exactly as it does on a sheet loaded from a file.
+    ///
+    /// The bug this pins: `add_sheet` created `Sheet::new(..)`, which reports
+    /// 0 rows x 0 columns, while the grid still handed out a viewport centre
+    /// for cells inside it. The click landed, the caret appeared, the user
+    /// typed — and the value went nowhere, with no message. That is the
+    /// silent-failure mode `commit_edit`'s `denied` branch exists to prevent.
+    ///
+    /// Asserted through the real keyboard, not `commit_edit_for_test`: the
+    /// bug lived between the click and the commit, so a fixture that skips
+    /// the keyboard cannot see it.
+    #[test]
+    fn a_new_sheet_accepts_typed_edits() {
+        let p = write_csv(&unique("new_sheet_typing", "csv"), SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.app_mut().add_sheet_for_test();
+        h.steps(2);
+
+        // The sheet holds nothing, and that is fine — a new sheet SHOULD
+        // report zero rows, because export, SUM and the status bar must not
+        // claim it has data. What must not be zero is what the user can
+        // REACH. The fix is viewport-side: the grid offers padding rows and
+        // a blank page of columns, so the model stays honest while the sheet
+        // stays typeable.
+        assert_eq!(
+            h.app().workbook().view().row_count(),
+            0,
+            "a new sheet must still CONTAIN nothing — a fix that inflates \
+             row_count would make export write a thousand blank lines"
+        );
+
+        assert!(
+            h.click_cell(CellRef::new(1, 1)),
+            "B2 must be reachable in a new sheet — this is the click that \
+             landed on a cell the grid was not painting"
+        );
+        h.type_text("100").step();
+        h.press_key(egui::Key::Enter).steps(2);
+
+        assert_eq!(
+            h.app().workbook().view().display(CellRef::new(1, 1)),
+            "100",
+            "typing into a new sheet was silently swallowed; status was {:?}",
+            h.status()
+        );
+        // The edit is what gives the sheet its extent, so the row is now
+        // reachable by every consumer, not just by the click that made it.
+        assert!(
+            h.app().workbook().view().row_count() > 1,
+            "the value committed but the sheet's extent did not grow to cover \
+             it, so export and SUM cannot see the row the user just filled"
+        );
+        assert!(
+            h.status().contains("updated"),
+            "a committed edit must SAY so; got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The same, for the blank workbook the start screen creates — the other
+    /// way a user reaches a zero-row sheet, and the sibling call site of the
+    /// same `Sheet::new` shape.
+    #[test]
+    fn a_blank_workbook_accepts_typed_edits() {
+        let mut h = Harness::new(None);
+        h.steps(2);
+        h.app_mut().new_blank_workbook();
+        h.steps(3);
+
+        assert!(
+            h.click_cell(CellRef::new(0, 0)),
+            "A1 must be reachable in a blank workbook — the start screen's \
+             'Blank workbook' produced a grid with nowhere to click"
+        );
+        h.type_text("hi").step();
+        h.press_key(egui::Key::Enter).steps(2);
+
+        assert_eq!(
+            h.app().workbook().view().display(CellRef::new(0, 0)),
+            "hi",
+            "typing into a blank workbook was swallowed; status was {:?}",
+            h.status()
+        );
+    }
+
+    /// The empty-state placeholder must still appear on a COLD START — the
+    /// launch with nothing open. Making a new sheet typeable must not replace
+    /// "Open a CSV to get started" with an empty grid on first run.
+    #[test]
+    fn a_cold_start_still_shows_the_open_a_file_placeholder() {
+        let mut h = Harness::new(None);
+        h.steps(3);
+        // The start screen owns the frame before any choice is made; dismiss
+        // it the way "Blank workbook" does not — by asking for the grid.
+        h.app_mut().dismiss_start_screen_for_test();
+        h.steps(2);
+        let texts = h.painted_texts();
+        assert!(
+            texts.iter().any(|t| t.contains("Open a CSV")),
+            "a cold start must still say there is nothing open; painted {texts:?}"
+        );
+    }
+
+    /// A loaded sheet's real column count is NOT widened by the blank-page
+    /// fallback. The fallback applies only when the sheet has no columns at
+    /// all, so a 3-column CSV keeps 3 columns.
+    #[test]
+    fn a_loaded_sheet_keeps_its_own_column_count() {
+        let p = write_csv(&unique("new_sheet_cols", "csv"), "a,b,c\n1,2,3\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(
+            h.app().workbook().view().col_count(),
+            3,
+            "the blank-page column fallback leaked into a sheet that has data"
+        );
+        // And the cursor cannot walk past the last real column.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        for _ in 0..5 {
+            h.press_key(egui::Key::ArrowRight).steps(1);
+        }
+        assert_eq!(
+            h.app().selection().cursor.col,
+            2,
+            "arrowing right past a loaded sheet's last column must stop there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A new sheet stays typeable AFTER the first edit.
+    ///
+    /// The subtle half of the fix. Keying the padding off `view.row_count()`
+    /// makes it vanish the moment the first value lands — the view then
+    /// reports 1 row, the toggle is off, and the padding that made row 2
+    /// reachable disappears. That is a sheet you can type into exactly once,
+    /// which is barely better than the original bug and far harder to spot.
+    /// The padding is keyed off the BASE, which stays empty forever on a
+    /// user-created sheet, so it does not evaporate under its own success.
+    #[test]
+    fn a_new_sheet_is_still_typeable_after_the_first_edit() {
+        let p = write_csv(&unique("new_sheet_twice", "csv"), SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.app_mut().add_sheet_for_test();
+        h.steps(2);
+
+        for (i, (cell, text)) in [
+            (CellRef::new(0, 0), "first"),
+            (CellRef::new(3, 1), "second"),
+            (CellRef::new(9, 4), "third"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                h.click_cell(cell),
+                "edit {i}: {cell:?} became unreachable after the previous one \
+                 — the padding collapsed onto the extent the last edit created"
+            );
+            h.type_text(text).step();
+            h.press_key(egui::Key::Enter).steps(2);
+            assert_eq!(
+                h.app().workbook().view().display(cell),
+                text,
+                "edit {i} was swallowed; status {:?}",
+                h.status()
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Typing deep in the padding of a new sheet lands where the user aimed.
+    ///
+    /// The padding rows are the mechanism that makes a new sheet typeable, so
+    /// the row a keystroke reaches has to be the row it addressed — a padding
+    /// row that resolved through a mapping would put the value somewhere else
+    /// entirely, which is the silent-wrong-record failure the row resolver
+    /// exists to prevent.
+    #[test]
+    fn a_new_sheet_commits_to_the_row_the_user_actually_reached() {
+        let p = write_csv(&unique("new_sheet_deep", "csv"), SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.app_mut().add_sheet_for_test();
+        h.steps(2);
+        assert_eq!(h.app().workbook().view().row_count(), 0, "precondition");
+
+        // Arrow down into the padding, then type. Both go through the real
+        // key path, so the row the app committed to is the row navigation
+        // actually reached.
+        h.click_cell(CellRef::new(0, 0));
+        for _ in 0..4 {
+            h.press_key(egui::Key::ArrowDown).steps(1);
+        }
+        let landed = h.app().selection().cursor;
+        assert_eq!(
+            landed,
+            CellRef::new(4, 0),
+            "arrowing down a new sheet must move — a zero-row sheet pinned the \
+             cursor at A1, which is why there was nowhere to type"
+        );
+        h.type_text("deep").step();
+        h.press_key(egui::Key::Enter).steps(2);
+
+        assert_eq!(
+            h.app().workbook().view().display(landed),
+            "deep",
+            "the value did not land on the row the cursor was on; status {:?}",
+            h.status()
+        );
+        assert!(
+            h.app().workbook().view().row_count() > landed.row as usize,
+            "the sheet accepted the value but did not grow its extent, so the \
+             row is invisible to export and SUM"
         );
         let _ = std::fs::remove_file(&p);
     }
