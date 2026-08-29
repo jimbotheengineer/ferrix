@@ -428,6 +428,12 @@ impl FerrixApp {
                 }
                 self.selection.move_to(CellRef::new(0, 0));
                 self.scroll = ScrollState::default();
+                // The workbook we just built has the FILE's sheet name, which
+                // is only known now — so this is where the sheet's remembered
+                // zoom is adopted. Doing it at construction would read the
+                // placeholder "Sheet1" and silently lose the preference.
+                self.zoom = self.prefs.zoom_of(self.wb.active_name());
+                self.panes = crate::grid::Panes::default();
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
@@ -3645,6 +3651,10 @@ impl FerrixApp {
                 self.header_hitboxes = resp.header_hitboxes.clone();
                 self.last_painted_rows = resp.painted_rows.clone();
                 self.last_frozen_rows = resp.frozen_row_count;
+                // The grid clamps the zoom (a band taller than the window is
+                // refused), so the app adopts what was ACTUALLY painted rather
+                // than what it asked for.
+                self.zoom = resp.zoom;
 
                 if let Some(cell) = resp.clicked {
                     if self.editing.is_some() && self.editing != Some(cell) {

@@ -430,6 +430,20 @@ mod tests {
 
     const SAMPLE: &str = "id,name,qty\n1,alpha,10\n2,beta,20\n3,gamma,30\n4,delta,40\n";
 
+    /// Guard for any test that WRITES preferences.
+    ///
+    /// `set_zoom` persists, and `FERRIX_CONFIG_DIR` plus the prefs file itself
+    /// are process-wide. Two zoom tests running in parallel write the same
+    /// file, and the one that writes second erases the other's entry — which
+    /// looks exactly like a broken persistence feature. Every test that
+    /// mutates prefs takes this lock, so the write and the read that follows
+    /// it are never interleaved with another test's write.
+    fn prefs_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::prefs::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn app_starts_and_runs_frames() {
         let mut h = Harness::new(None);
@@ -1966,6 +1980,442 @@ xxx,yyy,zzz
                 "one undo must restore row {r}"
             );
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================= roadmap #6: freeze panes, split view, zoom ============
+    //
+    // Every assertion below is on state the FEATURE changes: which underlying
+    // row a screen row shows, which row number is painted beside it, and which
+    // cell a pixel resolves to. None of them can be satisfied by a file having
+    // loaded or by a status string being non-empty.
+
+    /// Build a CSV with `n` data rows: `id,name,qty` where id == row index.
+    fn big_csv(name: &str, n: usize) -> std::path::PathBuf {
+        let mut body = String::with_capacity(n * 18 + 16);
+        body.push_str("id,name,qty\n");
+        for i in 0..n {
+            body.push_str(&format!("{i},r{i},{}\n", i % 97));
+        }
+        write_csv(name, &body)
+    }
+
+    /// THE acceptance test. Freeze at row 5, drive the body a million rows
+    /// down, and assert the frozen rows are STILL PAINTED, still showing their
+    /// own records, still numbered 1..5.
+    ///
+    /// If freeze did nothing at all, the body scroll would carry every painted
+    /// row past row 999,000 and row 1 would be nowhere in the frame — which is
+    /// exactly what the first assertion checks.
+    #[test]
+    fn freeze_at_row_5_keeps_row_1_on_screen_after_scrolling_to_row_1_000_000() {
+        let n = 1_100_000usize;
+        let p = big_csv("freeze_deep.csv", n);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(2000, |a| a.row_count() >= n),
+            "file never loaded; status: {}",
+            h.status()
+        );
+
+        // Freeze at row 5: the cursor sits on screen row 4 (data row index 4,
+        // the 5th row), so rows 1..=4 above it become the frozen band... put
+        // the cursor on the 6th row so five rows are frozen.
+        h.select(CellRef::new(5, 0), CellRef::new(5, 0));
+        h.freeze_at_cursor(true, false);
+        assert_eq!(h.app().panes().rows, 5, "five rows must be frozen");
+        assert!(h.app().panes().frozen);
+
+        // Now scroll the BODY a million rows down.
+        h.scroll_body_to(1_000_000.0);
+        assert!(
+            h.app().body_row_offset() >= 999_000.0,
+            "body did not actually scroll: offset {}",
+            h.app().body_row_offset()
+        );
+
+        let painted = h.app().painted_rows();
+        assert!(!painted.is_empty(), "nothing was painted at all");
+        let frozen = h.app().frozen_row_count();
+        assert_eq!(frozen, 5, "the frozen band must still paint five rows");
+
+        // ROW 1 IS STILL VISIBLE, and it is the FIRST thing painted -- the
+        // frozen band is iterated before the body.
+        assert_eq!(
+            painted[0],
+            (0usize, 0u32),
+            "screen row 0 must still show underlying row 0 (row number 1)"
+        );
+        // Its painted row NUMBER is 1: the row header prints row + 1, and that
+        // is the number the user reads.
+        let row_number = painted[0].1 as u64 + 1;
+        assert_eq!(row_number, 1, "the top row must still be numbered 1");
+        // And its DATA is row 1's data, not row 1,000,000's.
+        assert_eq!(h.app().display(CellRef::new(painted[0].1, 0)), "0");
+
+        // All five frozen rows are rows 1..=5, in order.
+        let frozen_numbers: Vec<u64> = painted[..5].iter().map(|&(_, r)| r as u64 + 1).collect();
+        assert_eq!(frozen_numbers, vec![1, 2, 3, 4, 5]);
+
+        // ...while the BODY really is down at a million.
+        let body_first = painted[5].1;
+        assert!(
+            body_first >= 999_000,
+            "the body pane should be near row 1,000,000, got {body_first}"
+        );
+
+        // The scale invariant: a frozen band is a handful of EXTRA rows, not a
+        // second pass over 1.1M rows.
+        assert!(
+            painted.len() < 200,
+            "a frame painted {} rows over a {n}-row sheet",
+            painted.len()
+        );
+
+        // Unfreezing removes the band, and then row 1 is genuinely gone --
+        // which proves the previous assertions were about the freeze and not
+        // about some unrelated always-paint-row-1 behaviour.
+        h.unfreeze();
+        h.scroll_body_to(1_000_000.0);
+        let after: Vec<u32> = h.app().painted_underlying_rows();
+        assert_eq!(h.app().frozen_row_count(), 0);
+        assert!(
+            !after.contains(&0),
+            "with no freeze, row 1 must NOT be on screen a million rows down"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// At 200% a click at a given point must still resolve to the correct data
+    /// cell. The point is chosen from the app's own painted geometry for a
+    /// KNOWN cell, then handed back as a raw pixel -- so this tests the hit
+    /// test's zoom arithmetic, not the test's ability to guess pixels.
+    #[test]
+    fn a_click_at_200_percent_resolves_to_the_correct_data_cell() {
+        let _prefs = prefs_guard();
+        let p = big_csv("zoom_click.csv", 400);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() >= 400));
+
+        let target = CellRef::new(7, 2);
+
+        // Where that cell is at 100%.
+        h.set_zoom(1.0);
+        let at_100 = h.app().cell_center(target).expect("cell on screen at 100%");
+
+        // Where it is at 200%. Geometry MUST move -- if zoom did nothing, the
+        // two points would coincide and the rest of this test would pass
+        // vacuously, so that is asserted first.
+        h.set_zoom(2.0);
+        assert!((h.app().zoom() - 2.0).abs() < 1e-4, "zoom was not applied");
+        let at_200 = h.app().cell_center(target).expect("cell on screen at 200%");
+        assert!(
+            (at_200.1 - at_100.1).abs() > 5.0,
+            "at 200% the cell should have moved down the screen: {at_100:?} -> {at_200:?}"
+        );
+
+        // Click that raw point. The app must resolve it back to C8.
+        h.click_point(at_200.0, at_200.1);
+        assert_eq!(
+            h.app().cursor(),
+            target,
+            "a click at {at_200:?} at 200% zoom selected the wrong cell"
+        );
+
+        // A row further down, to catch an off-by-a-scale-factor that happens to
+        // work near the top of the viewport.
+        let deeper = CellRef::new(12, 1);
+        let pt = h.app().cell_center(deeper).expect("deeper cell on screen");
+        h.click_point(pt.0, pt.1);
+        assert_eq!(h.app().cursor(), deeper);
+
+        // The SAME screen point means a DIFFERENT cell at a different zoom --
+        // the property that makes the hit test genuinely zoom-aware rather
+        // than accidentally correct.
+        h.set_zoom(1.0);
+        h.click_point(at_200.0, at_200.1);
+        let at_100_cursor = h.app().cursor();
+        assert_ne!(
+            at_100_cursor, target,
+            "the same pixel resolved to the same cell at both zooms, so the \
+             hit test is ignoring zoom"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Zoom and freeze must not disturb the row resolution: under an active
+    /// SORT, the record a given screen row shows is the same with and without
+    /// them. This is the regression that once painted wrong records under
+    /// correct row numbers.
+    #[test]
+    fn zoom_and_freeze_compose_with_a_sort_without_changing_which_record_a_row_shows() {
+        let _prefs = prefs_guard();
+        // Descending-ish qty so a sort genuinely permutes the rows.
+        let mut body = String::from("id,name,qty\n");
+        for i in 0..300usize {
+            body.push_str(&format!("{i},r{i},{}\n", (i * 37) % 300));
+        }
+        let p = write_csv("zoomsort.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() >= 300));
+
+        // Sort by qty (column 2) with a real header click.
+        h.click_header(2);
+        assert!(h.app().sort_dir(2).is_some(), "sort did not engage");
+        let sorted_order = h.app().visible_row_order();
+        assert_ne!(
+            sorted_order[..8].to_vec(),
+            (0u32..8).collect::<Vec<_>>(),
+            "the sort did not actually permute anything"
+        );
+
+        // Baseline: which underlying row each painted screen row shows.
+        h.steps(2);
+        let baseline: Vec<(usize, u32)> = h.app().painted_rows().to_vec();
+        assert!(baseline.len() > 10);
+        // The baseline agrees with the sort mapping -- if it did not, the rest
+        // of this test would be comparing two equally wrong things.
+        for &(screen, row) in baseline.iter().take(10) {
+            assert_eq!(
+                sorted_order[screen], row,
+                "screen row {screen} showed row {row}, sort says {}",
+                sorted_order[screen]
+            );
+        }
+
+        // Now zoom AND freeze, and re-read.
+        h.set_zoom(2.0);
+        h.select(
+            CellRef::new(sorted_order[3], 0),
+            CellRef::new(sorted_order[3], 0),
+        );
+        h.freeze_at_cursor(true, true);
+        assert_eq!(h.app().panes().rows, 3, "three rows frozen");
+        assert!((h.app().zoom() - 2.0).abs() < 1e-4);
+        // The sort is untouched by either.
+        assert!(
+            h.app().sort_dir(2).is_some(),
+            "zoom/freeze dropped the sort"
+        );
+        assert_eq!(
+            h.app().visible_row_order(),
+            sorted_order,
+            "zoom or freeze changed the sort order"
+        );
+
+        // Every painted screen row still shows the record the SORT says it
+        // should -- frozen band and body alike.
+        let after: Vec<(usize, u32)> = h.app().painted_rows().to_vec();
+        assert!(!after.is_empty());
+        assert_eq!(h.app().frozen_row_count(), 3);
+        for &(screen, row) in &after {
+            assert_eq!(
+                sorted_order[screen], row,
+                "under zoom+freeze, screen row {screen} shows row {row} but \
+                 the sort puts row {} there",
+                sorted_order[screen]
+            );
+        }
+        // Specifically: the three frozen rows are the sort's first three.
+        let frozen_rows: Vec<u32> = after[..3].iter().map(|&(_, r)| r).collect();
+        assert_eq!(frozen_rows, sorted_order[..3].to_vec());
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The same composition, under a FILTER rather than a sort.
+    #[test]
+    fn zoom_and_freeze_compose_with_a_filter_without_changing_which_record_a_row_shows() {
+        let _prefs = prefs_guard();
+        let mut body = String::from("id,name,qty\n");
+        for i in 0..400usize {
+            // Only every 7th row says "keepme".
+            let name = if i % 7 == 0 { "keepme" } else { "other" };
+            body.push_str(&format!("{i},{name},{}\n", i % 13));
+        }
+        let p = write_csv("zoomfilter.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() >= 400));
+
+        h.ctrl(Key::F).steps(2);
+        h.app_mut().set_search_input("keepme");
+        h.steps(3);
+        h.toggle_filter_mode();
+        h.steps(3);
+
+        let kept = h.app().visible_row_order();
+        assert!(kept.len() > 20, "filter kept too little: {}", kept.len());
+        assert!(
+            kept.iter().all(|r| r % 7 == 0),
+            "the filter kept rows it should not have"
+        );
+
+        // Zoom and freeze on top of the filter.
+        h.set_zoom(2.0);
+        h.select(CellRef::new(kept[2], 0), CellRef::new(kept[2], 0));
+        h.freeze_at_cursor(true, false);
+        assert_eq!(
+            h.app().panes().rows,
+            2,
+            "freeze must count SCREEN rows under a filter, not underlying ones"
+        );
+
+        // The filter survived, and every painted row still maps through it.
+        assert_eq!(h.app().visible_row_order(), kept, "filter changed");
+        let painted: Vec<(usize, u32)> = h.app().painted_rows().to_vec();
+        assert!(!painted.is_empty());
+        for &(screen, row) in &painted {
+            if screen < kept.len() {
+                assert_eq!(
+                    kept[screen], row,
+                    "screen row {screen} shows row {row}, filter says {}",
+                    kept[screen]
+                );
+            }
+        }
+        // The frozen band shows the filter's first two kept rows -- their real
+        // row numbers, not 1 and 2.
+        assert_eq!(painted[0].1, kept[0]);
+        assert_eq!(painted[1].1, kept[1]);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Split view: two independent scroll offsets over ONE column layout.
+    /// Scrolling the body must leave the split band where it was.
+    #[test]
+    fn split_view_scrolls_its_two_panes_independently() {
+        let p = big_csv("splitview.csv", 5_000);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(600, |a| a.row_count() >= 5_000));
+
+        h.select(CellRef::new(4, 0), CellRef::new(4, 0));
+        h.split_at_cursor();
+        assert_eq!(h.app().panes().rows, 4);
+        assert!(
+            !h.app().panes().frozen,
+            "a split band must NOT be pinned -- that is what makes it a split"
+        );
+
+        let band_before: Vec<u32> = h
+            .app()
+            .painted_rows()
+            .iter()
+            .take(4)
+            .map(|&(_, r)| r)
+            .collect();
+        assert_eq!(band_before, vec![0, 1, 2, 3]);
+
+        // Move only the body.
+        h.scroll_body_to(2_000.0);
+        let painted = h.app().painted_rows().to_vec();
+        let band_after: Vec<u32> = painted.iter().take(4).map(|&(_, r)| r).collect();
+        assert_eq!(
+            band_after, band_before,
+            "the body scroll dragged the split band with it"
+        );
+        // Unlike a freeze, a split band CAN show a row the body also could --
+        // but here the body has moved far away, so they are disjoint.
+        assert!(
+            painted[4].1 >= 1_900,
+            "the body pane did not move: first body row {}",
+            painted[4].1
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A frozen COLUMN band keeps its columns on screen while the body scrolls
+    /// right, and the same column keeps the same width in both bands.
+    #[test]
+    fn frozen_columns_stay_on_screen_and_share_the_body_column_widths() {
+        // Wide enough that scrolling right pushes column A off a normal grid.
+        let mut body = String::new();
+        for c in 0..40 {
+            if c > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!("col{c}"));
+        }
+        body.push('\n');
+        for r in 0..50 {
+            for c in 0..40 {
+                if c > 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!("v{r}_{c}"));
+            }
+            body.push('\n');
+        }
+        let p = write_csv("freezecols.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(600, |a| a.col_count() >= 40));
+
+        // Freeze the first two columns.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.freeze_at_cursor(false, true);
+        assert_eq!(h.app().panes().cols, 2);
+
+        // A frozen column's header is still on screen...
+        let a_header = h.app().header_center(0);
+        assert!(a_header.is_some(), "frozen column A lost its header");
+        // ...and a cell in it still has a rect.
+        let a_cell = h
+            .app()
+            .cell_center(CellRef::new(3, 0))
+            .expect("frozen column A must still be painted");
+        // Clicking it selects it, so the frozen band is really hit-testable.
+        h.click_point(a_cell.0, a_cell.1);
+        assert_eq!(h.app().cursor(), CellRef::new(3, 0));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Zoom is clamped to 25%..400% and remembered per sheet across a restart.
+    #[test]
+    fn zoom_is_clamped_and_persists_per_sheet() {
+        // FERRIX_CONFIG_DIR is process-wide and other tests in this binary
+        // redirect it too; without this lock they interleave and a working
+        // persistence feature reports itself broken.
+        let _guard = crate::prefs::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ferrix-zoom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev = std::env::var_os("FERRIX_CONFIG_DIR");
+        std::env::set_var("FERRIX_CONFIG_DIR", &dir);
+
+        let p = big_csv("zoompersist.csv", 100);
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(400, |a| a.row_count() >= 100));
+            // Out of range in both directions is clamped, not accepted.
+            h.set_zoom(99.0);
+            assert!((h.app().zoom() - 4.0).abs() < 1e-4, "zoom exceeded 400%");
+            h.set_zoom(0.01);
+            assert!((h.app().zoom() - 0.25).abs() < 1e-4, "zoom fell below 25%");
+            h.set_zoom(2.0);
+            assert!((h.app().zoom() - 2.0).abs() < 1e-4);
+        }
+
+        // A FRESH app is exactly what the next process run is.
+        {
+            let mut h2 = Harness::new(Some(&p));
+            assert!(h2.step_until(400, |a| a.row_count() >= 100));
+            assert!(
+                (h2.app().zoom() - 2.0).abs() < 1e-4,
+                "zoom did not survive a restart: got {}",
+                h2.app().zoom()
+            );
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("FERRIX_CONFIG_DIR", v),
+            None => std::env::remove_var("FERRIX_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&p);
     }
 }

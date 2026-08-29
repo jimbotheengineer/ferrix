@@ -70,9 +70,48 @@ Implementation complete and building; all three gates green (see Gates below).
   back from the app, same discipline as the existing `click_header`),
   `click_point` (raw pixel, for the zoom hit-test check).
 
-## Tests added
+## Tests added (7, all in `harness.rs`, driving the real app)
 
-See "Tests" section at the bottom — updated as they land.
+1. **`freeze_at_row_5_keeps_row_1_on_screen_after_scrolling_to_row_1_000_000`**
+   — THE acceptance test. 1.1M-row CSV, freeze 5 rows, `scroll_body_to(1_000_000)`.
+   Asserts the body really moved (offset ≥ 999,000), that `painted_rows()[0]`
+   is still `(screen 0, underlying 0)`, that its painted row NUMBER is 1, that
+   its DATA is row 1's, that all five frozen rows are numbered 1..5, that the
+   body's first row is ≥ 999,000, and that a frame painted < 200 rows (the
+   scale invariant). Then **unfreezes and re-scrolls and asserts row 1 is NOT
+   on screen** — so the earlier assertions cannot pass against a dead feature.
+2. **`a_click_at_200_percent_resolves_to_the_correct_data_cell`** — reads C8's
+   painted centre at 100%, then at 200%, asserts the geometry MOVED (or the
+   test would be vacuous), clicks the raw 200% pixel and asserts the cursor is
+   C8. Repeats deeper down the viewport. Then asserts the SAME pixel at 100%
+   resolves to a DIFFERENT cell — the property that makes the hit test
+   genuinely zoom-aware rather than accidentally correct.
+3. **`zoom_and_freeze_compose_with_a_sort_without_changing_which_record_a_row_shows`**
+   — real header click to sort, asserts the sort actually permuted, captures
+   the screen-row → underlying-row map, then applies zoom 200% AND freeze and
+   asserts EVERY painted screen row still shows the record `visible_row_order()`
+   says it should, band and body alike.
+4. **`zoom_and_freeze_compose_with_a_filter_without_changing_which_record_a_row_shows`**
+   — the same under search filter mode; also checks freeze counts SCREEN rows
+   under a filter, and that the frozen band shows the filter's kept rows with
+   their real row numbers.
+5. **`split_view_scrolls_its_two_panes_independently`** — split at row 5, scroll
+   the body to 2,000, assert the split band still shows rows 1..4 and the body
+   moved.
+6. **`frozen_columns_stay_on_screen_and_share_the_body_column_widths`** — 40
+   columns, freeze 2, assert column A keeps a header and a paintable rect, and
+   that clicking it selects A4 (the frozen band is hit-testable).
+7. **`zoom_is_clamped_and_persists_per_sheet`** — 99.0 clamps to 4.0, 0.01 to
+   0.25, and 2.0 survives constructing a FRESH app (what a restart is).
+
+**Bugs these tests caught and I fixed:**
+- Zoom was adopted at construction from the placeholder sheet name `"Sheet1"`
+  and never re-adopted after the file load renamed the sheet, so the persisted
+  zoom was silently lost on every restart. Fixed in `poll_load`.
+- Tests that write prefs raced on the process-wide `FERRIX_CONFIG_DIR` / prefs
+  file. Added `prefs::CONFIG_ENV_LOCK` and made every prefs-mutating test hold
+  it (including the pre-existing `theme_preference_survives_a_restart`, which
+  had the same latent race). Verified with 4 consecutive full-workspace runs.
 
 ## Not verified / known limits
 
@@ -92,6 +131,11 @@ Run from the clone root with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 | gate | result |
 |------|--------|
-| `cargo test --workspace` | see below |
-| `cargo fmt --all --check` | see below |
-| `cargo clippy --workspace --all-targets -- -D warnings` | see below |
+| `cargo test --workspace` | **PASS** — exit 0, **827 passed, 0 failed** (820 baseline + 7 new) |
+| `cargo fmt --all --check` | **PASS** — exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** — exit 0 |
+
+The test suite was run 4 consecutive times end-to-end, all exit 0, to confirm
+the prefs-locking fix removed the flake rather than hiding it.
+
+`benchdata/` — none was generated in this clone; nothing to clean.

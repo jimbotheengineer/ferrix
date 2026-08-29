@@ -28,7 +28,7 @@ use crate::theme::ThemeMode;
 /// `PartialEq` but not `Eq`: `zoom` is an f32. Comparisons here are exact by
 /// design — a zoom is only ever one of a fixed set of stops, or a value that
 /// round-tripped through this file's own formatting.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Prefs {
     /// `None` means "never chosen" — the caller then follows the OS.
     pub theme: Option<ThemeMode>,
@@ -40,16 +40,6 @@ pub struct Prefs {
     /// what the user recognises and what survives reopening the file. Only
     /// sheets the user actually zoomed appear, so the default costs nothing.
     pub zoom: Vec<(String, f32)>,
-}
-
-impl Default for Prefs {
-    fn default() -> Self {
-        Self {
-            theme: None,
-            show_empty_rows: false,
-            zoom: Vec::new(),
-        }
-    }
 }
 
 impl Prefs {
@@ -170,6 +160,16 @@ impl Prefs {
     }
 }
 
+/// Serializes tests that redirect `FERRIX_CONFIG_DIR`.
+///
+/// The environment is per-PROCESS, and every test in this binary runs in the
+/// same one on parallel threads. Two tests each doing set-use-restore will
+/// interleave, and the second `set_var` lands between the first test's set and
+/// its read — which is exactly how a working persistence feature reports
+/// itself broken. Any test that touches this variable must hold this lock.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +224,9 @@ mod tests {
     /// the config dir redirected at a temp directory.
     #[test]
     fn theme_preference_survives_a_restart() {
+        // Held for the whole test: the env var is process-wide and shared
+        // with every other test in this binary.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrix-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Set-and-restore rather than leaving it set: other tests in this
