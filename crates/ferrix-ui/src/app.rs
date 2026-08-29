@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use egui::{Align, Key, Layout, RichText};
-use ferrix_core::{CellRef, Selection, Sheet, Value};
+use ferrix_core::{CellRef, Selection, Sheet, Suggestions, Value};
 use ferrix_formula::eval_view;
 use ferrix_io::{load_csv, CsvOptions};
 
@@ -118,6 +118,14 @@ enum Focus {
 /// Named constants because F4 and the caret read-back have to address the
 /// SAME widget the editor was drawn with; two spellings of the same string
 /// would silently read an empty caret and put F4 on the wrong reference.
+/// Cap on cells the Circle Invalid Data pass will ring (issue #41).
+///
+/// A second belt on top of the viewport bound. The circles are already
+/// computed over the painted rows only, so this can never bite in practice —
+/// it exists so a future caller that widened the range cannot turn a 200M-row
+/// sheet into a 200M-entry `Vec`.
+pub const MAX_CIRCLED: usize = 4096;
+
 const CELL_EDITOR_ID: &str = "cell_editor";
 const FORMULA_BAR_ID: &str = "formula_bar_edit";
 
@@ -502,6 +510,33 @@ pub struct FerrixApp {
     /// bar so it survives the dialog closing.
     cond_warning: Option<String>,
 
+    // ---- data validation and autocomplete (issue #41) ----
+    /// The validation editor, when it is open. `None` costs nothing.
+    validation: Option<crate::validation_panel::ValidationState>,
+    /// The in-cell suggestion popup's state.
+    ///
+    /// Holds at most `MAX_SUGGESTIONS` strings, so its footprint has a hard
+    /// ceiling regardless of the column behind it.
+    autocomplete: crate::validation_panel::AutocompleteState,
+    /// Whether autocomplete is offering suggestions at all. A toggle, because
+    /// it is the kind of help that some people want off.
+    autocomplete_on: bool,
+    /// Where the in-cell dropdown arrow was painted last frame, if anywhere.
+    dropdown_button: Option<(CellRef, egui::Rect)>,
+    /// Cells the Circle Invalid Data pass ringed last frame.
+    ///
+    /// Recomputed per frame from the VIEWPORT, so it is bounded by the screen
+    /// and never by the sheet — a 200M-row sheet with every row invalid puts
+    /// at most a screenful in here.
+    circled: Vec<CellRef>,
+    /// Whether the circles are being drawn at all.
+    circle_invalid: bool,
+    /// Circles actually PAINTED last frame. Real paint output, counted at the
+    /// point of drawing, so a test asserting on it reads the screen rather
+    /// than the model — and it counts the specific shape this feature adds
+    /// rather than a total other effects also move.
+    last_validation_circles: usize,
+
     /// The Goal Seek dialog, when it is open (issue #35).
     ///
     /// `None` is the common case and costs nothing: no dialog, no solver, and
@@ -718,6 +753,13 @@ impl FerrixApp {
             name_box_sheet_scope: false,
             cond: None,
             cond_warning: None,
+            validation: None,
+            autocomplete: crate::validation_panel::AutocompleteState::default(),
+            autocomplete_on: true,
+            dropdown_button: None,
+            circled: Vec::new(),
+            circle_invalid: false,
+            last_validation_circles: 0,
             goal_seek: None,
             protect_dialog: None,
             // Recency is restored before the first frame, so the palette's
@@ -1048,9 +1090,39 @@ impl FerrixApp {
             return;
         };
         let raw = std::mem::take(&mut self.edit_buffer);
+        self.autocomplete.reset();
+
+        // --- data validation (issue #41) ---
+        //
+        // Checked BEFORE the write, on the raw text, at the same single
+        // chokepoint protection uses. A `Stop` rule REJECTS: nothing is
+        // written, the cell keeps what it had, and the message says why. A
+        // `Warning` rule lets the value through and still says so — the
+        // difference the acceptance criterion names, decided by one predicate
+        // (`ErrorStyle::rejects`) so the two paths cannot drift.
+        let verdict = self.wb.check_typed(cell, &raw);
+        if let Some((style, message)) = &verdict {
+            if style.rejects() {
+                self.status = format!("{} not changed — {message}", cell.to_a1());
+                self.focus = Focus::Grid;
+                self.sync_formula_bar();
+                return;
+            }
+        }
+
         let report = self.wb.commit_edit(cell, &raw);
         self.focus = Focus::Grid;
 
+        // A Warning rule allowed the entry; the user must still be told.
+        if let Some((style, message)) = &verdict {
+            if !style.rejects() {
+                self.status = format!("{} updated — warning: {message}", cell.to_a1());
+                self.sync_formula_bar();
+                // Recompute the rings so the newly-invalid cell is marked.
+                self.refresh_circles();
+                return;
+            }
+        }
         self.status = if let Some(denied) = &report.denied {
             // Issue #42: a refused edit MUST say why. Doing nothing silently
             // is the failure mode the acceptance criterion names, and it is
@@ -1085,6 +1157,7 @@ impl FerrixApp {
     fn cancel_edit(&mut self) {
         self.editing = None;
         self.edit_buffer.clear();
+        self.autocomplete.reset();
         self.formula_input = std::mem::take(&mut self.edit_pre_text);
         self.recompute_formula();
         self.ref_drag = None;
@@ -3816,6 +3889,294 @@ impl FerrixApp {
         self.wb.format.decor_count()
     }
 
+    // ============================ data validation & autocomplete (#41) =====
+
+    /// The rectangle the current selection means, for a validation rule.
+    fn selection_range(&self) -> ferrix_core::TableRange {
+        let (a, b) = self.selection.bounds();
+        ferrix_core::TableRange::new(a.row, a.col, b.row, b.col)
+    }
+
+    /// Open the New Rule dialog on the current selection.
+    pub fn validation_new_rule(&mut self) {
+        self.validation = Some(crate::validation_panel::ValidationState::new_rule(
+            self.selection_range(),
+        ));
+    }
+
+    /// Open the Manage Rules list.
+    pub fn validation_manage(&mut self) {
+        self.validation = Some(crate::validation_panel::ValidationState::manage(
+            self.selection_range(),
+        ));
+    }
+
+    /// Remove every rule covering the selection.
+    pub fn validation_clear_selection(&mut self) {
+        let range = self.selection_range();
+        let n = self.wb.validation.clear_overlapping(range);
+        self.wb.mark_dirty();
+        // The circles were computed against rules that no longer exist.
+        self.circled.clear();
+        self.status = match n {
+            0 => format!("No validation rules cover {}", range.to_a1()),
+            1 => format!("Validation removed from {}", range.to_a1()),
+            _ => format!("{n} validation rules removed from {}", range.to_a1()),
+        };
+    }
+
+    /// Turn the Circle Invalid Data overlay on, recomputing it this frame.
+    pub fn circle_invalid_data(&mut self) {
+        self.circle_invalid = true;
+        self.refresh_circles();
+        self.status = if self.wb.validation.is_empty() {
+            "No validation rules to check - add one first".to_string()
+        } else if self.circled.is_empty() {
+            "No invalid data in view".to_string()
+        } else {
+            format!(
+                "{} invalid cell{} circled in the current view",
+                self.circled.len(),
+                if self.circled.len() == 1 { "" } else { "s" }
+            )
+        };
+    }
+
+    pub fn clear_validation_circles(&mut self) {
+        self.circle_invalid = false;
+        self.circled.clear();
+        self.status = "Validation circles cleared".into();
+    }
+
+    pub fn toggle_autocomplete(&mut self) {
+        self.autocomplete_on = !self.autocomplete_on;
+        if !self.autocomplete_on {
+            self.autocomplete.dismiss();
+        }
+        self.status = format!(
+            "Value suggestions {}",
+            if self.autocomplete_on { "on" } else { "off" }
+        );
+    }
+
+    /// Recompute the circled set from the VIEWPORT.
+    ///
+    /// The bound the acceptance criterion names, and the reason this is not
+    /// simply `invalid_cells_in(whole_sheet)`: the range handed to the workbook
+    /// is the rows the last frame actually painted, so the pass is a screenful
+    /// of work however many rows the sheet has. `last_painted_rows` is real
+    /// paint output - the same list the paint loop walked - not a
+    /// recomputation, so this cannot drift from what is on screen.
+    fn refresh_circles(&mut self) {
+        self.circled.clear();
+        if !self.circle_invalid || self.wb.validation.is_empty() {
+            return;
+        }
+        let Some((first_row, last_row)) = self.visible_row_span() else {
+            return;
+        };
+        let cols = self.wb.view().col_count().max(1) as u32;
+        let range = ferrix_core::TableRange::new(first_row, 0, last_row, cols.saturating_sub(1));
+        // A hard cap on top of the viewport bound: even a caller that widened
+        // the range cannot make this allocate without limit.
+        self.circled = self.wb.invalid_cells_in(range, MAX_CIRCLED);
+    }
+
+    /// The row span the grid painted last frame, if it has painted one.
+    fn visible_row_span(&self) -> Option<(u32, u32)> {
+        let first = self.last_painted_rows.iter().map(|(_, r)| *r).min()?;
+        let last = self.last_painted_rows.iter().map(|(_, r)| *r).max()?;
+        Some((first, last))
+    }
+
+    /// Cells circled right now. Read by tests and by the paint loop.
+    pub fn circled_cells(&self) -> &[CellRef] {
+        &self.circled
+    }
+
+    /// Validation circles the last frame actually PAINTED.
+    ///
+    /// The specific shape this feature adds, counted where it is drawn -
+    /// deliberately not a total shape count, which selection, borders and
+    /// comment markers all move for unrelated reasons.
+    pub fn painted_validation_circles(&self) -> usize {
+        self.last_validation_circles
+    }
+
+    pub fn validation_is_open(&self) -> bool {
+        self.validation.is_some()
+    }
+
+    pub fn validation_state(&self) -> Option<&crate::validation_panel::ValidationState> {
+        self.validation.as_ref()
+    }
+
+    pub fn validation_state_mut(
+        &mut self,
+    ) -> Option<&mut crate::validation_panel::ValidationState> {
+        self.validation.as_mut()
+    }
+
+    /// The suggestion popup's state, for tests and the paint loop.
+    pub fn autocomplete_state(&self) -> &crate::validation_panel::AutocompleteState {
+        &self.autocomplete
+    }
+
+    /// Apply an outcome from the validation dialog.
+    fn validation_apply(&mut self, out: crate::validation_panel::ValidationOutcome) {
+        use crate::validation_panel::{ValidationForm, ValidationMode, ValidationState};
+        let Some(st) = self.validation.as_mut() else {
+            return;
+        };
+        let range = st.range;
+        if out.cancel {
+            self.validation = None;
+            return;
+        }
+        if out.new_rule {
+            *st = ValidationState::new_rule(range);
+        }
+        if let Some(i) = out.edit {
+            if let Some(rule) = self.wb.validation.get(i) {
+                let form = ValidationForm::from_rule(rule);
+                let r = rule.range;
+                if let Some(st) = self.validation.as_mut() {
+                    st.form = form;
+                    st.range = r;
+                    st.mode = ValidationMode::Edit(i);
+                }
+            }
+        }
+        if out.back {
+            if let Some(st) = self.validation.as_mut() {
+                st.mode = ValidationMode::Manage;
+            }
+        }
+        if let Some(i) = out.delete {
+            if self.wb.validation.remove(i).is_some() {
+                self.wb.mark_dirty();
+                self.circled.clear();
+                self.status = "Validation rule deleted".into();
+            }
+        }
+        if out.commit {
+            let st = self.validation.as_ref().expect("checked above");
+            let rule = st.form.to_validation(st.range);
+            let mode = st.mode;
+            let loss = ferrix_io::sheet_validation_xlsx_loss(&rule);
+            let label = rule.range.to_a1();
+            let domain = rule.domain.label();
+            let stored = match mode {
+                ValidationMode::Edit(i) => self.wb.validation.set(i, rule),
+                _ => self.wb.validation.push(rule).is_some(),
+            };
+            self.status = if !stored {
+                "Too many validation rules on this sheet".to_string()
+            } else {
+                self.wb.mark_dirty();
+                // The circles were computed against the previous rule set.
+                self.refresh_circles();
+                match loss.first() {
+                    Some(w) => format!("{domain} validation on {label} - note: {w}"),
+                    None => format!("{domain} validation applied to {label}"),
+                }
+            };
+            self.validation = Some(ValidationState::manage(range));
+        }
+    }
+
+    /// Draw the validation editor and act on what it reported.
+    fn show_validation_editor(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        // Drawn against a detached clone, so the read path is provably
+        // read-only and every mutation arrives as an outcome - the same
+        // discipline `show_cond_editor` uses.
+        let Some(mut st) = self.validation.clone() else {
+            return;
+        };
+        let out = crate::validation_panel::show(ctx, &mut st, &self.wb.validation, th);
+        if self.validation.is_some() {
+            self.validation = Some(st);
+        }
+        if !out.is_empty() {
+            self.validation_apply(out);
+        }
+    }
+
+    /// Refresh the suggestion popup for the live edit.
+    ///
+    /// Called once per frame while a cell is open for editing. The scan it
+    /// triggers is bounded by `SCAN_LIMIT`, so this is a fixed cost per frame
+    /// and not a function of the column's length.
+    fn refresh_autocomplete(&mut self) {
+        let Some(cell) = self.editing else {
+            self.autocomplete.reset();
+            return;
+        };
+        if !self.autocomplete_on || self.autocomplete.dismissed {
+            return;
+        }
+        // A formula is not a column value; suggesting one mid-formula would
+        // fight the reference highlighting.
+        if self.edit_buffer.trim_start().starts_with('=') {
+            self.autocomplete.cell = None;
+            return;
+        }
+        let (s, from_list, _) = self.wb.suggest(cell, &self.edit_buffer);
+        self.autocomplete.offer(cell, s, from_list);
+    }
+
+    /// Accept the highlighted suggestion into the edit buffer.
+    ///
+    /// Returns whether anything was accepted, so the caller can tell an
+    /// accepted Tab from one that should move the selection.
+    fn accept_suggestion(&mut self) -> bool {
+        let Some(text) = self.autocomplete.current().map(str::to_string) else {
+            return false;
+        };
+        self.edit_buffer.clone_from(&text);
+        self.formula_input.clone_from(&text);
+        self.edit_caret = self.edit_buffer.len();
+        self.pending_caret = Some(self.edit_caret);
+        self.autocomplete.dismiss();
+        // Dismissing sets `dismissed`, which would suppress the popup for the
+        // rest of THIS edit. Accepting is not a rejection, so clear it - the
+        // user may keep typing and want more help.
+        self.autocomplete.dismissed = false;
+        self.recompute_formula();
+        true
+    }
+
+    /// Open the in-cell dropdown on `cell`, listing its rule's allowed values.
+    ///
+    /// Begins an edit seeded with an EMPTY buffer so every allowed value is
+    /// offered; the cell's current value is untouched until the user picks
+    /// one, and Escape puts it back through the ordinary `edit_pre_text`
+    /// snapshot.
+    pub fn open_validation_dropdown(&mut self, cell: CellRef) {
+        let Some(values) = self.wb.dropdown_for(cell).map(<[String]>::to_vec) else {
+            return;
+        };
+        self.begin_edit(cell, Some(String::new()));
+        self.autocomplete.reset();
+        self.autocomplete
+            .offer(cell, Suggestions::from_list(&values, ""), true);
+    }
+
+    /// Escape while the popup is open: close it and change NOTHING else.
+    ///
+    /// Returns whether the popup absorbed the Escape, so the caller knows not
+    /// to also cancel the edit. This is the acceptance criterion "Escape
+    /// dismisses without altering the typed text", and it holds structurally:
+    /// `AutocompleteState::dismiss` has no access to the edit buffer.
+    fn dismiss_autocomplete(&mut self) -> bool {
+        if !self.autocomplete.is_open() {
+            return false;
+        }
+        self.autocomplete.dismiss();
+        true
+    }
+
     /// Open the New Rule dialog on the current selection.
     pub fn cond_new_rule(&mut self) {
         let (a, b) = self.selection.bounds();
@@ -4674,6 +5035,13 @@ impl FerrixApp {
                 // the same reason protection does: a sheet the user bordered
                 // and re-exported must still have its borders.
                 .with_format(&self.wb.format)
+                // Data validation must survive the round trip for the same
+                // reason protection and decoration do (issue #41): a sheet
+                // whose column the user restricted to a list, re-exported,
+                // must still carry that list. This is the SAME chokepoint the
+                // menu item runs, so a sibling export variant cannot silently
+                // omit it.
+                .with_validation(&self.wb.validation)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
@@ -4861,6 +5229,30 @@ impl FerrixApp {
     /// Read-only access to the workbook, for tests that assert on names.
     pub fn workbook(&self) -> &Workbook {
         &self.wb
+    }
+
+    /// Mutable workbook access, for tests that seed a store directly.
+    ///
+    /// Used to place a validation rule without driving the whole dialog, so a
+    /// test about the EDIT PATH is not also a test about the dialog. The tests
+    /// that assert the dialog works drive the dialog.
+    pub fn workbook_mut(&mut self) -> &mut Workbook {
+        &mut self.wb
+    }
+
+    /// The text currently in the CELL editor, or `None` when no edit is live.
+    ///
+    /// The accessor "Escape did not alter the typed text" is asserted on.
+    pub fn live_edit_buffer(&self) -> Option<String> {
+        self.editing.is_some().then(|| self.edit_buffer.clone())
+    }
+
+    /// Where the in-cell dropdown arrow was PAINTED last frame, if anywhere.
+    ///
+    /// Real paint geometry from the grid's own loop, so a test asserting the
+    /// arrow exists is reading the screen rather than the model.
+    pub fn dropdown_button_rect(&self) -> Option<egui::Rect> {
+        self.dropdown_button.map(|(_, r)| r)
     }
 
     /// The active selection, so a navigation can be checked.
@@ -6993,6 +7385,8 @@ impl FerrixApp {
             busy_hint: "Wait for the current operation to finish".to_string(),
             has_tables: !self.tables.is_empty(),
             has_trace: self.trace.is_some(),
+            has_validation: !self.wb.validation.is_empty(),
+            has_circles: self.circle_invalid,
             frozen: self.panes.is_active(),
             can_undo: self.wb.can_undo(),
             can_redo: self.wb.can_redo(),
@@ -7031,6 +7425,12 @@ impl FerrixApp {
             C::FileExportCsv => self.export_dialog(),
             C::FileExportXlsx => self.export_xlsx_dialog(),
             C::FileExportParquet => self.export_parquet_dialog(),
+            C::DataValidationNew => self.validation_new_rule(),
+            C::DataValidationManage => self.validation_manage(),
+            C::DataValidationClear => self.validation_clear_selection(),
+            C::DataCircleInvalid => self.circle_invalid_data(),
+            C::DataClearCircles => self.clear_validation_circles(),
+            C::DataAutocomplete => self.toggle_autocomplete(),
             C::FormatCondNew => self.cond_new_rule(),
             C::FormatCondManage => self.cond_manage(),
             C::FormatBold => {
@@ -7314,6 +7714,9 @@ impl FerrixApp {
         self.show_comment_editor(ctx);
         if self.cond.is_some() {
             self.show_cond_editor(ctx);
+        }
+        if self.validation.is_some() {
+            self.show_validation_editor(ctx);
         }
         {}
 
@@ -8218,6 +8621,7 @@ impl FerrixApp {
                         row_outline: Some(&self.sizing.row_outline),
                         col_resizing: self.col_resize,
                         show_formulas: show_formulas_now,
+                        validation: (!self.wb.validation.is_empty()).then_some(&self.wb.validation),
                     }
                     .show(ui)
                 };
@@ -8227,6 +8631,10 @@ impl FerrixApp {
                 self.last_border_segments = resp.border_segments;
                 self.last_rotated_texts = resp.rotated_texts;
                 self.last_wrapped_texts = resp.wrapped_texts;
+                // The in-cell dropdown arrow's real geometry (issue #41), so
+                // a click on it opens the list at the place it was drawn
+                // rather than at a constant that drifts when a bar opens.
+                self.dropdown_button = resp.dropdown_button;
 
                 // --- trace precedents / dependents arrows (roadmap #39) ---
                 //
@@ -8299,6 +8707,52 @@ impl FerrixApp {
                 } else {
                     self.last_trace_arrows = 0;
                     self.last_trace_total = 0;
+                }
+
+                // --- Circle Invalid Data (issue #41) ---
+                //
+                // Painted onto the grid's own Painter, through the SAME
+                // `cell_screen_rect` the trace arrows and the in-cell editor
+                // use — a second copy of the geometry would drift the moment a
+                // freeze or a filter is active.
+                //
+                // Bounded by the viewport by construction, twice over: the set
+                // is computed from the rows the grid PAINTED, and
+                // `cell_screen_rect` returns None for anything off screen. A
+                // 200M-row sheet where every row is invalid rings a screenful.
+                self.last_validation_circles = 0;
+                if self.circle_invalid && !self.circled.is_empty() {
+                    let pad = self.pad_space();
+                    let resolver = self.row_resolver(pad);
+                    let metrics = crate::grid::Metrics::new(self.zoom);
+                    let painter = ui.painter().with_clip_rect(outer);
+                    let mut drawn = 0usize;
+                    for cell in &self.circled {
+                        let Some(r) = Grid::cell_screen_rect(
+                            *cell,
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        ) else {
+                            continue;
+                        };
+                        if !r.intersect(outer).is_positive() {
+                            continue;
+                        }
+                        // An ellipse inscribed in the cell, the way Excel
+                        // draws it. Stroked, never filled: the value inside
+                        // has to stay readable.
+                        painter.add(egui::Shape::ellipse_stroke(
+                            r.center(),
+                            egui::vec2(r.width() * 0.46, r.height() * 0.42),
+                            egui::Stroke::new(1.6_f32, th.invalid_flag),
+                        ));
+                        drawn += 1;
+                    }
+                    self.last_validation_circles = drawn;
                 }
 
                 // --- coloured reference highlighting (issue #38) ---
@@ -8439,6 +8893,18 @@ impl FerrixApp {
                 self.zoom = resp.zoom;
 
                 if let Some(cell) = resp.clicked {
+                    // Clicking the in-cell dropdown arrow (issue #41) opens
+                    // the list rather than merely re-selecting the cell: an
+                    // arrow that does nothing when clicked is worse than no
+                    // arrow. Keyed off the rectangle the grid actually
+                    // PAINTED, so it cannot drift from what is on screen.
+                    let hit_arrow = self
+                        .dropdown_button
+                        .zip(ui.ctx().pointer_interact_pos())
+                        .is_some_and(|((c, r), p)| c == cell && r.contains(p));
+                    if hit_arrow {
+                        self.open_validation_dropdown(cell);
+                    }
                     if self.editing.is_some() && self.editing != Some(cell) {
                         self.commit_edit();
                     }
@@ -8699,14 +9165,60 @@ impl FerrixApp {
                         let enter = child.input(|i| i.key_pressed(Key::Enter));
                         let esc = child.input(|i| i.key_pressed(Key::Escape));
                         let tab = child.input(|i| i.key_pressed(Key::Tab));
-                        if esc {
-                            self.cancel_edit();
+                        let down = child.input(|i| i.key_pressed(Key::ArrowDown));
+                        let up = child.input(|i| i.key_pressed(Key::ArrowUp));
+
+                        // --- in-cell autocomplete (issue #41) ---
+                        //
+                        // Refreshed from the CURRENT buffer, after the
+                        // TextEdit has taken this frame's keystrokes, so the
+                        // popup reflects what the user has actually typed
+                        // rather than lagging one character behind.
+                        self.refresh_autocomplete();
+                        if let Some(picked) = crate::validation_panel::show_autocomplete(
+                            ctx,
+                            &self.autocomplete,
+                            rect,
+                            th,
+                        ) {
+                            self.edit_buffer.clone_from(&picked);
+                            self.formula_input = picked;
+                            self.autocomplete.dismiss();
+                            self.autocomplete.dismissed = false;
+                            self.recompute_formula();
+                        }
+                        let popup_open = self.autocomplete.is_open();
+                        if popup_open && (down || up) {
+                            self.autocomplete.move_highlight(if down { 1 } else { -1 });
+                        } else if esc {
+                            // ESCAPE ORDER MATTERS. While the popup is open,
+                            // Escape closes IT and leaves the typed text
+                            // exactly as it stands; only a second Escape
+                            // abandons the edit. Cancelling the edit on the
+                            // first Escape would discard what the user typed
+                            // as the price of closing a suggestion list they
+                            // never asked for.
+                            if !self.dismiss_autocomplete() {
+                                self.cancel_edit();
+                            }
                         } else if enter {
-                            self.commit_edit();
-                            self.move_selection(1, 0);
+                            if popup_open && self.autocomplete.from_list {
+                                // A validation dropdown's Enter picks the
+                                // highlighted allowed value; committing the
+                                // partial text would only be rejected.
+                                self.accept_suggestion();
+                            } else {
+                                self.commit_edit();
+                                self.move_selection(1, 0);
+                            }
                         } else if tab {
-                            self.commit_edit();
-                            self.move_selection(0, 1);
+                            if popup_open && self.accept_suggestion() {
+                                // Tab accepted the suggestion; the selection
+                                // stays put so the user can keep editing.
+                            } else {
+                                self.commit_edit();
+                                self.move_selection(0, 1);
+                            }
                         }
                     } else {
                         // Scrolled out of view — commit rather than lose input.

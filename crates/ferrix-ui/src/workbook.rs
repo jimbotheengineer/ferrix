@@ -5,7 +5,8 @@
 //! only has to say "the user typed X into A1".
 
 use ferrix_core::{
-    CellInput, CellRef, EditOverlay, ErrorKind, Selection, SheetCell, SheetId, Value,
+    CellInput, CellRef, DistinctValues, EditOverlay, ErrorKind, ScanBudget, Selection, SheetCell,
+    SheetId, Suggestions, TableRange, Value,
 };
 use ferrix_formula::depgraph::DepGraph;
 use ferrix_formula::fill::FillKind;
@@ -284,6 +285,13 @@ pub struct Workbook {
     /// 200M-row selection is one small entry, so styling costs nothing per
     /// row and appending rows inherits it for free.
     pub format: ferrix_core::SheetFormat,
+    /// Sheet-range data validation for the ACTIVE sheet (issue #41).
+    ///
+    /// Beside the data, never inside it, and keyed by RANGE rather than by
+    /// cell — the same discipline `format` uses for conditional rules. A rule
+    /// over a 200M-row column is one small entry, so validating a whole sheet
+    /// costs nothing per row.
+    pub validation: ferrix_core::SheetValidation,
     /// Display-order permutation for the ACTIVE sheet.
     ///
     /// Reordering a column must not move data: on a 200M-row sheet that would
@@ -350,6 +358,7 @@ impl Workbook {
             active: 0,
             order: ferrix_core::SheetOrder::new(),
             format: ferrix_core::SheetFormat::new(),
+            validation: ferrix_core::SheetValidation::new(),
             merges: ferrix_core::merge::MergeMap::new(),
             comments: ferrix_core::CommentMap::new(),
             parked: std::collections::HashMap::new(),
@@ -1643,6 +1652,132 @@ impl Workbook {
         self.undo.push(entry);
         self.redo.clear();
         self.enforce_undo_limit();
+    }
+
+    // ================================================ data validation (#41) ==
+
+    /// Evaluate a validation rule's custom formula for one cell.
+    ///
+    /// `None` when the rule is not a custom one or the formula does not parse
+    /// — an unrunnable rule condemns nothing, matching the stance
+    /// `RangeValidation::check` takes for an unparseable regex.
+    ///
+    /// The formula is evaluated through [`WorkbookSource`], the same door
+    /// every other formula goes through, so `Sheet2!A1` resolves inside a
+    /// validation rule exactly as it does in a cell.
+    fn eval_custom_rule(&self, rule: &ferrix_core::RangeValidation) -> Option<bool> {
+        let src = rule.custom_formula()?;
+        let expr = self.parse_on(self.active_sheet(), src).ok()?;
+        let source = WorkbookSource::new(self, self.active_sheet());
+        let v = eval_view(&expr, &source);
+        Some(match v {
+            Value::Bool(b) => b,
+            Value::Number(n) => n != 0.0,
+            Value::Empty => false,
+            // An error result is not a pass. A rule whose formula blew up must
+            // not silently certify every cell it covers.
+            _ => false,
+        })
+    }
+
+    /// Check what the user TYPED against whatever rule covers `cell`.
+    ///
+    /// Called before the edit is written, from `commit_edit`. Takes the raw
+    /// string rather than a `Value` so nothing is interned for a check —
+    /// growing the arena by one entry per rejected keystroke is a permanent
+    /// leak, and this is the path a rejected entry takes.
+    pub fn check_typed(
+        &self,
+        cell: CellRef,
+        raw: &str,
+    ) -> Option<(ferrix_core::ErrorStyle, String)> {
+        let (_, rule) = self.validation.rule_for(cell)?;
+        let cand = ferrix_core::Candidate::from_input(raw);
+        let custom = self.eval_custom_rule(rule);
+        let v = rule.check(&cand, custom)?;
+        Some((rule.style, rule.explain(&v)))
+    }
+
+    /// Check a STORED cell, for the Circle Invalid Data pass.
+    ///
+    /// Separate from [`Self::check_typed`] because a stored cell already has a
+    /// `Value` and a display text, and re-parsing its text would disagree with
+    /// what is in it.
+    pub fn check_stored(&self, cell: CellRef) -> Option<ferrix_core::Violation> {
+        let (_, rule) = self.validation.rule_for(cell)?;
+        let view = self.view();
+        let value = view.get(cell);
+        let text = view.display(cell);
+        let cand = ferrix_core::Candidate::from_value(&value, &text);
+        rule.check(&cand, self.eval_custom_rule(rule))
+    }
+
+    /// The values a list rule offers in `cell`, for the in-cell dropdown.
+    pub fn dropdown_for(&self, cell: CellRef) -> Option<&[String]> {
+        self.validation.dropdown_for(cell)
+    }
+
+    /// Bounded autocomplete suggestions for a partially typed cell.
+    ///
+    /// A validation LIST rule wins when there is one: it is the authoritative
+    /// set of allowed values, so offering whatever else is in the column would
+    /// suggest entries the same rule is about to reject.
+    ///
+    /// Otherwise the column is scanned — for at most
+    /// `ferrix_core::autocomplete::SCAN_LIMIT` rows, from a window around
+    /// `cell`. NEVER a full pass: `suggestion_scan_is_bounded_on_a_huge_column`
+    /// asserts the row count actually touched.
+    pub fn suggest(&self, cell: CellRef, typed: &str) -> (Suggestions, bool, ScanBudget) {
+        if let Some(list) = self.validation.dropdown_for(cell) {
+            return (
+                Suggestions::from_list(list, typed),
+                true,
+                ScanBudget::with_limit(0),
+            );
+        }
+        let BaseData::Memory(sheet) = &*self.base else {
+            // A memory-mapped base has no `Column` to scan. Suggesting nothing
+            // is the honest answer; the alternative — materialising a column
+            // from a 12GB mapping — is precisely the allocation the scale
+            // invariant forbids.
+            return (Suggestions::default(), false, ScanBudget::with_limit(0));
+        };
+        let Some(col) = sheet.column(cell.col as usize) else {
+            return (Suggestions::default(), false, ScanBudget::with_limit(0));
+        };
+        let distinct = DistinctValues::scan(col, cell.row as usize, ScanBudget::default());
+        let budget = distinct.budget;
+        (
+            Suggestions::rank(&distinct, &sheet.arena, typed),
+            false,
+            budget,
+        )
+    }
+
+    /// Cells in `range` that fail their validation rule, capped at `limit`.
+    ///
+    /// The Circle Invalid Data pass. `range` is THE VIEWPORT, supplied by the
+    /// caller — this function never decides for itself how much to look at,
+    /// which is what keeps a 200M-row sheet's circle pass the cost of a
+    /// screenful. `limit` is a second belt: a viewport is already small, but a
+    /// caller that passed a huge range would still be bounded.
+    pub fn invalid_cells_in(&self, range: TableRange, limit: usize) -> Vec<CellRef> {
+        let mut out = Vec::new();
+        if self.validation.is_empty() {
+            return out;
+        }
+        'outer: for row in range.first_row..=range.last_row {
+            for col in range.first_col..=range.last_col {
+                let cell = CellRef::new(row, col);
+                if self.check_stored(cell).is_some() {
+                    out.push(cell);
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Evaluate a single formula cell anywhere in the workbook.

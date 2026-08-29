@@ -254,7 +254,17 @@ impl Suggestions {
         let mut items: Vec<String> = Vec::new();
         let mut total = 0usize;
         for v in values {
-            if lower.is_empty() || v.to_lowercase().contains(&lower) {
+            let vl = v.to_lowercase();
+            // A value identical to what is already typed is not offered — the
+            // same rule `rank` follows, and here it is load-bearing rather
+            // than merely tidy: accepting "Alpha" would otherwise leave a
+            // popup containing exactly "Alpha", so the next Enter would accept
+            // it again instead of committing, and the cell could never be
+            // confirmed at all.
+            if !lower.is_empty() && vl == lower {
+                continue;
+            }
+            if lower.is_empty() || vl.contains(&lower) {
                 total += 1;
                 if items.len() < MAX_SUGGESTIONS {
                     items.push(v.clone());

@@ -575,6 +575,10 @@ pub struct GridResponse {
     pub rotated_texts: usize,
     /// Cells whose text was laid out WRAPPED this frame.
     pub wrapped_texts: usize,
+    /// The in-cell dropdown arrow's hit rectangle, when one was drawn this
+    /// frame (issue #41). Real paint geometry, reported so the caller can
+    /// open the list on a click at the arrow rather than guessing where it is.
+    pub dropdown_button: Option<(CellRef, egui::Rect)>,
 }
 
 pub struct Grid<'a> {
@@ -658,6 +662,14 @@ pub struct Grid<'a> {
     /// drag started at and the width it started from. Owned by the APP between
     /// press and release, so the gesture survives the release frame.
     pub col_resizing: Option<(usize, f32, f32)>,
+    /// Sheet-range data validation (issue #41), for the in-cell dropdown
+    /// affordance.
+    ///
+    /// Consulted for ONE cell per frame — the selection cursor — the way
+    /// Excel draws it: the arrow appears on the active cell, not on every cell
+    /// in the range. That is what keeps a list rule over 200M rows from
+    /// costing a lookup per painted cell.
+    pub validation: Option<&'a ferrix_core::SheetValidation>,
     /// Show formula SOURCE instead of computed values (issue #38, Ctrl+`).
     ///
     /// A flag, not a precomputed map of text. The source is fetched with
@@ -1215,6 +1227,7 @@ impl<'a> Grid<'a> {
         let mut fill_released = false;
         let mut painted_cells = 0usize;
         let mut comment_markers = 0usize;
+        let mut dropdown_button: Option<(CellRef, egui::Rect)> = None;
         let mut hovered_comment: Option<CellRef> = None;
         let mut context_click: Option<(CellRef, egui::Pos2)> = None;
         let mut painted_rows: Vec<(usize, u32)> = Vec::with_capacity(row_bands.len());
@@ -1950,6 +1963,39 @@ impl<'a> Grid<'a> {
                     }
                 }
 
+                // The in-cell dropdown arrow for a validation LIST rule
+                // (issue #41).
+                //
+                // Drawn on the SELECTION CURSOR only, the way Excel does it:
+                // an arrow in every cell of a 200M-row list column would be
+                // both unreadable and a lookup per painted cell. One cell per
+                // frame means the cost is O(1) whatever the rule covers.
+                if !is_pad
+                    && self.selection.is_some_and(|s| s.cursor == cref)
+                    && self
+                        .validation
+                        .is_some_and(|v| v.dropdown_for(cref).is_some())
+                {
+                    let w = (14.0 * m.zoom).min(cell_rect.width());
+                    let btn = egui::Rect::from_min_max(
+                        egui::pos2(cell_rect.max.x - w, cell_rect.min.y),
+                        cell_rect.max,
+                    );
+                    painter.rect_filled(btn, 0.0, th.header_bg);
+                    let c = btn.center();
+                    let a = 3.0 * m.zoom;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(c.x - a, c.y - a * 0.5),
+                            egui::pos2(c.x + a, c.y - a * 0.5),
+                            egui::pos2(c.x, c.y + a * 0.8),
+                        ],
+                        th.text_dim,
+                        Stroke::NONE,
+                    ));
+                    dropdown_button = Some((cref, btn));
+                }
+
                 // The comment marker: a small triangle in the TOP-LEFT corner.
                 //
                 // Deliberately the opposite corner from the validation flag,
@@ -2550,6 +2596,7 @@ impl<'a> Grid<'a> {
         );
 
         GridResponse {
+            dropdown_button,
             clicked,
             drag_to,
             fill_started,

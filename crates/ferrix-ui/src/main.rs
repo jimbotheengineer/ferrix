@@ -15,6 +15,7 @@ mod sheet_view;
 mod table_view;
 mod theme;
 mod trace;
+mod validation_panel;
 mod workbook;
 
 use app::FerrixApp;

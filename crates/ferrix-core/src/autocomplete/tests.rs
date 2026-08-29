@@ -97,7 +97,7 @@ fn scan_window_follows_the_cursor() {
     }
     let top = DistinctValues::scan(&col, 0, ScanBudget::default());
     let near = DistinctValues::scan(&col, 150_000, ScanBudget::default());
-    let has = |d: &DistinctValues| d.ids().iter().any(|i| *i == rare);
+    let has = |d: &DistinctValues| d.ids().contains(&rare);
     assert!(!has(&top), "row 150k is outside a 20k window starting at 0");
     assert!(has(&near), "the window must follow the edited row");
 }
@@ -191,4 +191,10 @@ fn a_list_rule_supplies_the_suggestions_directly() {
     assert_eq!(all.len(), 4, "an empty prefix opens the whole dropdown");
     let one = Suggestions::from_list(&vals, "sou");
     assert_eq!(one.items, vec!["South".to_string()]);
+    assert!(
+        Suggestions::from_list(&vals, "South").is_empty(),
+        "a value identical to the typed text must not be re-offered — \
+         otherwise accepting it leaves a popup that swallows the next Enter \
+         and the cell can never be committed"
+    );
 }
