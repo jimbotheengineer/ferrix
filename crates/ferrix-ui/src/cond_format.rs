@@ -38,10 +38,7 @@
 //! resolver walks, not a second opinion about it.
 
 use egui::{Color32, RichText};
-use ferrix_core::{
-    format::{ManualStyle, Typography},
-    CmpOp, ConditionalRule, Rgb, SheetFormat, TableRange,
-};
+use ferrix_core::{format::Typography, CmpOp, ConditionalRule, Rgb, SheetFormat, TableRange};
 
 use crate::theme::Theme;
 
@@ -437,6 +434,15 @@ pub struct CondFormatState {
     /// both OK and Cancel; the app reads it to decide whether to build the
     /// preview overlay at all.
     pub preview: bool,
+    /// Where the OK and Cancel buttons were actually painted last frame.
+    ///
+    /// Recorded so a test can click the REAL buttons rather than calling the
+    /// handler behind them — the difference between proving the dialog works
+    /// and proving a function works. Same discipline as the grid reporting its
+    /// header hitboxes: geometry comes from what was painted, never from
+    /// constants that silently drift when a row is added above.
+    pub ok_rect: Option<egui::Rect>,
+    pub cancel_rect: Option<egui::Rect>,
 }
 
 impl CondFormatState {
@@ -446,6 +452,8 @@ impl CondFormatState {
             mode: CondMode::New,
             form: RuleForm::default(),
             preview: true,
+            ok_rect: None,
+            cancel_rect: None,
         }
     }
 
@@ -455,6 +463,8 @@ impl CondFormatState {
             mode: CondMode::Manage,
             form: RuleForm::default(),
             preview: false,
+            ok_rect: None,
+            cancel_rect: None,
         }
     }
 
@@ -875,13 +885,15 @@ fn show_form(ui: &mut egui::Ui, st: &mut CondFormatState, th: Theme, out: &mut C
         ui.checkbox(&mut st.preview, "Live preview")
             .on_hover_text("Show this rule on the grid before saving it. Cancel discards it.");
         ui.add_space(12.0);
-        if ui
-            .add_enabled(problem.is_none(), egui::Button::new("OK"))
-            .clicked()
-        {
+        let ok = ui.add_enabled(problem.is_none(), egui::Button::new("OK"));
+        // Reported so a test can press the real button. See `ok_rect`.
+        st.ok_rect = Some(ok.rect);
+        if ok.clicked() {
             out.commit = true;
         }
-        if ui.button("Cancel").clicked() {
+        let cancel = ui.button("Cancel");
+        st.cancel_rect = Some(cancel.rect);
+        if cancel.clicked() {
             out.cancel = true;
         }
         if matches!(st.mode, CondMode::Edit(_)) && ui.button("Back to rules").clicked() {
@@ -899,20 +911,6 @@ fn scale_note(ui: &mut egui::Ui, th: Theme) {
         .color(th.text_dim)
         .small(),
     );
-}
-
-/// A manual style as the toolbar would express it, for callers that want to
-/// turn the Manual form into a `ManualStyle` rather than a rule.
-pub fn manual_of(form: &RuleForm) -> ManualStyle {
-    ManualStyle {
-        fill: form.manual_fill,
-        text: form.manual_text,
-        typography: Typography {
-            bold: form.bold.then_some(true),
-            italic: form.italic.then_some(true),
-            ..Default::default()
-        },
-    }
 }
 
 #[cfg(test)]

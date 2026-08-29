@@ -386,19 +386,3 @@ fn a_later_rule_wins_and_reordering_flips_which_one_that_is() {
         "after the reorder the OTHER rule wins — the order is the behaviour"
     );
 }
-
-#[test]
-fn manual_of_carries_the_typography_switches() {
-    let f = RuleForm {
-        kind: RuleKind::Manual,
-        manual_fill: Some(Rgb(1, 2, 3)),
-        manual_text: None,
-        bold: true,
-        italic: false,
-        ..Default::default()
-    };
-    let m = manual_of(&f);
-    assert_eq!(m.fill, Some(Rgb(1, 2, 3)));
-    assert_eq!(m.typography.bold, Some(true));
-    assert_eq!(m.typography.italic, None, "an unset switch must inherit");
-}

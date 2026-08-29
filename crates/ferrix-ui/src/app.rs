@@ -2100,6 +2100,77 @@ impl FerrixApp {
         }
     }
 
+    /// The style a cell resolves to RIGHT NOW, through exactly the format the
+    /// grid is painting from this frame — the preview clone while a dialog is
+    /// previewing, the real store otherwise.
+    ///
+    /// This is the app's own answer to "what does this cell look like", and it
+    /// is what the editor's tests assert on. Asserting that a rule appears in a
+    /// list would pass against an editor that stores rules nothing ever reads;
+    /// asserting the resolved style cannot.
+    ///
+    /// Window-dependent rules (colour scales, data bars, top/bottom-N) are
+    /// evaluated over `window` — pass the rows the caller means, since "the
+    /// visible window" is a property of the frame, not of a cell.
+    pub fn resolved_style(
+        &self,
+        cell: CellRef,
+        window: std::ops::Range<u32>,
+    ) -> ferrix_core::CellStyle {
+        let fmt_owned = self.cond_preview_format();
+        let fmt = fmt_owned.as_ref().unwrap_or(&self.wb.format);
+        let view = self.wb.view();
+        let mut plan = Vec::new();
+        fmt.plan(cell.col, &mut plan);
+        let mut evals = Vec::new();
+        if ferrix_core::SheetFormat::plan_needs_window(&plan) {
+            let mut vals: Vec<f64> = Vec::new();
+            for r in window {
+                if let ferrix_core::Value::Number(n) = view.get(CellRef::new(r, cell.col)) {
+                    vals.push(n);
+                }
+            }
+            for e in &plan {
+                let mut scratch = vals.clone();
+                evals.push(ferrix_core::RuleEval::for_rule(e.rule, &mut scratch));
+            }
+        }
+        let value = view.get(cell);
+        let text = if ferrix_core::SheetFormat::plan_needs_text(&plan) {
+            view.display(cell)
+        } else {
+            String::new()
+        };
+        fmt.resolve(cell, &value, &text, &plan, &evals)
+    }
+
+    /// How many conditional rules are configured on this sheet, across every
+    /// scope. The number the scale invariant is asserted on: it is a function
+    /// of how many rules the user made, never of how many rows they cover.
+    pub fn rule_count(&self) -> usize {
+        self.wb.format.rule_count()
+    }
+
+    /// A snapshot of all sheet formatting, for tests that need to prove Cancel
+    /// changed nothing. `SheetFormat` is `PartialEq`, so this compares whole.
+    pub fn format_snapshot(&self) -> ferrix_core::SheetFormat {
+        self.wb.format.clone()
+    }
+
+    /// Direct access to the format store, for tests that drive a Manage-list
+    /// action (reorder, delete) whose button lives at a pixel that moves with
+    /// the theme. The same `SheetFormat` the dialog's buttons mutate.
+    pub fn format_mut_for_test(&mut self) -> &mut ferrix_core::SheetFormat {
+        self.wb.mark_dirty();
+        &mut self.wb.format
+    }
+
+    /// Close the editor without touching anything, for tests that need the
+    /// dialog's own chrome out of the frame before counting shapes.
+    pub fn cond_close_for_test(&mut self) {
+        self.cond = None;
+    }
+
     fn open_xlsx_dialog_impl(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel workbook", &["xlsx"])

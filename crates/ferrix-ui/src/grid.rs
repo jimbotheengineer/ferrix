@@ -723,16 +723,31 @@ impl<'a> Grid<'a> {
         // is delivered. A synthetic click with no preceding move lands nowhere
         // and looks like a broken grid. Send a move first, or test by hand.
         let interact_rect = Rect::from_min_max(body_origin, outer.max);
+        // A click that egui has already given to a floating window (a modal,
+        // a menu, a combo popup) must NOT also reach the grid underneath.
+        //
+        // The grid hand-hit-tests raw pointer state rather than going through
+        // a widget Response, so without this check pressing "OK" in a dialog
+        // ALSO lands on whatever cell happens to be behind the button — which
+        // silently collapses the user's selection at the exact moment they
+        // are acting on it. That is how the conditional-format editor's second
+        // rule ended up on a different range than its first.
+        let over_window = ui.ctx().is_pointer_over_area() && !ui.ui_contains_pointer();
         let (pointer_pos, wheel, primary_clicked, primary_pressed, primary_double, dragging) =
             ui.ctx().input(|i| {
                 (
-                    i.pointer.interact_pos(),
-                    i.raw_scroll_delta,
-                    i.pointer.primary_clicked(),
-                    i.pointer.primary_pressed(),
+                    i.pointer.interact_pos().filter(|_| !over_window),
+                    if over_window {
+                        egui::Vec2::ZERO
+                    } else {
+                        i.raw_scroll_delta
+                    },
+                    i.pointer.primary_clicked() && !over_window,
+                    i.pointer.primary_pressed() && !over_window,
                     i.pointer
-                        .button_double_clicked(egui::PointerButton::Primary),
-                    i.pointer.primary_down(),
+                        .button_double_clicked(egui::PointerButton::Primary)
+                        && !over_window,
+                    i.pointer.primary_down() && !over_window,
                 )
             });
         let drag_pos = pointer_pos;
