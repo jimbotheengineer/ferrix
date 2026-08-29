@@ -442,6 +442,18 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn cmp_rule(op: CmpOp, v: f64) -> DataValidationRule<f64> {
+    cmp_rule_generic(op, v)
+}
+
+/// [`cmp_rule`] over any value type the writer accepts.
+///
+/// Generic because sheet-range validation (issue #41) needs the SAME operator
+/// mapping for `i32` whole numbers and `u32` text lengths. One function, so a
+/// `>=` cannot mean one thing for a table column and another for a range.
+pub(crate) fn cmp_rule_generic<T: rust_xlsxwriter::IntoDataValidationValue>(
+    op: CmpOp,
+    v: T,
+) -> DataValidationRule<T> {
     match op {
         CmpOp::Eq => DataValidationRule::EqualTo(v),
         CmpOp::Ne => DataValidationRule::NotEqualTo(v),
