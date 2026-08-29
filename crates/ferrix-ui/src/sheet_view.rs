@@ -703,6 +703,10 @@ impl<'a> ferrix_formula::CellSource for SheetView<'a> {
 pub struct OwnedSheet {
     base: std::sync::Arc<BaseData>,
     overlay: EditOverlay,
+    /// Sheet name for the print header/footer `&A` field and HTML title. The
+    /// CSV/Parquet paths do not need it, so it defaults to empty and is set
+    /// only on the print path via [`OwnedSheet::with_name`].
+    name: String,
 }
 
 impl OwnedSheet {
@@ -711,7 +715,14 @@ impl OwnedSheet {
         Self {
             base,
             overlay: overlay.clone(),
+            name: String::new(),
         }
+    }
+
+    /// Give the snapshot a sheet name, for the print `&A` field / HTML title.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// What taking this snapshot will actually allocate.
@@ -752,6 +763,23 @@ impl ferrix_io::export::ExportSource for OwnedSheet {
     }
     fn header(&self, col: usize) -> String {
         self.view().header_or_letter(col)
+    }
+}
+
+/// Print/PDF export renders the composite view too. This first cut prints the
+/// values as unstyled text — the same strings the CSV export writes. Carrying
+/// conditional-format fills, per-cell typography and merged-cell spanning into
+/// the print snapshot is a follow-up: it needs the format map and merge map
+/// copied alongside the overlay, which `snapshot_cost_bytes` would have to
+/// account for. `sheet_name` is overridden so the header/footer `&A` field and
+/// the HTML title are correct.
+impl ferrix_io::render::RenderSource for OwnedSheet {
+    fn sheet_name(&self) -> String {
+        if self.name.is_empty() {
+            "Sheet1".to_string()
+        } else {
+            self.name.clone()
+        }
     }
 }
 

@@ -163,6 +163,10 @@ registry! {
         "Write this sheet and its table as a real Excel Table, with validation, conditional formatting and autoFilter." }
     FileExportParquet { "file.export_parquet", Some(Menu::File), "⬈ Export Parquet…", None, false, None,
         "Write this sheet, including edits, as a Parquet file. Columns keep their type, and the write streams one column stripe at a time." }
+    FilePrintPdf { "file.print_pdf", Some(Menu::File), "🖨 Print to PDF…", None, false, None,
+        "Render this sheet to a paginated PDF. Streams one page at a time; a very large sheet is refused until confirmed." }
+    FilePrintHtml { "file.print_html", Some(Menu::File), "🖨 Print to HTML…", None, false, None,
+        "Render this sheet to a single self-contained HTML page, one table per printed page." }
 
     // ---- Format ----
     FormatCondNew { "format.cond_new", Some(Menu::Format), "🎨 Conditional Formatting — New Rule…", None, false, Some(Note::Selection),
@@ -364,6 +368,7 @@ impl Command {
         use CommandId::*;
         match self.id {
             FileOpen | FileOpenXlsx | FileExportCsv | FileExportXlsx | FileExportParquet
+            | FilePrintPdf | FilePrintHtml
                 if st.busy =>
             {
                 say(&st.busy_hint, "Wait for the current operation to finish")
