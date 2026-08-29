@@ -499,6 +499,9 @@ pub struct SheetExport<'a> {
     pub tables: &'a [ferrix_core::Table],
     /// Merged regions, written as `<mergeCells>`.
     pub merges: Option<&'a ferrix_core::merge::MergeMap>,
+    /// Cell comments, written as legacy Excel notes — see
+    /// [`crate::table_xlsx::write_comments`] for exactly what Excel shows.
+    pub comments: Option<&'a ferrix_core::CommentMap>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -509,6 +512,7 @@ impl<'a> SheetExport<'a> {
             formulas: None,
             tables: &[],
             merges: None,
+            comments: None,
         }
     }
 
@@ -520,6 +524,12 @@ impl<'a> SheetExport<'a> {
     /// Attach merged regions, written as `<mergeCells>`.
     pub fn with_merges(mut self, merges: &'a ferrix_core::merge::MergeMap) -> Self {
         self.merges = Some(merges);
+        self
+    }
+
+    /// Attach cell comments, written as legacy Excel notes.
+    pub fn with_comments(mut self, comments: &'a ferrix_core::CommentMap) -> Self {
+        self.comments = Some(comments);
         self
     }
 
@@ -598,7 +608,13 @@ pub fn export_workbook_with_names(
         // Merges, like tables, need the buffering writer: a merge is applied
         // to a range after its cells are written, which the constant-memory
         // writer cannot revisit.
-        let ws = if s.tables.is_empty() && s.merges.is_none_or(|m| m.is_empty()) {
+        // Notes join tables and merges on the non-constant-memory path: a
+        // note is attached to a cell after the fact, which the streaming
+        // writer cannot revisit.
+        let ws = if s.tables.is_empty()
+            && s.merges.is_none_or(|m| m.is_empty())
+            && s.comments.is_none_or(|c| c.is_empty())
+        {
             wb.add_worksheet_with_constant_memory()
         } else {
             wb.add_worksheet()
@@ -610,6 +626,9 @@ pub fn export_workbook_with_names(
         }
         if let Some(m) = s.merges {
             crate::table_xlsx::write_merges(ws, m).map_err(write_err)?;
+        }
+        if let Some(c) = s.comments {
+            crate::table_xlsx::write_comments(ws, c).map_err(write_err)?;
         }
     }
     write_defined_names(&mut wb, names)?;

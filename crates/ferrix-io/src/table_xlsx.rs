@@ -64,13 +64,13 @@ use std::path::Path;
 
 use ferrix_core::merge::MergeMap;
 use ferrix_core::{
-    CmpOp, ColumnType, ConditionalRule, NumberFormat, Predicate, Rgb, Table, TableColumn,
-    TableRange, Validation, ValidationRule,
+    CellRef, CmpOp, ColumnType, Comment, CommentMap, ConditionalRule, NumberFormat, Predicate, Rgb,
+    Table, TableColumn, TableRange, Validation, ValidationRule,
 };
 use rust_xlsxwriter::{
     ConditionalFormat2ColorScale, ConditionalFormat3ColorScale, ConditionalFormatCell,
     ConditionalFormatCellRule, ConditionalFormatDataBar, DataValidation, DataValidationRule,
-    Format, Worksheet,
+    Format, Note, Worksheet,
 };
 
 use crate::xlsx::XlsxError;
@@ -689,6 +689,262 @@ pub fn write_merges(
         )?;
     }
     Ok(())
+}
+
+/// A cell comment found in a worksheet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedComment {
+    /// Index of the owning worksheet, in workbook order.
+    pub sheet_index: usize,
+    pub cell: CellRef,
+    pub comment: Comment,
+}
+
+/// Default author written for a comment the user left unattributed.
+///
+/// `xl/comments1.xml` addresses every comment through an `authorId` into an
+/// `<authors>` list, so there is no spelling for "no author". Rather than
+/// invent a blank entry Excel would render as a stray colon, unattributed
+/// comments are written under this name and mapped back to an empty author on
+/// import — so an unattributed comment stays unattributed across the trip.
+pub const DEFAULT_COMMENT_AUTHOR: &str = "Ferrix";
+
+/// Write a sheet's comments as real Excel notes.
+///
+/// ## What Excel shows, and what it does not
+///
+/// `rust_xlsxwriter`'s `insert_note` emits the whole legacy note apparatus,
+/// not just the text part: `xl/comments1.xml` carries the author list and the
+/// comment bodies, and the VML drawing (`xl/drawings/vmlDrawing1.vml`, plus
+/// its rels and the `<legacyDrawing>` element on the worksheet) carries the
+/// yellow box's geometry. Both are required — a comments part on its own is
+/// silently ignored by Excel, which is the failure mode the task warned about,
+/// and it is avoided here by writing through the library that owns both parts
+/// rather than hand-rolling the XML.
+///
+/// So an exported comment appears in Excel as an ordinary note: red marker
+/// triangle in the cell's corner, text on hover, author shown in the box.
+///
+/// What is deliberately NOT written, matching v1's scope:
+///
+/// * **No reply threading.** Modern Excel's threaded comments are a separate
+///   pair of parts (`xl/threadedComments/*.xml` plus a persons list) and a
+///   different data model — a chain of authored replies rather than one note.
+///   Ferrix stores one author and one body per cell, so it writes the legacy
+///   note, which every Excel version since 97 reads. Excel will offer to
+///   "convert to a threaded comment"; nothing is lost if the user accepts.
+/// * **No box geometry, colour, or visibility.** The note uses the library's
+///   defaults (hidden until hover, standard size). Ferrix has no model for
+///   any of it, so there is nothing to round-trip.
+///
+/// The tests unzip the written package and assert `xl/comments1.xml` and the
+/// VML part are both present with the expected text — but Excel itself is not
+/// available in this environment and was never launched, so the claim is "the
+/// parts Excel reads are present and structurally correct", not "opened in
+/// Excel and confirmed".
+pub fn write_comments(
+    ws: &mut Worksheet,
+    comments: &CommentMap,
+) -> Result<(), rust_xlsxwriter::XlsxError> {
+    for (cell, c) in comments.iter() {
+        // Excel's own column ceiling; a comment past it would make the whole
+        // package unopenable, and dropping one note is better than that.
+        let Ok(col) = u16::try_from(cell.col) else {
+            continue;
+        };
+        let author = if c.author.is_empty() {
+            DEFAULT_COMMENT_AUTHOR
+        } else {
+            c.author.as_str()
+        };
+        let note = Note::new(&c.text)
+            .set_author(author)
+            // The author prefix would bake "ana:" into the TEXT, so a
+            // round-trip would grow the prefix again on every save. The author
+            // travels in its own attribute instead.
+            .add_author_prefix(false);
+        ws.insert_note(cell.row, col, &note)?;
+    }
+    Ok(())
+}
+
+/// Read every cell comment out of an `.xlsx`.
+///
+/// Opens the package directly, like [`import_tables`]: calamine surfaces cell
+/// values and knows nothing about `xl/comments*.xml`.
+///
+/// A workbook with no comments returns an empty vector; that is not an error.
+pub fn import_comments(path: impl AsRef<Path>) -> Result<Vec<ImportedComment>, XlsxError> {
+    let path = path.as_ref();
+    let disp = path.display().to_string();
+    let io_err = |e: std::io::Error| XlsxError::Read {
+        path: disp.clone(),
+        source: Box::new(calamine::XlsxError::Io(e)),
+    };
+    let zip_err = |msg: String| XlsxError::TableParse {
+        path: disp.clone(),
+        detail: msg,
+    };
+
+    let file = std::fs::File::open(path).map_err(io_err)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
+    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| zip_err(e.to_string()))?;
+        if !f.is_file() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut buf).map_err(io_err)?;
+        parts.insert(name, buf);
+    }
+
+    let mut out = Vec::new();
+    for (sheet_index, sp) in worksheet_paths(&parts).iter().enumerate() {
+        // The comments part is reached through the WORKSHEET's relationships,
+        // not by guessing `comments{n}.xml` matches sheet n. Excel numbers the
+        // parts by the order sheets that *have* comments appear, so sheet 3
+        // may own comments1.xml.
+        let rels = rels_for(&parts, sp);
+        let Some(target) = rels
+            .values()
+            .find(|t| t.contains("comments") && t.ends_with(".xml"))
+        else {
+            continue;
+        };
+        let Some(xml) = parts.get(target) else {
+            continue;
+        };
+        for (cell, comment) in parse_comments_part(xml) {
+            out.push(ImportedComment {
+                sheet_index,
+                cell,
+                comment,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Parse one `xl/comments*.xml` into (cell, comment) pairs.
+///
+/// The text of a comment is a rich-text run sequence — `<text><r><t>..</t></r>
+/// ...</text>` — so every `<t>` inside one `<comment>` is concatenated. Taking
+/// only the first would silently truncate any note Excel split into runs, and
+/// Excel splits on the smallest formatting change.
+fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
+    let mut authors: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    let mut rd = quick_xml::Reader::from_reader(xml);
+    let mut buf = Vec::new();
+
+    let mut in_authors = false;
+    let mut in_author = false;
+    let mut current: Option<(CellRef, usize)> = None;
+    let mut in_t = false;
+    let mut text = String::new();
+    let mut author_text = String::new();
+
+    loop {
+        match rd.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"authors" => in_authors = true,
+                b"author" if in_authors => {
+                    in_author = true;
+                    author_text.clear();
+                }
+                b"comment" => {
+                    let cell = attr(e, b"ref").and_then(|r| CellRef::from_a1(&r));
+                    let id = attr(e, b"authorId")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    current = cell.map(|c| (c, id));
+                    text.clear();
+                }
+                b"t" => in_t = true,
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Text(ref t)) => {
+                let s = t.decode().map(|c| c.into_owned()).unwrap_or_default();
+                if in_author {
+                    author_text.push_str(&s);
+                } else if in_t {
+                    text.push_str(&s);
+                }
+            }
+            // quick-xml 0.41 reports entity references as their own event
+            // rather than folding them into the surrounding Text. Ignoring
+            // them would silently DELETE every `<`, `&` and `>` a user typed
+            // into a note, which is exactly the kind of quiet corruption an
+            // annotation must never suffer.
+            Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                let Some(dst) = (if in_author {
+                    Some(&mut author_text)
+                } else if in_t {
+                    Some(&mut text)
+                } else {
+                    None
+                }) else {
+                    buf.clear();
+                    continue;
+                };
+                if let Ok(Some(ch)) = r.resolve_char_ref() {
+                    dst.push(ch);
+                } else {
+                    match r.decode().as_deref() {
+                        Ok("amp") => dst.push('&'),
+                        Ok("lt") => dst.push('<'),
+                        Ok("gt") => dst.push('>'),
+                        Ok("quot") => dst.push('"'),
+                        Ok("apos") => dst.push('\''),
+                        // An entity no XML spreadsheet writer emits. Keeping
+                        // the raw `&name;` is closer to the truth than
+                        // dropping it.
+                        Ok(other) => {
+                            dst.push('&');
+                            dst.push_str(other);
+                            dst.push(';');
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(ref e)) => match e.local_name().as_ref() {
+                b"authors" => in_authors = false,
+                b"author" if in_author => {
+                    in_author = false;
+                    authors.push(std::mem::take(&mut author_text));
+                }
+                b"t" => in_t = false,
+                b"comment" => {
+                    if let Some((cell, id)) = current.take() {
+                        let author = authors.get(id).cloned().unwrap_or_default();
+                        // The placeholder written for an unattributed comment
+                        // maps back to empty, so a note the user never signed
+                        // does not acquire an author by making a round trip.
+                        let author = if author == DEFAULT_COMMENT_AUTHOR {
+                            String::new()
+                        } else {
+                            author
+                        };
+                        out.push((
+                            cell,
+                            Comment {
+                                author,
+                                text: std::mem::take(&mut text),
+                            },
+                        ));
+                    }
+                }
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 /// Every table found in a workbook, with the worksheet it belongs to.
