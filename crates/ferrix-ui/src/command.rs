@@ -167,6 +167,10 @@ registry! {
         "Render this sheet to a paginated PDF. Streams one page at a time; a very large sheet is refused until confirmed." }
     FilePrintHtml { "file.print_html", Some(Menu::File), "🖨 Print to HTML…", None, false, None,
         "Render this sheet to a single self-contained HTML page, one table per printed page." }
+    FileSetPrintArea { "file.set_print_area", Some(Menu::File), "⌗ Set Print Area", None, false, Some(Note::Selection),
+        "Print only the selected range. A later Print to PDF/HTML renders just this area." }
+    FileClearPrintArea { "file.clear_print_area", Some(Menu::File), "⌗ Clear Print Area", None, false, None,
+        "Go back to printing the whole sheet." }
 
     // ---- Format ----
     FormatCondNew { "format.cond_new", Some(Menu::Format), "🎨 Conditional Formatting — New Rule…", None, false, Some(Note::Selection),
@@ -391,6 +395,7 @@ impl Command {
             DataClearCircles if !st.has_circles => {
                 Some("No validation circles are drawn".to_string())
             }
+            FileClearPrintArea if !st.has_print_area => Some("No print area is set".to_string()),
             // Nothing to group and nothing to dedupe on an empty sheet, and a
             // consolidation of one sheet is a copy. Said out loud rather than
             // hidden: a user who searches "consolidate" and finds nothing
@@ -450,6 +455,8 @@ pub struct CommandState {
     pub has_validation: bool,
     /// Validation circles are currently drawn.
     pub has_circles: bool,
+    /// A print area is set, so "Clear Print Area" has something to clear (#37).
+    pub has_print_area: bool,
     pub frozen: bool,
     pub can_undo: bool,
     pub can_redo: bool,

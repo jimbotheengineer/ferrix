@@ -393,6 +393,11 @@ impl Harness {
         self
     }
 
+    /// The active print area, for asserting Set/Clear Print Area (#37).
+    pub fn print_area(&self) -> Option<ferrix_core::TableRange> {
+        self.app.print_area()
+    }
+
     // ---- clipboard interop and Paste Special (issue #30) ----
     //
     // Copy goes through the REAL Ctrl+C path, so what these tests read back is
@@ -10070,6 +10075,57 @@ xxx,yyy,zzz
 
         let _ = std::fs::remove_file(&csv);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_print_area_limits_the_pdf_to_the_selected_range() {
+        // NUMS is id,qty with the id/qty header consumed on load, so the data
+        // row holding qty 150 is sheet row 1 (the second data row: 2,150). Set
+        // the print area to just that row and confirm the PDF contains 150 but
+        // NOT the other quantities — the area clipped the output, not annotated.
+        let (mut h, csv) = numeric_app("print_area.csv");
+        h.select(CellRef::new(1, 0), CellRef::new(1, 1));
+        h.run_command(crate::command::CommandId::FileSetPrintArea);
+        assert!(h.print_area().is_some(), "Set Print Area did nothing");
+
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-print-area-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+        h.print_to_path(&out, false, false);
+        assert!(out.exists(), "no PDF: {}", h.status());
+        let text = pdf_text_literals(&std::fs::read(&out).unwrap()).join(" ");
+        assert!(
+            text.contains("150"),
+            "the in-area value 150 must be printed: {text:?}"
+        );
+        for outside in ["200", "180", "120"] {
+            assert!(
+                !text.contains(outside),
+                "value {outside} is OUTSIDE the print area but was printed: {text:?}"
+            );
+        }
+
+        // Clearing the print area restores the whole sheet.
+        h.run_command(crate::command::CommandId::FileClearPrintArea);
+        assert!(h.print_area().is_none(), "Clear Print Area did nothing");
+        let out2 = out.with_extension("all.pdf");
+        let _ = std::fs::remove_file(&out2);
+        h.print_to_path(&out2, false, false);
+        let text2 = pdf_text_literals(&std::fs::read(&out2).unwrap()).join(" ");
+        assert!(
+            text2.contains("150") && text2.contains("200"),
+            "after clearing, the whole sheet must print: {text2:?}"
+        );
+
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&out2);
     }
 
     /// Pull the `(...)` string literals a PDF content stream draws with `Tj`,

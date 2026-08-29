@@ -291,6 +291,10 @@ pub struct FerrixApp {
     /// Row/column sizes, hidden spans and outline groups for the active sheet
     /// (issue #29).
     sizing: ferrix_core::sizing::SheetSizing,
+    /// Print area: the range printed instead of the whole used extent, 0-based
+    /// inclusive. `None` prints everything. Set from the selection and cleared
+    /// by the File menu (#37). Stored once per sheet, not per cell.
+    print_area: Option<ferrix_core::TableRange>,
     /// Column being resized by its border: (column, pointer x at press, width
     /// at press). OWNED HERE rather than read from egui's `is_dragging`, which
     /// is cleared on the release frame — the width would be lost exactly when
@@ -712,6 +716,7 @@ impl FerrixApp {
             subtotal_spec: None,
             header_drag: None,
             sizing: ferrix_core::sizing::SheetSizing::new(),
+            print_area: None,
             col_resize: None,
             header_menu: None,
             last_autofit_rows: 0,
@@ -1515,6 +1520,8 @@ impl FerrixApp {
         self.sizing_path = None;
         self.set_sizing(ferrix_core::sizing::SheetSizing::new());
         self.sizing_dirty = false;
+        // The print area is per sheet; a new file starts with none.
+        self.print_area = None;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -5307,6 +5314,36 @@ impl FerrixApp {
         };
     }
 
+    /// Set the print area to the current selection (#37). A later print — PDF,
+    /// HTML — renders only this range instead of the whole used extent. Stored
+    /// once for the sheet, not per cell, so it costs nothing on a 200M-row
+    /// sheet.
+    pub fn set_print_area(&mut self) {
+        let range = self.selection_range();
+        self.print_area = Some(range);
+        self.status = format!(
+            "Print area set to {}{}:{}{}",
+            ferrix_core::column_name(range.first_col),
+            range.first_row + 1,
+            ferrix_core::column_name(range.last_col),
+            range.last_row + 1,
+        );
+    }
+
+    /// Clear the print area, so the next print covers the whole sheet again.
+    pub fn clear_print_area(&mut self) {
+        if self.print_area.take().is_some() {
+            self.status = "Print area cleared — prints will cover the whole sheet".into();
+        } else {
+            self.status = "No print area was set".into();
+        }
+    }
+
+    /// The current print area, for tests and the menu's enabled state.
+    pub fn print_area(&self) -> Option<ferrix_core::TableRange> {
+        self.print_area
+    }
+
     /// Write this sheet to `path` as a PDF or a single-file HTML page.
     ///
     /// Dialog-free so a test can drive the REAL export the menu runs (the
@@ -5340,7 +5377,10 @@ impl FerrixApp {
         .with_name(&name);
 
         let setup = ferrix_core::page::PageSetup::default();
-        let opts = ferrix_io::render::RenderOptions::default();
+        let opts = ferrix_io::render::RenderOptions {
+            print_area: self.print_area,
+            ..Default::default()
+        };
         let rows = self.sizing.rows.clone();
         let cols = self.sizing.cols.clone();
 
@@ -8310,6 +8350,7 @@ impl FerrixApp {
             has_trace: self.trace.is_some(),
             has_validation: !self.wb.validation.is_empty(),
             has_circles: self.circle_invalid,
+            has_print_area: self.print_area.is_some(),
             frozen: self.panes.is_active(),
             can_undo: self.wb.can_undo(),
             can_redo: self.wb.can_redo(),
@@ -8355,6 +8396,8 @@ impl FerrixApp {
             C::FileExportParquet => self.export_parquet_dialog(),
             C::FilePrintPdf => self.print_pdf_dialog(),
             C::FilePrintHtml => self.print_html_dialog(),
+            C::FileSetPrintArea => self.set_print_area(),
+            C::FileClearPrintArea => self.clear_print_area(),
             C::DataValidationNew => self.validation_new_rule(),
             C::DataValidationManage => self.validation_manage(),
             C::DataValidationClear => self.validation_clear_selection(),
