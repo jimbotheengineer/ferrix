@@ -1734,6 +1734,25 @@ impl FerrixApp {
         self.paste_special = None;
     }
 
+    /// The number format a cell resolves to, as the painter sees it.
+    ///
+    /// Goes through `SheetFormat::number_format`, so it answers with the real
+    /// precedence — cell override over range over column — rather than
+    /// re-deriving it and possibly disagreeing with what is drawn.
+    pub fn number_format_at(&self, cell: CellRef) -> Option<ferrix_core::NumberFormat> {
+        self.wb.format.number_format(cell).cloned()
+    }
+
+    /// The style a cell resolves to, as the painter sees it.
+    pub fn style_at(&self, cell: CellRef) -> ferrix_core::CellStyle {
+        let mut plan = Vec::new();
+        self.wb.format.plan(cell.col, &mut plan);
+        let view = self.wb.view();
+        let value = view.get(cell);
+        let text = view.display(cell);
+        self.wb.format.resolve(cell, &value, &text, &plan, &[])
+    }
+
     /// Clear every cell in the selection as one undo step.
     fn clear_selection(&mut self) {
         let sel = self.selection;
@@ -4181,6 +4200,46 @@ impl FerrixApp {
     /// changed nothing. `SheetFormat` is `PartialEq`, so this compares whole.
     pub fn format_snapshot(&self) -> ferrix_core::SheetFormat {
         self.wb.format.clone()
+    }
+
+    /// Commit a value into a cell through the app's real edit path.
+    ///
+    /// Used by tests that need a specific value or formula in place before
+    /// exercising something else. Goes through `Workbook::commit_edit`, so the
+    /// dependency graph and recalculation happen exactly as they do for a
+    /// typed edit.
+    pub fn commit_edit_for_test(&mut self, cell: CellRef, text: &str) {
+        self.wb.commit_edit(cell, text);
+        self.wb.end_edit_run();
+    }
+
+    /// The formula SOURCE behind a cell, or `None` if it holds a literal.
+    ///
+    /// The distinction Paste Values depends on: after pasting values, a cell
+    /// showing `15` must have no formula behind it.
+    pub fn formula_src_at_for_test(&self, cell: CellRef) -> Option<String> {
+        self.wb.formula_src_at(cell)
+    }
+
+    /// Apply a number format to the selection, as the Format menu does.
+    pub fn apply_number_format_for_test(&mut self, fmt: ferrix_core::NumberFormat) {
+        let (a, b) = self.selection.bounds();
+        if a == b {
+            let mut ov = self.wb.format.cell_override(a).cloned().unwrap_or_default();
+            ov.format = Some(fmt);
+            self.wb.format.set_cell_override(a, ov);
+        } else {
+            let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+            let mut rf = ferrix_core::RangeFormat::new(range);
+            rf.format = Some(fmt);
+            self.wb.format.push_range(rf);
+        }
+        self.wb.mark_dirty();
+    }
+
+    /// Bytes the sheet's format store holds, for the scale assertions.
+    pub fn format_heap_bytes(&self) -> usize {
+        self.wb.format.heap_bytes()
     }
 
     /// Direct access to the format store, for tests that drive a Manage-list

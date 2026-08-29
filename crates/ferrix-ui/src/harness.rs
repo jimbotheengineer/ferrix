@@ -320,6 +320,98 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    // ---- clipboard interop and Paste Special (issue #30) ----
+    //
+    // Copy goes through the REAL Ctrl+C path, so what these tests read back is
+    // what the app actually put on the clipboard. Paste has to be driven
+    // directly because egui delivers clipboard content as a `Paste` EVENT and
+    // the harness has no OS clipboard to populate — `paste_text` synthesises
+    // exactly that event, so everything downstream of it is the real app.
+
+    /// Copy the selection through the real Ctrl+C handler.
+    pub fn copy(&mut self) -> &mut Self {
+        self.ctrl(Key::C).steps(2);
+        self
+    }
+
+    /// Cut the selection through the real Ctrl+X handler.
+    pub fn cut(&mut self) -> &mut Self {
+        self.ctrl(Key::X).steps(2);
+        self
+    }
+
+    /// Deliver `text` as a clipboard Paste event and let the app handle it,
+    /// exactly as a real Ctrl+V does.
+    pub fn paste_text(&mut self, text: &str) -> &mut Self {
+        self.events.push(Event::Paste(text.to_string()));
+        self.pending_modifiers = Modifiers::COMMAND;
+        self.events.push(Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        });
+        self.steps(2);
+        self
+    }
+
+    /// The TSV the app last put on the system clipboard.
+    ///
+    /// Read back from the app's own rich copy rather than from a stashed
+    /// string, so it cannot drift from what `copy_selection` actually
+    /// serialised.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.app
+            .clipboard_block()
+            .map(|b| ferrix_core::tsv::to_tsv(&b.to_text_grid()))
+    }
+
+    /// The HTML flavour the app rendered for the last copy.
+    pub fn clipboard_html(&self) -> Option<&str> {
+        self.app.clipboard_html()
+    }
+
+    /// Paste the app's own last copy back, with an explicit Paste Special
+    /// request. This is the Ferrix -> clipboard -> Ferrix round trip.
+    pub fn paste_special(&mut self, opts: ferrix_core::clipboard::PasteOptions) -> &mut Self {
+        let text = self.clipboard_text().unwrap_or_default();
+        self.app.paste_special(&text, opts);
+        self.steps(2);
+        self
+    }
+
+    /// Paste arbitrary clipboard text with a Paste Special request.
+    pub fn paste_text_special(
+        &mut self,
+        text: &str,
+        opts: ferrix_core::clipboard::PasteOptions,
+    ) -> &mut Self {
+        self.app.paste_special(text, opts);
+        self.steps(2);
+        self
+    }
+
+    /// Merge an explicit rectangle, for setting up a merge-conflict test.
+    pub fn merge_range(&mut self, a: ferrix_core::CellRef, b: ferrix_core::CellRef) {
+        self.select(a, b);
+        self.app.toggle_merge();
+        self.steps(2);
+    }
+
+    /// The resolved number format on a cell, as the painter would see it.
+    pub fn number_format_at(
+        &self,
+        cell: ferrix_core::CellRef,
+    ) -> Option<ferrix_core::NumberFormat> {
+        self.app.number_format_at(cell)
+    }
+
+    /// The resolved style on a cell, as the painter would see it.
+    pub fn style_at(&self, cell: ferrix_core::CellRef) -> ferrix_core::CellStyle {
+        self.app.style_at(cell)
+    }
+
     // ---- cell comments (roadmap #12) ----
     //
     // These drive the same entry points the context menu and the editor's
@@ -5616,6 +5708,608 @@ xxx,yyy,zzz
 
         crate::prefs::set_test_config_dir(prev);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================= clipboard interop and Paste Special (issue #30) =====
+    //
+    // Driven through the real app: Ctrl+C is the app's own copy handler, and
+    // a paste arrives as the `Paste` EVENT egui actually delivers. Every
+    // assertion below is on a VALUE at a coordinate, a resolved format, or an
+    // exact undo depth — never on "the status line said something".
+
+    /// A fixture with a formula, a number format and a manual style, so a
+    /// round trip has something to lose.
+    fn rich_fixture(name: &str) -> (Harness, std::path::PathBuf) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        (h, p)
+    }
+
+    #[test]
+    fn copy_puts_tsv_on_the_clipboard_and_renders_the_html_flavour() {
+        // Both flavours are built by the REAL Ctrl+C path. The HTML one cannot
+        // reach the system clipboard (eframe is text-only) but it must exist
+        // and be well-formed, because that is what the paste path reads.
+        let (mut h, p) = rich_fixture("clip_copy.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(1, 2));
+        h.copy();
+
+        let tsv = h.clipboard_text().expect("Ctrl+C must fill the clipboard");
+        assert_eq!(
+            tsv, "1\talpha\t10\r\n2\tbeta\t20",
+            "the TSV flavour must be the copied rectangle"
+        );
+
+        let html = h.clipboard_html().expect("the HTML flavour must be built");
+        assert_eq!(html.matches("<tr>").count(), 2, "one <tr> per copied row");
+        assert_eq!(html.matches("<td").count(), 6, "one <td> per copied cell");
+        assert!(html.contains(">alpha</td>"), "cell values must be in it");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn pasting_an_excel_html_table_lands_values_not_markup() {
+        // THE interop criterion: the HTML flavour is preferred over plain
+        // text. Read as TSV this payload would be one cell of markup; read as
+        // HTML it is the grid Excel meant.
+        let (mut h, p) = rich_fixture("clip_html_paste.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text(
+            "<html><body><table>\
+             <tr><td>111</td><td>222</td></tr>\
+             <tr><td>333</td><td>444</td></tr>\
+             </table></body></html>",
+        );
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "111");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "222");
+        assert_eq!(h.app().display(CellRef::new(1, 0)), "333");
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "444",
+            "the whole 2x2 grid must land, not a single markup cell"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn pasting_excel_html_carries_the_number_format_and_styling() {
+        // The reason the HTML flavour exists: TSV would land "1234.5" with no
+        // format and no colour. Asserted on the RESOLVED format and style,
+        // which is what the painter reads.
+        let (mut h, p) = rich_fixture("clip_html_fmt.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text(
+            "<table><tr>\
+             <td style=\"mso-number-format:'#,##0.00';background-color:#FFFF00;font-weight:bold\">1234.5</td>\
+             </tr></table>",
+        );
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1234.5", "the value");
+        assert_eq!(
+            h.number_format_at(CellRef::new(0, 0)),
+            Some(ferrix_core::NumberFormat::Thousands { places: 2 }),
+            "the number format must survive the paste"
+        );
+        let style = h.style_at(CellRef::new(0, 0));
+        assert_eq!(
+            style.fill,
+            Some(ferrix_core::Rgb(0xFF, 0xFF, 0x00)),
+            "the fill must survive the paste"
+        );
+        assert_eq!(style.typography.bold, Some(true), "and the boldness");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn plain_tsv_paste_still_works_exactly_as_before() {
+        // The HTML support must not break the path that already worked.
+        let (mut h, p) = rich_fixture("clip_tsv_paste.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text("7\t8\r\n9\t10");
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "7");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "10");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_round_trip_preserves_values_number_formats_and_styling() {
+        // Ferrix -> clipboard -> Ferrix, through the app's own copy and paste.
+        // Every property is asserted at the DESTINATION coordinate, so a round
+        // trip that carried only the text fails here.
+        let (mut h, p) = rich_fixture("clip_roundtrip.csv");
+
+        // Give the source region a format and a style to lose.
+        h.select(CellRef::new(0, 2), CellRef::new(1, 2));
+        h.app_mut()
+            .apply_number_format_for_test(ferrix_core::NumberFormat::Currency {
+                symbol: "$".into(),
+                places: 2,
+            });
+        h.app_mut()
+            .apply_typography(|t| *t = t.with_bold(true).with_italic(true));
+        h.steps(2);
+
+        let src_fmt = h.number_format_at(CellRef::new(0, 2));
+        assert!(src_fmt.is_some(), "setup: the source must have a format");
+
+        h.select(CellRef::new(0, 2), CellRef::new(1, 2));
+        h.copy();
+        // Paste far away, so nothing could be "preserved" by simply not moving.
+        h.select(CellRef::new(5, 5), CellRef::new(5, 5));
+        h.paste_special(ferrix_core::clipboard::PasteOptions::plain());
+
+        assert_eq!(
+            h.app().display(CellRef::new(5, 5)),
+            "10",
+            "the value must arrive"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(6, 5)),
+            "20",
+            "and the second row"
+        );
+        assert_eq!(
+            h.number_format_at(CellRef::new(5, 5)),
+            src_fmt,
+            "the number format must survive the round trip"
+        );
+        let style = h.style_at(CellRef::new(5, 5));
+        assert_eq!(style.typography.bold, Some(true), "bold must survive");
+        assert_eq!(style.typography.italic, Some(true), "italic must survive");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_values_drops_the_formula_and_keeps_the_number() {
+        let (mut h, p) = rich_fixture("clip_values.csv");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.app_mut()
+            .commit_edit_for_test(CellRef::new(0, 4), "=10+5");
+        h.steps(2);
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "15", "setup");
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.copy();
+        h.select(CellRef::new(3, 4), CellRef::new(3, 4));
+        h.paste_special(ferrix_core::clipboard::PasteOptions::values());
+
+        assert_eq!(
+            h.app().display(CellRef::new(3, 4)),
+            "15",
+            "the computed value must land"
+        );
+        assert_eq!(
+            h.app().formula_src_at_for_test(CellRef::new(3, 4)),
+            None,
+            "Paste Values must NOT carry the formula"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_formulas_rewrites_relative_refs_and_pins_absolute_ones() {
+        // The formula criterion, end to end. `=B1*$A$1` copied two rows down
+        // must become `=B3*$A$1`: the relative reference follows, the anchored
+        // one does not.
+        let (mut h, p) = rich_fixture("clip_formulas.csv");
+        h.app_mut()
+            .commit_edit_for_test(CellRef::new(0, 4), "=B1*$A$1");
+        h.steps(2);
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.copy();
+        h.select(CellRef::new(2, 4), CellRef::new(2, 4));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            what: ferrix_core::clipboard::PasteWhat::Formulas,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            h.app()
+                .formula_src_at_for_test(CellRef::new(2, 4))
+                .as_deref(),
+            Some("=B3*$A$1"),
+            "the relative ref must follow and the $ anchor must pin"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_formats_changes_formatting_without_touching_values() {
+        // Formats-only must be exactly that. The destination's VALUE is
+        // asserted unchanged, which a mode that quietly wrote contents fails.
+        let (mut h, p) = rich_fixture("clip_formats.csv");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.app_mut()
+            .apply_number_format_for_test(ferrix_core::NumberFormat::Percent { places: 1 });
+        h.steps(2);
+
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.copy();
+
+        let before = h.app().display(CellRef::new(2, 1));
+        h.select(CellRef::new(2, 1), CellRef::new(2, 1));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            what: ferrix_core::clipboard::PasteWhat::Formats,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            h.app().display(CellRef::new(2, 1)),
+            before,
+            "Paste Formats must not change the value"
+        );
+        assert_eq!(
+            h.number_format_at(CellRef::new(2, 1)),
+            Some(ferrix_core::NumberFormat::Percent { places: 1 }),
+            "but it must change the format"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_column_widths_resizes_columns_and_leaves_cells_alone() {
+        let (mut h, p) = rich_fixture("clip_widths.csv");
+        h.set_col_width(0, 240.0);
+        h.steps(2);
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.copy();
+
+        let value_before = h.app().display(CellRef::new(0, 2));
+        let width_before = h.app().col_width(2);
+        assert!(
+            (width_before - 240.0).abs() > 1.0,
+            "setup: the destination must start at a different width"
+        );
+
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            what: ferrix_core::clipboard::PasteWhat::ColumnWidths,
+            ..Default::default()
+        });
+
+        assert!(
+            (h.app().col_width(2) - 240.0).abs() < 1.0,
+            "the destination column must take the source's width, got {}",
+            h.app().col_width(2)
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            value_before,
+            "pasting widths must not touch cell contents"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_transpose_swaps_rows_and_columns() {
+        let (mut h, p) = rich_fixture("clip_transpose.csv");
+        // Source: a 1x3 row of known values.
+        for (c, v) in [(0u32, "71"), (1, "72"), (2, "73")] {
+            h.app_mut().commit_edit_for_test(CellRef::new(6, c), v);
+        }
+        h.steps(2);
+
+        h.select(CellRef::new(6, 0), CellRef::new(6, 2));
+        h.copy();
+        h.select(CellRef::new(9, 5), CellRef::new(9, 5));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            transpose: true,
+            ..Default::default()
+        });
+
+        // A 1x3 row must land as a 3x1 column.
+        assert_eq!(h.app().display(CellRef::new(9, 5)), "71");
+        assert_eq!(h.app().display(CellRef::new(10, 5)), "72");
+        assert_eq!(h.app().display(CellRef::new(11, 5)), "73");
+        assert_ne!(
+            h.app().display(CellRef::new(9, 6)),
+            "72",
+            "a transposed paste must NOT also lay the row out sideways"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_add_combines_with_what_is_already_there() {
+        // Arithmetic paste, end to end. The destination starts at 10 and the
+        // clipboard holds 30, so Add must produce 40 — a number neither side
+        // holds, which no accidental plain paste could produce.
+        let (mut h, p) = rich_fixture("clip_add.csv");
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 0), "30");
+        h.steps(2);
+
+        h.select(CellRef::new(6, 0), CellRef::new(6, 0));
+        h.copy();
+
+        // C1 is 10 in SAMPLE.
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "10", "setup");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            op: ferrix_core::clipboard::PasteOp::Add,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "40",
+            "Add must combine 10 + 30, not overwrite with 30"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn paste_multiply_and_subtract_use_the_right_operand_order() {
+        // Subtract is not commutative: dest - src, not src - dest. A test
+        // using equal-ish operands could not tell the two apart.
+        let (mut h, p) = rich_fixture("clip_sub.csv");
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 0), "3");
+        h.steps(2);
+        h.select(CellRef::new(6, 0), CellRef::new(6, 0));
+        h.copy();
+
+        // C1 = 10.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            op: ferrix_core::clipboard::PasteOp::Subtract,
+            ..Default::default()
+        });
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "7",
+            "must be dest - src (10 - 3), not src - dest"
+        );
+
+        // C2 = 20, multiplied by 3.
+        h.select(CellRef::new(1, 2), CellRef::new(1, 2));
+        h.paste_special(ferrix_core::clipboard::PasteOptions {
+            op: ferrix_core::clipboard::PasteOp::Multiply,
+            ..Default::default()
+        });
+        assert_eq!(h.app().display(CellRef::new(1, 2)), "60");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn skip_blanks_leaves_the_destination_alone_under_empty_cells() {
+        // The whole point of Skip Blanks: a blank in the clipboard must not
+        // erase what is underneath it.
+        let (mut h, p) = rich_fixture("clip_skip.csv");
+        // Source row: "99", blank, "77".
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 0), "99");
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 2), "77");
+        h.steps(2);
+
+        h.select(CellRef::new(6, 0), CellRef::new(6, 2));
+        h.copy();
+
+        // Destination row 0 is 1, alpha, 10.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text_special(
+            &h.clipboard_text().unwrap(),
+            ferrix_core::clipboard::PasteOptions {
+                skip_blanks: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "99", "written");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "alpha",
+            "the blank source cell must NOT have cleared 'alpha'"
+        );
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "77", "written");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn without_skip_blanks_a_blank_source_cell_does_clear_the_destination() {
+        // The contrast that makes the previous test meaningful. If this
+        // behaved the same way, Skip Blanks would be a no-op flag and its
+        // test would be passing for the wrong reason.
+        let (mut h, p) = rich_fixture("clip_noskip.csv");
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 0), "99");
+        h.app_mut().commit_edit_for_test(CellRef::new(6, 2), "77");
+        h.steps(2);
+
+        h.select(CellRef::new(6, 0), CellRef::new(6, 2));
+        h.copy();
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_special(ferrix_core::clipboard::PasteOptions::plain());
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "",
+            "a plain paste MUST clear under a blank source cell"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_paste_that_would_clip_a_merged_region_is_refused_with_a_message() {
+        // The merge criterion: refused, said out loud, and NOTHING written.
+        let (mut h, p) = rich_fixture("clip_merge.csv");
+        // Merge C3:D4, then aim a paste at a rectangle that clips its corner.
+        h.merge_range(CellRef::new(2, 2), CellRef::new(3, 3));
+        let anchor_before = h.app().display(CellRef::new(2, 2));
+
+        h.select(CellRef::new(0, 0), CellRef::new(1, 1));
+        h.copy();
+        // Paste at B2 covers B2:C3 — which clips C3:D4 rather than covering it.
+        h.select(CellRef::new(1, 1), CellRef::new(1, 1));
+        let depth_before = h.app().undo_depth();
+        let b2_before = h.app().display(CellRef::new(1, 1));
+        h.paste_special(ferrix_core::clipboard::PasteOptions::plain());
+
+        assert!(
+            h.status().contains("refused") && h.status().contains("merged"),
+            "the refusal must say why; status was {:?}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before,
+            "a refused paste must push NO undo entry"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            b2_before,
+            "a refused paste must write nothing at all"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(2, 2)),
+            anchor_before,
+            "least of all inside the merged region"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_paste_that_covers_a_merge_entirely_is_allowed() {
+        // The other half: refusing every paste that touches a merge would be
+        // too blunt. Covering a merge writes it as a unit and is fine — so
+        // this proves the check is about CLIPPING, not about mere contact.
+        let (mut h, p) = rich_fixture("clip_merge_ok.csv");
+        h.merge_range(CellRef::new(2, 2), CellRef::new(2, 3));
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 2));
+        h.copy();
+        h.select(CellRef::new(2, 2), CellRef::new(2, 2));
+        let depth_before = h.app().undo_depth();
+        h.paste_special(ferrix_core::clipboard::PasteOptions::plain());
+
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before + 1,
+            "a paste that fully covers the merge must go through; status: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_100k_cell_paste_is_exactly_one_undo_step_and_one_undo_restores_it() {
+        // THE bulk criterion, matching `a_bulk_clear_is_exactly_one_undo_step`
+        // and the Replace All test: exact undo DEPTH before and after, and a
+        // single Ctrl+Z that puts every changed cell back.
+        let p = write_csv("clip_bulk.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // 100k cells: 500 rows x 200 columns, built as clipboard TEXT so the
+        // test does not depend on having copied that much first.
+        let rows = 500usize;
+        let cols = 200usize;
+        let mut tsv = String::with_capacity(rows * cols * 3);
+        for r in 0..rows {
+            if r > 0 {
+                tsv.push_str("\r\n");
+            }
+            for c in 0..cols {
+                if c > 0 {
+                    tsv.push('\t');
+                }
+                tsv.push_str(&((r * cols + c) % 97).to_string());
+            }
+        }
+
+        let depth_before = h.app().undo_depth();
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text(&tsv);
+
+        // It must actually have done the work, or "one undo step" is trivial.
+        assert_eq!(
+            h.app().display(CellRef::new(499, 199)),
+            ((499 * cols + 199) % 97).to_string(),
+            "the far corner of a 100k-cell paste must be written; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before + 1,
+            "a 100k-cell paste must push EXACTLY ONE undo entry"
+        );
+
+        // Values that must come back, sampled across the whole region.
+        let probes = [
+            CellRef::new(0, 0),
+            CellRef::new(0, 199),
+            CellRef::new(250, 100),
+            CellRef::new(499, 0),
+            CellRef::new(499, 199),
+        ];
+        let pasted: Vec<String> = probes.iter().map(|c| h.app().display(*c)).collect();
+        assert!(
+            pasted.iter().all(|v| !v.is_empty()),
+            "setup: every probe must have been written"
+        );
+
+        h.ctrl(Key::Z).steps(3);
+
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before,
+            "one undo must consume exactly the one entry"
+        );
+        for c in probes {
+            // Row 0 columns 0..3 came from the CSV; everything else was empty.
+            let want = if c.row == 0 && c.col < 3 {
+                ["1", "alpha", "10"][c.col as usize].to_string()
+            } else {
+                String::new()
+            };
+            assert_eq!(
+                h.app().display(c),
+                want,
+                "a single undo must restore {c:?} to what it held before"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn pasting_one_format_over_a_wide_region_stores_rectangles_not_cells() {
+        // The scale invariant, asserted on real memory. Formatting is stored
+        // per RANGE; a paste of one uniform format over 20k cells that stored
+        // per cell would be caught by the heap-bytes bound here.
+        let p = write_csv("clip_fmt_scale.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // A 200x100 HTML table where every cell carries the same format.
+        let mut html = String::from("<table>");
+        for _ in 0..200 {
+            html.push_str("<tr>");
+            for _ in 0..100 {
+                html.push_str("<td style=\"mso-number-format:'0.00'\">1</td>");
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table>");
+
+        let before = h.app().format_heap_bytes();
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.paste_text(&html);
+
+        // It must actually have applied the format somewhere.
+        assert_eq!(
+            h.number_format_at(CellRef::new(150, 90)),
+            Some(ferrix_core::NumberFormat::Decimal { places: 2 }),
+            "the format must reach the far corner of the region"
+        );
+
+        let grew = h.app().format_heap_bytes().saturating_sub(before);
+        assert!(
+            grew < 8_192,
+            "20,000 uniformly formatted cells must collapse to a rectangle; \
+             the format store grew by {grew} bytes"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

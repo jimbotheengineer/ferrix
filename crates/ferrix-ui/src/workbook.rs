@@ -2089,6 +2089,20 @@ impl Workbook {
                 let text = self.paste_cell_text(cell, src, opts);
                 let before = self.overlay.get(cell).cloned();
                 let after = match &text {
+                    // A BLANK clipboard cell clears the destination, which for
+                    // a cell whose value lives in the base means writing an
+                    // explicit empty rather than clearing the overlay —
+                    // clearing would merely reveal the base value again and
+                    // the paste would look like it had skipped the cell. Same
+                    // reasoning, and the same representation, as `clear_range`.
+                    Some(t) if t.trim().is_empty() => {
+                        let already_empty =
+                            before.is_none() && self.view().get(cell) == Value::Empty;
+                        if already_empty {
+                            continue;
+                        }
+                        Some(CellInput::Literal(Value::Empty))
+                    }
                     Some(t) => self.classify(t),
                     // `None` means the arithmetic refused this pair; leave the
                     // destination untouched rather than writing an error over
@@ -2269,6 +2283,18 @@ impl Workbook {
                 intersects && !fully_inside
             })
             .copied()
+    }
+
+    /// The formula source behind a cell, or `None` if it holds a literal.
+    ///
+    /// Reads the overlay's own record rather than re-deriving from the display
+    /// text: a cell showing `15` may be a literal or `=10+5`, and only the
+    /// overlay knows which.
+    pub fn formula_src_at(&self, cell: CellRef) -> Option<String> {
+        self.overlay
+            .get(cell)
+            .and_then(|i| i.formula_src())
+            .map(|s| s.to_string())
     }
 
     /// Clear every cell in a selection as ONE undo step.
