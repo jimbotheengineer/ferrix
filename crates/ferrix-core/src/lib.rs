@@ -17,6 +17,8 @@ pub mod chart;
 pub mod clipboard;
 pub mod column;
 pub mod comment;
+pub mod consolidate;
+pub mod dedupe;
 pub mod filter;
 pub mod format;
 pub mod merge;
@@ -31,6 +33,7 @@ pub mod sheet;
 pub mod sizing;
 pub mod sort;
 pub mod sparkline;
+pub mod subtotal;
 pub mod table;
 pub mod tsv;
 pub mod value;
@@ -41,6 +44,11 @@ pub use budget::Budget;
 pub use cancel::CancelToken;
 pub use column::Column;
 pub use comment::{Comment, CommentMap};
+pub use consolidate::{
+    consolidate, ConsolidateError, ConsolidateFn, ConsolidateReport, ConsolidateRequest,
+    Consolidated, MAX_OUTPUT_CELLS,
+};
+pub use dedupe::{scan_duplicates, DupeKeys, DupeReport, DupeScan, KeyCell};
 pub use filter::RowFilter;
 pub use format::{
     Border, BorderStyle, CellDecor, CellOverride, ColumnFormat, DecorEntry, Diagonal, HAlign,
@@ -63,6 +71,9 @@ pub use sizing::{
 };
 pub use sort::{cycle_click, CellKeys, SortCell, SortDir, SortKey, SortOrder};
 pub use sparkline::{sparkline_shape, SparkBar, SparkGroup, SparkKind, SparkShape, SparklineMap};
+pub use subtotal::{
+    Agg, GroupSource, SubRow, SubtotalCell, SubtotalError, SubtotalFn, SubtotalPlan, MAX_GROUPS,
+};
 pub use table::{
     CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,
     Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,
