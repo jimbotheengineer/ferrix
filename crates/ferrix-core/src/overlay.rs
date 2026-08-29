@@ -82,11 +82,26 @@ pub struct EditOverlay {
     /// Rows/cols the user extended the sheet to by editing past the end.
     extra_rows: usize,
     extra_cols: usize,
+    /// Bumped on every mutation that changes what would be serialized.
+    ///
+    /// Autosave uses this to answer "has anything changed since the last
+    /// tick?" in O(1). Comparing overlays cell by cell would make an idle
+    /// timer cost as much as a save, which is exactly what the timer exists
+    /// to avoid; a counter makes the common case — nothing typed in the last
+    /// 30 seconds — free.
+    revision: u64,
 }
 
 impl EditOverlay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Monotonic edit counter. Two reads returning the same value mean the
+    /// serialized form of this overlay is unchanged between them.
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     #[inline]
@@ -118,12 +133,17 @@ impl EditOverlay {
     pub fn set(&mut self, cell: CellRef, input: CellInput) -> Option<CellInput> {
         self.extra_rows = self.extra_rows.max(cell.row as usize + 1);
         self.extra_cols = self.extra_cols.max(cell.col as usize + 1);
+        self.revision = self.revision.wrapping_add(1);
         self.cells.insert(cell, input)
     }
 
     /// Remove an edit, reverting the cell to its base value.
     pub fn clear(&mut self, cell: CellRef) -> Option<CellInput> {
-        self.cells.remove(&cell)
+        let prev = self.cells.remove(&cell);
+        if prev.is_some() {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        prev
     }
 
     /// Restore a previous state exactly — the undo primitive.
@@ -193,7 +213,13 @@ impl EditOverlay {
     /// Used by recalc, which must not disturb what the user typed.
     pub fn update_cached(&mut self, cell: CellRef, value: Value) {
         if let Some(CellInput::Formula { cached, .. }) = self.cells.get_mut(&cell) {
-            *cached = value;
+            // Only a real change counts: recalc runs far more often than the
+            // values actually move, and treating every recalc as an edit would
+            // make an idle autosave timer rewrite the file forever.
+            if *cached != value {
+                *cached = value;
+                self.revision = self.revision.wrapping_add(1);
+            }
         }
     }
 
@@ -232,6 +258,7 @@ impl EditOverlay {
             arena,
             extra_rows,
             extra_cols,
+            revision: 0,
         }
     }
 

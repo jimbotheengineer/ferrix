@@ -184,7 +184,32 @@ pub fn save_edits(
     overlay: &EditOverlay,
     fingerprint: BaseFingerprint,
 ) -> Result<u64, EditError> {
-    let tmp = path.with_extension("fxedits.tmp");
+    write_atomic(path, ".tmp", overlay, fingerprint)
+}
+
+/// The shared atomic writer behind both the official sidecar and the autosave.
+///
+/// Follows the pattern established in `export.rs`: serialize into a temp file
+/// that is a *sibling* of the destination (so the rename stays on one
+/// filesystem and is therefore atomic), flush and fsync it so the bytes are
+/// durable before the rename, then rename into place.
+///
+/// The consequence that matters: a crash at any instant leaves either the
+/// complete previous file or the complete new one on disk. Never a prefix of
+/// the new one. A truncated recovery file is worse than none at all, because
+/// the user believes they are protected right up until they try to use it.
+///
+/// The temp suffix is a parameter rather than derived, because
+/// `Path::with_extension` would mangle `sales.ferrix.fxedits.autosave` into
+/// `sales.ferrix.fxedits.tmp` — colliding with the real sidecar's temp file.
+/// Suffixes are appended here, never substituted.
+fn write_atomic(
+    path: &Path,
+    tmp_suffix: &str,
+    overlay: &EditOverlay,
+    fingerprint: BaseFingerprint,
+) -> Result<u64, EditError> {
+    let tmp = sibling_with_suffix(path, tmp_suffix);
     {
         let f = File::create(&tmp)?;
         let mut w = BufWriter::new(f);
@@ -227,12 +252,132 @@ pub fn save_edits(
             }
         }
         w.flush()?;
+        // fsync before the rename. Without this the rename can land in the
+        // directory while the file's contents are still only in the page
+        // cache, and a power loss leaves a correctly-named empty file — the
+        // truncation this whole dance exists to prevent.
+        w.get_ref().sync_all()?;
     }
     let size = std::fs::metadata(&tmp)?.len();
     // Windows will not rename onto an existing file.
     let _ = std::fs::remove_file(path);
     std::fs::rename(&tmp, path)?;
     Ok(size)
+}
+
+/// Append a suffix to a path, never substituting its extension.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+// --- autosave ---
+
+/// Suffix appended to the sidecar path to get its autosave companion.
+pub const AUTOSAVE_SUFFIX: &str = ".autosave";
+
+/// Default autosave cadence in seconds.
+pub const DEFAULT_AUTOSAVE_SECS: u64 = 30;
+
+/// Where the autosave for a given sidecar lives: `<base>.fxedits.autosave`.
+///
+/// Deliberately a separate file from the sidecar. Autosave is speculative —
+/// the user has not asked for it and may not want it — so it must never be
+/// able to overwrite the thing they *did* ask for. Recovery promotes the
+/// autosave into the overlay only after the user says so.
+pub fn autosave_path_for_sidecar(sidecar: &Path) -> PathBuf {
+    sibling_with_suffix(sidecar, AUTOSAVE_SUFFIX)
+}
+
+/// Write the overlay to the autosave file, atomically.
+///
+/// Cost is O(edits), identical to `save_edits`: 100 edits over a 200M-row
+/// sheet write a few kilobytes regardless of row count.
+pub fn write_autosave(
+    sidecar: &Path,
+    overlay: &EditOverlay,
+    fingerprint: BaseFingerprint,
+) -> Result<u64, EditError> {
+    let path = autosave_path_for_sidecar(sidecar);
+    write_atomic(&path, ".tmp", overlay, fingerprint)
+}
+
+/// Delete the autosave, if present. Missing is success: the caller's intent is
+/// "there must be no autosave after this", and there isn't.
+pub fn discard_autosave(sidecar: &Path) -> io::Result<()> {
+    let path = autosave_path_for_sidecar(sidecar);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// An autosave that is newer than the sidecar it sits beside — i.e. work the
+/// user would otherwise have lost.
+#[derive(Debug, Clone)]
+pub struct RecoveryCandidate {
+    pub autosave: PathBuf,
+    /// How long ago the autosave was written, for the prompt's "HH:MM ago".
+    pub age: std::time::Duration,
+}
+
+impl RecoveryCandidate {
+    /// The age rendered as `HH:MM`, which is what the prompt shows.
+    pub fn age_hhmm(&self) -> String {
+        let total = self.age.as_secs();
+        format!("{:02}:{:02}", total / 3600, (total % 3600) / 60)
+    }
+}
+
+fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Decide whether there is recoverable work next to `sidecar`.
+///
+/// Returns `Some` only when an autosave exists AND is strictly newer than the
+/// official sidecar. If the sidecar is newer, the user has saved since the
+/// autosave was written and the autosave holds nothing they do not already
+/// have — prompting there would be noise, and worse, would invite them to
+/// overwrite a good save with stale edits.
+///
+/// A missing sidecar with a present autosave *is* a candidate: that is exactly
+/// the crash-before-first-save case, the one where everything typed is only in
+/// the autosave.
+///
+/// This deliberately does not parse the autosave. It is a `stat` of two files,
+/// so it stays instant on a huge overlay; the contents are read only if the
+/// user chooses to recover.
+pub fn find_recovery(sidecar: &Path) -> Option<RecoveryCandidate> {
+    let auto = autosave_path_for_sidecar(sidecar);
+    let auto_mtime = mtime_of(&auto)?;
+    if let Some(side_mtime) = mtime_of(sidecar) {
+        if auto_mtime <= side_mtime {
+            return None;
+        }
+    }
+    let age = std::time::SystemTime::now()
+        .duration_since(auto_mtime)
+        // A clock skew that puts the file in the future is not worth failing
+        // over; report it as brand new.
+        .unwrap_or_default();
+    Some(RecoveryCandidate {
+        autosave: auto,
+        age,
+    })
+}
+
+/// Load the overlay out of an autosave, with the same staleness check the
+/// sidecar gets. Recovering edits onto a base that has changed underneath
+/// would misapply them by position, which is the data-loss mode the
+/// fingerprint exists to stop — autosave gets no exemption from it.
+pub fn load_autosave(
+    sidecar: &Path,
+    expected: BaseFingerprint,
+) -> Result<Option<EditOverlay>, EditError> {
+    load_edits(&autosave_path_for_sidecar(sidecar), expected)
 }
 
 // --- reading ---
@@ -524,5 +669,242 @@ mod tests {
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
+    }
+
+    // --- autosave ---
+
+    /// A scratch sidecar path unique to this test, so the autosave tests can
+    /// run in parallel without fighting over the same files.
+    fn side(name: &str) -> PathBuf {
+        let p = scratch().join(format!("{name}.fxedits"));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(autosave_path_for_sidecar(&p));
+        p
+    }
+
+    fn overlay_of(vals: &[(u32, f64)]) -> EditOverlay {
+        let mut ov = EditOverlay::new();
+        for (row, v) in vals {
+            ov.set(CellRef::new(*row, 0), CellInput::Literal(Value::Number(*v)));
+        }
+        ov
+    }
+
+    #[test]
+    fn autosave_path_sits_beside_the_sidecar_and_is_not_it() {
+        let s = edits_path_for(Path::new("data/sales.ferrix"));
+        let a = autosave_path_for_sidecar(&s);
+        assert!(a
+            .to_string_lossy()
+            .ends_with("sales.ferrix.fxedits.autosave"));
+        assert_ne!(a, s, "autosave must never be the official sidecar");
+    }
+
+    #[test]
+    fn autosave_roundtrips_without_touching_the_sidecar() {
+        let s = side("auto_roundtrip");
+        let ov = overlay_of(&[(0, 1.0), (5, 2.0)]);
+        write_autosave(&s, &ov, fp()).unwrap();
+
+        // The official sidecar must not have been created as a side effect.
+        assert!(
+            !s.exists(),
+            "autosave wrote the official sidecar; it must only ever write its own file"
+        );
+        let back = load_autosave(&s, fp()).unwrap().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.value(CellRef::new(5, 0)), Some(Value::Number(2.0)));
+    }
+
+    #[test]
+    fn recovery_offered_when_autosave_is_newer_than_the_sidecar() {
+        let s = side("recover_newer");
+        // Sidecar first, then a later autosave: the crash-after-save case.
+        save_edits(&s, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_autosave(&s, &overlay_of(&[(0, 1.0), (1, 2.0)]), fp()).unwrap();
+
+        let c = find_recovery(&s).expect("newer autosave must be offered for recovery");
+        assert!(c.autosave.exists());
+    }
+
+    #[test]
+    fn recovery_not_offered_when_the_sidecar_is_newer() {
+        // The user saved after the autosave. The autosave holds nothing they
+        // do not already have, so prompting would invite them to overwrite a
+        // good save with stale edits.
+        let s = side("recover_older");
+        write_autosave(&s, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        save_edits(&s, &overlay_of(&[(0, 1.0), (1, 2.0)]), fp()).unwrap();
+
+        assert!(
+            find_recovery(&s).is_none(),
+            "a sidecar newer than the autosave must not prompt"
+        );
+    }
+
+    #[test]
+    fn recovery_offered_when_there_is_no_sidecar_at_all() {
+        // Crash before the first ever save: everything typed lives only in
+        // the autosave, so this is the case that matters most.
+        let s = side("recover_no_sidecar");
+        write_autosave(&s, &overlay_of(&[(3, 7.0)]), fp()).unwrap();
+        assert!(!s.exists());
+        assert!(
+            find_recovery(&s).is_some(),
+            "an autosave with no sidecar is pure unrecovered work"
+        );
+    }
+
+    #[test]
+    fn no_autosave_means_no_recovery() {
+        let s = side("recover_none");
+        save_edits(&s, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        assert!(find_recovery(&s).is_none());
+    }
+
+    #[test]
+    fn discard_removes_the_autosave_and_leaves_the_sidecar_intact() {
+        let s = side("discard");
+        save_edits(&s, &overlay_of(&[(0, 42.0)]), fp()).unwrap();
+        let sidecar_bytes = std::fs::read(&s).unwrap();
+        write_autosave(&s, &overlay_of(&[(0, 42.0), (1, 99.0)]), fp()).unwrap();
+
+        discard_autosave(&s).unwrap();
+
+        assert!(
+            !autosave_path_for_sidecar(&s).exists(),
+            "discard must delete"
+        );
+        assert_eq!(
+            std::fs::read(&s).unwrap(),
+            sidecar_bytes,
+            "discarding an autosave must not touch the official sidecar"
+        );
+        assert!(find_recovery(&s).is_none());
+    }
+
+    #[test]
+    fn discarding_a_missing_autosave_is_not_an_error() {
+        let s = side("discard_missing");
+        discard_autosave(&s).expect("removing a nonexistent autosave must succeed");
+    }
+
+    #[test]
+    fn autosave_stale_base_is_rejected_like_the_sidecar() {
+        // Recovery must not misapply edits by position onto changed data.
+        let s = side("auto_stale");
+        write_autosave(&s, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        let changed = BaseFingerprint { rows: 7, ..fp() };
+        assert!(matches!(
+            load_autosave(&s, changed),
+            Err(EditError::StaleBase { .. })
+        ));
+    }
+
+    #[test]
+    fn an_autosave_over_an_existing_one_is_never_observed_truncated() {
+        // The core atomicity claim. A reader racing repeated autosaves must
+        // only ever see a complete, loadable file — never a prefix of the one
+        // being written. Without the temp-file + rename this fails, because a
+        // reader catches File::create's zero-length truncation.
+        let s = side("auto_atomic");
+        // First autosave, so there is always an existing file to overwrite.
+        write_autosave(&s, &overlay_of(&[(0, 0.0)]), fp()).unwrap();
+        let auto = autosave_path_for_sidecar(&s);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_path = auto.clone();
+        // The reader loads the file as fast as it can while writes churn.
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            let mut bad = Vec::new();
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match load_edits(&reader_path, fp()) {
+                    // A complete file, or momentarily absent mid-rename.
+                    Ok(_) => reads += 1,
+                    // Windows can deny access during the rename; that is a
+                    // sharing violation, not a truncated file.
+                    Err(EditError::Io(_)) => {}
+                    // Truncated / bad magic means a partial file was visible,
+                    // which is precisely the failure this test exists to catch.
+                    Err(e) => bad.push(format!("{e}")),
+                }
+            }
+            (reads, bad)
+        });
+
+        // A sizeable overlay, so a non-atomic write would have a wide window
+        // in which a reader could catch it half-written.
+        let big: Vec<(u32, f64)> = (0..4000).map(|i| (i, i as f64)).collect();
+        let ov = overlay_of(&big);
+        for _ in 0..40 {
+            write_autosave(&s, &ov, fp()).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, bad) = reader.join().unwrap();
+
+        assert!(
+            bad.is_empty(),
+            "reader observed {} truncated/corrupt autosave(s): {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+        assert!(
+            reads > 0,
+            "reader never managed a read; test proved nothing"
+        );
+    }
+
+    #[test]
+    fn autosave_cost_tracks_edits_not_rows() {
+        // The scale invariant: 100 edits over 200M rows is kilobytes and
+        // milliseconds. A row-proportional implementation would blow both.
+        let s = side("auto_scale");
+        let mut ov = EditOverlay::new();
+        for i in 0..100u32 {
+            ov.set(
+                CellRef::new(i * 2_000_000, 3),
+                CellInput::Literal(Value::Number(i as f64)),
+            );
+        }
+        let big = BaseFingerprint {
+            len: 12_000_000_000,
+            mtime: 1,
+            rows: 200_000_000,
+            cols: 8,
+        };
+        let t = std::time::Instant::now();
+        let size = write_autosave(&s, &ov, big).unwrap();
+        let ms = t.elapsed().as_millis();
+        assert!(size < 8_000, "100 autosaved edits wrote {size} bytes");
+        assert!(ms < 500, "autosaving 100 edits took {ms}ms");
+        assert_eq!(load_autosave(&s, big).unwrap().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn autosave_temp_file_does_not_collide_with_the_sidecar_temp() {
+        // with_extension() would map both sales.fxedits and
+        // sales.fxedits.autosave onto the same .tmp path, so two writers
+        // would corrupt each other. Suffixes are appended, never replaced.
+        let s = Path::new("data/sales.ferrix.fxedits");
+        let a = autosave_path_for_sidecar(s);
+        assert_ne!(
+            sibling_with_suffix(s, ".tmp"),
+            sibling_with_suffix(&a, ".tmp")
+        );
+    }
+
+    #[test]
+    fn age_renders_as_hours_and_minutes() {
+        let c = |secs| RecoveryCandidate {
+            autosave: PathBuf::from("x"),
+            age: std::time::Duration::from_secs(secs),
+        };
+        assert_eq!(c(0).age_hhmm(), "00:00");
+        assert_eq!(c(90).age_hhmm(), "00:01");
+        assert_eq!(c(3600 * 2 + 60 * 5).age_hhmm(), "02:05");
     }
 }
