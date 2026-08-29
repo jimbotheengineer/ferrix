@@ -178,6 +178,27 @@ registry! {
     FormatMerge { "format.merge", Some(Menu::Format), "⬓ Merge / unmerge", None, true, None,
         "Merge the selection, or unmerge it if it is already merged." }
 
+    // ---- Format: cell decoration (issue #28) ----
+    //
+    // The decoration model and the paint path both landed complete, and for a
+    // while nothing constructed a `CellDecor` outside the tests — the exact
+    // "model-complete, unreachable" shape this repo has shipped four times.
+    // These rows are the user-facing half. They cover the decorations that are
+    // one unambiguous action; anything needing a value (rotation angle, indent
+    // level, border colour) waits for a dialog rather than guessing a default.
+    FormatBorderBox { "format.border_box", Some(Menu::Format), "▢ Box border", None, true, Some(Note::Selection),
+        "Draw a thin border around the selection. Stored once per column or range, never per cell." }
+    FormatBorderNone { "format.border_none", Some(Menu::Format), "▁ Clear borders", None, false, None,
+        "Remove the borders from the selection." }
+    FormatWrapText { "format.wrap_text", Some(Menu::Format), "↵ Wrap text", None, false, None,
+        "Wrap long text inside the cell, growing the row to fit." }
+    FormatAlignLeft { "format.align_left", Some(Menu::Format), "⯇ Align left", None, true, None,
+        "Align the selection's text to the left of its cells." }
+    FormatAlignCenter { "format.align_center", Some(Menu::Format), "⯀ Align centre", None, false, None,
+        "Centre the selection's text in its cells." }
+    FormatAlignRight { "format.align_right", Some(Menu::Format), "⯈ Align right", None, false, None,
+        "Align the selection's text to the right of its cells." }
+
     // ---- Data: protection (issue #42) ----
     //
     // In the Data menu rather than Format: locking a cell is a statement
@@ -247,6 +268,10 @@ registry! {
         "Search the sheet." }
     EditReplace { "edit.replace", None, "🔁 Find and Replace…", Some("Ctrl+H"), false, None,
         "Search and replace across the sheet." }
+    // Issue #30. Plain Ctrl+V is a keystroke, not a command; Paste Special
+    // needs a way in, and this is the one that does not require a toolbar.
+    EditPasteSpecial { "edit.paste_special", None, "📋 Paste Special…", Some("Ctrl+Shift+V"), false, None,
+        "Paste values, formulas, formats, column widths, transposed, or combined arithmetically with what is already there." }
 }
 
 impl Command {

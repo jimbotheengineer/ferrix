@@ -7033,6 +7033,30 @@ impl FerrixApp {
                 self.apply_typography(move |t| t.underline = Some(on));
             }
             C::FormatMerge => self.toggle_merge(),
+            // Issue #28. These construct a `CellDecor` and hand it to
+            // `apply_decor`, which is the same call the harness tests drive —
+            // so the menu item and the test exercise one path, not two.
+            C::FormatBorderBox => self.apply_decor(
+                ferrix_core::CellDecor::default()
+                    .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::Thin)),
+            ),
+            C::FormatBorderNone => self.apply_decor(
+                ferrix_core::CellDecor::default()
+                    .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::None)),
+            ),
+            C::FormatWrapText => {
+                let on = !self.decor_at(self.selection.cursor).wrap.unwrap_or(false);
+                self.apply_decor(ferrix_core::CellDecor::default().with_wrap(on));
+            }
+            C::FormatAlignLeft => self.apply_decor(
+                ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Left),
+            ),
+            C::FormatAlignCenter => self.apply_decor(
+                ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Center),
+            ),
+            C::FormatAlignRight => self.apply_decor(
+                ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Right),
+            ),
             C::FormulaTracePrecedents => self.trace_precedents(),
             C::FormulaTraceDependents => self.trace_dependents(),
             C::FormulaTraceClear => self.clear_trace(),
@@ -7069,6 +7093,9 @@ impl FerrixApp {
                 }
             }
             C::EditSelectAll => self.select_all(),
+            // Issue #30. Opening the dialog does not paste; the request is
+            // assembled first and applied when the user confirms it.
+            C::EditPasteSpecial => self.paste_special_open(),
             C::EditFind => {
                 self.search_open = true;
                 self.focus = Focus::Search;

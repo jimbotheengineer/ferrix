@@ -7224,4 +7224,94 @@ xxx,yyy,zzz
         );
         let _ = std::fs::remove_file(&p);
     }
+
+    // ============ the seam: are these features REACHABLE by a user? =========
+    //
+    // Both #28 and #30 arrived model-complete with full paint-path coverage
+    // and NOTHING outside the tests constructing a `CellDecor` or opening the
+    // Paste Special dialog. That is the shape this repo has shipped four times
+    // already: a perfectly tested engine no menu, palette or key can reach.
+    // Nothing warns about it — the type is used (by tests), so no dead-code
+    // lint fires, and every one of those test suites stays green.
+    //
+    // These two tests assert on the PRODUCTION dispatch path — `run_command`,
+    // which the menu bar and the command palette both call — rather than on
+    // `apply_decor` / `paste_special_open` directly. Calling the engine would
+    // pass while the registry row was missing, which is exactly the failure
+    // being guarded against.
+
+    #[test]
+    fn the_format_menu_actually_reaches_the_decor_engine() {
+        use crate::command::CommandId;
+        let (p, mut h) = decor_fixture("decor_wiring.csv");
+        let cell = CellRef::new(1, 1);
+        h.select(cell, cell);
+        h.steps(2);
+
+        assert_eq!(
+            h.painted_border_segments(),
+            0,
+            "baseline: nothing configured, nothing painted"
+        );
+
+        // The menu item's own dispatch, not `apply_decor`.
+        h.app_mut().run_command(CommandId::FormatBorderBox);
+        h.steps(2);
+        assert_eq!(
+            h.painted_border_segments(),
+            4,
+            "the Box border command must reach the painter through run_command"
+        );
+
+        h.app_mut().run_command(CommandId::FormatAlignRight);
+        h.steps(2);
+        assert_eq!(
+            h.app().decor_at(cell).h_align,
+            Some(ferrix_core::HAlign::Right),
+            "the Align right command must reach the decor store"
+        );
+
+        h.app_mut().run_command(CommandId::FormatWrapText);
+        h.steps(2);
+        assert_eq!(
+            h.app().decor_at(cell).wrap,
+            Some(true),
+            "Wrap text must turn wrapping ON from the menu"
+        );
+        // A toggle that only ever turns on is half a feature.
+        h.app_mut().run_command(CommandId::FormatWrapText);
+        h.steps(2);
+        assert_eq!(
+            h.app().decor_at(cell).wrap,
+            Some(false),
+            "Wrap text must toggle back OFF on a second invocation"
+        );
+
+        h.app_mut().run_command(CommandId::FormatBorderNone);
+        h.steps(2);
+        assert_eq!(
+            h.painted_border_segments(),
+            0,
+            "Clear borders must remove what Box border drew"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_paste_special_command_actually_opens_the_dialog() {
+        use crate::command::CommandId;
+        let (p, mut h) = decor_fixture("paste_special_wiring.csv");
+        assert!(
+            !h.app().paste_special_is_open(),
+            "baseline: the dialog starts closed"
+        );
+        h.app_mut().run_command(CommandId::EditPasteSpecial);
+        h.steps(2);
+        assert!(
+            h.app().paste_special_is_open(),
+            "Paste Special must be reachable from the command palette, not \
+             only from a test calling paste_special_open directly"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }
