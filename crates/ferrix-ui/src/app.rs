@@ -401,8 +401,40 @@ pub struct FerrixApp {
     /// bar so it survives the dialog closing.
     cond_warning: Option<String>,
 
+    /// The Goal Seek dialog, when it is open (issue #35).
+    ///
+    /// `None` is the common case and costs nothing: no dialog, no solver, and
+    /// the paint path never looks at it.
+    goal_seek: Option<GoalSeekState>,
+
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
+}
+
+/// The Goal Seek dialog's state: three input fields, a result line, and the
+/// rects of its buttons so the harness can click the REAL widgets.
+#[derive(Default)]
+pub struct GoalSeekState {
+    /// "Set cell" — an A1 reference, as typed.
+    pub set_cell: String,
+    /// "To value" — a number, as typed.
+    pub to_value: String,
+    /// "By changing cell" — an A1 reference, as typed.
+    pub by_changing: String,
+    /// What to tell the user about the last run: the text, and whether it is
+    /// a failure (rendered in the error colour).
+    pub message: Option<(String, bool)>,
+    /// Set once a run has actually COMMITTED an edit.
+    ///
+    /// This is what makes Cancel safe. Goal Seek's single undo entry is the
+    /// only thing Cancel may rewind; without this flag, pressing Cancel on a
+    /// dialog that never solved anything — or after a refusal, which commits
+    /// nothing — would undo the user's previous, unrelated edit.
+    pub applied: bool,
+    /// Where the buttons were actually painted, so a test clicks the real
+    /// widget rather than trusting a handler call. `None` until painted.
+    pub solve_rect: Option<egui::Rect>,
+    pub cancel_rect: Option<egui::Rect>,
 }
 
 // The observation API below (row_count, display, cursor, ...) is consumed only
@@ -525,6 +557,7 @@ impl FerrixApp {
             name_box_sheet_scope: false,
             cond: None,
             cond_warning: None,
+            goal_seek: None,
             prefs,
         };
         if let Some(p) = initial {
@@ -1968,6 +2001,118 @@ impl FerrixApp {
         }
     }
 
+    /// The Goal Seek dialog (issue #35).
+    ///
+    /// Records the real painted rects of Solve and Cancel into the state, so
+    /// harness tests click the widget that was actually drawn rather than
+    /// calling the handler behind it — a dialog whose button never paints
+    /// fails the test instead of passing it.
+    fn show_goal_seek(&mut self, ctx: &egui::Context) {
+        if self.goal_seek.is_none() {
+            return;
+        }
+        let th = self.theme;
+        let mut solve = false;
+        let mut cancel = false;
+        let mut close = false;
+        // Taken out so the closure can hold `&mut` on the fields without
+        // borrowing all of `self`; put back immediately after.
+        let mut st = self.goal_seek.take().expect("checked above");
+
+        egui::Window::new("Goal Seek")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("goal_seek_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Set cell");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut st.set_cell)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("C10")
+                                .desired_width(120.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("To value");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut st.to_value)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("0")
+                                .desired_width(120.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("By changing cell");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut st.by_changing)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("B4")
+                                .desired_width(120.0),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let r = ui.button("Solve");
+                    st.solve_rect = Some(r.rect);
+                    if r.clicked() {
+                        solve = true;
+                    }
+                    // Cancel means "put it back", which is only distinct from
+                    // Close once a run has applied something. Labelled so the
+                    // difference is visible rather than inferred.
+                    let c = ui
+                        .button(if st.applied {
+                            "Cancel (restore)"
+                        } else {
+                            "Cancel"
+                        })
+                        .on_hover_text(
+                            "Undoes the whole Goal Seek run in one step, restoring the \
+                             changing cell.",
+                        );
+                    st.cancel_rect = Some(c.rect);
+                    if c.clicked() {
+                        cancel = true;
+                    }
+                    if st.applied && ui.button("Keep").clicked() {
+                        close = true;
+                    }
+                });
+
+                if let Some((msg, is_err)) = &st.message {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        RichText::new(msg)
+                            .color(if *is_err { th.error } else { th.number })
+                            .size(12.5),
+                    );
+                }
+
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                    solve = true;
+                }
+            });
+
+        self.goal_seek = Some(st);
+        if solve {
+            self.goal_seek_solve();
+        } else if cancel {
+            self.goal_seek_cancel();
+        } else if close {
+            self.goal_seek_close();
+        }
+    }
+
     fn show_close_prompt(&mut self, ctx: &egui::Context) {
         let th = self.theme;
         let mut save_and_close = false;
@@ -2752,6 +2897,192 @@ impl FerrixApp {
     /// The lossy-export warning currently in force, if any.
     pub fn cond_warning(&self) -> Option<&str> {
         self.cond_warning.as_deref()
+    }
+
+    // ================================== goal seek (issue #35) ==============
+
+    /// Open the Goal Seek dialog, seeded from the current selection.
+    ///
+    /// "Set cell" defaults to the cursor because the user has almost always
+    /// just clicked the number they want to change. "By changing cell" is left
+    /// blank on purpose: guessing it would be guessing which input drives the
+    /// model, and a wrong guess silently pointed at the wrong cell is worse
+    /// than an empty field.
+    pub fn goal_seek_open(&mut self) {
+        let cursor = self.selection.cursor;
+        self.goal_seek = Some(GoalSeekState {
+            set_cell: cell_label(cursor),
+            to_value: String::new(),
+            by_changing: String::new(),
+            ..Default::default()
+        });
+    }
+
+    pub fn goal_seek_is_open(&self) -> bool {
+        self.goal_seek.is_some()
+    }
+
+    pub fn goal_seek_state(&self) -> Option<&GoalSeekState> {
+        self.goal_seek.as_ref()
+    }
+
+    pub fn goal_seek_state_mut(&mut self) -> Option<&mut GoalSeekState> {
+        self.goal_seek.as_mut()
+    }
+
+    /// The dialog's result line, if a run has produced one.
+    pub fn goal_seek_message(&self) -> Option<&str> {
+        self.goal_seek
+            .as_ref()
+            .and_then(|s| s.message.as_ref())
+            .map(|(t, _)| t.as_str())
+    }
+
+    /// Run the solver on whatever is in the dialog's fields.
+    ///
+    /// Every failure — an unparseable reference, a non-numeric target, a
+    /// refusal from the solver — lands in the dialog's own message rather than
+    /// only in the status bar, because the dialog is what the user is looking
+    /// at and it stays open so the input can be corrected.
+    pub fn goal_seek_solve(&mut self) {
+        let Some(st) = self.goal_seek.as_ref() else {
+            return;
+        };
+        let (set_cell, to_value, by_changing) = (
+            st.set_cell.trim().to_string(),
+            st.to_value.trim().to_string(),
+            st.by_changing.trim().to_string(),
+        );
+
+        let fail = |app: &mut Self, msg: String| {
+            if let Some(s) = app.goal_seek.as_mut() {
+                s.message = Some((msg.clone(), true));
+            }
+            app.status = msg;
+        };
+
+        let Some(target) = CellRef::from_a1(&set_cell) else {
+            fail(
+                self,
+                format!("Set cell: {set_cell:?} is not a cell like B4"),
+            );
+            return;
+        };
+        let Ok(value) = to_value.parse::<f64>() else {
+            fail(self, format!("To value: {to_value:?} is not a number"));
+            return;
+        };
+        let Some(changing) = CellRef::from_a1(&by_changing) else {
+            fail(
+                self,
+                format!("By changing cell: {by_changing:?} is not a cell like B4"),
+            );
+            return;
+        };
+        if target == changing {
+            fail(
+                self,
+                "Set cell and By changing cell must be different".to_string(),
+            );
+            return;
+        }
+
+        match self.wb.goal_seek(target, value, changing) {
+            Err(crate::workbook::GoalSeekError::NotDependent) => {
+                // The real explanation the issue asks for, not "did not
+                // converge": nothing was ever going to converge, and saying so
+                // points the user at the actual mistake.
+                fail(
+                    self,
+                    format!(
+                        "{} does not depend on {} — changing {} cannot move it. \
+                         Check the formula, or pick a cell {} actually reads.",
+                        cell_label(target),
+                        cell_label(changing),
+                        cell_label(changing),
+                        cell_label(target)
+                    ),
+                );
+            }
+            Err(crate::workbook::GoalSeekError::ChangingCellIsFormula) => {
+                fail(
+                    self,
+                    format!(
+                        "{} holds a formula. Goal Seek would have to overwrite it \
+                         with a number; pick an input cell instead.",
+                        cell_label(changing)
+                    ),
+                );
+            }
+            Ok(report) => {
+                let msg = if report.converged {
+                    format!(
+                        "{} = {} with {} = {} ({} iteration{})",
+                        cell_label(target),
+                        ferrix_core::format_number(report.final_a.unwrap_or(report.target)),
+                        cell_label(changing),
+                        ferrix_core::format_number(report.final_b),
+                        report.iterations,
+                        if report.iterations == 1 { "" } else { "s" }
+                    )
+                } else {
+                    // Non-convergence reports what was ACTUALLY reached, never
+                    // the requested value: claiming success here is the exact
+                    // failure the issue calls out.
+                    match report.final_a {
+                        Some(a) => format!(
+                            "No solution found after {} iterations. Closest: {} = {} \
+                             with {} = {} (wanted {}).",
+                            report.iterations,
+                            cell_label(target),
+                            ferrix_core::format_number(a),
+                            cell_label(changing),
+                            ferrix_core::format_number(report.final_b),
+                            ferrix_core::format_number(report.target)
+                        ),
+                        None => format!(
+                            "{} never evaluated to a number, so there was nothing to \
+                             solve for. {} is unchanged.",
+                            cell_label(target),
+                            cell_label(changing)
+                        ),
+                    }
+                };
+                self.status = msg.clone();
+                if let Some(s) = self.goal_seek.as_mut() {
+                    s.message = Some((msg, !report.converged));
+                    // Only a run that produced a number committed an edit;
+                    // `final_a == None` restores and commits nothing, so
+                    // Cancel must not try to undo it.
+                    s.applied = report.final_a.is_some();
+                }
+                // Show the user the cell that moved.
+                self.set_selection(Selection::single(changing));
+                self.sync_formula_bar();
+            }
+        }
+    }
+
+    /// Cancel the dialog, restoring the changing cell if a run applied one.
+    ///
+    /// Because the whole run is a single undo entry (see
+    /// `Workbook::goal_seek`), one `undo()` puts the changing cell AND every
+    /// dependent back — Cancel does not need to remember the old value itself.
+    pub fn goal_seek_cancel(&mut self) {
+        let applied = self.goal_seek.as_ref().is_some_and(|s| s.applied);
+        if applied {
+            if let Some(cell) = self.wb.undo() {
+                self.set_selection(Selection::single(cell));
+                self.status = "Goal Seek cancelled — the changing cell was restored".into();
+            }
+            self.sync_formula_bar();
+        }
+        self.goal_seek = None;
+    }
+
+    /// Close the dialog, KEEPING whatever the run applied.
+    pub fn goal_seek_close(&mut self) {
+        self.goal_seek = None;
     }
 
     /// The format the grid should paint with THIS FRAME.
@@ -4685,6 +5016,8 @@ impl FerrixApp {
         // Some(true) = Manage, Some(false) = New. Recorded and applied after
         // the panel closure, for the same borrow reason as the View menu.
         let mut cond_action: Option<bool> = None;
+        // Deferred for the same borrow reason as the menus above.
+        let mut open_goal_seek = false;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
@@ -4851,6 +5184,21 @@ impl FerrixApp {
                         }
                     });
 
+                    // --- Data menu: what-if analysis (issue #35) ---
+                    ui.menu_button("Data", |ui| {
+                        if ui
+                            .button("🎯 Goal Seek…")
+                            .on_hover_text(
+                                "Set a formula cell to a target value by changing one \
+                                 input cell. The whole run is a single undo step.",
+                            )
+                            .clicked()
+                        {
+                            open_goal_seek = true;
+                            ui.close_menu();
+                        }
+                    });
+
                     // --- View menu: freeze panes, split, zoom (roadmap #6) ---
                     ui.menu_button("View", |ui| {
                         let frozen = self.panes.is_active();
@@ -5007,6 +5355,9 @@ impl FerrixApp {
             Some(false) => self.cond_new_rule(),
             None => {}
         }
+        if open_goal_seek {
+            self.goal_seek_open();
+        }
 
         // --- formula bar ---
         egui::TopBottomPanel::top("formula_bar")
@@ -5103,6 +5454,9 @@ impl FerrixApp {
         if self.names_open {
             self.show_name_manager(ctx);
         }
+
+        // --- Goal Seek (issue #35) ---
+        self.show_goal_seek(ctx);
 
         // --- search bar ---
         if self.search_open {
