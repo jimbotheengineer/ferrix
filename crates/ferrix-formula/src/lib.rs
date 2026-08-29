@@ -11,6 +11,7 @@ pub mod names;
 pub mod parser;
 pub mod refscan;
 pub mod remap;
+pub mod stats;
 
 pub use criteria::{Criterion, Pattern, Scalar};
 pub use depgraph::{DepGraph, Precedent};

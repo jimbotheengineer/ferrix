@@ -397,6 +397,7 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
         }
         "SUMIF" | "AVERAGEIF" | "COUNTIF" => eval_if_single(name, args, src),
         "SUMIFS" | "AVERAGEIFS" | "COUNTIFS" => eval_ifs(name, args, src),
+        name if crate::stats::is_stat_fn(name) => crate::stats::call(name, args, src),
         "IFERROR" | "IFNA" => {
             if args.len() != 2 {
                 return Value::Error(ErrorKind::Value);
@@ -497,11 +498,11 @@ fn probe_arg<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Probe {
 
 /// A rectangular region, possibly in a sibling sheet.
 #[derive(Clone, Copy)]
-struct RangeSpec<'a> {
+pub(crate) struct RangeSpec<'a> {
     sheet: Option<&'a str>,
     start: CellRef,
-    rows: u32,
-    cols: u32,
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
 }
 
 impl RangeSpec<'_> {
@@ -513,7 +514,10 @@ impl RangeSpec<'_> {
 
 /// Interpret an argument as a range. A lone cell reference is a 1x1 range,
 /// which is what Excel does.
-fn range_spec<'a, S: CellSource + ?Sized>(arg: &'a Expr, src: &S) -> Option<RangeSpec<'a>> {
+pub(crate) fn range_spec<'a, S: CellSource + ?Sized>(
+    arg: &'a Expr,
+    src: &S,
+) -> Option<RangeSpec<'a>> {
     let (sheet, start, end) = match arg {
         Expr::Range(s, e) => (None, *s, *e),
         Expr::XRange(sh, s, e) => (Some(sh.as_str()), *s, *e),
@@ -541,7 +545,12 @@ fn range_spec<'a, S: CellSource + ?Sized>(arg: &'a Expr, src: &S) -> Option<Rang
 /// Read the cell at `(dr, dc)` inside a spec. Offsets past the sheet read as
 /// `Empty`, which is how a resized SUMIF sum_range behaves.
 #[inline]
-fn spec_get<S: CellSource + ?Sized>(spec: &RangeSpec<'_>, src: &S, dr: u32, dc: u32) -> Value {
+pub(crate) fn spec_get<S: CellSource + ?Sized>(
+    spec: &RangeSpec<'_>,
+    src: &S,
+    dr: u32,
+    dc: u32,
+) -> Value {
     let cell = CellRef::new(spec.start.row + dr, spec.start.col + dc);
     match spec.sheet {
         None => src.get(cell),
