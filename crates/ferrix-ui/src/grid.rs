@@ -55,6 +55,20 @@ const SCROLLBAR_W: f32 = 12.0;
 /// what export, SUM and the status bar read — never sees them.
 pub const EMPTY_ROW_PADDING: usize = 200;
 
+/// Columns a sheet with NO DATA offers anyway (issue #52).
+///
+/// A brand-new sheet holds nothing, so `view.col_count()` is 0 — and a grid
+/// zero columns wide has nowhere to put a cursor and nothing to hit-test, so
+/// every click and keystroke lands nowhere. A blank spreadsheet page is
+/// A..Z, so that is what an empty sheet offers.
+///
+/// Like [`EMPTY_ROW_PADDING`], this is PURE VIEWPORT: it widens what can be
+/// scrolled to and typed in, and `SheetView::col_count` — what export and the
+/// status bar read — never sees it. Typing in one of these columns extends
+/// the sheet through the overlay's own extent, exactly as typing in a padding
+/// row does.
+pub const BLANK_SHEET_COLS: usize = 26;
+
 /// Base font size for cell text at 100% zoom.
 pub const BASE_FONT: f32 = 12.5;
 
@@ -753,6 +767,12 @@ pub struct Grid<'a> {
     /// Empty rows to offer past the end of the sheet, or 0 when the "show
     /// empty rows" toggle is off (issue #20).
     pub pad_rows: usize,
+    /// Columns the grid offers when the sheet's BASE has none (issue #52).
+    ///
+    /// Zero means "use the view's own count" — the caller sets it, so the
+    /// grid and the app's hit-testing/navigation cannot disagree about how
+    /// wide a blank sheet is.
+    pub blank_cols: usize,
     /// Sheet-wide formatting: manual colours and type styling that apply to
     /// any cell, table or not. `None` when nothing has been formatted, which
     /// keeps the default path free of lookups.
@@ -1161,7 +1181,12 @@ impl<'a> Grid<'a> {
             first_pad_data_row: view.row_count(),
         });
         let total_rows = (filtered_rows + self.pad_rows).max(1);
-        let total_cols = view.col_count().max(1);
+        // A sheet whose BASE has no columns still gets a page to type into
+        // (issue #52), supplied by the caller so this and the app's
+        // hit-testing agree by construction. `max` rather than a replacement:
+        // once the overlay has widened the view past the blank page, the
+        // view's own count wins.
+        let total_cols = view.col_count().max(self.blank_cols).max(1);
 
         // THE single row resolution, used by painting, row headers,
         // hit-testing and the cell editor alike. Filters compose first, sort
