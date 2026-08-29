@@ -118,6 +118,19 @@ impl std::fmt::Display for SheetError {
 ///
 /// The dependency graph, by contrast, is workbook-wide and keyed by
 /// [`SheetCell`], because a formula chain does not respect tabs.
+///
+/// Adapts a display-position remap to the [`AxisMap`] the formula rewriter
+/// wants. A column not in the map did not move.
+struct ColumnMove {
+    map: std::collections::HashMap<u32, u32>,
+}
+
+impl ferrix_formula::remap::AxisMap for ColumnMove {
+    fn map(&self, old: u32) -> Option<u32> {
+        Some(self.map.get(&old).copied().unwrap_or(old))
+    }
+}
+
 pub struct Workbook {
     /// The ACTIVE sheet's immutable base. Never present in `parked`.
     ///
@@ -135,6 +148,13 @@ pub struct Workbook {
     sheets: Vec<SheetMeta>,
     /// Index into `sheets` of the sheet whose data is in `base`/`overlay`.
     active: usize,
+    /// Display-order permutation for the ACTIVE sheet.
+    ///
+    /// Reordering a column must not move data: on a 200M-row sheet that would
+    /// be gigabytes of copying for a gesture that should feel instant. The
+    /// permutation lives here instead, and `view()` reads through it — so a
+    /// reorder is O(cols) and the `.ferrix` file on disk is never rewritten.
+    order: ferrix_core::SheetOrder,
     /// Storage for every INACTIVE sheet.
     parked: std::collections::HashMap<SheetId, (std::sync::Arc<BaseData>, EditOverlay)>,
     /// Monotonic id source. Never reused, so a deleted sheet's id can never
@@ -174,6 +194,7 @@ impl Workbook {
                 view: SheetViewState::default(),
             }],
             active: 0,
+            order: ferrix_core::SheetOrder::new(),
             parked: std::collections::HashMap::new(),
             next_id: 1,
             undo: Vec::new(),
@@ -580,7 +601,132 @@ impl Workbook {
     }
 
     pub fn view(&self) -> SheetView<'_> {
-        SheetView::new(&self.base, &self.overlay)
+        SheetView::with_order(&self.base, &self.overlay, &self.order)
+    }
+
+    /// Move `count` columns starting at display position `from` so they land
+    /// at display position `to`.
+    ///
+    /// This permutes the display order; it does not touch a single cell of
+    /// data. On a 200M-row sheet that is the difference between instant and
+    /// several seconds of copying.
+    ///
+    /// Formulas are rewritten so they keep referring to the same DATA. A
+    /// formula reading `=SUM(B1:B10)` must still sum the same values after B
+    /// is dragged elsewhere, or a reorder would silently change every result
+    /// on the sheet.
+    pub fn move_columns(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let cols = self.view().col_count().max(1) as u64;
+        let before = self.order.clone();
+
+        self.order
+            .cols_mut(cols)
+            .move_span(from, count, to)
+            .map_err(|e| format!("{e:?}"))?;
+
+        // Rewriting formula TEXT rather than the AST, for the same reason fill
+        // does: the parser discards the `$` markers the tokenizer records, so
+        // an AST rewrite would silently unpin every absolute reference.
+        let remapped = self.remap_formulas_for_order(&before);
+
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: CellRef::new(0, from as u32),
+            changes: remapped,
+            side_effects: Vec::new(),
+            bulk: true,
+        });
+        self.dirty = true;
+        self.recalc_all();
+        Ok(())
+    }
+
+    /// Rewrite every formula so its references survive an order change.
+    ///
+    /// Returns the edits made, so the whole reorder collapses into one undo
+    /// step rather than one per formula.
+    fn remap_formulas_for_order(&mut self, before: &ferrix_core::SheetOrder) -> Vec<CellChange> {
+        use ferrix_formula::remap::remap_columns;
+
+        // Display position a data column occupied before, and occupies now.
+        // The map a formula needs is old-display -> new-display.
+        let cols = self.view().col_count().max(1) as u64;
+        let mut map = std::collections::HashMap::new();
+        for old_display in 0..cols {
+            let data = before
+                .cols
+                .as_ref()
+                .and_then(|a| a.data_of(old_display))
+                .unwrap_or(old_display as u32);
+            let new_display = self
+                .order
+                .cols
+                .as_ref()
+                .and_then(|a| a.display_of(data))
+                .unwrap_or(data as u64);
+            if old_display != new_display {
+                map.insert(old_display as u32, new_display as u32);
+            }
+        }
+        if map.is_empty() {
+            return Vec::new();
+        }
+
+        let mover = ColumnMove { map: map.clone() };
+        let mut changes = Vec::new();
+
+        // Overlay cells are keyed by DISPLAY position, while base data is
+        // reached through the order. So a reorder that only permutes the order
+        // moves the base values and strands every edit on the wrong column:
+        // the user's typed value and their formula stay put while the data
+        // slides out from under them.
+        //
+        // Relocating the overlay keeps the two in step. It costs O(edits),
+        // never O(rows) — the whole reason edits live in a sparse overlay.
+        let existing: Vec<(CellRef, CellInput)> = self
+            .overlay
+            .edited_cells()
+            .map(|(c, i)| (*c, i.clone()))
+            .collect();
+
+        for (cell, input) in &existing {
+            let Some(&new_col) = map.get(&cell.col) else {
+                continue;
+            };
+            // Clear the old position, then write the relocated one below.
+            if let Some(prev) = self.overlay.clear(*cell) {
+                changes.push(CellChange {
+                    cell: *cell,
+                    before: Some(prev),
+                    after: None,
+                });
+            }
+            let _ = (new_col, input);
+        }
+
+        for (cell, input) in existing {
+            let Some(&new_col) = map.get(&cell.col) else {
+                continue;
+            };
+            let dest = CellRef::new(cell.row, new_col);
+            // A formula's TEXT is rewritten as well as its position, so it
+            // keeps reading the same data from its new home.
+            let moved = match &input {
+                CellInput::Formula { src, .. } => CellInput::Formula {
+                    src: remap_columns(src, &mover),
+                    cached: Value::Empty,
+                },
+                other => other.clone(),
+            };
+            let prev = self.overlay.set(dest, moved.clone());
+            changes.push(CellChange {
+                cell: dest,
+                before: prev,
+                after: Some(moved),
+            });
+        }
+
+        changes
     }
 
     /// How many undo entries are stacked. Exposed so tests can assert that a

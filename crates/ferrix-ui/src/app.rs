@@ -1321,6 +1321,20 @@ impl FerrixApp {
         self.wb.undo_depth()
     }
 
+    /// Move columns in the display order.
+    ///
+    /// Exposed on the app (not just the workbook) because the reorder gesture
+    /// lives in the grid, and because the harness needs to drive it: dragging
+    /// a header through synthetic pixels would test the drag arithmetic, not
+    /// the reorder semantics this actually guards.
+    pub fn move_columns(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.wb.move_columns(from, count, to);
+        if r.is_ok() {
+            self.status = format!("Moved {count} column(s)");
+        }
+        r
+    }
+
     /// Whether a load is still in flight.
     pub fn is_loading(&self) -> bool {
         self.loading

@@ -212,6 +212,15 @@ impl Harness {
 
     // ---- observation ----
 
+    /// Drive a column reorder.
+    ///
+    /// The one mutating entry point the harness exposes, and only because the
+    /// alternative -- synthesising a header drag in pixels -- would test drag
+    /// arithmetic rather than whether a reorder preserves meaning.
+    pub fn move_columns(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        self.app.move_columns(from, count, to)
+    }
+
     /// The app under test, for assertions.
     pub fn app(&self) -> &FerrixApp {
         &self.app
@@ -545,6 +554,96 @@ mod tests {
         );
         assert_eq!(h.app().row_count(), 3);
         assert_eq!(h.app().display(CellRef::new(1, 1)), "closed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn moving_a_column_moves_the_data_with_it() {
+        // Reorder is a permutation of the DISPLAY order: no cell is copied,
+        // and the .ferrix file on disk is never rewritten. What the user sees
+        // must still be the column they dragged.
+        let p = write_csv("reorder.csv", "a,b,c\n1,2,3\n4,5,6\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "2");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "3");
+
+        // `to` is an insertion point in the ORIGINAL indexing, so moving
+        // column A past all three columns means to = 3.
+        h.move_columns(0, 1, 3).expect("move");
+        h.steps(2);
+
+        // b, c, a — the values travelled with their column.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "2");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "3");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "1");
+        // Second row too, proving this is not a one-row fluke.
+        assert_eq!(h.app().display(CellRef::new(1, 0)), "5");
+        assert_eq!(h.app().display(CellRef::new(1, 2)), "4");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_a_reorder() {
+        // The failure this guards against is silent and total: if references
+        // are not rewritten, every formula on the sheet quietly starts
+        // reading a different column and the numbers are simply wrong.
+        // Four columns so the formula has a home that already exists.
+        let p = write_csv("reorderfx.csv", "a,b,c,d\n10,20,30,0\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // D1 = B1 * 2 = 40, written by typing into the grid.
+        for _ in 0..3 {
+            h.press_key(Key::ArrowRight).step();
+        }
+        h.type_text("=B1*2").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "40",
+            "setup: =B1*2 over b=20"
+        );
+
+        // Move column A to the end: b becomes display 0, so the formula must
+        // now say =A1*2 to keep reading the same 20.
+        h.move_columns(0, 1, 3).expect("move");
+        h.steps(3);
+
+        // Columns are now b, c, a, d — A was inserted at position 3, pushing
+        // d right, so the formula stays at display 3.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "20", "b");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "30", "c");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "10", "a");
+
+        // THE POINT: b moved from display 1 to display 0, so =B1*2 had to
+        // become =A1*2. If references were not rewritten this would now read
+        // column a and quietly return 20 instead of 40 — wrong, with nothing
+        // on screen to suggest it.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "40",
+            "the formula must still evaluate over the SAME data after a reorder"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_reorder_is_one_undo_step() {
+        let p = write_csv("reorderundo.csv", "a,b,c\n1,2,3\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = h.app().undo_depth();
+        h.move_columns(0, 1, 2).expect("move");
+        h.steps(2);
+        assert_eq!(
+            h.app().undo_depth(),
+            before + 1,
+            "a reorder must be a single undo entry"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
