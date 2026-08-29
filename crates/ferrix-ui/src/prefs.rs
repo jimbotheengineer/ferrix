@@ -43,6 +43,10 @@ pub struct Prefs {
     /// what the user recognises and what survives reopening the file. Only
     /// sheets the user actually zoomed appear, so the default costs nothing.
     pub zoom: Vec<(String, f32)>,
+    /// Issue #40: command palette recency, most-recently-run first, stored as
+    /// command SLUGS rather than indices — a registry reorder must not
+    /// silently reassign somebody's history to different commands.
+    pub recent_commands: Vec<String>,
 }
 
 impl Prefs {
@@ -137,6 +141,18 @@ impl Prefs {
                 // cadence — never zero, which would silently disable
                 // autosave because of a typo in a config file.
                 "autosave_secs" => out.autosave_secs = v.parse::<u64>().ok(),
+                // Issue #40: `recent_commands = a,b,c`, most recent first.
+                // Unknown slugs are kept here and filtered where they are
+                // resolved, so a preference written by a newer build is not
+                // destroyed by an older one reading it.
+                "recent_commands" => {
+                    out.recent_commands = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
                 // `zoom.<sheet name> = 2` — one line per zoomed sheet. A name
                 // containing '=' still parses: `split_once` takes the FIRST
                 // '=', and the key is everything before it.
@@ -162,6 +178,20 @@ impl Prefs {
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
         if let Some(secs) = self.autosave_secs {
             s.push_str(&format!("autosave_secs = {secs}\n"));
+        }
+        // Issue #40. Omitted entirely when nothing has been run, so a fresh
+        // install's file gains no line. Slugs contain no ',' or newline by
+        // construction, but both are stripped anyway — a preference file must
+        // never be able to forge an entry.
+        if !self.recent_commands.is_empty() {
+            let joined = self
+                .recent_commands
+                .iter()
+                .map(|c| c.replace([',', '\n', '\r'], ""))
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            s.push_str(&format!("recent_commands = {joined}\n"));
         }
         for (name, z) in &self.zoom {
             // Newlines in a sheet name would forge a second key, so they are
@@ -209,6 +239,7 @@ mod tests {
                         show_empty_rows,
                         autosave_secs,
                         zoom: Vec::new(),
+                        recent_commands: Vec::new(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -221,6 +252,9 @@ mod tests {
                     show_empty_rows,
                     autosave_secs: Some(45),
                     zoom: vec![("Sheet1".into(), 2.0), ("quarterly report".into(), 0.5)],
+                    // Recency travels in the same file; a round trip that
+                    // omits it cannot catch the writer dropping it.
+                    recent_commands: vec!["view.zoom_in".into(), "file.save".into()],
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -284,6 +318,7 @@ mod tests {
             show_empty_rows: true,
             autosave_secs: None,
             zoom: vec![("Sheet1".into(), 3.0)],
+            recent_commands: Vec::new(),
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -311,6 +346,7 @@ mod tests {
             show_empty_rows: true,
             autosave_secs: Some(45),
             zoom: vec![("Sheet1".into(), 2.0)],
+            recent_commands: vec!["data.goal_seek".into(), "view.theme".into()],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

@@ -11,34 +11,12 @@ use ferrix_io::{load_csv, CsvOptions};
 
 use crate::grid::{Grid, ScrollState, DEFAULT_COL_WIDTH};
 use crate::prefs::Prefs;
-
-/// What the View menu was asked to do, applied after the panel closure ends.
-///
-/// The menu reads `self` (to label the zoom and enable Unfreeze) while it is
-/// being built, so it cannot also call `&mut self` methods; recording the
-/// choice keeps both borrows legal without duplicating the logic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// A File-menu choice, deferred out of the panel closure.
-///
-/// The menu's items all need `&mut self`, which the closure already holds
-/// immutably to render the enabled/disabled state — so the choice is recorded
-/// and acted on after the panel ends, exactly as `ViewAction` does.
-enum FileAction {
-    Open,
-    Save,
-    Compact,
-    ExportCsv,
-}
-
-enum ViewAction {
-    /// (freeze rows, freeze columns) at the cursor.
-    Freeze(bool, bool),
-    Unfreeze,
-    Split,
-    ZoomIn,
-    ZoomOut,
-    ZoomReset,
-}
+// A menu choice cannot be dispatched inside the panel closure: the closure
+// holds `self` while it renders enabled/disabled state, so the choice is
+// recorded and acted on after the panel ends. That used to be two enums,
+// `FileAction` and `ViewAction`; issue #40 replaced both with a single
+// `Option<CommandId>`, because every menu item is now a registry command and
+// there is one dispatcher.
 use crate::sheet_view::BaseData;
 use crate::theme::{Theme, ThemeMode};
 use crate::workbook::Workbook;
@@ -418,6 +396,13 @@ pub struct FerrixApp {
     /// the paint path never looks at it.
     goal_seek: Option<GoalSeekState>,
 
+    /// The command palette (issue #40).
+    ///
+    /// Closed is the overwhelmingly common case and costs nothing per frame.
+    /// Note the name: `palette` alone means the COLOUR palette here (`theme`,
+    /// issue #19), so this one is always spelled out.
+    command_palette: crate::command::CommandPalette,
+
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
 }
@@ -572,6 +557,14 @@ impl FerrixApp {
             cond: None,
             cond_warning: None,
             goal_seek: None,
+            // Recency is restored before the first frame, so the palette's
+            // ranking is right the first time it is opened rather than after
+            // the first command of the session.
+            command_palette: {
+                let mut p = crate::command::CommandPalette::default();
+                p.set_recent_slugs(&prefs.recent_commands);
+                p
+            },
             prefs,
         };
         if let Some(p) = initial {
@@ -5005,6 +4998,210 @@ impl FerrixApp {
     }
 }
 
+impl FerrixApp {
+    // ---- the command registry (issue #40) ----
+    //
+    // These three are the whole app-side surface of the palette: a snapshot of
+    // availability, one dispatcher, and the frame hook. The menu bar and the
+    // palette both go through them, which is what makes "a command in a menu
+    // but not in the palette" unrepresentable rather than merely unlikely.
+
+    /// Snapshot of everything the registry needs to decide what can run now.
+    ///
+    /// A snapshot rather than a borrow: the menu-bar closure already holds
+    /// `&mut self`, so it cannot also hold a reference into the app.
+    pub fn command_state(&self) -> crate::command::CommandState {
+        let busy = self.loading || self.exporting || self.compacting;
+        crate::command::CommandState {
+            can_compact: self.can_compact(),
+            compact_hint: self.compact_hint(),
+            can_save: self.wb.is_dirty() && self.edits_path.is_some(),
+            save_hint: if !self.wb.is_dirty() {
+                "Nothing to save — there are no unsaved edits".to_string()
+            } else {
+                "This sheet has no edit sidecar to save into (open a CSV to get one)".to_string()
+            },
+            busy,
+            busy_hint: "Wait for the current operation to finish".to_string(),
+            has_tables: !self.tables.is_empty(),
+            has_trace: self.trace.is_some(),
+            frozen: self.panes.is_active(),
+            can_undo: self.wb.can_undo(),
+            can_redo: self.wb.can_redo(),
+            editing: self.editing.is_some(),
+            zoom: self.zoom,
+            selection_label: self.selection.label(),
+        }
+    }
+
+    /// Run a command, whatever invoked it, and record it as recently used.
+    ///
+    /// The match is exhaustive over `CommandId` by construction, so adding a
+    /// registry row without giving it behaviour is a compile error rather than
+    /// a menu item that does nothing.
+    pub fn run_command(&mut self, id: crate::command::CommandId) {
+        use crate::command::CommandId as C;
+        // Recorded before dispatch: a command that opens a modal returns with
+        // the app in a different state, and the ranking should reflect that
+        // the user asked for it either way.
+        self.command_palette.record(id);
+        self.prefs.recent_commands = self.command_palette.recent_slugs();
+        self.persist_prefs();
+        match id {
+            C::FileOpen => self.open_dialog(),
+            C::FileOpenXlsx => self.open_xlsx_dialog(),
+            C::FileSave => {
+                let _ = self.save_edits();
+            }
+            C::FileCompact => self.start_compact(),
+            C::FileExportCsv => self.export_dialog(),
+            C::FileExportXlsx => self.export_xlsx_dialog(),
+            C::FormatCondNew => self.cond_new_rule(),
+            C::FormatCondManage => self.cond_manage(),
+            C::FormatBold => {
+                let on = !self.selection_typography().resolved(12.5).bold;
+                self.apply_typography(move |t| t.bold = Some(on));
+            }
+            C::FormatItalic => {
+                let on = !self.selection_typography().resolved(12.5).italic;
+                self.apply_typography(move |t| t.italic = Some(on));
+            }
+            C::FormatUnderline => {
+                let on = !self.selection_typography().resolved(12.5).underline;
+                self.apply_typography(move |t| t.underline = Some(on));
+            }
+            C::FormatMerge => self.toggle_merge(),
+            C::FormulaTracePrecedents => self.trace_precedents(),
+            C::FormulaTraceDependents => self.trace_dependents(),
+            C::FormulaTraceClear => self.clear_trace(),
+            C::FormulaNames => self.names_open = true,
+            C::DataGoalSeek => self.goal_seek_open(),
+            C::DataChart => self.open_chart(),
+            C::ViewFreezeRows => self.freeze_at_cursor(true, false),
+            C::ViewFreezeCols => self.freeze_at_cursor(false, true),
+            C::ViewFreezeBoth => self.freeze_at_cursor(true, true),
+            C::ViewUnfreeze => self.unfreeze(),
+            C::ViewSplit => self.split_at_cursor(),
+            C::ViewZoomIn => self.zoom_in(),
+            C::ViewZoomOut => self.zoom_out(),
+            C::ViewZoomReset => self.zoom_reset(),
+            C::ViewTheme => self.set_theme(self.theme.mode.toggled()),
+            C::ViewEmptyRows => self.set_show_empty_rows(!self.show_empty_rows),
+            C::EditUndo => {
+                if let Some(c) = self.wb.undo() {
+                    self.selection.move_to(c);
+                    self.scroll_to_selection();
+                    self.sync_formula_bar();
+                }
+            }
+            C::EditRedo => {
+                if let Some(c) = self.wb.redo() {
+                    self.selection.move_to(c);
+                    self.scroll_to_selection();
+                    self.sync_formula_bar();
+                }
+            }
+            C::EditSelectAll => self.select_all(),
+            C::EditFind => {
+                self.search_open = true;
+                self.focus = Focus::Search;
+                self.search_focus_pending = true;
+            }
+            C::EditReplace => {
+                self.search_open = true;
+                self.replace_open = true;
+                self.focus = Focus::Search;
+                self.replace_focus_pending = true;
+            }
+        }
+    }
+
+    /// Keyboard + drawing for the palette, called once per frame.
+    ///
+    /// Returns true when the palette consumed this frame's keys, so the grid's
+    /// own handler stands down. Opening deliberately does NOT commit or cancel
+    /// an in-progress cell edit: the edit buffer, the editing cell and the
+    /// selection are all left exactly as they were.
+    fn command_palette_frame(&mut self, ctx: &egui::Context) -> bool {
+        use crate::command::PaletteKey;
+        let st = self.command_state();
+        let mut consumed = false;
+        match self.command_palette.keys(ctx, &st) {
+            PaletteKey::None => {}
+            PaletteKey::Open => {
+                self.command_palette.open(self.selection);
+                consumed = true;
+            }
+            PaletteKey::Consumed => consumed = true,
+            PaletteKey::Close => {
+                // Escape restores the selection the palette opened over and
+                // hands the keyboard back to the grid for real — egui would
+                // otherwise keep focus on the hidden search field and swallow
+                // every subsequent grid chord.
+                if let Some(sel) = self.command_palette.close(true) {
+                    self.selection = sel;
+                }
+                if self.editing.is_none() {
+                    if let Some(fid) = ctx.memory(|m| m.focused()) {
+                        ctx.memory_mut(|m| m.surrender_focus(fid));
+                    }
+                    self.focus = Focus::Grid;
+                }
+                consumed = true;
+            }
+            PaletteKey::Run(id) => {
+                self.command_palette.close(false);
+                if let Some(fid) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(fid));
+                }
+                if self.editing.is_none() {
+                    self.focus = Focus::Grid;
+                }
+                self.run_command(id);
+                consumed = true;
+            }
+        }
+        // Drawn after the key pass so a click and a keypress in the same frame
+        // agree about which list they are acting on.
+        let st = self.command_state();
+        let th = self.theme;
+        if let Some(id) = self.command_palette.show(ctx, &th, &st) {
+            self.command_palette.close(false);
+            self.run_command(id);
+            consumed = true;
+        }
+        consumed || self.command_palette.is_open()
+    }
+
+    /// Is the palette open? Observation API for the harness, like the rest of
+    /// the `#[allow(dead_code)]` block above — the running app never asks.
+    #[allow(dead_code)]
+    pub fn command_palette_is_open(&self) -> bool {
+        self.command_palette.is_open()
+    }
+
+    /// The palette itself, for tests asserting on the ranked list.
+    #[allow(dead_code)]
+    pub fn command_palette_state(&self) -> &crate::command::CommandPalette {
+        &self.command_palette
+    }
+
+    #[allow(dead_code)]
+    pub fn command_palette_state_mut(&mut self) -> &mut crate::command::CommandPalette {
+        &mut self.command_palette
+    }
+
+    /// The in-progress cell edit, if any, as (cell, buffer).
+    ///
+    /// Observation only. Exists so a test can assert that opening the palette
+    /// leaves an edit strictly alone — the state that would otherwise be
+    /// silently committed or discarded.
+    #[allow(dead_code)]
+    pub fn editing_for_test(&self) -> Option<(CellRef, String)> {
+        self.editing.map(|c| (c, self.edit_buffer.clone()))
+    }
+}
+
 impl eframe::App for FerrixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe's Frame is only a handle for viewport commands, which this
@@ -5101,26 +5298,22 @@ impl FerrixApp {
         }
         {}
 
-        self.handle_keys(ctx);
+        // The command palette (issue #40) sees the keyboard first: while it is
+        // open it owns the keys, and its open chord must not also reach the
+        // grid. Everything else about the app's state — including an edit in
+        // progress — is left untouched.
+        if !self.command_palette_frame(ctx) {
+            self.handle_keys(ctx);
+        }
 
         // --- toolbar ---
         //
-        // The toggles are recorded and acted on after the panel closes: the
-        // closure holds `&mut self` fields, so mutating the theme in place
-        // here would conflict with the `th` the same frame is painting with.
-        let mut toggle_theme = false;
-        // The View menu borrows `self` immutably to read the current state, so
-        // its choice is recorded and applied after the panel closure ends.
-        let mut view_action: Option<ViewAction> = None;
-        // Same deferral for the File menu: its items call `&mut self` methods
-        // that cannot run while the panel closure holds the borrow.
-        let mut file_action: Option<FileAction> = None;
-        let mut toggle_empty = false;
-        // Some(true) = Manage, Some(false) = New. Recorded and applied after
-        // the panel closure, for the same borrow reason as the View menu.
-        let mut cond_action: Option<bool> = None;
-        // Deferred for the same borrow reason as the menus above.
-        let mut open_goal_seek = false;
+        // Menu and toolbar choices are recorded and acted on after the panel
+        // closes: the closure holds `&mut self` fields, so dispatching in
+        // place would conflict with the `th` the same frame is painting with.
+        // One variable for all of them now that they are all registry
+        // commands (issue #40).
+        let mut chosen_command: Option<crate::command::CommandId> = None;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
@@ -5128,21 +5321,21 @@ impl FerrixApp {
                     ui.label(RichText::new("FERRIX").color(th.accent).strong().size(15.0));
                     ui.add_space(12.0);
                     if ui.button("Open CSV…").clicked() {
-                        self.open_dialog();
+                        chosen_command = Some(crate::command::CommandId::FileOpen);
                     }
                     if ui
                         .button("⬈ Export CSV…")
                         .on_hover_text("Write this sheet, including edits, to a CSV file")
                         .clicked()
                     {
-                        self.export_dialog();
+                        chosen_command = Some(crate::command::CommandId::FileExportCsv);
                     }
                     if ui
                         .button("📈 Chart…")
                         .on_hover_text("Chart the selected range")
                         .clicked()
                     {
-                        self.open_chart();
+                        chosen_command = Some(crate::command::CommandId::DataChart);
                     }
                     ui.separator();
                     if ui
@@ -5150,7 +5343,7 @@ impl FerrixApp {
                         .on_hover_text("Merge the selection, or unmerge it if already merged")
                         .clicked()
                     {
-                        self.toggle_merge();
+                        chosen_command = Some(crate::command::CommandId::FormatMerge);
                     }
                     self.type_controls(ui, th);
                     ui.separator();
@@ -5162,7 +5355,7 @@ impl FerrixApp {
                         )
                         .clicked()
                     {
-                        self.open_xlsx_dialog();
+                        chosen_command = Some(crate::command::CommandId::FileOpenXlsx);
                     }
                     if ui
                         .add_enabled(!self.tables.is_empty(), egui::Button::new("⬈ Export xlsx…"))
@@ -5172,7 +5365,7 @@ impl FerrixApp {
                         )
                         .clicked()
                     {
-                        self.export_xlsx_dialog();
+                        chosen_command = Some(crate::command::CommandId::FileExportXlsx);
                     }
                     ui.add_space(4.0);
                     let dirty = self.wb.is_dirty();
@@ -5184,25 +5377,19 @@ impl FerrixApp {
                         .on_hover_text("Save edits (Ctrl+S)")
                         .clicked()
                     {
-                        let _ = self.save_edits();
+                        chosen_command = Some(crate::command::CommandId::FileSave);
                     }
                     if ui
                         .add_enabled(self.wb.can_undo(), egui::Button::new("↶ Undo"))
                         .clicked()
                     {
-                        if let Some(c) = self.wb.undo() {
-                            self.selection.move_to(c);
-                            self.sync_formula_bar();
-                        }
+                        chosen_command = Some(crate::command::CommandId::EditUndo);
                     }
                     if ui
                         .add_enabled(self.wb.can_redo(), egui::Button::new("↷ Redo"))
                         .clicked()
                     {
-                        if let Some(c) = self.wb.redo() {
-                            self.selection.move_to(c);
-                            self.sync_formula_bar();
-                        }
+                        chosen_command = Some(crate::command::CommandId::EditRedo);
                     }
                     ui.add_space(4.0);
                     // --- theme toggle (issue #19) ---
@@ -5211,7 +5398,7 @@ impl FerrixApp {
                         .on_hover_text("Switch between light and dark. Remembered between runs.")
                         .clicked()
                     {
-                        toggle_theme = true;
+                        chosen_command = Some(crate::command::CommandId::ViewTheme);
                     }
                     // --- empty rows toggle (issue #20) ---
                     if ui
@@ -5223,167 +5410,24 @@ impl FerrixApp {
                         )
                         .clicked()
                     {
-                        toggle_empty = true;
+                        chosen_command = Some(crate::command::CommandId::ViewEmptyRows);
                     }
-                    // --- File menu ---
+                    // --- menu bar (issue #40) ---
                     //
-                    // Compact lives here rather than on the toolbar on
-                    // purpose: it rewrites the user's data file, and a
-                    // destructive-by-nature action should not sit one stray
-                    // click away from Undo.
-                    let can_compact = self.can_compact();
-                    let compact_hint = self.compact_hint();
-                    ui.menu_button("File", |ui| {
-                        if ui.button("📂 Open…").clicked() {
-                            file_action = Some(FileAction::Open);
-                            ui.close_menu();
-                        }
-                        if ui.button("💾 Save edits  (Ctrl+S)").clicked() {
-                            file_action = Some(FileAction::Save);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(can_compact, egui::Button::new("🗜 Compact…"))
-                            .on_hover_text(&compact_hint)
-                            .on_disabled_hover_text(&compact_hint)
-                            .clicked()
-                        {
-                            file_action = Some(FileAction::Compact);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("⬈ Export CSV…").clicked() {
-                            file_action = Some(FileAction::ExportCsv);
-                            ui.close_menu();
-                        }
-                    });
-                    // --- Format menu: conditional formatting (roadmap #11) ---
-                    ui.menu_button("Format", |ui| {
-                        ui.label(
-                            RichText::new(format!("Selection: {}", self.selection.label()))
-                                .color(th.text_dim)
-                                .small(),
-                        );
-                        ui.separator();
-                        if ui
-                            .button("🎨 Conditional Formatting — New Rule…")
-                            .on_hover_text(
-                                "Colour cells by their value. Stored once per column or \
-                                 range, never per cell.",
-                            )
-                            .clicked()
-                        {
-                            cond_action = Some(false);
-                            ui.close_menu();
-                        }
-                        if ui
-                            .button("☰ Conditional Formatting — Manage Rules…")
-                            .on_hover_text("List, reorder, edit and delete the rules here.")
-                            .clicked()
-                        {
-                            cond_action = Some(true);
-                            ui.close_menu();
-                        }
-                    });
-
-                    // --- Formula menu: trace precedents/dependents (roadmap #39) ---
-                    ui.menu_button("Formula", |ui| {
-                        let has_trace = self.trace.is_some();
-                        if ui
-                            .button("↖ Trace Precedents  (Ctrl+[)")
-                            .on_hover_text(
-                                "Draw arrows from what this cell reads. Press again to walk one level further out.",
-                            )
-                            .clicked()
-                        {
-                            self.trace_precedents();
-                            ui.close_menu();
-                        }
-                        if ui
-                            .button("↘ Trace Dependents  (Ctrl+])")
-                            .on_hover_text(
-                                "Draw arrows to what reads this cell. Press again to walk one level further out.",
-                            )
-                            .clicked()
-                        {
-                            self.trace_dependents();
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add_enabled(has_trace, egui::Button::new("✖ Remove Arrows"))
-                            .clicked()
-                        {
-                            self.clear_trace();
-                            ui.close_menu();
-                        }
-                    });
-
-                    // --- Data menu: what-if analysis (issue #35) ---
-                    ui.menu_button("Data", |ui| {
-                        if ui
-                            .button("🎯 Goal Seek…")
-                            .on_hover_text(
-                                "Set a formula cell to a target value by changing one \
-                                 input cell. The whole run is a single undo step.",
-                            )
-                            .clicked()
-                        {
-                            open_goal_seek = true;
-                            ui.close_menu();
-                        }
-                    });
-
-                    // --- View menu: freeze panes, split, zoom (roadmap #6) ---
-                    ui.menu_button("View", |ui| {
-                        let frozen = self.panes.is_active();
-                        if ui
-                            .button("❄ Freeze rows above cursor")
-                            .on_hover_text("Rows above the cursor stay put while the rest scrolls.")
-                            .clicked()
-                        {
-                            view_action = Some(ViewAction::Freeze(true, false));
-                            ui.close_menu();
-                        }
-                        if ui.button("❄ Freeze columns left of cursor").clicked() {
-                            view_action = Some(ViewAction::Freeze(false, true));
-                            ui.close_menu();
-                        }
-                        if ui.button("❄ Freeze both at cursor").clicked() {
-                            view_action = Some(ViewAction::Freeze(true, true));
-                            ui.close_menu();
-                        }
-                        if ui
-                            .add_enabled(frozen, egui::Button::new("✖ Unfreeze"))
-                            .clicked()
-                        {
-                            view_action = Some(ViewAction::Unfreeze);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("⬍ Split at cursor")
-                            .on_hover_text("Two independent scroll offsets over the same columns.")
-                            .clicked()
-                        {
-                            view_action = Some(ViewAction::Split);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        ui.label(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
-                        if ui.button("＋ Zoom in  (Ctrl +)").clicked() {
-                            view_action = Some(ViewAction::ZoomIn);
-                            ui.close_menu();
-                        }
-                        if ui.button("－ Zoom out  (Ctrl -)").clicked() {
-                            view_action = Some(ViewAction::ZoomOut);
-                            ui.close_menu();
-                        }
-                        if ui.button("＝ Reset to 100%  (Ctrl 0)").clicked() {
-                            view_action = Some(ViewAction::ZoomReset);
-                            ui.close_menu();
-                        }
-                    });
+                    // Every menu is drawn from command::REGISTRY, the same
+                    // table the palette searches. This used to be five
+                    // hand-written closures, which is exactly how a command
+                    // ends up in a menu and nowhere else. Availability, and
+                    // the reason for it, come from the registry too, so a
+                    // greyed item explains itself in both front-ends.
+                    let cmd_state = self.command_state();
+                    for menu in crate::command::Menu::ALL {
+                        ui.menu_button(menu.title(), |ui| {
+                            if let Some(id) = crate::command::menu_items(ui, menu, &cmd_state) {
+                                chosen_command = Some(id);
+                            }
+                        });
+                    }
 
                     if self.loading {
                         ui.add(egui::Spinner::new().size(14.0));
@@ -5461,37 +5505,11 @@ impl FerrixApp {
                 });
             });
 
-        if toggle_theme {
-            self.set_theme(self.theme.mode.toggled());
-        }
-        match file_action {
-            Some(FileAction::Open) => self.open_dialog(),
-            Some(FileAction::Save) => {
-                let _ = self.save_edits();
-            }
-            Some(FileAction::Compact) => self.start_compact(),
-            Some(FileAction::ExportCsv) => self.export_dialog(),
-            None => {}
-        }
-        match view_action {
-            Some(ViewAction::Freeze(r, c)) => self.freeze_at_cursor(r, c),
-            Some(ViewAction::Unfreeze) => self.unfreeze(),
-            Some(ViewAction::Split) => self.split_at_cursor(),
-            Some(ViewAction::ZoomIn) => self.zoom_in(),
-            Some(ViewAction::ZoomOut) => self.zoom_out(),
-            Some(ViewAction::ZoomReset) => self.zoom_reset(),
-            None => {}
-        }
-        if toggle_empty {
-            self.set_show_empty_rows(!self.show_empty_rows);
-        }
-        match cond_action {
-            Some(true) => self.cond_manage(),
-            Some(false) => self.cond_new_rule(),
-            None => {}
-        }
-        if open_goal_seek {
-            self.goal_seek_open();
+        // One dispatch point for every menu item and toolbar button, so a
+        // command invoked by clicking is recorded in the palette's recency
+        // exactly as one invoked from the palette is.
+        if let Some(id) = chosen_command {
+            self.run_command(id);
         }
 
         // --- formula bar ---

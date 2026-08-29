@@ -599,6 +599,75 @@ impl Harness {
         self.app.goal_seek_is_open()
     }
 
+    // ---- command palette (issue #40) ----
+    //
+    // Deliberately thin: the palette is driven through REAL keyboard events
+    // here, because the shortcut, the focus handover and Escape restoring the
+    // selection are the behaviour under test. Only observation is exposed.
+
+    /// Ctrl+Shift+P, the primary open chord.
+    pub fn open_command_palette(&mut self) -> &mut Self {
+        self.key(
+            Key::P,
+            Modifiers {
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        self.steps(2);
+        self
+    }
+
+    /// Ctrl+/, the alternate open chord.
+    pub fn open_command_palette_alt(&mut self) -> &mut Self {
+        self.ctrl(Key::Slash);
+        self.steps(2);
+        self
+    }
+
+    pub fn command_palette_is_open(&self) -> bool {
+        self.app.command_palette_is_open()
+    }
+
+    /// Type into the palette's query field, as the TextEdit's own binding
+    /// does. The field owns egui's keyboard focus while it is open, so a
+    /// `Text` event would be consumed by it and never reach the model — this
+    /// sets the same string the widget would have set.
+    pub fn command_palette_query(&mut self, q: &str) -> &mut Self {
+        self.app.command_palette_state_mut().query = q.to_string();
+        self.app.command_palette_state_mut().cursor = 0;
+        self.steps(2);
+        self
+    }
+
+    /// The palette's filtered, ranked list as titles, top first.
+    pub fn command_palette_titles(&self) -> Vec<&'static str> {
+        let st = self.app.command_state();
+        self.app
+            .command_palette_state()
+            .matches(&st)
+            .iter()
+            .map(|m| m.title)
+            .collect()
+    }
+
+    /// The palette's list as (title, disabled reason).
+    pub fn command_palette_rows(&self) -> Vec<(&'static str, Option<String>)> {
+        let st = self.app.command_state();
+        self.app
+            .command_palette_state()
+            .matches(&st)
+            .iter()
+            .map(|m| (m.title, m.disabled.clone()))
+            .collect()
+    }
+
+    /// Recently-used order, as the slugs that get persisted.
+    pub fn command_recent_slugs(&self) -> Vec<String> {
+        self.app.command_palette_state().recent_slugs()
+    }
+
     /// Frames run so far.
     pub fn frames(&self) -> u64 {
         self.frame
@@ -4589,6 +4658,347 @@ xxx,yyy,zzz
             "By changing must NOT be guessed, got {:?}",
             st.by_changing
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- command palette (issue #40) ----
+
+    fn palette_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "file never loaded"
+        );
+        (p, h)
+    }
+
+    #[test]
+    fn ctrl_shift_p_opens_the_palette_and_ctrl_slash_does_too() {
+        let (p, mut h) = palette_fixture("cmdpal_open.csv");
+        assert!(!h.command_palette_is_open(), "must start closed");
+
+        let before = h.app().display(CellRef::new(0, 0));
+        h.open_command_palette();
+        assert!(
+            h.command_palette_is_open(),
+            "Ctrl+Shift+P must open the palette"
+        );
+        // The chord must not also reach the grid, which is the exact way the
+        // search shortcut once cleared a cell.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 0)),
+            before,
+            "the open chord leaked into the grid and changed A1"
+        );
+
+        // Pressing it again closes.
+        h.open_command_palette();
+        assert!(!h.command_palette_is_open(), "the chord must toggle");
+
+        h.open_command_palette_alt();
+        assert!(h.command_palette_is_open(), "Ctrl+/ must open it too");
+        assert_eq!(h.app().display(CellRef::new(0, 0)), before);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_palette_lists_every_command_and_filters_to_the_typed_one() {
+        let (p, mut h) = palette_fixture("cmdpal_filter.csv");
+        h.open_command_palette();
+
+        let all = h.command_palette_titles();
+        assert_eq!(
+            all.len(),
+            crate::command::REGISTRY.len(),
+            "an unfiltered palette must show the whole registry"
+        );
+
+        h.command_palette_query("goal");
+        let filtered = h.command_palette_titles();
+        assert!(
+            filtered.iter().any(|t| t.contains("Goal Seek")),
+            "typing 'goal' must surface Goal Seek; got {filtered:?}"
+        );
+        assert!(
+            filtered.len() < all.len(),
+            "the query filtered nothing: {} of {}",
+            filtered.len(),
+            all.len()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_command() {
+        let (p, mut h) = palette_fixture("cmdpal_enter.csv");
+        assert!(
+            !h.app().goal_seek_is_open(),
+            "Goal Seek must start closed or this proves nothing"
+        );
+
+        h.open_command_palette();
+        h.command_palette_query("goal seek");
+        h.press_key(Key::Enter).steps(3);
+
+        assert!(
+            h.app().goal_seek_is_open(),
+            "Enter must actually RUN the highlighted command"
+        );
+        assert!(
+            !h.command_palette_is_open(),
+            "running a command must close the palette"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn escape_closes_and_leaves_the_selection_exactly_as_it_was() {
+        let (p, mut h) = palette_fixture("cmdpal_escape.csv");
+        // A multi-cell selection, so a restore that only keeps the cursor
+        // would still fail this.
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(1, 0), CellRef::new(2, 2));
+        h.steps(2);
+        let before = h.app().selection_bounds();
+
+        h.open_command_palette();
+        // Move the highlight around: the point is that browsing changes
+        // nothing about the grid.
+        h.press_key(Key::ArrowDown).steps(1);
+        h.press_key(Key::ArrowDown).steps(1);
+        assert_eq!(
+            h.app().selection_bounds(),
+            before,
+            "browsing the palette moved the grid selection"
+        );
+
+        h.press_key(Key::Escape).steps(3);
+        assert!(
+            !h.command_palette_is_open(),
+            "Escape must close the palette"
+        );
+        assert_eq!(
+            h.app().selection_bounds(),
+            before,
+            "Escape must return the exact prior selection"
+        );
+
+        // Focus is really back on the grid: a plain arrow key must move the
+        // cursor again, which it cannot do if a hidden text field still owns
+        // the keyboard.
+        let cursor_before = h.app().cursor();
+        h.press_key(Key::ArrowDown).steps(2);
+        assert_ne!(
+            h.app().cursor(),
+            cursor_before,
+            "after Escape the grid never got the keyboard back"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn opening_the_palette_does_not_disturb_an_edit_in_progress() {
+        let (p, mut h) = palette_fixture("cmdpal_edit.csv");
+        let before = h.app().display(CellRef::new(0, 0));
+
+        // Start typing into A1 but do not commit.
+        h.press_key(Key::F2).steps(2);
+        h.type_text("hello").steps(2);
+        let editing = h
+            .app()
+            .editing_for_test()
+            .expect("F2 must have opened an edit");
+
+        h.open_command_palette();
+        assert!(h.command_palette_is_open());
+        assert_eq!(
+            h.app().editing_for_test(),
+            Some(editing),
+            "opening the palette committed or discarded the in-progress edit"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 0)),
+            before,
+            "the cell's committed value changed while the palette opened"
+        );
+
+        h.press_key(Key::Escape).steps(2);
+        assert!(
+            h.app().editing_for_test().is_some(),
+            "closing the palette must leave the edit alone too"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unavailable_commands_are_listed_with_their_reason_not_hidden() {
+        let (p, mut h) = palette_fixture("cmdpal_disabled.csv");
+        h.open_command_palette();
+        h.command_palette_query("unfreeze");
+
+        let rows = h.command_palette_rows();
+        let (_, reason) = rows
+            .iter()
+            .find(|(t, _)| t.contains("Unfreeze"))
+            .expect("Unfreeze must be LISTED even though nothing is frozen");
+        assert!(
+            reason.is_some(),
+            "Unfreeze is listed but claims to be runnable with nothing frozen"
+        );
+        assert!(
+            reason.as_deref().unwrap().contains("frozen"),
+            "the reason must say why: {reason:?}"
+        );
+
+        // Freeze, and the same command must become runnable — otherwise the
+        // 'disabled' state is a constant, not a reflection of the app.
+        h.freeze_at_cursor(true, false);
+        h.steps(2);
+        let rows = h.command_palette_rows();
+        let (_, reason) = rows
+            .iter()
+            .find(|(t, _)| t.contains("Unfreeze"))
+            .expect("still listed");
+        assert_eq!(
+            *reason, None,
+            "Unfreeze stayed disabled after freezing panes"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn menu_commands_and_palette_commands_come_from_one_registry() {
+        // The criterion the issue is really about. A palette with its own list
+        // would pass a test that only inspects the palette, so this walks the
+        // MENU construction — the same call the menu bar makes — and requires
+        // every item it yields to be present in the palette's list.
+        let (p, mut h) = palette_fixture("cmdpal_registry.csv");
+        h.open_command_palette();
+        let listed = h.command_palette_titles();
+
+        let mut menu_items = 0;
+        for menu in crate::command::Menu::ALL {
+            let items: Vec<&crate::command::Command> = crate::command::for_menu(menu).collect();
+            assert!(!items.is_empty(), "{} menu is empty", menu.title());
+            for c in items {
+                assert!(
+                    listed.contains(&c.title),
+                    "{} is in the {} menu but missing from the palette",
+                    c.slug,
+                    menu.title()
+                );
+                menu_items += 1;
+            }
+        }
+        assert!(menu_items >= 20, "only {menu_items} menu items");
+        // And the palette is a superset: toolbar/shortcut-only commands are
+        // exactly the ones a menu-shaped registry would lose.
+        assert!(
+            listed.len() > menu_items,
+            "the palette lists nothing beyond the menus, so shortcut-only \
+             commands are still undiscoverable"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn running_a_command_reorders_recency_and_it_survives_a_restart() {
+        // Writes prefs, so it holds the shared config lock.
+        let _guard = prefs_guard();
+        let dir = std::env::temp_dir().join(format!("ferrix-cmdpal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev = std::env::var_os("FERRIX_CONFIG_DIR");
+        std::env::set_var("FERRIX_CONFIG_DIR", &dir);
+
+        let p = write_csv("cmdpal_recent.csv", SAMPLE);
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            assert!(
+                h.command_recent_slugs().is_empty(),
+                "a fresh profile must start with no history"
+            );
+
+            h.open_command_palette();
+            h.command_palette_query("goal seek");
+            h.press_key(Key::Enter).steps(3);
+            assert_eq!(
+                h.command_recent_slugs().first().map(String::as_str),
+                Some("data.goal_seek"),
+                "running a command must record it"
+            );
+
+            // A second command displaces the first.
+            h.app_mut().goal_seek_close();
+            h.steps(2);
+            h.open_command_palette();
+            h.command_palette_query("split at cursor");
+            h.press_key(Key::Enter).steps(3);
+            assert_eq!(
+                h.command_recent_slugs(),
+                vec!["view.split".to_string(), "data.goal_seek".to_string()],
+                "recency must be most-recent-first"
+            );
+        }
+
+        // A fresh app is exactly what the next process run builds.
+        {
+            let mut h2 = Harness::new(Some(&p));
+            assert!(h2.step_until(200, |a| a.row_count() > 0));
+            assert_eq!(
+                h2.command_recent_slugs(),
+                vec!["view.split".to_string(), "data.goal_seek".to_string()],
+                "the ranking did not survive a restart"
+            );
+            // And it actually affects the order the user sees: with an empty
+            // query the most recent command must sort to the top.
+            h2.open_command_palette();
+            let titles = h2.command_palette_titles();
+            assert_eq!(
+                titles.first().copied(),
+                Some(crate::command::Command::of(crate::command::CommandId::ViewSplit).title),
+                "the restored ranking did not reach the list: {titles:?}"
+            );
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("FERRIX_CONFIG_DIR", v),
+            None => std::env::remove_var("FERRIX_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_menu_click_records_recency_too() {
+        // Both front-ends go through one dispatcher, so a command run from a
+        // menu ranks in the palette. Driven through the app's real dispatch
+        // entry point rather than a pixel click on a menu that moves with the
+        // theme; what is asserted is that the SHARED path records.
+        let _guard = prefs_guard();
+        let dir = std::env::temp_dir().join(format!("ferrix-cmdmenu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev = std::env::var_os("FERRIX_CONFIG_DIR");
+        std::env::set_var("FERRIX_CONFIG_DIR", &dir);
+
+        let (p, mut h) = palette_fixture("cmdpal_menu.csv");
+        h.app_mut()
+            .run_command(crate::command::CommandId::ViewZoomIn);
+        h.steps(2);
+        assert_eq!(
+            h.command_recent_slugs().first().map(String::as_str),
+            Some("view.zoom_in"),
+            "a command run outside the palette was not recorded"
+        );
+        // And it really ran: the zoom actually changed.
+        assert!(h.app().zoom() > 1.0, "run_command dispatched nothing");
+
+        match prev {
+            Some(v) => std::env::set_var("FERRIX_CONFIG_DIR", v),
+            None => std::env::remove_var("FERRIX_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&p);
     }
 }
