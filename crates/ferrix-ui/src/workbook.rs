@@ -74,6 +74,10 @@ pub struct CommitReport {
     pub circular: bool,
     pub parse_error: Option<String>,
     pub micros: u128,
+    /// Set when protection refused the edit (issue #42). When this is
+    /// `Some`, NOTHING was written: the cell holds exactly what it held
+    /// before, and the caller is expected to show the reason.
+    pub denied: Option<ferrix_core::Denied>,
 }
 
 // ============================================================================
@@ -144,6 +148,16 @@ struct SheetMeta {
     id: SheetId,
     name: String,
     view: SheetViewState,
+    /// Protection state for this sheet (issue #42).
+    ///
+    /// Lives beside the tab rather than beside the DATA because a parked
+    /// sheet must keep its protection while its storage is swapped out — a
+    /// sheet that quietly unprotected itself when the user clicked another
+    /// tab would be worse than no protection at all.
+    ///
+    /// Bounded by the number of unlocked RECTANGLES, so a protected 200M-row
+    /// sheet costs the same as a protected ten-row one.
+    protection: ferrix_core::SheetProtection,
 }
 
 /// Why a sheet operation was refused.
@@ -153,6 +167,8 @@ pub enum SheetError {
     EmptyName,
     LastSheet,
     NoSuchSheet,
+    /// The workbook's structure is protected (issue #42).
+    Protected(ferrix_core::Denied),
 }
 
 impl std::fmt::Display for SheetError {
@@ -162,6 +178,7 @@ impl std::fmt::Display for SheetError {
             SheetError::EmptyName => write!(f, "a sheet name cannot be blank"),
             SheetError::LastSheet => write!(f, "a workbook must keep at least one sheet"),
             SheetError::NoSuchSheet => write!(f, "no such sheet"),
+            SheetError::Protected(d) => write!(f, "{d}"),
         }
     }
 }
@@ -265,6 +282,17 @@ pub struct Workbook {
     /// Edits made since the last save. Drives the dirty indicator and the
     /// close prompt; without it a user can lose work by closing the window.
     dirty: bool,
+    /// Workbook-structure protection (issue #42): the tab strip, not the
+    /// cells. One small struct for the whole workbook.
+    wb_protection: ferrix_core::WorkbookProtection,
+    /// The most recent refusal by the protection guards, for the UI to say
+    /// out loud. Cleared by every successful edit, so a stale message cannot
+    /// be mistaken for a fresh refusal.
+    ///
+    /// A refusal that only returned `false` would satisfy the letter of
+    /// "cannot edit a protected cell" while producing exactly the silent
+    /// no-op the acceptance criteria call out.
+    last_denial: Option<ferrix_core::Denied>,
 }
 
 impl Workbook {
@@ -285,6 +313,7 @@ impl Workbook {
                 id: SheetId::MAIN,
                 name: name.to_string(),
                 view: SheetViewState::default(),
+                protection: ferrix_core::SheetProtection::new(),
             }],
             active: 0,
             order: ferrix_core::SheetOrder::new(),
@@ -299,6 +328,8 @@ impl Workbook {
             last_edit: None,
             replace_window_rows: REPLACE_WINDOW_ROWS,
             dirty: false,
+            wb_protection: ferrix_core::WorkbookProtection::new(),
+            last_denial: None,
         }
     }
 
@@ -374,6 +405,149 @@ impl Workbook {
         Ok(trimmed.to_string())
     }
 
+    // ------------------------------------------------------------ protection
+    //
+    // Issue #42. Read `ferrix_core::protect`'s module docs before touching
+    // anything here: none of this is security, and the UI is required to say
+    // so. What it does is stop an accidental keystroke landing in a formula
+    // the sheet's author asked people not to touch.
+    //
+    // Enforcement lives at exactly two chokepoints — `guard_edit` for cells
+    // and `check_structure` for the tab strip — so no edit path can grow its
+    // own copy that drifts out of step.
+
+    /// The ACTIVE sheet's protection state.
+    pub fn protection(&self) -> &ferrix_core::SheetProtection {
+        &self.sheets[self.active].protection
+    }
+
+    /// Mutable access to the ACTIVE sheet's protection.
+    ///
+    /// Marking a range unlocked is not itself an edit to any cell, so it is
+    /// deliberately allowed while the sheet is protected: it is the author
+    /// changing the rules, not a user editing through them. The UI is what
+    /// gates who reaches this.
+    pub fn protection_mut(&mut self) -> &mut ferrix_core::SheetProtection {
+        self.dirty = true;
+        let i = self.active;
+        &mut self.sheets[i].protection
+    }
+
+    /// Another sheet's protection, by id. Used by export, which must write
+    /// every sheet's `<sheetProtection>`, not only the visible one.
+    pub fn protection_of(&self, id: SheetId) -> Option<&ferrix_core::SheetProtection> {
+        self.sheets
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| &s.protection)
+    }
+
+    pub fn protection_of_mut(&mut self, id: SheetId) -> Option<&mut ferrix_core::SheetProtection> {
+        self.dirty = true;
+        self.sheets
+            .iter_mut()
+            .find(|s| s.id == id)
+            .map(|s| &mut s.protection)
+    }
+
+    /// Workbook-structure protection.
+    pub fn workbook_protection(&self) -> &ferrix_core::WorkbookProtection {
+        &self.wb_protection
+    }
+
+    pub fn workbook_protection_mut(&mut self) -> &mut ferrix_core::WorkbookProtection {
+        self.dirty = true;
+        &mut self.wb_protection
+    }
+
+    /// The most recent protection refusal, if the last operation was refused.
+    ///
+    /// The UI reads this to explain a no-op. Cleared by anything that
+    /// succeeds, so it can never describe an operation the user has since
+    /// completed.
+    pub fn last_denial(&self) -> Option<ferrix_core::Denied> {
+        self.last_denial
+    }
+
+    pub fn clear_denial(&mut self) {
+        self.last_denial = None;
+    }
+
+    /// THE cell-edit chokepoint. Every write to the overlay that originates
+    /// from a user gesture passes through here.
+    ///
+    /// Returns `Err(reason)` when protection refuses the write, and records
+    /// the reason so the UI can say it out loud rather than silently doing
+    /// nothing — which is the acceptance criterion this exists for.
+    fn guard_edit(&mut self, cell: CellRef) -> Result<(), ferrix_core::Denied> {
+        match self.sheets[self.active].protection.deny_edit(cell) {
+            Some(d) => {
+                self.last_denial = Some(d);
+                Err(d)
+            }
+            None => {
+                self.last_denial = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Refuse a bulk operation if ANY cell it would touch is protected.
+    ///
+    /// All-or-nothing on purpose: a paste that wrote the eleven unlocked cells
+    /// of a twelve-cell block and dropped the twelfth would leave the user
+    /// with a plausibly-shaped, silently wrong result. Better to refuse the
+    /// whole thing and say which cell caused it.
+    ///
+    /// Bounded work: it stops at the first locked cell, and an unprotected
+    /// sheet returns before iterating at all — so this cannot make a
+    /// whole-column selection walk 200M cells on the common path.
+    fn guard_range(&mut self, sel: Selection) -> Result<(), ferrix_core::Denied> {
+        let prot = &self.sheets[self.active].protection;
+        if !prot.is_enabled() {
+            self.last_denial = None;
+            return Ok(());
+        }
+        let (tl, br) = sel.bounds();
+        // The whole rectangle is locked unless an unlocked range reaches into
+        // it, so ask the range map first and only then walk cells.
+        let touches_unlocked = prot.unlocked().ranges().any(|r| {
+            r.first_row <= br.row
+                && r.last_row >= tl.row
+                && r.first_col <= br.col
+                && r.last_col >= tl.col
+        });
+        let denied = if !touches_unlocked {
+            prot.deny_edit(tl)
+        } else {
+            sel.iter().find_map(|c| prot.deny_edit(c))
+        };
+        match denied {
+            Some(d) => {
+                self.last_denial = Some(d);
+                Err(d)
+            }
+            None => {
+                self.last_denial = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// THE structure chokepoint: add / delete / rename / reorder.
+    fn check_structure(&mut self, op: ferrix_core::StructureOp) -> Result<(), SheetError> {
+        match self.wb_protection.deny(op) {
+            Some(d) => {
+                self.last_denial = Some(d);
+                Err(SheetError::Protected(d))
+            }
+            None => {
+                self.last_denial = None;
+                Ok(())
+            }
+        }
+    }
+
     /// A name no existing sheet uses, of the form `Sheet<N>`.
     pub fn unique_sheet_name(&self) -> String {
         let mut n = self.sheets.len() + 1;
@@ -389,6 +563,7 @@ impl Workbook {
     /// Add a sheet with its own storage, immediately after the active tab.
     /// Does NOT switch to it; the caller decides.
     pub fn add_sheet(&mut self, name: &str, base: BaseData) -> Result<SheetId, SheetError> {
+        self.check_structure(ferrix_core::StructureOp::AddSheet)?;
         let name = self.validate_name(name, None)?;
         let id = SheetId(self.next_id);
         self.next_id += 1;
@@ -399,6 +574,7 @@ impl Workbook {
                 id,
                 name,
                 view: SheetViewState::default(),
+                protection: ferrix_core::SheetProtection::new(),
             },
         );
         self.parked
@@ -417,6 +593,7 @@ impl Workbook {
     /// sources is a bigger change than this issue asks for, and getting it
     /// half-right is worse than being explicit.
     pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<(), SheetError> {
+        self.check_structure(ferrix_core::StructureOp::RenameSheet)?;
         let name = self.validate_name(name, Some(id))?;
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
         let old = std::mem::replace(&mut self.sheets[idx].name, name.clone());
@@ -432,6 +609,7 @@ impl Workbook {
 
     /// Delete a sheet and everything it stored. The last sheet cannot go.
     pub fn delete_sheet(&mut self, id: SheetId) -> Result<(), SheetError> {
+        self.check_structure(ferrix_core::StructureOp::DeleteSheet)?;
         if self.sheets.len() == 1 {
             return Err(SheetError::LastSheet);
         }
@@ -474,6 +652,7 @@ impl Workbook {
 
     /// Move a sheet to a new position in the tab strip.
     pub fn reorder_sheet(&mut self, id: SheetId, to: usize) -> Result<(), SheetError> {
+        self.check_structure(ferrix_core::StructureOp::ReorderSheet)?;
         let from = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
         let to = to.min(self.sheets.len() - 1);
         if from == to {
@@ -1119,9 +1298,21 @@ impl Workbook {
 
     /// Commit what the user typed into `cell` on the ACTIVE sheet, then
     /// recalculate dependents — including any on other sheets.
+    ///
+    /// Protection (issue #42) is enforced HERE, at the single chokepoint every
+    /// typed edit passes through, rather than at the several call sites that
+    /// reach it. A refused edit sets [`CommitReport::denied`] and writes
+    /// nothing at all — the overlay, the graph and the dirty flag are left
+    /// exactly as they were, so "refused" is observable as the value not
+    /// changing, not merely as a message appearing.
     pub fn commit_edit(&mut self, cell: CellRef, raw: &str) -> CommitReport {
         let start = std::time::Instant::now();
         let mut report = CommitReport::default();
+        if let Err(denied) = self.guard_edit(cell) {
+            report.denied = Some(denied);
+            report.micros = start.elapsed().as_micros();
+            return report;
+        }
         self.dirty = true;
         let sheet = self.active_sheet();
         let at = SheetCell::new(sheet, cell);
@@ -1628,6 +1819,9 @@ impl Workbook {
                 max_cells
             ));
         }
+        // Issue #42: same chokepoint discipline as `commit_edit`. All or
+        // nothing — see `guard_range`.
+        self.guard_range(sel).map_err(|d| d.to_string())?;
         let sheet = self.active_sheet();
         let mut changes = Vec::new();
         for cell in sel.iter() {
@@ -1701,6 +1895,8 @@ impl Workbook {
 
         let mut changes: Vec<CellChange> = Vec::new();
         let mut examined = 0usize;
+        // Matches left untouched because the cell is protected (issue #42).
+        let mut protected_skipped = 0usize;
         let mut outcome = ReplaceOutcome::Completed;
         let mut first_cell: Option<CellRef> = None;
 
@@ -1727,6 +1923,17 @@ impl Workbook {
                 let Some(new_text) = spec.rewrite(&text) else {
                     continue;
                 };
+                // Issue #42. Unlike paste/fill, a Replace All is a SCAN of the
+                // whole sheet, so all-or-nothing would mean one locked cell
+                // anywhere cancels a legitimate replace everywhere. Protected
+                // cells are skipped instead, and counted, so the report can
+                // say how many were left alone rather than the user
+                // discovering it later.
+                if let Some(d) = self.sheets[self.active].protection.deny_edit(cell) {
+                    protected_skipped += 1;
+                    self.last_denial = Some(d);
+                    continue;
+                }
                 if changes.len() >= max_edits {
                     outcome = ReplaceOutcome::BudgetExhausted;
                     break 'outer;
@@ -1788,6 +1995,7 @@ impl Workbook {
             examined,
             outcome,
             millis: started.elapsed().as_millis(),
+            protected_skipped,
         }
     }
 
@@ -1826,6 +2034,15 @@ impl Workbook {
                 "pasting {cells} cells exceeds the {max_cells}-cell limit"
             ));
         }
+        // Issue #42. The destination rectangle is the block's extent from the
+        // origin, which is what a paste actually writes.
+        let rows = block.len().max(1) as u32;
+        let cols = block.iter().map(|r| r.len()).max().unwrap_or(1).max(1) as u32;
+        let dest = Selection::new(
+            origin,
+            CellRef::new(origin.row + rows - 1, origin.col + cols - 1),
+        );
+        self.guard_range(dest).map_err(|d| d.to_string())?;
         let mut changes = Vec::new();
         for (dr, row) in block.iter().enumerate() {
             for (dc, text) in row.iter().enumerate() {
@@ -1885,6 +2102,8 @@ impl Workbook {
                 max_cells
             ));
         }
+        // Issue #42.
+        self.guard_range(target).map_err(|d| d.to_string())?;
         let (src_tl, src_br) = source.bounds();
         let (tgt_tl, tgt_br) = target.bounds();
 
