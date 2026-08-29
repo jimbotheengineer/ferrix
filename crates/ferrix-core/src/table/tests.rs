@@ -965,3 +965,86 @@ fn row_mask_memory_is_one_bit_per_row_not_four_bytes() {
     let index_bytes = 1_000_000usize.div_ceil(RANK_BLOCK) * 8;
     assert!(index_bytes < 4096, "rank index is {index_bytes} bytes");
 }
+
+#[test]
+fn serial_from_civil_is_the_exact_inverse_of_the_renderer() {
+    // ONE calendar: the forward direction (civil_from_serial, which
+    // render_serial and serial_parts share) and the inverse must agree on
+    // every day in the 1900 date system, phantom 1900-02-29 included.
+    //
+    // Exhaustive rather than sampled: a one-day drift near a century rule or
+    // either side of serial 60 is exactly the bug this guards, and 2.9M
+    // iterations of integer maths is fast.
+    let mut checked = 0u32;
+    for s in 0..=2_958_465i64 {
+        let (y, m, d, ..) = serial_parts(s as f64);
+        let back = serial_from_civil(y, m, d);
+        assert_eq!(
+            back,
+            Some(s as f64),
+            "serial {s} decomposes to {y}-{m}-{d}, which converts back to {back:?}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2_958_466, "the whole supported range was walked");
+}
+
+#[test]
+fn serial_from_civil_reproduces_excels_leap_bug() {
+    // Anchors: the phantom day exists, and its neighbours are one serial
+    // apart from IT but two apart from each other.
+    assert_eq!(serial_from_civil(1900, 2, 29), Some(60.0));
+    assert_eq!(serial_from_civil(1900, 2, 28), Some(59.0));
+    assert_eq!(serial_from_civil(1900, 3, 1), Some(61.0));
+    assert_eq!(serial_from_civil(1900, 1, 1), Some(1.0));
+    // Known Excel serials.
+    assert_eq!(serial_from_civil(1970, 1, 1), Some(25_569.0));
+    assert_eq!(serial_from_civil(2023, 3, 15), Some(45_000.0));
+    assert_eq!(serial_from_civil(9999, 12, 31), Some(2_958_465.0));
+    // Out of range and nonsense months.
+    // Serial 0 is Excel's "1900-01-00" placeholder, which the renderer shows
+    // as 1899-12-31, so that IS in range -- the inverse must agree with it
+    // rather than inventing a stricter floor than the renderer has.
+    assert_eq!(serial_from_civil(1899, 12, 31), Some(0.0));
+    assert_eq!(render_serial(0.0, DateStyle::Iso), "1899-12-31");
+    assert_eq!(serial_from_civil(1899, 12, 30), None);
+    assert_eq!(serial_from_civil(10_000, 1, 1), None);
+    assert_eq!(serial_from_civil(2023, 13, 1), None);
+    assert_eq!(serial_from_civil(2023, 0, 1), None);
+}
+
+#[test]
+fn days_in_month_agrees_with_the_rendered_month_end() {
+    // days_in_month is what EOMONTH clamps to, so it must equal the day the
+    // renderer prints for the last serial of that month -- including
+    // February 1900, which has a 29th only because of Excel's bug.
+    for (y, m) in [
+        (1900, 1),
+        (1900, 2),
+        (1900, 3),
+        (2000, 2),
+        (1900, 12),
+        (2023, 2),
+        (2024, 2),
+        (2100, 2),
+        (2023, 4),
+        (2023, 7),
+        (9999, 12),
+    ] {
+        let dim = days_in_month(y, m);
+        let last = serial_from_civil(y, m, dim).expect("month end is in range");
+        assert_eq!(
+            render_serial(last, DateStyle::Iso),
+            format!("{y:04}-{m:02}-{dim:02}"),
+            "days_in_month({y}, {m}) = {dim} does not render as that month's end"
+        );
+        // And one more day rolls into the next month.
+        let (_, next_m, next_d, ..) = serial_parts(last + 1.0);
+        assert_eq!(next_d, 1, "the day after {y}-{m}-{dim} must be the 1st");
+        assert_ne!(next_m, m);
+    }
+    assert_eq!(days_in_month(1900, 2), 29, "Excel's phantom leap day");
+    assert_eq!(days_in_month(1901, 2), 28);
+    assert_eq!(days_in_month(2000, 2), 29);
+    assert_eq!(days_in_month(2100, 2), 28, "century rule");
+}
