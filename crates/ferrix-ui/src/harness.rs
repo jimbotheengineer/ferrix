@@ -2213,6 +2213,172 @@ xxx,yyy,zzz
         );
     }
 
+    // --- Compact (roadmap #7) ---
+
+    /// An app whose active base is a real `.ferrix` cache.
+    ///
+    /// The normal loader only reaches the mmap path above 1 GB, which no test
+    /// should be writing, so the cache is built directly and attached. The
+    /// grid, the overlay, and Compact itself all see exactly what they would
+    /// after a real large-file open.
+    fn app_over_a_cache(tag: &str) -> (Harness, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("ferrix_ui_compact_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("data.csv");
+        let mut body = String::from("id,name,qty\n");
+        for i in 0..200 {
+            body.push_str(&format!("{i},row{i},{}\n", i * 2));
+        }
+        std::fs::write(&csv, body).unwrap();
+        let cache = ferrix_io::cache_path_for(&csv);
+        ferrix_io::convert_csv(&csv, &cache, b',', true, |_, _| {}).unwrap();
+
+        let mut h = Harness::new(None);
+        h.step();
+        h.app_mut().adopt_cache_for_test(&cache).unwrap();
+        h.step();
+        (h, cache)
+    }
+
+    #[test]
+    fn compact_is_offered_only_when_there_is_something_to_bake() {
+        let (mut h, cache) = app_over_a_cache("gate");
+        assert!(
+            !h.app().compact_available(),
+            "an unedited cache has nothing to compact"
+        );
+        assert!(h.app().compact_tooltip().contains("no edits"));
+
+        edit_cell(&mut h, 3, 1, "changed");
+        assert!(
+            h.app().compact_available(),
+            "one edit is enough to make Compact meaningful"
+        );
+
+        // And an in-RAM sheet — no cache at all — can never compact.
+        let p = write_csv("compact_inram.csv", SAMPLE);
+        let mut h2 = Harness::new(Some(&p));
+        assert!(h2.step_until(200, |a| a.row_count() > 0));
+        edit_cell(&mut h2, 0, 0, "x");
+        assert!(!h2.app().compact_available());
+        assert!(h2.app().compact_tooltip().contains("columnar cache"));
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+    }
+
+    /// The headline scenario: edit, compact, and the sidecar is gone while
+    /// every value — edited and untouched — is exactly right.
+    #[test]
+    fn compact_bakes_edits_retires_the_sidecar_and_clears_undo() {
+        let (mut h, cache) = app_over_a_cache("headline");
+
+        // Snapshot the BEFORE state so untouched cells can be compared per
+        // row rather than by any kind of total.
+        let before: Vec<Vec<String>> = (0..200)
+            .map(|r| {
+                (0..3)
+                    .map(|c| h.app().display_for_test(CellRef::new(r, c)))
+                    .collect()
+            })
+            .collect();
+
+        edit_cell(&mut h, 5, 1, "EDITED");
+        edit_cell(&mut h, 150, 2, "-7");
+        // Saving writes the sidecar, which is the thing compact must retire.
+        assert!(h.app_mut().save_edits_for_test());
+        let sidecar = h.app().sidecar_path().unwrap().to_path_buf();
+        assert!(sidecar.exists(), "a sidecar must exist before the compact");
+
+        // Undo history exists right up until the compact.
+        edit_cell(&mut h, 6, 1, "another");
+        assert!(h.app().workbook().can_undo());
+
+        h.app_mut().start_compact();
+        assert!(
+            h.step_until(500, |a| !a.is_compacting()),
+            "the compact must finish"
+        );
+
+        assert!(!sidecar.exists(), "the sidecar must be retired");
+        assert!(
+            !h.app().workbook().can_undo(),
+            "undo history must be cleared on compact, as on save"
+        );
+        assert!(
+            h.app().status_text().contains("Compacted"),
+            "status: {}",
+            h.app().status_text()
+        );
+
+        // Every edited cell shows its edited value...
+        assert_eq!(h.app().display_for_test(CellRef::new(5, 1)), "EDITED");
+        assert_eq!(h.app().display_for_test(CellRef::new(6, 1)), "another");
+        assert_eq!(h.app().display_for_test(CellRef::new(150, 2)), "-7");
+        // ...and every other cell is byte-identical, row by row, so a reorder
+        // or a dropped row is caught at the exact index.
+        assert_eq!(h.app().row_count(), 200, "row count preserved");
+        let edited = [(5u32, 1usize), (6, 1), (150, 2)];
+        for (r, row) in before.iter().enumerate() {
+            for (c, was) in row.iter().enumerate() {
+                if edited.contains(&(r as u32, c)) {
+                    continue;
+                }
+                assert_eq!(
+                    &h.app().display_for_test(CellRef::new(r as u32, c as u32)),
+                    was,
+                    "row {r} col {c} changed"
+                );
+            }
+        }
+
+        // The compacted cache reopens on its own, with the edits in it.
+        let m = ferrix_io::MappedSheet::open(&cache).unwrap();
+        assert_eq!(m.row_count(), 200);
+        assert_eq!(m.display(CellRef::new(5, 1)), "EDITED");
+        assert_eq!(m.display(CellRef::new(150, 2)), "-7");
+
+        let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+    }
+
+    /// A further edit after a compact must still save. This is the fingerprint
+    /// re-anchoring: compact rewrote the base, so a stale fingerprint would
+    /// make the next open reject the sidecar and the edits would look lost.
+    #[test]
+    fn edits_made_after_a_compact_still_save_and_reload() {
+        let (mut h, cache) = app_over_a_cache("refingerprint");
+        edit_cell(&mut h, 1, 1, "first");
+        h.app_mut().start_compact();
+        assert!(h.step_until(500, |a| !a.is_compacting()));
+
+        edit_cell(&mut h, 2, 1, "second");
+        assert!(h.app_mut().save_edits_for_test(), "the save must succeed");
+        let sidecar = h.app().sidecar_path().unwrap().to_path_buf();
+
+        // The sidecar must load against the CURRENT base, not the pre-compact
+        // one. A stale fingerprint fails exactly here.
+        let m = ferrix_io::MappedSheet::open(&cache).unwrap();
+        let fp = ferrix_io::edits::BaseFingerprint::of(
+            &cache,
+            m.row_count() as u64,
+            m.col_count() as u32,
+        )
+        .unwrap();
+        let back = ferrix_io::edits::load_edits(&sidecar, fp)
+            .expect("must not be rejected as stale")
+            .expect("must be present");
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            m.display(CellRef::new(1, 1)),
+            "first",
+            "baked into the cache"
+        );
+
+        let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+    }
+
     // --- Name Box and Name Manager (issue #4) ---
 
     /// A loaded app with `Sales` defined over B1:B3 of the sample, plus a

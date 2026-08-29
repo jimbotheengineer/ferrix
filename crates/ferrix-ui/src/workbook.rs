@@ -749,6 +749,18 @@ impl Workbook {
         self
     }
 
+    /// Swap the ACTIVE sheet's immutable base for a different one.
+    ///
+    /// Exists for Compact, which rewrites the `.ferrix` file underneath a live
+    /// mapping. On Windows a mapped file cannot be renamed over, so the UI
+    /// must let go of the old mapping before the commit and adopt the new one
+    /// after — this is that handover. Everything else (overlay, formats,
+    /// merges, order) is by construction independent of which base is under
+    /// it, so nothing else needs to move.
+    pub fn replace_base(&mut self, base: BaseData) {
+        self.base = std::sync::Arc::new(base);
+    }
+
     /// Replace the ACTIVE sheet's overlay in place.
     ///
     /// Used when loading a multi-sheet workbook: each sheet is added, made

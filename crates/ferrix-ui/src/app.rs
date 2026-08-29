@@ -18,6 +18,18 @@ use crate::prefs::Prefs;
 /// being built, so it cannot also call `&mut self` methods; recording the
 /// choice keeps both borrows legal without duplicating the logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A File-menu choice, deferred out of the panel closure.
+///
+/// The menu's items all need `&mut self`, which the closure already holds
+/// immutably to render the enabled/disabled state — so the choice is recorded
+/// and acted on after the panel ends, exactly as `ViewAction` does.
+enum FileAction {
+    Open,
+    Save,
+    Compact,
+    ExportCsv,
+}
+
 enum ViewAction {
     /// (freeze rows, freeze columns) at the cursor.
     Freeze(bool, bool),
@@ -52,6 +64,10 @@ struct Loaded {
     /// they belong to. `None` when the source could not be fingerprinted.
     edits_path: Option<PathBuf>,
     fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+    /// The `.ferrix` cache backing this sheet, when there is one. Only the
+    /// out-of-core path has one; an in-RAM CSV or an xlsx has nothing to
+    /// compact, which is exactly why the menu item is disabled for them.
+    cache_path: Option<PathBuf>,
     /// Edits restored from a sidecar, if one was present and current.
     restored: Option<ferrix_core::EditOverlay>,
     /// Set when a sidecar existed but was rejected, so the UI can warn instead
@@ -67,6 +83,26 @@ struct Loaded {
 }
 
 type LoadResult = Result<Loaded, String>;
+
+/// What a finished compact hands back to the UI thread.
+///
+/// The stats are flattened rather than passing `CompactStats` through, because
+/// the residual overlay has to come across too and the UI wants one message
+/// per completion, not two.
+struct CompactDone {
+    rows: u64,
+    cols: usize,
+    edits_baked: usize,
+    formulas_kept: usize,
+    output_bytes: u64,
+    millis: u128,
+    peak_heap_bytes: usize,
+    /// Edits that could NOT be baked into a columnar file — formulas, which
+    /// keep their source. Empty in the ordinary all-literals case.
+    residual: ferrix_core::EditOverlay,
+    /// The sidecar that now exists, or `None` when it was retired outright.
+    sidecar: Option<PathBuf>,
+}
 
 /// Progress reported from the loader thread.
 #[derive(Clone, Copy, Default)]
@@ -204,6 +240,25 @@ pub struct FerrixApp {
     /// None until a file is loaded.
     edits_path: Option<PathBuf>,
     fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+
+    // --- compact (roadmap #7) ---
+    //
+    // Compact rewrites the `.ferrix` cache with the overlay baked in, so the
+    // sidecar can be retired. It is minutes of work on a 10 GB file and it
+    // rewrites the user's data, so it runs on a worker with a modal in front
+    // of it: no editing while the file underneath is being replaced.
+    /// The cache this sheet reads from, when it is out-of-core.
+    cache_path: Option<PathBuf>,
+    /// Column headers recovered from the source, re-applied to the new
+    /// mapping. The cache stores data only, so losing these would blank the
+    /// header row on compact.
+    cache_headers: Vec<String>,
+    compacting: bool,
+    compact_rx: Option<Receiver<Result<CompactDone, String>>>,
+    compact_progress_rx: Option<Receiver<Progress>>,
+    compact_progress: Progress,
+    compact_cancel: Option<ferrix_core::CancelToken>,
+    compact_started: Option<std::time::Instant>,
 
     // --- autosave (roadmap #8) ---
     //
@@ -366,6 +421,14 @@ impl FerrixApp {
             table_report: ferrix_core::ValidationReport::default(),
             edits_path: None,
             fingerprint: None,
+            cache_path: None,
+            cache_headers: Vec::new(),
+            compacting: false,
+            compact_rx: None,
+            compact_progress_rx: None,
+            compact_progress: Progress::default(),
+            compact_cancel: None,
+            compact_started: None,
             autosave_last: None,
             autosave_revision: None,
             autosave_rx: None,
@@ -476,6 +539,11 @@ impl FerrixApp {
                 self.stats_cols = loaded.cols;
                 self.edits_path = loaded.edits_path;
                 self.fingerprint = loaded.fingerprint;
+                self.cache_path = loaded.cache_path;
+                self.cache_headers = match &loaded.base {
+                    BaseData::Mapped(m) => m.headers().to_vec(),
+                    BaseData::Memory(_) => Vec::new(),
+                };
                 // Offer recovery before anything else touches the overlay.
                 self.recovery = loaded.recovery;
                 self.recovery_resolved = false;
@@ -1328,6 +1396,364 @@ impl FerrixApp {
         self.clear_autosave();
     }
 
+    // --- Compact (roadmap #7) ---
+
+    /// Can this sheet be compacted right now?
+    ///
+    /// Requires a columnar cache (the in-RAM and xlsx paths have none), edits
+    /// worth baking, and no other long job in flight — two writers over the
+    /// same file would race for the rename.
+    fn can_compact(&self) -> bool {
+        self.cache_path.is_some()
+            && !self.wb.overlay.is_empty()
+            && !self.compacting
+            && !self.loading
+            && !self.exporting
+    }
+
+    /// Why Compact is unavailable, in the user's terms. A greyed-out menu item
+    /// with no explanation is indistinguishable from a bug.
+    fn compact_hint(&self) -> String {
+        if self.cache_path.is_none() {
+            "Only files large enough to use the columnar cache can be compacted".to_string()
+        } else if self.wb.overlay.is_empty() {
+            "Nothing to compact — there are no edits to bake in".to_string()
+        } else if self.compacting {
+            "A compact is already running".to_string()
+        } else if self.loading || self.exporting {
+            "Wait for the current operation to finish".to_string()
+        } else {
+            format!(
+                "Rewrite the cache with {} edit{} baked in, then retire the sidecar",
+                fmt_int(self.wb.overlay.len()),
+                if self.wb.overlay.len() == 1 { "" } else { "s" }
+            )
+        }
+    }
+
+    /// Start a compact on a worker thread.
+    ///
+    /// ## Why the mapping is dropped first
+    ///
+    /// The compactor renames the new cache over the old one. On Windows an
+    /// open memory mapping locks the file and the rename fails; on Unix it
+    /// would succeed but leave this process reading a deleted inode — stale
+    /// data with no warning. Either way the live mapping must go before the
+    /// commit. So the base is swapped for an empty in-RAM sheet for the
+    /// duration, the modal blocks interaction, and the new mapping is adopted
+    /// when the worker reports back.
+    ///
+    /// The overlay is *not* dropped: if the compact fails or is cancelled, the
+    /// original cache is still on disk and re-mapping it restores exactly the
+    /// state the user was in.
+    pub fn start_compact(&mut self) {
+        if !self.can_compact() {
+            self.status = self.compact_hint();
+            return;
+        }
+        let Some(cache) = self.cache_path.clone() else {
+            return;
+        };
+
+        // The overlay is cloned for the worker so the UI keeps its copy to
+        // restore from on failure. Cost is O(edits) — the same snapshot the
+        // export path already admits against the budget.
+        let overlay = self.wb.overlay.clone();
+        let edits = overlay.len();
+
+        // Let go of the mapping before anything can try to rename over it.
+        self.wb
+            .replace_base(BaseData::Memory(ferrix_core::Sheet::new("compacting")));
+
+        let (tx, rx) = channel::<Result<CompactDone, String>>();
+        let (ptx, prx) = channel::<Progress>();
+        let cancel = ferrix_core::CancelToken::new();
+        let mut should_cancel = cancel.checker();
+        let target = cache.clone();
+
+        std::thread::spawn(move || {
+            let result = ferrix_io::compact::compact_cache(
+                &target,
+                &overlay,
+                |done, total| {
+                    let _ = ptx.send(Progress { done, total });
+                },
+                &mut should_cancel,
+            )
+            .map_err(|e| e.to_string())
+            .map(|out| CompactDone {
+                rows: out.stats.rows,
+                cols: out.stats.cols,
+                edits_baked: out.stats.edits_baked,
+                formulas_kept: out.stats.formulas_kept,
+                output_bytes: out.stats.output_bytes,
+                millis: out.stats.millis,
+                peak_heap_bytes: out.stats.peak_heap_bytes(),
+                residual: out.residual,
+                sidecar: out.sidecar,
+            });
+            let _ = tx.send(result);
+        });
+
+        self.compacting = true;
+        self.compact_cancel = Some(cancel);
+        self.compact_rx = Some(rx);
+        self.compact_progress_rx = Some(prx);
+        self.compact_progress = Progress::default();
+        self.compact_started = Some(std::time::Instant::now());
+        self.status = format!("Compacting {} edits into the cache…", fmt_int(edits));
+    }
+
+    /// Whether the Compact menu item is enabled, for the headless harness.
+    pub fn compact_available(&self) -> bool {
+        self.can_compact()
+    }
+
+    /// The Compact tooltip, for the headless harness.
+    pub fn compact_tooltip(&self) -> String {
+        self.compact_hint()
+    }
+
+    /// Is a compact in flight? For the headless harness.
+    pub fn is_compacting(&self) -> bool {
+        self.compacting
+    }
+
+    /// Attach an existing `.ferrix` cache to this app as the active base.
+    ///
+    /// Test-only. The real path only reaches the mmap branch for files above
+    /// 1 GB, which no test should be writing, so this is how a harness gets a
+    /// mapped sheet with a known cache under it.
+    #[cfg(test)]
+    pub fn adopt_cache_for_test(&mut self, cache: &Path) -> Result<(), String> {
+        self.cache_path = Some(cache.to_path_buf());
+        let (rows, cols) = self.remap_cache()?;
+        self.stats_rows = rows;
+        self.stats_cols = cols;
+        self.edits_path = Some(ferrix_io::edits::edits_path_for(cache));
+        self.fingerprint =
+            ferrix_io::compact::fingerprint_after(cache, rows as u64, cols as u32).ok();
+        Ok(())
+    }
+
+    /// The active sidecar path, for the headless harness.
+    pub fn sidecar_path(&self) -> Option<&Path> {
+        self.edits_path.as_deref()
+    }
+
+    /// Ask a running compact to stop.
+    ///
+    /// The worker polls between columns and every 64K rows, deletes its
+    /// scratch file, and returns before the rename — so the original cache and
+    /// sidecar are both untouched.
+    pub fn cancel_compact(&mut self) {
+        if let Some(c) = &self.compact_cancel {
+            c.cancel();
+            self.status = "Cancelling compact…".into();
+        }
+    }
+
+    /// Re-map the cache and adopt it as the active base.
+    ///
+    /// Used on both the success and failure paths: on success it picks up the
+    /// rewritten file, on failure the original, which is still exactly where
+    /// it was.
+    fn remap_cache(&mut self) -> Result<(usize, usize), String> {
+        let Some(cache) = self.cache_path.clone() else {
+            return Err("no cache to map".into());
+        };
+        let mut mapped = ferrix_io::MappedSheet::open(&cache).map_err(|e| e.to_string())?;
+        if !self.cache_headers.is_empty() {
+            mapped.set_headers(self.cache_headers.clone());
+        }
+        let (rows, cols) = (mapped.row_count(), mapped.col_count());
+        self.wb.replace_base(BaseData::Mapped(Box::new(mapped)));
+        Ok((rows, cols))
+    }
+
+    /// Drain compact progress and completion.
+    fn poll_compact(&mut self) {
+        if let Some(prx) = &self.compact_progress_rx {
+            while let Ok(p) = prx.try_recv() {
+                self.compact_progress = p;
+            }
+        }
+
+        let Some(rx) = &self.compact_rx else { return };
+        let outcome = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Compact thread died — the original cache and edits are unchanged".to_string())
+            }
+        };
+
+        self.compacting = false;
+        self.compact_rx = None;
+        self.compact_progress_rx = None;
+        self.compact_cancel = None;
+        let secs = self
+            .compact_started
+            .take()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+
+        match outcome {
+            Ok(done) => {
+                // The overlay is now IN the cache. What remains is whatever
+                // could not be baked — formulas, which keep their source so
+                // they can be re-evaluated against the new base.
+                self.wb.adopt_overlay(done.residual);
+                self.edits_path = done.sidecar.clone();
+
+                match self.remap_cache() {
+                    Ok((rows, cols)) => {
+                        self.stats_rows = rows;
+                        self.stats_cols = cols;
+                        self.col_widths = match &*self.wb.base {
+                            BaseData::Mapped(m) => compute_col_widths_mapped(m),
+                            BaseData::Memory(s) => compute_col_widths_mem(s),
+                        };
+                        // Re-anchor the fingerprint: the base has changed, so
+                        // every fingerprint taken against the old one is stale
+                        // by construction and a later save would be rejected.
+                        let cache = self.cache_path.clone();
+                        self.fingerprint = cache.as_ref().and_then(|c| {
+                            ferrix_io::compact::fingerprint_after(c, rows as u64, cols as u32).ok()
+                        });
+                        if self.edits_path.is_none() {
+                            // No residual sidecar was written, but a future
+                            // edit still needs somewhere to go.
+                            self.edits_path =
+                                cache.as_ref().map(|c| ferrix_io::edits::edits_path_for(c));
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!(
+                            "Compacted, but the new cache could not be opened: {e} — reopen the file"
+                        );
+                        return;
+                    }
+                }
+
+                // Undo history does not survive a compact, for the same reason
+                // it does not survive a save, only more so: the timeline's
+                // "before" states describe a file that no longer exists.
+                let lost = self.wb.save_committed();
+                self.autosave_last = None;
+                self.autosave_revision = None;
+                let history = if lost > 0 {
+                    format!(
+                        " · undo history cleared ({} step{})",
+                        fmt_int(lost),
+                        if lost == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                };
+                let kept = if done.formulas_kept > 0 {
+                    format!(
+                        " · {} formula{} kept in a new sidecar",
+                        fmt_int(done.formulas_kept),
+                        if done.formulas_kept == 1 { "" } else { "s" }
+                    )
+                } else {
+                    " · sidecar retired".to_string()
+                };
+                self.status = format!(
+                    "Compacted {} edits into {} rows × {} cols ({:.1} GB) in {:.1}s · peak {:.0} MB{}{}",
+                    fmt_int(done.edits_baked),
+                    fmt_int(done.rows as usize),
+                    done.cols,
+                    done.output_bytes as f64 / 1e9,
+                    if done.millis > 0 {
+                        done.millis as f64 / 1000.0
+                    } else {
+                        secs
+                    },
+                    done.peak_heap_bytes as f64 / 1e6,
+                    kept,
+                    history
+                );
+            }
+            Err(e) => {
+                // Nothing on disk changed. Put the original mapping back so
+                // the user is exactly where they were, edits and all.
+                let restored = self.remap_cache();
+                self.status = if e.contains("cancelled") {
+                    "Compact cancelled — the cache and your edits are unchanged".to_string()
+                } else {
+                    format!("Compact failed: {e} — the cache and your edits are unchanged")
+                };
+                if let Err(e2) = restored {
+                    self.status = format!("{} (could not re-open the cache: {e2})", self.status);
+                }
+            }
+        }
+    }
+
+    /// The modal shown while a compact runs.
+    ///
+    /// Deliberately modal rather than a toolbar spinner like export: an export
+    /// only reads, so editing during one is harmless, while a compact is
+    /// rewriting the very file the grid reads from. Blocking input is the
+    /// simplest honest way to say "this file is being replaced".
+    fn show_compact_modal(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        let mut cancel = false;
+        let p = self.compact_progress;
+
+        egui::Window::new("Compacting")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new("Baking edits into the columnar cache")
+                        .color(th.text)
+                        .size(14.0),
+                );
+                ui.add_space(6.0);
+                if p.total > 0 {
+                    let frac = p.done as f32 / p.total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(340.0)
+                            .text(format!("column {} of {}", p.done, p.total)),
+                    );
+                } else {
+                    ui.add(
+                        egui::ProgressBar::new(0.0)
+                            .desired_width(340.0)
+                            .text("starting…"),
+                    );
+                }
+                ui.add_space(6.0);
+                // Say what is and is not at risk. A progress bar over someone's
+                // data file without this sentence is just anxiety.
+                ui.label(
+                    RichText::new(
+                        "Your existing file is untouched until this finishes. \
+                         Cancelling now changes nothing.",
+                    )
+                    .color(th.text_dim)
+                    .size(12.0),
+                );
+                ui.add_space(8.0);
+                if ui.button("✖ Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            self.cancel_compact();
+        }
+    }
+
     /// The unsaved-changes modal shown when the user tries to close the window
     /// with a dirty workbook.
     ///
@@ -2071,6 +2497,18 @@ impl FerrixApp {
     /// The status line, the app's own account of what it last did.
     pub fn status_text(&self) -> &str {
         &self.status
+    }
+
+    /// What the grid would draw in a cell — base with the overlay applied.
+    /// For the headless harness.
+    pub fn display_for_test(&self, cell: CellRef) -> String {
+        self.wb.view().display(cell)
+    }
+
+    /// Write the sidecar, for the headless harness. Same entry point the
+    /// toolbar's Save button and Ctrl+S use.
+    pub fn save_edits_for_test(&mut self) -> bool {
+        self.save_edits()
     }
 
     // --- Name Box / Name Manager seams ---
@@ -3587,11 +4025,12 @@ impl FerrixApp {
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.poll_load();
         self.poll_export();
+        self.poll_compact();
         // Refresh the memory reading at most once a second. Sampling is a
         // syscall; doing it per frame at 60fps would be measurable for no
         // benefit, and the number does not move meaningfully faster than that.
         self.budget = ferrix_core::budget::cached();
-        if self.loading || self.exporting {
+        if self.loading || self.exporting || self.compacting {
             ctx.request_repaint();
         }
         let frame_start = std::time::Instant::now();
@@ -3637,6 +4076,11 @@ impl FerrixApp {
         if self.close_prompt {
             self.show_close_prompt(ctx);
         }
+        // The compact modal outranks everything below it: the file under the
+        // grid is being replaced, so nothing else should be reachable.
+        if self.compacting {
+            self.show_compact_modal(ctx);
+        }
         // Offer to recover a previous session's autosave. Shown after the
         // close prompt so an in-progress close keeps precedence.
         if self.recovery.is_some() {
@@ -3659,6 +4103,9 @@ impl FerrixApp {
         // The View menu borrows `self` immutably to read the current state, so
         // its choice is recorded and applied after the panel closure ends.
         let mut view_action: Option<ViewAction> = None;
+        // Same deferral for the File menu: its items call `&mut self` methods
+        // that cannot run while the panel closure holds the borrow.
+        let mut file_action: Option<FileAction> = None;
         let mut toggle_empty = false;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
@@ -3764,6 +4211,39 @@ impl FerrixApp {
                     {
                         toggle_empty = true;
                     }
+                    // --- File menu ---
+                    //
+                    // Compact lives here rather than on the toolbar on
+                    // purpose: it rewrites the user's data file, and a
+                    // destructive-by-nature action should not sit one stray
+                    // click away from Undo.
+                    let can_compact = self.can_compact();
+                    let compact_hint = self.compact_hint();
+                    ui.menu_button("File", |ui| {
+                        if ui.button("📂 Open…").clicked() {
+                            file_action = Some(FileAction::Open);
+                            ui.close_menu();
+                        }
+                        if ui.button("💾 Save edits  (Ctrl+S)").clicked() {
+                            file_action = Some(FileAction::Save);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(can_compact, egui::Button::new("🗜 Compact…"))
+                            .on_hover_text(&compact_hint)
+                            .on_disabled_hover_text(&compact_hint)
+                            .clicked()
+                        {
+                            file_action = Some(FileAction::Compact);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("⬈ Export CSV…").clicked() {
+                            file_action = Some(FileAction::ExportCsv);
+                            ui.close_menu();
+                        }
+                    });
                     // --- View menu: freeze panes, split, zoom (roadmap #6) ---
                     ui.menu_button("View", |ui| {
                         let frozen = self.panes.is_active();
@@ -3893,6 +4373,15 @@ impl FerrixApp {
 
         if toggle_theme {
             self.set_theme(self.theme.mode.toggled());
+        }
+        match file_action {
+            Some(FileAction::Open) => self.open_dialog(),
+            Some(FileAction::Save) => {
+                let _ = self.save_edits();
+            }
+            Some(FileAction::Compact) => self.start_compact(),
+            Some(FileAction::ExportCsv) => self.export_dialog(),
+            None => {}
         }
         match view_action {
             Some(ViewAction::Freeze(r, c)) => self.freeze_at_cursor(r, c),
@@ -4831,6 +5320,9 @@ where
             first_formulas: None,
             edits_path: restored_edits.path,
             fingerprint: restored_edits.fingerprint,
+            // An in-RAM sheet has no columnar cache, so there is nothing to
+            // compact into. Compact is an out-of-core feature by definition.
+            cache_path: None,
             restored: restored_edits.overlay,
             edit_warning: restored_edits.warning,
             recovery: restored_edits.recovery,
@@ -4891,6 +5383,7 @@ where
         first_formulas: None,
         edits_path: restored_edits.path,
         fingerprint: restored_edits.fingerprint,
+        cache_path: Some(cache),
         restored: restored_edits.overlay,
         edit_warning: restored_edits.warning,
         recovery: restored_edits.recovery,
@@ -4960,6 +5453,7 @@ fn load_xlsx(path: &Path) -> LoadResult {
         // silent mismatch waiting to happen.
         edits_path: None,
         fingerprint: None,
+        cache_path: None,
         restored: None,
         edit_warning: None,
         recovery: None,

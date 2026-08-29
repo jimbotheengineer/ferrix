@@ -358,12 +358,11 @@ where
 
     let run = (|| -> Result<(u64, usize), CompactError> {
         let mut finished = Vec::with_capacity(cols);
-        for ci in 0..cols {
+        for (ci, edits) in by_col.iter().enumerate().take(cols) {
             if should_cancel() {
                 return Err(CompactError::Cancelled);
             }
             let mut spill = Spill::new(&scratch, ci)?;
-            let edits = &by_col[ci];
             let col_is_base = ci < base_cols;
 
             for row in 0..rows {
