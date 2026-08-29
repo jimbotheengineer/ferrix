@@ -31,6 +31,7 @@ pub mod selection;
 pub mod sheet;
 pub mod sizing;
 pub mod sort;
+pub mod sparkline;
 pub mod table;
 pub mod tsv;
 pub mod validate;
@@ -48,7 +49,7 @@ pub use format::{
     Border, BorderStyle, CellDecor, CellOverride, ColumnFormat, DecorEntry, Diagonal, HAlign,
     ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat, Side, VAlign,
 };
-pub use order::{AxisOrder, OrderError, SheetOrder};
+pub use order::{AxisOrder, AxisShift, OrderError, SheetOrder};
 pub use overlay::{CellInput, EditOverlay, OverlayChange};
 pub use protect::{
     Action as ProtectAction, Allowances, CellLockState, Denied, LockMap, PasswordHash,
@@ -64,6 +65,7 @@ pub use sizing::{
     MAX_OUTLINE_LEVEL,
 };
 pub use sort::{cycle_click, CellKeys, SortCell, SortDir, SortKey, SortOrder};
+pub use sparkline::{sparkline_shape, SparkBar, SparkGroup, SparkKind, SparkShape, SparklineMap};
 pub use table::{
     CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,
     Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,

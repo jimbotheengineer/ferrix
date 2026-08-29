@@ -129,6 +129,16 @@ pub const MAX_CIRCLED: usize = 4096;
 const CELL_EDITOR_ID: &str = "cell_editor";
 const FORMULA_BAR_ID: &str = "formula_bar_edit";
 
+/// How many DISJOINT selection ranges are kept (issue #17).
+///
+/// Ctrl+clicking headers accumulates ranges, and without a cap a user leaning
+/// on Ctrl would grow the list without bound. 64 is far more scattered ranges
+/// than anyone assembles by hand, each is 16 bytes, and the paint loop tests
+/// membership against all of them per visible cell — so the bound is what keeps
+/// that per-cell cost a small constant rather than something that grows with
+/// the session. The cap is REPORTED when it bites, never silently enforced.
+pub const MAX_DISJOINT_SELECTIONS: usize = 64;
+
 /// A highlighted reference outline being dragged onto another cell.
 #[derive(Clone, Copy, Debug)]
 struct RefDrag {
@@ -149,6 +159,15 @@ pub struct FerrixApp {
     col_widths: Vec<f32>,
     /// Active selection. `cursor` is the cell that typing lands in.
     selection: Selection,
+    /// Additional DISJOINT ranges, from Ctrl+clicking row or column headers
+    /// (issue #17).
+    ///
+    /// Bounded on purpose. Each entry is two corners, so a hundred disjoint
+    /// full-column selections over a 200M-row sheet is a few kilobytes rather
+    /// than a row list — but the list itself still has to stop somewhere, or a
+    /// held-down Ctrl+click would grow it without limit. See
+    /// [`MAX_DISJOINT_SELECTIONS`].
+    extra_selections: Vec<Selection>,
     scroll: ScrollState,
 
     focus: Focus,
@@ -305,6 +324,9 @@ pub struct FerrixApp {
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
     header_hitboxes: Vec<(usize, egui::Pos2)>,
+    /// Where each visible ROW header was painted last frame (issue #17).
+    /// Same purpose as `header_hitboxes`, for the other axis.
+    row_header_hitboxes: Vec<(u32, egui::Pos2)>,
     /// (screen row, underlying row) for every row the LAST FRAME painted,
     /// frozen band first. Read back by tests as the app's own account of what
     /// is on screen.
@@ -449,6 +471,11 @@ pub struct FerrixApp {
     last_border_segments: usize,
     last_rotated_texts: usize,
     last_wrapped_texts: usize,
+    /// Sparkline primitives, and covered-but-blank cells, the grid painted
+    /// last frame (issue #36). Same discipline: the count of the SPECIFIC
+    /// shape kind this feature emits, not a slice of the frame total.
+    last_sparkline_shapes: usize,
+    last_sparkline_blanks: usize,
 
     /// Active trace-precedents/dependents session (roadmap #39), if any.
     /// `None` means "Remove Arrows" was pressed or nothing has been traced.
@@ -619,6 +646,7 @@ impl FerrixApp {
             stats_cols: 0,
             col_widths: Vec::new(),
             selection: Selection::default(),
+            extra_selections: Vec::new(),
             scroll: ScrollState::default(),
             focus: Focus::Grid,
             editing: None,
@@ -669,6 +697,7 @@ impl FerrixApp {
             last_outline_buttons: 0,
             sizing_path: None,
             header_hitboxes: Vec::new(),
+            row_header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
             last_frozen_rows: 0,
             last_grid_rect: None,
@@ -718,6 +747,8 @@ impl FerrixApp {
             last_border_segments: 0,
             last_rotated_texts: 0,
             last_wrapped_texts: 0,
+            last_sparkline_shapes: 0,
+            last_sparkline_blanks: 0,
             trace: None,
             last_trace_arrows: 0,
             last_trace_total: 0,
@@ -3617,6 +3648,22 @@ impl FerrixApp {
         self.last_wrapped_texts
     }
 
+    /// Sparkline primitives painted last frame (issue #36).
+    ///
+    /// Zero on every sheet with no sparkline group. This is the number a test
+    /// asserts on rather than `paint_shape_count()`: a frame total moves when
+    /// a selection rectangle appears or a grid line leaves, so it can rise
+    /// while the feature draws nothing and fall while it draws plenty.
+    pub fn painted_sparklines(&self) -> usize {
+        self.last_sparkline_shapes
+    }
+
+    /// Cells a sparkline group covers that deliberately drew NOTHING last
+    /// frame, because their source was empty or held no numbers.
+    pub fn blank_sparklines(&self) -> usize {
+        self.last_sparkline_blanks
+    }
+
     /// Persist comments beside the base file.
     ///
     /// Independent of `save_edits`: a session that only added a note has
@@ -3874,6 +3921,105 @@ impl FerrixApp {
         }
         self.wb.mark_dirty();
         self.status = "Cell formatting applied".into();
+    }
+
+    // ---- sparklines (issue #36) ----
+
+    /// Add a sparkline group over the selection, drawing into the column
+    /// immediately to its RIGHT.
+    ///
+    /// The selection is the SOURCE, and the destination is derived rather than
+    /// asked for. That follows the precedent the border commands set: a
+    /// command that needs a value waits for a dialog, and one that has an
+    /// unambiguous answer just does it. "Beside the numbers" is where a
+    /// sparkline column goes in every spreadsheet anyone has used.
+    ///
+    /// ONE entry is written however many rows the selection spans -- see
+    /// `ferrix_core::sparkline`. `sparkline_over_a_100k_row_selection_stores_one_group`
+    /// asserts it.
+    pub fn add_sparkline(&mut self, kind: ferrix_core::SparkKind) {
+        // A sparkline is formatting, so it answers to the same granular
+        // allowance the other format commands do.
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::FormatCells)
+        {
+            self.status = format!("Sparkline refused -- {d}");
+            return;
+        }
+        let (a, b) = self.selection.bounds();
+        if a.col == b.col {
+            // One source column is one point per row, which draws a dot and
+            // says nothing. Refusing with a sentence beats painting a column
+            // of specks the user cannot interpret.
+            self.status =
+                "Select at least two columns of numbers -- a sparkline plots a row of them".into();
+            return;
+        }
+        let target_col = b.col + 1;
+        let group = ferrix_core::SparkGroup::new(
+            kind,
+            ferrix_core::TableRange::new(a.row, target_col, b.row, target_col),
+            a.col,
+            b.col,
+        );
+        self.wb.sparklines.add(group);
+        self.wb.mark_dirty();
+        let rows = (b.row - a.row + 1) as u64;
+        self.status = format!(
+            "{} sparklines in column {} over {rows} row{}",
+            kind.label(),
+            ferrix_core::column_name(target_col),
+            if rows == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Remove every sparkline group drawing inside the selection.
+    pub fn clear_sparklines(&mut self) {
+        let (a, b) = self.selection.bounds();
+        let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+        let n = self.wb.sparklines.clear_in(range);
+        if n == 0 {
+            self.status = "No sparklines in the selection".into();
+            return;
+        }
+        self.wb.mark_dirty();
+        self.status = format!(
+            "Removed {n} sparkline group{}",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
+    /// How many sparkline GROUPS are configured. A function of how many the
+    /// user made, never of how many rows they cover.
+    pub fn sparkline_group_count(&self) -> usize {
+        self.wb.sparklines.len()
+    }
+
+    /// Widen the single configured sparkline group down to `last_row`.
+    ///
+    /// For the scale test only. There is no gesture that selects 200M rows,
+    /// and materialising them to build one is precisely what the invariant
+    /// forbids -- so the group is widened here and the assertion is still made
+    /// on what the PAINT LOOP does with it.
+    #[cfg(test)]
+    pub fn widen_sparkline_for_test(&mut self, last_row: u32) {
+        let Some(g) = self.wb.sparklines.iter().next().copied() else {
+            panic!("a group must already be configured");
+        };
+        self.wb.sparklines.clear_in(g.target);
+        self.wb.sparklines.add(ferrix_core::SparkGroup::new(
+            g.kind,
+            ferrix_core::TableRange::new(
+                g.target.first_row,
+                g.target.first_col,
+                last_row,
+                g.target.last_col,
+            ),
+            g.src_first_col,
+            g.src_last_col,
+        ));
     }
 
     /// The decoration a cell resolves to right now, through the same
@@ -5042,6 +5188,10 @@ impl FerrixApp {
                 // menu item runs, so a sibling export variant cannot silently
                 // omit it.
                 .with_validation(&self.wb.validation)
+                // Sparklines (issue #36) survive as `<extLst>` groups. A group
+                // Excel cannot express is reported below rather than silently
+                // dropped.
+                .with_sparklines(&self.wb.sparklines)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
@@ -5092,6 +5242,14 @@ impl FerrixApp {
         }
         for (_, ov) in self.wb.format.overrides() {
             push(&ov.decor, &mut out);
+        }
+        // Sparklines (issue #36), same contract: a group Excel cannot express
+        // is reported HERE, in the editor, rather than discovered after the
+        // file is opened.
+        for m in ferrix_io::sparkline_xlsx_loss(&self.wb.sparklines) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
         }
         out
     }
@@ -5304,6 +5462,261 @@ impl FerrixApp {
             self.status = format!("Moved {count} column(s)");
         }
         r
+    }
+
+    /// Move rows as a display-order permutation (issue #17, scope item 4).
+    ///
+    /// A row MOVE, not an arbitrary permutation: see `Workbook::move_rows` for
+    /// why that is affordable at 200M rows and what the visible limit is. A
+    /// refusal lands in the status line rather than being swallowed.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.wb.move_rows(from, count, to);
+        match &r {
+            Ok(()) => {
+                let (runs, cap) = self.wb.row_order_runs();
+                // The run count is surfaced as it approaches the cap, so the
+                // user meets the limit as a warning rather than as a refusal
+                // out of nowhere.
+                self.status = if runs * 4 > cap {
+                    format!(
+                        "Moved {count} row(s) — {runs} of {cap} reorder steps tracked; \
+                         save and reopen to start from a clean order"
+                    )
+                } else {
+                    format!("Moved {count} row(s) to row {}", to + 1)
+                };
+            }
+            Err(e) => self.status = format!("Cannot move those rows: {e}"),
+        }
+        r
+    }
+
+    // ---- structural edits: insert / delete row and column (issue #17) ----
+    //
+    // Each takes the span from the CURRENT SELECTION, so "Insert Row" with
+    // three rows selected inserts three — the behaviour every spreadsheet has.
+    // Each is one undo step, and each reports what it did in the status line
+    // so a refusal (see `AxisOrder::MAX_RUNS`) is visible rather than silent.
+
+    /// Rows the selection spans, as `(first, count)` in display space.
+    fn selected_row_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.row_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    /// Columns the selection spans, as `(first, count)` in display space.
+    fn selected_col_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.col_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    pub fn insert_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .insert_rows(at, count)
+            .map(|()| format!("Inserted {count} row(s) at row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .delete_rows(at, count)
+            .map(|()| format!("Deleted {count} row(s) from row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn insert_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.insert_columns(at, count).map(|()| {
+            format!(
+                "Inserted {count} column(s) at {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.delete_columns(at, count).map(|()| {
+            format!(
+                "Deleted {count} column(s) from {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    /// Report a structural edit and refresh the derived view state.
+    ///
+    /// A REFUSAL IS SHOWN, not swallowed. `AxisOrder` refuses an edit that
+    /// would fragment the display order past its cap, and the whole point of
+    /// that cap is that the user sees the limit rather than feeling it as
+    /// unexplained slowness.
+    fn apply_structural(&mut self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(msg) => {
+                self.status = msg;
+                // The sheet's extent changed, so anything derived from it —
+                // the row count in the status bar, the table filter mask —
+                // has to be recomputed rather than left describing the old
+                // shape.
+                let rows = self.wb.view().row_count();
+                self.stats_rows = rows;
+                self.refresh_tables();
+                self.clamp_selection_to_sheet();
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = format!("Cannot do that: {e}"),
+        }
+    }
+
+    /// Pull the selection back inside the sheet after a delete shrinks it.
+    ///
+    /// Without this, deleting the last row leaves the cursor addressing a row
+    /// that no longer exists, and the next keystroke would extend the sheet to
+    /// recreate it.
+    fn clamp_selection_to_sheet(&mut self) {
+        let view = self.wb.view();
+        let last_row = view.row_count().saturating_sub(1) as u32;
+        let last_col = view.col_count().saturating_sub(1) as u32;
+        let clamp = |c: CellRef| CellRef::new(c.row.min(last_row), c.col.min(last_col));
+        self.selection = Selection::new(clamp(self.selection.anchor), clamp(self.selection.cursor));
+    }
+
+    // ---- row / column header selection (issue #17) ----
+    //
+    // The COLUMN case existed (press selects the whole column); the ROW case
+    // did not, and neither had Ctrl for disjoint or Shift for a span. All
+    // three go through one pair of methods so a row and a column cannot end up
+    // behaving differently by accident.
+
+    /// Select the whole of display row `row`.
+    ///
+    /// `mods` decides how it composes with what is already selected:
+    /// * plain — replace the selection with this row;
+    /// * Shift — extend from the anchor to cover every row between;
+    /// * Ctrl  — ADD this row as a disjoint range, leaving the others alone.
+    ///
+    /// The selection stays two corners in every case. Selecting row 1 and row
+    /// 50,000,000 of a 200M-row sheet must not materialise the 50M rows
+    /// between them, which is exactly what a bounding-box-only model would do
+    /// and why Ctrl needs its own list.
+    pub fn select_row(&mut self, row: u32, mods: egui::Modifiers) {
+        let last_col = self.stats_cols.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(row, 0), CellRef::new(row, last_col));
+        let note = self.apply_header_selection(band, mods, true);
+        // A warning outranks the routine confirmation: "row 4 selected" is
+        // what the user can already see, whereas "the oldest was dropped" is
+        // the only signal that the cap just bit.
+        self.status = note.unwrap_or_else(|| format!("Row {} selected", row as u64 + 1));
+    }
+
+    /// Select the whole of display column `col`. Same modifier rules as
+    /// [`Self::select_row`].
+    pub fn select_column(&mut self, col: u32, mods: egui::Modifiers) {
+        let last_row = self.stats_rows.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(0, col), CellRef::new(last_row, col));
+        let note = self.apply_header_selection(band, mods, false);
+        self.status =
+            note.unwrap_or_else(|| format!("Column {} selected", ferrix_core::column_name(col)));
+    }
+
+    /// Compose a header band with the existing selection per the modifiers.
+    ///
+    /// Returns a status message the caller must PREFER over its own, when the
+    /// composition did something the user needs told about.
+    fn apply_header_selection(
+        &mut self,
+        band: Selection,
+        mods: egui::Modifiers,
+        is_row: bool,
+    ) -> Option<String> {
+        let mut note = None;
+        if mods.command {
+            // Ctrl: a DISJOINT addition. The current selection is pushed into
+            // the extra list and the new band becomes the active one, so the
+            // cursor — and therefore where typing lands — is always the band
+            // the user just clicked.
+            if self.extra_selections.len() < MAX_DISJOINT_SELECTIONS {
+                self.extra_selections.push(self.selection);
+            } else {
+                // Visible, not silent. A cap the user cannot see is a cap they
+                // experience as the feature randomly not working.
+                note = Some(format!(
+                    "Only {MAX_DISJOINT_SELECTIONS} separate selections are kept — \
+                     the oldest was dropped"
+                ));
+                self.extra_selections.remove(0);
+                self.extra_selections.push(self.selection);
+            }
+            self.selection = band;
+        } else if mods.shift {
+            // Shift: one contiguous span from the existing ANCHOR to this
+            // band. Disjoint ranges are cleared, matching what every
+            // spreadsheet does — a span replaces a scattering.
+            self.extra_selections.clear();
+            let anchor = self.selection.anchor;
+            self.selection = if is_row {
+                Selection::new(
+                    CellRef::new(anchor.row, band.anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            } else {
+                Selection::new(
+                    CellRef::new(band.anchor.row, anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            };
+        } else {
+            self.extra_selections.clear();
+            self.selection = band;
+        }
+        self.focus = Focus::Grid;
+        self.sync_formula_bar();
+        note
+    }
+
+    /// The disjoint ranges currently held, for tests and for the paint call.
+    pub fn extra_selections(&self) -> &[Selection] {
+        &self.extra_selections
+    }
+
+    /// Whether a cell is inside ANY selected range, active or disjoint.
+    pub fn cell_is_selected(&self, cell: CellRef) -> bool {
+        self.selection.contains(cell) || self.extra_selections.iter().any(|s| s.contains(cell))
+    }
+
+    /// Whether a display row is fully or partly selected, counting disjoint
+    /// ranges. This is what the row header highlight reads.
+    pub fn row_is_selected(&self, row: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.row_range();
+            row >= a && row <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Whether a display column is fully or partly selected, counting disjoint
+    /// ranges.
+    pub fn column_is_selected(&self, col: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.col_range();
+            col >= a && col <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Where each visible ROW header was painted last frame, for tests that
+    /// need to click one without guessing pixels.
+    pub fn row_header_center(&self, row: u32) -> Option<(f32, f32)> {
+        self.row_header_hitboxes
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, p)| (p.x, p.y))
     }
 
     /// Whether a load is still in flight.
@@ -7470,11 +7883,25 @@ impl FerrixApp {
             C::FormatAlignRight => self.apply_decor(
                 ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Right),
             ),
+            // Issue #36. Dispatch through `add_sparkline`, which is the same
+            // method the harness drives -- so a test asserts through the
+            // registry and the paint loop rather than around them.
+            C::FormatSparkLine => self.add_sparkline(ferrix_core::SparkKind::Line),
+            C::FormatSparkColumn => self.add_sparkline(ferrix_core::SparkKind::Column),
+            C::FormatSparkWinLoss => self.add_sparkline(ferrix_core::SparkKind::WinLoss),
+            C::FormatSparkClear => self.clear_sparklines(),
             C::FormulaTracePrecedents => self.trace_precedents(),
             C::FormulaTraceDependents => self.trace_dependents(),
             C::FormulaTraceClear => self.clear_trace(),
             C::FormulaNames => self.names_open = true,
             C::DataGoalSeek => self.goal_seek_open(),
+            // Issue #17. These go through the same selection-span methods the
+            // harness tests drive, so the menu item and the test exercise one
+            // path rather than two.
+            C::DataInsertRow => self.insert_rows_at_selection(),
+            C::DataDeleteRow => self.delete_rows_at_selection(),
+            C::DataInsertColumn => self.insert_columns_at_selection(),
+            C::DataDeleteColumn => self.delete_columns_at_selection(),
             C::DataChart => self.open_chart(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),
@@ -8591,6 +9018,7 @@ impl FerrixApp {
                     Grid {
                         view: &view,
                         selection: Some(self.selection),
+                        extra_selections: &self.extra_selections,
                         col_widths: &self.col_widths,
                         scroll: &mut self.scroll,
                         editing: self.editing,
@@ -8622,6 +9050,7 @@ impl FerrixApp {
                         col_resizing: self.col_resize,
                         show_formulas: show_formulas_now,
                         validation: (!self.wb.validation.is_empty()).then_some(&self.wb.validation),
+                        sparklines: Some(&self.wb.sparklines),
                     }
                     .show(ui)
                 };
@@ -8635,6 +9064,8 @@ impl FerrixApp {
                 // a click on it opens the list at the place it was drawn
                 // rather than at a constant that drifts when a bar opens.
                 self.dropdown_button = resp.dropdown_button;
+                self.last_sparkline_shapes = resp.sparkline_shapes;
+                self.last_sparkline_blanks = resp.sparkline_blanks;
 
                 // --- trace precedents / dependents arrows (roadmap #39) ---
                 //
@@ -8885,6 +9316,7 @@ impl FerrixApp {
                 // click one without guessing at pixels that move whenever a
                 // bar above the grid opens.
                 self.header_hitboxes = resp.header_hitboxes.clone();
+                self.row_header_hitboxes = resp.row_header_hitboxes.clone();
                 self.last_painted_rows = resp.painted_rows.clone();
                 self.last_frozen_rows = resp.frozen_row_count;
                 // The grid clamps the zoom (a band taller than the window is
@@ -8978,10 +9410,22 @@ impl FerrixApp {
                 // user sees what they grabbed. Release commits the move.
                 if let Some(c) = resp.header_press {
                     self.header_drag = Some(c);
-                    let last = self.stats_rows.saturating_sub(1) as u32;
-                    self.selection =
-                        Selection::new(CellRef::new(0, c as u32), CellRef::new(last, c as u32));
-                    self.status = format!("Column {} selected", ferrix_core::column_name(c as u32));
+                    // Plain / Ctrl / Shift all go through the SAME method the
+                    // row case uses, so the two axes cannot drift apart.
+                    let mods = ui.input(|i| i.modifiers);
+                    self.select_column(c as u32, mods);
+                }
+                // --- row header selection (issue #17) ---
+                //
+                // The mirror of the column press above. Reported on PRESS with
+                // the modifiers captured on that frame, because egui's
+                // aggregate `i.modifiers` is only correct while the frame that
+                // produced the press is still being handled.
+                if let Some((row, mods)) = resp.row_header_press {
+                    if self.editing.is_some() {
+                        self.commit_edit();
+                    }
+                    self.select_row(row, mods);
                 }
                 if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
                     if src != dst {
@@ -10101,6 +10545,57 @@ mod tests {
         assert!(
             wbp.structure_locked(),
             "workbook structure protection was stripped by export"
+        );
+    }
+
+    /// Issue #36: the EXPORT the menu item runs must carry sparklines.
+    ///
+    /// Asserts through `export_xlsx_to` -- the production path -- for exactly
+    /// the reason the protection test above gives. `sparkline_xlsx`'s own
+    /// tests would keep passing if `export_xlsx_to` never called
+    /// `.with_sparklines(..)`, and the file would come back with none.
+    /// Re-importing is what proves the bytes carry it.
+    #[test]
+    fn exporting_preserves_sparkline_groups() {
+        let mut app = FerrixApp::new(None);
+        // Four numeric source columns over two rows.
+        for r in 0..2u32 {
+            for c in 0..4u32 {
+                app.wb
+                    .commit_edit(CellRef::new(r, c), &format!("{}", r * 4 + c + 1));
+            }
+        }
+        app.set_selection_for_test(CellRef::new(0, 0), CellRef::new(1, 3));
+        // Through the REGISTRY dispatch, not `add_sparkline`.
+        app.run_command(crate::command::CommandId::FormatSparkColumn);
+        assert_eq!(app.sparkline_group_count(), 1, "status: {}", app.status);
+
+        let tmp = TempXlsx::new("spark-roundtrip");
+        app.export_xlsx_to(tmp.path());
+        assert!(
+            tmp.path().exists(),
+            "export did not write a file; status: {}",
+            app.status
+        );
+
+        let back = ferrix_io::import_sparklines(tmp.path()).expect("re-import sparklines");
+        assert_eq!(
+            back.len(),
+            1,
+            "the re-imported workbook has no sparkline group -- export stripped it"
+        );
+        assert_eq!(
+            back[0].group.kind,
+            ferrix_core::SparkKind::Column,
+            "the TYPE must survive, not just the geometry"
+        );
+        assert_eq!(
+            back[0].group.target,
+            ferrix_core::TableRange::new(0, 4, 1, 4)
+        );
+        assert_eq!(
+            (back[0].group.src_first_col, back[0].group.src_last_col),
+            (0, 3)
         );
     }
 

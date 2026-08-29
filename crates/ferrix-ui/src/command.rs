@@ -199,6 +199,23 @@ registry! {
     FormatAlignRight { "format.align_right", Some(Menu::Format), "⯈ Align right", None, false, None,
         "Align the selection's text to the right of its cells." }
 
+    // ---- Format: sparklines (issue #36) ----
+    //
+    // In the Format menu rather than Data: a sparkline is a way of DRAWING
+    // cells the user already has, not a transformation of the data. It is
+    // stored exactly like a conditional format -- one entry per range -- and
+    // is drawn by the grid's paint loop rather than by a chart object, which
+    // is why it belongs beside the other per-range formatting rather than
+    // beside "Chart...".
+    FormatSparkLine { "format.spark_line", Some(Menu::Format), "\u{2197} Sparkline: line", None, true, Some(Note::Selection),
+        "Draw a tiny line chart of each selected row in the column to its right. Painted per visible row, so it costs the same on a 200M-row sheet." }
+    FormatSparkColumn { "format.spark_column", Some(Menu::Format), "\u{2588} Sparkline: column", None, false, None,
+        "Draw a tiny bar chart of each selected row in the column to its right." }
+    FormatSparkWinLoss { "format.spark_winloss", Some(Menu::Format), "\u{00b1} Sparkline: win/loss", None, false, None,
+        "Draw one equal-height bar per value, up for positive and down for negative. Magnitude is deliberately ignored." }
+    FormatSparkClear { "format.spark_clear", Some(Menu::Format), "\u{2716} Remove sparklines", None, false, None,
+        "Remove the sparkline groups drawing inside the selection." }
+
     // ---- Data: protection (issue #42) ----
     //
     // In the Data menu rather than Format: locking a cell is a statement
@@ -221,6 +238,25 @@ registry! {
         "Clear the trace arrows." }
     FormulaNames { "formula.names", Some(Menu::Formula), "🏷 Name Manager…", None, true, None,
         "Define, edit and scope named ranges." }
+
+    // ---- Data: structural edits (issue #17) ----
+    //
+    // In the Data menu because inserting a row changes the DATA's shape, not
+    // its appearance. Each acts on the selection's span, so selecting three
+    // rows and choosing Insert Row inserts three.
+    //
+    // These are registry rows AND `run_command` arms on purpose: this repo has
+    // shipped six model-complete, unreachable features, and an engine method
+    // with no dispatch arm is exactly that shape. The harness tests drive
+    // `run_command`, so a missing arm fails a test rather than shipping.
+    DataInsertRow { "data.insert_row", Some(Menu::Data), "⬆ Insert row(s)", None, true, Some(Note::Selection),
+        "Insert blank rows above the selection. Permutes the display order only — the columnar file on disk is never rewritten." }
+    DataDeleteRow { "data.delete_row", Some(Menu::Data), "⌫ Delete row(s)", None, false, None,
+        "Delete the selected rows. Formulas referring to them become #REF! rather than silently reading a neighbour." }
+    DataInsertColumn { "data.insert_column", Some(Menu::Data), "⬅ Insert column(s)", None, false, None,
+        "Insert blank columns left of the selection. Formula references follow the shift, so =SUM(B1:B10) keeps summing the same data." }
+    DataDeleteColumn { "data.delete_column", Some(Menu::Data), "⌦ Delete column(s)", None, false, None,
+        "Delete the selected columns. Formulas referring to them become #REF! rather than silently reading a neighbour." }
 
     // ---- Data ----
     // ---- Data: validation and autocomplete (issue #41) ----

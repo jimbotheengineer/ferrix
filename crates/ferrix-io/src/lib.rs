@@ -26,6 +26,7 @@ pub mod protect_xlsx;
 pub mod safeguard;
 pub mod sizing_sidecar;
 pub mod sniff;
+pub mod sparkline_xlsx;
 pub mod table_xlsx;
 pub mod validate_xlsx;
 pub mod xlsx;
@@ -58,6 +59,10 @@ pub use sizing_sidecar::{load_sizing, save_sizing, sizing_path_for, SizeSidecarE
 pub use sniff::{
     encoding_for_label, preview_bytes, preview_path, sniff_bytes, sniff_path, Detection, Preview,
     CANDIDATE_DELIMITERS, CANDIDATE_QUOTES, ENCODING_CHOICES, PREFIX_BYTES, PREVIEW_ROWS,
+};
+pub use sparkline_xlsx::{
+    import_sparklines, sparkline_survives_xlsx, sparkline_xlsx_loss, write_sparklines,
+    ImportedSparkline, MAX_SPARKLINE_CELLS,
 };
 pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,

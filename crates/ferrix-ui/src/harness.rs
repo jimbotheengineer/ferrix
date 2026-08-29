@@ -320,6 +320,62 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    /// Drive a ROW reorder (issue #17), the mirror of `move_columns`.
+    ///
+    /// Same justification: synthesising a row-header drag in pixels would test
+    /// drag arithmetic rather than whether a reorder preserves meaning. The
+    /// row-header GESTURE is covered separately by `click_row_header`.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.app.move_rows(from, count, to);
+        self.steps(2);
+        r
+    }
+
+    /// Set the modifiers the NEXT frame reports on `RawInput.modifiers`.
+    ///
+    /// They lift after that frame, matching how the real app sees a held key.
+    /// This is the aggregate the app reads via `i.modifiers`; per-event
+    /// modifiers alone make a Ctrl+click arrive as a plain click, which is the
+    /// exact failure synthetic OS input produces.
+    pub fn set_modifiers(&mut self, modifiers: Modifiers) -> &mut Self {
+        self.pending_modifiers = modifiers;
+        self
+    }
+
+    /// Click a ROW header (issue #17), optionally with modifiers.
+    ///
+    /// Reads the row header's ACTUAL painted centre back from the app, for the
+    /// same reason `click_header` does: the row band's y depends on the scroll
+    /// offset, the zoom, per-row heights and the frozen band, so hard-coded
+    /// pixels test arithmetic rather than the gesture. Three wrong guesses at
+    /// a header y-band cost a compile-test round each in an earlier session.
+    ///
+    /// Modifiers go on `RawInput.modifiers` via `set_modifiers`, NOT per event:
+    /// the app reads `i.modifiers` from the aggregate.
+    pub fn click_row_header(&mut self, row: u32, modifiers: Modifiers) -> &mut Self {
+        self.step();
+        let (x, y) = self
+            .app
+            .row_header_center(row)
+            .unwrap_or_else(|| panic!("row {row} header is not on screen"));
+        self.pending_modifiers = modifiers;
+        self.click_at(x, y).steps(2);
+        self
+    }
+
+    /// Run a registry command by id — the REAL dispatch path (issue #17).
+    ///
+    /// Structural-edit tests go through this rather than calling the workbook
+    /// method, because the failure this repo keeps shipping is a complete
+    /// engine with no way to reach it. Driving `run_command` means a missing
+    /// `run_command` arm or a missing registry row fails a test instead of
+    /// shipping as an invisible feature.
+    pub fn run_command(&mut self, id: crate::command::CommandId) -> &mut Self {
+        self.app.run_command(id);
+        self.steps(2);
+        self
+    }
+
     // ---- clipboard interop and Paste Special (issue #30) ----
     //
     // Copy goes through the REAL Ctrl+C path, so what these tests read back is
@@ -553,6 +609,40 @@ impl Harness {
     pub fn painted_wrapped_texts(&mut self) -> usize {
         self.step();
         self.app.painted_wrapped_texts()
+    }
+
+    // ---- sparklines (issue #36) ----
+    //
+    // `painted_sparklines` reads the grid's own count of the primitives the
+    // sparkline code emitted, not the frame total. A test that asserted on
+    // `paint_shape_count()` would be asserting on the whole frame: the
+    // selection rectangle alone moves it, so it can rise while sparklines
+    // draw nothing at all.
+
+    /// Sparkline primitives the last frame actually painted.
+    pub fn painted_sparklines(&mut self) -> usize {
+        self.step();
+        self.app.painted_sparklines()
+    }
+
+    /// Cells a sparkline group covers that drew NOTHING last frame.
+    pub fn blank_sparklines(&mut self) -> usize {
+        self.step();
+        self.app.blank_sparklines()
+    }
+
+    /// Widen the single configured sparkline group down to `last_row`, keeping
+    /// its type and source columns.
+    ///
+    /// The scale test needs a group covering 200M rows, and there is no
+    /// gesture for selecting 200M rows — the app would have to materialise
+    /// them, which is the very thing the invariant forbids. So the group is
+    /// widened in the store the command writes to, and the assertion is still
+    /// on what the PAINT LOOP does with it.
+    pub fn widen_sparkline_to(&mut self, last_row: u32) -> &mut Self {
+        self.app.widen_sparkline_for_test(last_row);
+        self.steps(2);
+        self
     }
 
     /// Height the app currently paints a row at, read back from its own
@@ -7975,6 +8065,1160 @@ xxx,yyy,zzz
             h.app().paste_special_is_open(),
             "Paste Special must be reachable from the command palette, not \
              only from a test calling paste_special_open directly"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17: insert / delete row and column
+    //
+    // Every assertion below is per-cell identity at an exact coordinate, never
+    // a total. SUM is order-independent, so a sum-based assertion passes even
+    // when rows have been reordered or dropped — precisely the bug a structural
+    // edit introduces. These read the value AT a coordinate and the formula's
+    // RESULT, so a shift that loses a record fails.
+
+    /// Four rows whose values identify themselves, so a misplaced row is
+    /// obvious rather than absorbed into an aggregate.
+    fn structural_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        (p, h)
+    }
+
+    #[test]
+    fn inserting_a_row_pushes_every_later_record_down_by_one() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_row.csv");
+
+        // Baseline, per row. If this drifts the fixture changed, not the code.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "gamma");
+
+        // Insert one row at display row 1 (where "beta" is).
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        // The new row reads EMPTY — it addresses no base data at all, rather
+        // than showing whatever record used to be there.
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "",
+            "the inserted row must be blank, not a duplicate of its neighbour"
+        );
+        // Everything above is untouched, everything below moved down by one.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(4, 1)), "delta");
+        // And the qty column moved with its name — a per-axis bug would slide
+        // one column and not the other.
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "20");
+        assert_eq!(h.app().display(CellRef::new(4, 2)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_row_removes_that_record_and_no_other() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("del_row.csv");
+
+        // Delete display row 1 = "beta".
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataDeleteRow);
+
+        // "beta" is gone and "gamma" took its place. A test that only checked
+        // the row COUNT, or a SUM, would pass here even if the wrong record
+        // had been dropped.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "gamma",
+            "deleting beta's row must pull gamma up, not delta"
+        );
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "delta");
+        assert_eq!(h.app().display(CellRef::new(1, 2)), "30");
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn inserting_a_column_pushes_every_later_column_right() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_col.csv");
+
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "10");
+
+        // Insert one column at display column 1 (where "name" is).
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataInsertColumn);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "",
+            "the inserted column must read empty"
+        );
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1", "id stays put");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(0, 3)), "10");
+        // gamma's row moved the same way — a column shift must apply to every
+        // row, not just the one the cursor was on.
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(2, 3)), "30");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_column_removes_that_column_and_no_other() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("del_col.csv");
+
+        // Delete display column 1 = "name".
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "10",
+            "deleting the name column must pull qty left"
+        );
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_an_insert_shifts_it() {
+        use crate::command::CommandId;
+        // THE acceptance criterion. =SUM(C2:C5) sums the qty column; after a
+        // column is inserted to its left the qty data lives at D, and the
+        // formula must follow it. The formula's own result is the thing under
+        // test here, and it is pinned alongside the rewritten reference TEXT
+        // and a per-cell identity check.
+        let (p, mut h) = structural_fixture("ins_col_formula.csv");
+
+        // Put the formula somewhere the insert will not move it into: column E.
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(C1:C4)");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "100",
+            "baseline: 10+20+30+40"
+        );
+
+        // Insert a column at A — everything, including the qty column, shifts
+        // one to the right.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertColumn);
+
+        // The qty data is now at display column 3 (D).
+        assert_eq!(h.app().display(CellRef::new(0, 3)), "10");
+        // The formula moved to F (display column 5) and STILL reads 100. If
+        // the reference had not been rewritten it would now sum the name
+        // column and produce 0.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 5)),
+            "100",
+            "the formula must follow its data across the insert"
+        );
+        assert_eq!(
+            h.app()
+                .formula_src_at_for_test(CellRef::new(0, 5))
+                .as_deref(),
+            Some("=SUM(D1:D4)"),
+            "the reference text itself must have been rewritten"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_reading_a_deleted_column_becomes_ref_error_not_wrong_data() {
+        use crate::command::CommandId;
+        // Clamping a broken reference onto a neighbour would silently sum a
+        // DIFFERENT column and look entirely plausible. A visible #REF! is the
+        // whole point.
+        let (p, mut h) = structural_fixture("del_col_formula.csv");
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(C1:C4)");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "100");
+
+        // Delete the qty column the formula reads.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        let src = h.app().formula_src_at_for_test(CellRef::new(0, 3));
+        assert!(
+            src.as_deref().is_some_and(|s| s.contains("#REF!")),
+            "a reference to a deleted column must become #REF!, got {src:?}"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_a_row_insert() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_row_formula.csv");
+
+        // A formula in a column the insert does not move, reading a row below
+        // the insertion point.
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=C3");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "30",
+            "baseline: C3 is gamma's qty"
+        );
+
+        // Insert a row above gamma.
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        eprintln!(
+            "DBG src={:?}",
+            h.app().formula_src_at_for_test(CellRef::new(0, 4))
+        );
+        // gamma's qty is now on display row 3, i.e. C4 in A1 notation.
+        assert_eq!(h.app().display(CellRef::new(3, 2)), "30");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "30",
+            "the formula must still read gamma's qty, not the blank row"
+        );
+        assert_eq!(
+            h.app()
+                .formula_src_at_for_test(CellRef::new(0, 4))
+                .as_deref(),
+            Some("=C4"),
+            "the row reference must have been rewritten"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_edit_overlay_cell_follows_the_row_it_was_typed_into() {
+        use crate::command::CommandId;
+        // The side-table trap: routing base reads through the order while
+        // leaving the sparse overlay keyed by the pre-change coordinate slides
+        // the user's own typed value onto a different record.
+        let (p, mut h) = structural_fixture("overlay_follows.csv");
+
+        // Type a marker into gamma's row.
+        h.select(CellRef::new(2, 1), CellRef::new(2, 1));
+        h.type_text("EDITED");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "EDITED");
+
+        // Insert a row above it.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        assert_eq!(
+            h.app().display(CellRef::new(3, 1)),
+            "EDITED",
+            "the typed value must move down with its row"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(2, 1)),
+            "beta",
+            "and must NOT be left behind on the record that took its place"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_is_exactly_one_undo_step() {
+        use crate::command::CommandId;
+        // A per-cell undo entry would make undoing an insert on a wide sheet
+        // take dozens of Ctrl+Z presses.
+        let (p, mut h) = structural_fixture("one_undo.csv");
+
+        // Several overlay edits, so the insert has real work to relocate.
+        for row in 0..=2u32 {
+            h.select(CellRef::new(row, 1), CellRef::new(row, 1));
+            h.type_text("x").step();
+            h.press_key(Key::Enter).steps(2);
+        }
+        let before = h.app().undo_depth();
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        assert_eq!(
+            h.app().undo_depth(),
+            before + 1,
+            "an insert that relocated 3 overlay cells must still be ONE step"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn structural_edits_are_reachable_from_the_command_registry() {
+        use crate::command::{CommandId, REGISTRY};
+        // The wiring assertion. Six features in this repo landed model-complete
+        // and unreachable; a registry row is what makes a command discoverable
+        // from both the menu bar and the palette.
+        for id in [
+            CommandId::DataInsertRow,
+            CommandId::DataDeleteRow,
+            CommandId::DataInsertColumn,
+            CommandId::DataDeleteColumn,
+        ] {
+            let row = REGISTRY.iter().find(|c| c.id == id);
+            let row = row.unwrap_or_else(|| panic!("{id:?} has no registry row"));
+            assert!(row.menu.is_some(), "{id:?} must appear in a menu");
+            assert!(!row.hint.is_empty(), "{id:?} must explain itself");
+        }
+    }
+
+    #[test]
+    fn deleting_the_selected_span_deletes_all_of_it() {
+        use crate::command::CommandId;
+        // The span comes from the SELECTION, so selecting two rows deletes two.
+        // A hard-coded count of 1 would pass a single-row test and silently do
+        // the wrong thing here.
+        let (p, mut h) = structural_fixture("del_span.csv");
+
+        h.select(CellRef::new(0, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataDeleteRow);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "gamma",
+            "both alpha and beta must be gone"
+        );
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "delta");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_does_not_rewrite_the_file_on_disk() {
+        use crate::command::CommandId;
+        // THE .ferrix constraint: a display-order permutation must not touch
+        // the source. Asserted on the real file's bytes, not on a model of it.
+        let (p, mut h) = structural_fixture("no_rewrite.csv");
+        let before = std::fs::read(&p).expect("fixture readable");
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        let after = std::fs::read(&p).expect("fixture still readable");
+        assert_eq!(
+            before, after,
+            "insert/delete must permute the display order, never rewrite the source file"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17: row header selection, Ctrl for disjoint, Shift for a span
+    //
+    // The COLUMN case already existed. These cover the row case and the two
+    // modifiers on both axes. Every assertion reads the app's own selection
+    // state back, and the "did nothing at all" question is answered by
+    // asserting the row that must NOT be selected as well as the one that must.
+
+    #[test]
+    fn pressing_a_row_header_selects_the_whole_row() {
+        let (p, mut h) = structural_fixture("rowsel.csv");
+
+        // Baseline: only the cursor cell is selected, so a dead gesture cannot
+        // pass this test by accident.
+        assert!(
+            !h.app().row_is_selected(2),
+            "baseline: row 2 must not already be selected"
+        );
+
+        h.click_row_header(2, Modifiers::default());
+
+        let (tl, br) = h.app().selection_bounds();
+        assert_eq!(tl.row, 2, "the selection must start on the pressed row");
+        assert_eq!(br.row, 2, "and must not spill onto its neighbours");
+        assert_eq!(tl.col, 0, "a row selection starts at column 0");
+        assert_eq!(
+            br.col as usize,
+            h.app().col_count().saturating_sub(1),
+            "a row selection reaches the last column"
+        );
+        assert!(h.app().row_is_selected(2));
+        assert!(
+            !h.app().row_is_selected(1) && !h.app().row_is_selected(3),
+            "pressing one row header must not select its neighbours"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_full_row_selection_stays_two_corners_not_a_cell_list() {
+        // The scale invariant. A row of a 200M-column sheet is absurd, but the
+        // COLUMN case is real: selecting a column of a 200M-row sheet as a
+        // Vec<CellRef> would be 1.6 GB. Both are stored as bounds.
+        let (p, mut h) = structural_fixture("rowsel_bounds.csv");
+
+        h.click_row_header(1, Modifiers::default());
+        let sel = h.app().selection_bounds();
+        // Two corners fully describe it: the count is derived, not stored.
+        let cells = (u64::from(sel.1.row - sel.0.row) + 1) * (u64::from(sel.1.col - sel.0.col) + 1);
+        assert!(cells >= 3, "the row must actually span the sheet's columns");
+        assert_eq!(
+            std::mem::size_of::<ferrix_core::Selection>(),
+            16,
+            "a selection must stay two corners, whatever it covers"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ctrl_clicking_row_headers_selects_disjoint_rows_not_the_span_between() {
+        // THE point of disjoint selection. A bounding box from row 0 to row 3
+        // would also cover rows 1 and 2, which is precisely what the user did
+        // NOT ask for — and on a big sheet is the difference between two rows
+        // and fifty million.
+        let (p, mut h) = structural_fixture("rowsel_ctrl.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(3, Modifiers::COMMAND);
+
+        assert!(h.app().row_is_selected(0), "the first row stays selected");
+        assert!(
+            h.app().row_is_selected(3),
+            "the Ctrl+clicked row is selected"
+        );
+        assert!(
+            !h.app().row_is_selected(1) && !h.app().row_is_selected(2),
+            "Ctrl+click must NOT select the rows between — that is the whole \
+             difference between disjoint selection and a span"
+        );
+        assert_eq!(
+            h.app().extra_selections().len(),
+            1,
+            "the earlier row must be kept as a separate range"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn shift_clicking_a_row_header_selects_the_span() {
+        // The counterpart: Shift DOES want everything between.
+        let (p, mut h) = structural_fixture("rowsel_shift.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(3, Modifiers::SHIFT);
+
+        for row in 0..=3u32 {
+            assert!(
+                h.app().row_is_selected(row),
+                "Shift+click must select the whole span, missing row {row}"
+            );
+        }
+        assert!(
+            h.app().extra_selections().is_empty(),
+            "a span replaces any scattering rather than adding to it"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ctrl_clicking_column_headers_selects_disjoint_columns() {
+        // The same rule on the other axis, driven through the real column
+        // header gesture that already existed.
+        let (p, mut h) = structural_fixture("colsel_ctrl.csv");
+
+        h.click_header(0);
+        assert!(h.app().column_is_selected(0));
+
+        // Ctrl+click column 2, skipping column 1.
+        h.step();
+        let (x, y) = h.app().header_center(2).expect("column 2 header on screen");
+        h.set_modifiers(Modifiers::COMMAND);
+        h.click_at(x, y).steps(2);
+
+        assert!(h.app().column_is_selected(0), "the first column stays");
+        assert!(
+            h.app().column_is_selected(2),
+            "the Ctrl+clicked column joins"
+        );
+        assert!(
+            !h.app().column_is_selected(1),
+            "Ctrl+click must skip the column between"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_plain_row_header_press_replaces_a_disjoint_selection() {
+        // Without this, the scattering accumulates forever and the user has no
+        // way back to a single row except restarting.
+        let (p, mut h) = structural_fixture("rowsel_reset.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(2, Modifiers::COMMAND);
+        assert_eq!(h.app().extra_selections().len(), 1, "setup: two ranges");
+
+        h.click_row_header(3, Modifiers::default());
+        assert!(
+            h.app().extra_selections().is_empty(),
+            "a plain press must clear the disjoint ranges"
+        );
+        assert!(h.app().row_is_selected(3));
+        assert!(
+            !h.app().row_is_selected(0) && !h.app().row_is_selected(2),
+            "and must deselect what was scattered"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn disjoint_selections_are_bounded_and_the_cap_is_reported() {
+        // A cap the user cannot see is one they experience as the feature
+        // randomly not working. This asserts BOTH that the list stops growing
+        // and that the app says so.
+        let (p, mut h) = structural_fixture("rowsel_cap.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        // Far more Ctrl+clicks than the cap, cycling over the rows available.
+        for i in 0..(crate::app::MAX_DISJOINT_SELECTIONS + 20) {
+            let row = (i % 4) as u32;
+            h.click_row_header(row, Modifiers::COMMAND);
+        }
+
+        assert!(
+            h.app().extra_selections().len() <= crate::app::MAX_DISJOINT_SELECTIONS,
+            "the disjoint list must stay bounded, got {}",
+            h.app().extra_selections().len()
+        );
+        assert!(
+            h.app().status_text().contains("separate selections"),
+            "the cap must be REPORTED, not silently enforced; status was {:?}",
+            h.app().status_text()
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_header_press_selects_the_row_the_number_beside_it_names() {
+        // The single-mapping rule. Row headers show the ORIGINAL row number
+        // even under a filter, and the press is resolved from the SAME band
+        // walk that paints that number — so the two cannot disagree. A second
+        // row mapping is exactly what once painted wrong records under correct
+        // row numbers here.
+        let (p, mut h) = structural_fixture("rowsel_mapping.csv");
+
+        // Row 2 holds "gamma". Press its header and read the value back at the
+        // selected coordinate: if the press resolved through a different
+        // mapping than the paint, this reads the wrong record.
+        h.click_row_header(2, Modifiers::default());
+        let (tl, _) = h.app().selection_bounds();
+        assert_eq!(
+            h.app().display(CellRef::new(tl.row, 1)),
+            "gamma",
+            "the selected row must hold the record whose number was painted"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17 scope item 4: ROW REORDER
+    //
+    // Implemented as option (a), a row MOVE, because nothing in the path is
+    // proportional to the row count — see Workbook::move_rows for the full
+    // argument. These tests pin the two things that argument rests on: the
+    // move is correct per record, and it does no per-row work.
+
+    #[test]
+    fn moving_a_row_puts_that_record_where_it_was_dropped() {
+        let (p, mut h) = structural_fixture("move_row.csv");
+
+        // Rows are alpha, beta, gamma, delta.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "delta");
+
+        // Move alpha (row 0) to sit after gamma.
+        h.move_rows(0, 1, 3).expect("move rows");
+
+        // Per-row identity, exactly. A SUM over the qty column would be 100
+        // before and after and would pass even if a row had been dropped.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "delta");
+        // The whole record moved, not just the column the drag started in.
+        assert_eq!(h.app().display(CellRef::new(2, 0)), "1", "alpha's id");
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "10", "alpha's qty");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn moving_a_row_backwards_works_too() {
+        let (p, mut h) = structural_fixture("move_row_back.csv");
+
+        // Move delta (row 3) up to the top.
+        h.move_rows(3, 1, 0).expect("move rows");
+
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "delta");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "40", "delta's qty");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_does_not_lose_or_duplicate_any_record() {
+        // The property a SUM cannot see. Collect every name after the move and
+        // assert the SET is unchanged and nothing repeats — a move that
+        // clobbered a row would still sum to 100.
+        let (p, mut h) = structural_fixture("move_row_set.csv");
+
+        h.move_rows(1, 2, 4).expect("move rows");
+
+        let mut names: Vec<String> = (0..4)
+            .map(|r| h.app().display(CellRef::new(r, 1)))
+            .collect();
+        let mut expected = vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+        ];
+        names.sort();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "a row move must permute the records, never lose or duplicate one"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_a_row_move() {
+        // The reorder analogue of the insert case: =C1 reads alpha's qty, and
+        // after alpha is dragged down the formula must follow it.
+        let (p, mut h) = structural_fixture("move_row_formula.csv");
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=C1").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "10",
+            "baseline: C1 is alpha's qty"
+        );
+
+        // Move alpha to the end. Its qty is now on display row 3.
+        h.move_rows(0, 1, 4).expect("move rows");
+        assert_eq!(h.app().display(CellRef::new(3, 2)), "10", "alpha moved");
+
+        // The formula moved with row 0's contents. It now lives on the row
+        // that took alpha's place, and must still read alpha's qty.
+        let found = (0..4u32).find_map(|r| {
+            h.app()
+                .formula_src_at_for_test(CellRef::new(r, 4))
+                .map(|s| (r, s))
+        });
+        let (row, src) = found.expect("the formula must still exist somewhere");
+        assert_eq!(src, "=C4", "the row reference must have been rewritten");
+        assert_eq!(
+            h.app().display(CellRef::new(row, 4)),
+            "10",
+            "and must still evaluate over alpha's qty, not whatever took row 1"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_is_one_undo_step() {
+        let (p, mut h) = structural_fixture("move_row_undo.csv");
+
+        for row in 0..=2u32 {
+            h.select(CellRef::new(row, 1), CellRef::new(row, 1));
+            h.type_text("x").step();
+            h.press_key(Key::Enter).steps(2);
+        }
+        let before = h.app().undo_depth();
+
+        h.move_rows(0, 1, 3).expect("move rows");
+        assert_eq!(
+            h.app().undo_depth(),
+            before + 1,
+            "a row move that relocated 3 overlay cells must still be ONE step"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_and_its_inverse_return_the_sheet_to_where_it_started() {
+        // Self-healing. If the runs did not coalesce, every drag-and-drag-back
+        // would leave the order permanently more fragmented and the user would
+        // walk into MAX_RUNS for work they had already undone.
+        let (p, mut h) = structural_fixture("move_row_inverse.csv");
+
+        h.move_rows(0, 1, 3).expect("move");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "alpha");
+        // alpha now sits at display 2; drag it home.
+        h.move_rows(2, 1, 0).expect("move back");
+
+        for (row, name) in [(0, "alpha"), (1, "beta"), (2, "gamma"), (3, "delta")] {
+            assert_eq!(
+                h.app().display(CellRef::new(row, 1)),
+                name,
+                "row {row} did not come back"
+            );
+        }
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_composes_with_an_active_search_filter() {
+        // THE composition constraint. `RowResolver` is the single row
+        // resolution path and composes the table filter, the search filter and
+        // sort; the display ORDER sits underneath it, inside `SheetView`. If a
+        // structural edit had introduced a second row mapping, this is where it
+        // would show: wrong records under correct row numbers, which is the bug
+        // this project already hit once and which no single-feature test could
+        // see.
+        //
+        // Six rows, three containing "open". A column delete must not disturb
+        // the filter, and the rows the filter kept must still be those rows.
+        let p = write_csv(
+            "structfilter.csv",
+            "status,note,qty\nopen,a,50\nclosed,b,99\nopen,c,10\nclosed,d,1\nopen,e,30\nclosed,f,70\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        h.toggle_filter_mode();
+        h.steps(2);
+
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "precondition: filter mode shows only the three 'open' rows; \
+             status: {}",
+            h.status()
+        );
+        assert_eq!(screen_row_numbers(&h), vec![1, 3, 5]);
+
+        // Delete the middle column while the filter is live.
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(crate::command::CommandId::DataDeleteColumn);
+
+        // The filter still holds the same three records, still under their own
+        // original row numbers.
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "the filter must survive a structural edit; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            screen_row_numbers(&h),
+            vec![1, 3, 5],
+            "row numbers must still name the original rows"
+        );
+        // And the qty column pulled left into the deleted column's place, per
+        // record — the decisive check that the two mappings composed rather
+        // than each doing its own thing.
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["50", "10", "30"],
+            "each filtered row must show ITS OWN qty after the column delete"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_composes_with_an_active_search_filter() {
+        // The other half: a display-order permutation underneath a filter.
+        let p = write_csv(
+            "movefilter.csv",
+            "status,qty\nopen,50\nclosed,99\nopen,10\nclosed,1\nopen,30\nclosed,70\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Move the LAST row to the front, before any filter is on.
+        h.move_rows(5, 1, 0).expect("move rows");
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["closed", "open", "closed", "open", "closed", "open"],
+            "setup: the last row moved to the front"
+        );
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        h.toggle_filter_mode();
+        h.steps(2);
+
+        // The filter runs over the REORDERED sheet, so it must find exactly
+        // the three 'open' records and pair each with its own qty.
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "the filter must see the reordered sheet; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["50", "10", "30"],
+            "each filtered row must carry ITS OWN qty through the reorder"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================= sparklines (issue #36) =================
+    //
+    // Every assertion here reads `painted_sparklines()` — the grid's count of
+    // the primitives THIS feature emitted — and every one of them drives the
+    // production dispatch path, `run_command`, rather than `add_sparkline`
+    // directly. Both choices are deliberate:
+    //
+    // * A frame TOTAL (`paint_shape_count`) moves for a dozen unrelated
+    //   reasons. It would rise when a selection rectangle appears and fall
+    //   when a grid line leaves, so "the total went up" is not evidence that a
+    //   sparkline was drawn. The specific counter cannot move for any other
+    //   reason: it is incremented at the `painter` calls in `paint_sparkline`
+    //   and nowhere else.
+    // * Calling `add_sparkline` directly would pass with no registry row and
+    //   no dispatch arm — the "model-complete and unreachable" shape this repo
+    //   has shipped four times. `run_command` is what the menu bar and the
+    //   palette both call.
+
+    /// Four numeric columns (0..=3), an empty destination column (4), two TEXT
+    /// columns (5, 6) and a second empty destination (7).
+    ///
+    /// The destination columns exist in the file on purpose: the grid paints
+    /// columns `0..view.col_count()`, so a sparkline written one column past
+    /// the sheet's own extent would be stored and never drawn. That is a real
+    /// limitation of deriving the destination rather than asking for it, and
+    /// it is recorded here rather than papered over.
+    const SPARK_SAMPLE: &str = "q1,q2,q3,q4,spark,label,note,spark2
+                                1,5,2,9,,alpha,a,
+                                4,4,4,4,,beta,b,
+                                -3,2,-1,6,,gamma,c,
+                                10,20,15,30,,delta,d,
+";
+
+    fn spark_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(&unique(name, "csv"), SPARK_SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+        (p, h)
+    }
+
+    /// Select the four data columns of every data row — the source a user
+    /// would highlight before asking for a sparkline column.
+    fn select_spark_source(h: &mut Harness) {
+        h.select(CellRef::new(0, 0), CellRef::new(3, 3));
+        h.steps(2);
+    }
+
+    /// The headline criterion: what is PAINTED changes when a sparkline is
+    /// added.
+    ///
+    /// What would this assert if the feature did nothing at all? The baseline
+    /// is asserted to be exactly 0 and the post-command count is asserted to
+    /// be a specific non-zero number, so a dead command fails — and a command
+    /// that stored a config entry without painting fails too, which is the
+    /// specific failure the criterion names.
+    #[test]
+    fn adding_a_sparkline_changes_what_is_painted() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_painted");
+        assert_eq!(
+            h.painted_sparklines(),
+            0,
+            "baseline: no group configured, nothing painted"
+        );
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+
+        let drawn = h.painted_sparklines();
+        assert!(
+            drawn > 0,
+            "the Sparkline command must reach the PAINTER through run_command, \
+             not merely store a config entry — drew {drawn} primitives"
+        );
+        // Four rows of four values: each row is three line segments, so the
+        // count is exact rather than merely non-zero. An off-by-one in the
+        // polyline, or a row silently skipped, fails here.
+        assert_eq!(
+            drawn, 12,
+            "4 rows x (4 points -> 3 segments) = 12 line segments"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 1, "ONE entry for 4 rows");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// All three types reach the painter, and they are distinguishable.
+    ///
+    /// A line of n points is n-1 segments; a column chart is n bars. So the
+    /// counts differ by construction, and a match arm that fell through to
+    /// Line for every type would fail here rather than passing quietly.
+    #[test]
+    fn all_three_sparkline_types_are_painted_and_differ() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_types");
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+        let line = h.painted_sparklines();
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkColumn);
+        h.steps(2);
+        let column = h.painted_sparklines();
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        let winloss = h.painted_sparklines();
+
+        assert!(
+            line > 0 && column > 0 && winloss > 0,
+            "every type must paint: line={line} column={column} winloss={winloss}"
+        );
+        assert_eq!(line, 12, "4 rows x 3 segments");
+        assert_eq!(column, 16, "4 rows x 4 bars");
+        // Win/loss only drops ZEROES, and this fixture has none.
+        assert_eq!(winloss, 16, "4 rows x 4 win/loss bars");
+        assert_ne!(
+            line, column,
+            "a line and a column sparkline must not paint identically"
+        );
+        assert_eq!(
+            h.app().sparkline_group_count(),
+            1,
+            "re-applying to the same target replaces rather than stacking"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A non-numeric source draws nothing rather than erroring.
+    ///
+    /// The `label` column is text. Sparklining it must leave the cells blank
+    /// and the app alive — asserted as an exact 0 painted AND a non-zero
+    /// count of deliberately-blank cells, so "drew nothing" is distinguished
+    /// from "the group was never consulted".
+    #[test]
+    fn a_text_source_draws_nothing_rather_than_erroring() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_text");
+        // Columns 5..=6 are both TEXT, so the source is legal (two columns)
+        // and holds no numbers at all. The destination, column 7, exists.
+        h.select(CellRef::new(0, 5), CellRef::new(3, 6));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+
+        assert_eq!(h.painted_sparklines(), 0, "a text source must draw NOTHING");
+        assert_eq!(
+            h.blank_sparklines(),
+            4,
+            "but the group must still be consulted for all 4 covered rows — a \
+             zero here would mean the group was never reached, which would \
+             make the assertion above pass for the wrong reason"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Removing the group removes the picture.
+    ///
+    /// A feature that can only be turned on is half a feature, and the
+    /// baseline here is a non-zero count so "0 painted" is a real change.
+    #[test]
+    fn removing_a_sparkline_group_stops_the_painting() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_clear");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkColumn);
+        h.steps(2);
+        assert!(h.painted_sparklines() > 0, "precondition: it is drawing");
+
+        // Select the DESTINATION column the command derived.
+        h.select(CellRef::new(0, 4), CellRef::new(3, 4));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkClear);
+        h.steps(2);
+
+        assert_eq!(
+            h.painted_sparklines(),
+            0,
+            "Remove sparklines must stop the painting"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A sparkline plots the user's EDITS, not the base file.
+    ///
+    /// The picture is produced in the paint loop from `view.get`, so a typed
+    /// value changes it on the next frame with no invalidation step. This is
+    /// what a cached series object would get wrong, and the assertion is on
+    /// the painted count changing rather than on the model.
+    #[test]
+    fn an_edit_changes_the_sparkline_on_the_next_frame() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_edit");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        assert_eq!(h.painted_sparklines(), 16, "precondition: 16 bars");
+
+        // Type a zero into one source cell. Win/loss draws NOTHING for a
+        // zero, so exactly one bar must disappear.
+        h.select(CellRef::new(1, 1), CellRef::new(1, 1));
+        h.steps(2);
+        h.type_text("0").step();
+        h.press_key(Key::Enter).steps(2);
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "0",
+            "precondition: the edit committed"
+        );
+
+        assert_eq!(
+            h.painted_sparklines(),
+            15,
+            "an edited source cell must change the PICTURE on the next frame, \
+             with no cache to invalidate"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The scale invariant, asserted through the real paint path.
+    ///
+    /// A group covering 200M rows is ONE entry, and the frame paints the same
+    /// number of primitives it would for a group covering only the rows on
+    /// screen — because the paint loop only ever visits visible rows. If a
+    /// future change materialised a series per row, this test would either
+    /// blow the count up or take minutes; both are failures.
+    #[test]
+    fn a_200m_row_group_costs_one_entry_and_a_viewport_of_paint() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_scale");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+        let small = h.painted_sparklines();
+        assert!(small > 0, "precondition: the 4-row group paints");
+
+        // Widen the SAME group to 200M rows, in the store the command writes
+        // to, and paint again.
+        h.widen_sparkline_to(199_999_999);
+        h.steps(2);
+
+        assert_eq!(
+            h.app().sparkline_group_count(),
+            1,
+            "a 200M-row group is ONE entry"
+        );
+        assert_eq!(
+            h.painted_sparklines(),
+            small,
+            "a 200M-row group must paint exactly what the 4-row one did: the \
+             sheet has 4 rows of data, and cost is per VISIBLE row"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A one-column selection is refused with a sentence, not silently.
+    ///
+    /// One source value per row is a dot, which says nothing. The refusal is
+    /// asserted through the painted count AND the group count, so a command
+    /// that stored an unpaintable group would still fail.
+    #[test]
+    fn a_single_column_source_is_refused_rather_than_drawn() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_onecol");
+        h.select(CellRef::new(0, 0), CellRef::new(3, 0));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+
+        assert_eq!(h.app().sparkline_group_count(), 0, "nothing was stored");
+        assert_eq!(h.painted_sparklines(), 0, "and nothing was drawn");
+        assert!(
+            h.status().contains("at least two columns"),
+            "the refusal must say WHY, got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A sparkline follows a SORT, because it resolves rows through the one
+    /// row resolver the rest of the grid uses.
+    ///
+    /// The guide's warning about a second row mapping applies directly: a
+    /// sparkline keyed off the screen row rather than the resolved data row
+    /// would paint one row's series beside another row's numbers — plausibly,
+    /// and invisibly. The row count on screen is unchanged by a sort, so the
+    /// bar count must be too.
+    #[test]
+    fn sparklines_follow_a_sort_rather_than_the_screen_row() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_sort");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        let before = h.painted_sparklines();
+        assert!(before > 0, "precondition: it is drawing");
+
+        // Sort by the first column through a real header click.
+        h.click_header(0);
+        h.steps(2);
+
+        assert_eq!(
+            h.painted_sparklines(),
+            before,
+            "the same four rows are on screen after a sort, so the same number \
+             of bars must be drawn — a sparkline that read the screen row as a \
+             data row would address rows past the end and draw fewer"
         );
         let _ = std::fs::remove_file(&p);
     }
