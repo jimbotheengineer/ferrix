@@ -127,18 +127,17 @@ impl HiddenRows {
 
     /// Index of the span containing `row`, if any.
     fn span_of(&self, row: u32) -> Option<usize> {
-        match self.spans.binary_search_by(|&(a, b)| {
-            if row < a {
-                std::cmp::Ordering::Greater
-            } else if row > b {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }) {
-            Ok(i) => Some(i),
-            Err(_) => None,
-        }
+        self.spans
+            .binary_search_by(|&(a, b)| {
+                if row < a {
+                    std::cmp::Ordering::Greater
+                } else if row > b {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
     }
 
     pub fn is_hidden(&self, row: u32) -> bool {
