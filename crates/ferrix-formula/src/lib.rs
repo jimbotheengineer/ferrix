@@ -19,6 +19,8 @@ pub mod text;
 
 #[cfg(test)]
 mod compose_tests;
+#[cfg(test)]
+mod rewrite_compose_tests;
 
 pub use criteria::{Criterion, Pattern, Scalar};
 pub use depgraph::{DepGraph, Precedent};
