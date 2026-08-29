@@ -8,6 +8,7 @@ pub mod datetime;
 pub mod depgraph;
 pub mod eval;
 pub mod fill;
+pub mod lookup;
 pub mod names;
 pub mod parser;
 pub mod refscan;

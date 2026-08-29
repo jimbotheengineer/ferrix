@@ -474,6 +474,13 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
         // on purpose: the whole library is one module file, so it can grow
         // without touching this match again.
         name if crate::text::is_text_fn(name) => crate::text::call(name, args, src),
+        // Lookup functions live entirely in `crate::lookup`. One arm again —
+        // and note that this guard, like the three above it, must claim ONLY
+        // names no other family owns: guard arms match in order, so the first
+        // claimant silently wins and the loser's own tests never notice
+        // (they do not route through this match). `crate::compose_tests`
+        // pins the mutual exclusion.
+        name if crate::lookup::is_lookup_fn(name) => crate::lookup::call(name, args, src),
         _ => Value::Error(ErrorKind::Name),
     }
 }
