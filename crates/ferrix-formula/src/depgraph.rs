@@ -11,7 +11,7 @@
 //! expanded into ten million edges. Checking whether a changed cell affects a
 //! formula is then a rectangle containment test.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use ferrix_core::{CellRef, SheetCell, SheetId};
 
@@ -174,6 +174,100 @@ pub fn collect_precedents_scoped(
 #[inline]
 fn scoped_contains(p: &ScopedPrecedent, target: SheetCell) -> bool {
     p.0 == target.sheet && p.1.contains(target.cell)
+}
+
+/// A set of formula cells, indexed so that "which of these does this rectangle
+/// cover?" is a binary search plus a short scan.
+///
+/// Every range precedent asks that question, and the graph used to answer it by
+/// rescanning EVERY formula key in the workbook. With `F` formulas that is O(F)
+/// per range, O(F²)–O(F³) over a walk — so a workbook of thousands of
+/// `=SUM(A1:A1000000)` plus many small formulas inside those ranges turned
+/// recalculation into a CPU denial of service (issue #59). The rescans
+/// terminated, so this is a cost bug, not a hang.
+///
+/// Cost is one `CellRef` per FORMULA, per sheet — a workbook quantity, never a
+/// row one. A 200M-row sheet with 50 formulas indexes 50 entries, so the scale
+/// invariant is untouched.
+///
+/// Built on demand rather than cached in the graph: rebuilding is O(F log F),
+/// already far under the O(F²) it replaces, and a cached copy would need
+/// invalidating on every `set_formula_at` / `remove_at` / `remove_sheet` — a
+/// staleness bug that would mis-order a recalculation, which is a wrong-number
+/// bug rather than a slow one.
+#[derive(Debug, Default)]
+struct CellIndex {
+    /// sheet -> column -> that column's formula rows, ascending.
+    ///
+    /// Column-major, and the `BTreeMap` is the point: a rectangle is a column
+    /// span crossed with a row span, so the lookup walks only the columns that
+    /// BOTH the range covers and a formula actually occupies, then binary
+    /// searches the row window inside each.
+    ///
+    /// A row-major layout was tried first and is a trap — `=SUM(A1:A1000000)`
+    /// is one column but a million rows, so seeking to the row band and
+    /// scanning it touches every formula in those rows regardless of column,
+    /// which is the same O(F) rescan with extra steps.
+    by_sheet: HashMap<SheetId, BTreeMap<u32, Vec<u32>>>,
+}
+
+impl CellIndex {
+    fn build(cells: impl Iterator<Item = SheetCell>) -> Self {
+        let mut by_sheet: HashMap<SheetId, BTreeMap<u32, Vec<u32>>> = HashMap::new();
+        for sc in cells {
+            by_sheet
+                .entry(sc.sheet)
+                .or_default()
+                .entry(sc.cell.col)
+                .or_default()
+                .push(sc.cell.row);
+        }
+        for cols in by_sheet.values_mut() {
+            for rows in cols.values_mut() {
+                rows.sort_unstable();
+            }
+        }
+        Self { by_sheet }
+    }
+
+    /// Call `f` for every indexed cell that `p` covers, within `sheet`.
+    ///
+    /// The membership test is exactly the one [`Precedent::contains`] applies,
+    /// so this is a pure speed change: the same cells come back, and a range
+    /// left un-normalized (start > end) yields nothing from both, as before.
+    ///
+    /// Work is proportional to the cells actually found, plus one binary search
+    /// per occupied column inside the span. That per-column term is capped by
+    /// the sheet's column count, never by the row count — so a range a million
+    /// rows tall costs the same as a range one row tall.
+    fn for_each_in(&self, sheet: SheetId, p: &Precedent, mut f: impl FnMut(CellRef)) {
+        let Some(cols) = self.by_sheet.get(&sheet) else {
+            return;
+        };
+        match p {
+            Precedent::Cell(c) => {
+                if let Some(rows) = cols.get(&c.col) {
+                    if rows.binary_search(&c.row).is_ok() {
+                        f(*c);
+                    }
+                }
+            }
+            Precedent::Range(a, b) => {
+                if a.row > b.row || a.col > b.col {
+                    return;
+                }
+                for (&col, rows) in cols.range(a.col..=b.col) {
+                    let start = rows.partition_point(|&r| r < a.row);
+                    for &row in &rows[start..] {
+                        if row > b.row {
+                            break;
+                        }
+                        f(CellRef::new(row, col));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Formula dependency graph, keyed workbook-wide.
@@ -363,6 +457,7 @@ impl DepGraph {
     /// Does this formula reference itself, directly or transitively —
     /// including via a chain that leaves and re-enters its sheet?
     pub fn is_circular_at(&self, start: SheetCell) -> bool {
+        let index = CellIndex::build(self.precedents.keys().copied());
         let mut seen = HashSet::new();
         let mut stack = vec![start];
         let mut first = true;
@@ -390,14 +485,19 @@ impl DepGraph {
                         }
                         Precedent::Range(_, _) => {
                             // A range may cover other formula cells; check each
-                            // formula in THAT sheet for membership.
-                            for f in self.precedents.keys() {
-                                if f.sheet == *sheet && p.contains(f.cell) {
-                                    if *f == start {
-                                        return true;
-                                    }
-                                    stack.push(*f);
+                            // formula in THAT sheet for membership. Indexed, so
+                            // this touches the covered formulas instead of
+                            // rescanning every formula in the workbook (#59).
+                            let mut hit_start = false;
+                            index.for_each_in(*sheet, p, |c| {
+                                let f = SheetCell::new(*sheet, c);
+                                if f == start {
+                                    hit_start = true;
                                 }
+                                stack.push(f);
+                            });
+                            if hit_start {
+                                return true;
                             }
                         }
                     }
@@ -427,6 +527,7 @@ impl DepGraph {
         if target == from {
             return false;
         }
+        let index = CellIndex::build(self.precedents.keys().copied());
         let mut seen = HashSet::new();
         let mut stack = vec![target];
         while let Some(cur) = stack.pop() {
@@ -456,11 +557,11 @@ impl DepGraph {
                         // A range may also cover other formula cells whose
                         // OWN precedents need walking (a formula inside the
                         // summed range that itself reads `from` indirectly).
-                        for f in self.precedents.keys() {
-                            if f.sheet == *sheet && p.contains(f.cell) {
-                                stack.push(*f);
-                            }
-                        }
+                        // Indexed rather than a full rescan of every formula
+                        // key in the workbook (#59).
+                        index.for_each_in(*sheet, p, |c| {
+                            stack.push(SheetCell::new(*sheet, c));
+                        });
                     }
                 }
             }
@@ -513,10 +614,31 @@ impl DepGraph {
         let mut indegree: HashMap<SheetCell, usize> = nodes.iter().map(|n| (*n, 0)).collect();
         let mut edges: HashMap<SheetCell, Vec<SheetCell>> = HashMap::new();
 
+        // Indexed over `nodes` — the induced subgraph — not the whole graph,
+        // so an edge can only ever land on a node this sort actually owns.
+        // Replaces the O(F²) `for n in nodes { for m in nodes { ... } }` double
+        // loop that made ordering a CPU denial of service on range-heavy
+        // workbooks (#59).
+        let index = CellIndex::build(nodes.iter().copied());
+
+        // Reused across nodes so a wide range does not reallocate per formula.
+        let mut covered: HashSet<SheetCell> = HashSet::new();
         for &n in &nodes {
             if let Some(ps) = self.precedents.get(&n) {
-                for &m in &nodes {
-                    if m != n && ps.iter().any(|p| scoped_contains(p, m)) {
+                // DEDUPED, and this is load-bearing: the old double loop asked
+                // `ps.iter().any(...)`, so two precedents covering the same `m`
+                // (`=A1+SUM(A1:A9)`) produced ONE edge. Pushing one per
+                // precedent would inflate `m`'s indegree above the number of
+                // times the drain can decrement it, stranding it at non-zero —
+                // reported as a false circular reference.
+                covered.clear();
+                for (sheet, p) in ps {
+                    index.for_each_in(*sheet, p, |c| {
+                        covered.insert(SheetCell::new(*sheet, c));
+                    });
+                }
+                for &m in covered.iter() {
+                    if m != n {
                         // n reads m, so m must be evaluated first.
                         edges.entry(m).or_default().push(n);
                         *indegree.get_mut(&n).unwrap() += 1;
@@ -551,7 +673,11 @@ impl DepGraph {
         }
 
         if order.len() != nodes.len() {
-            let stuck: Vec<SheetCell> = nodes.into_iter().filter(|n| !order.contains(n)).collect();
+            // Set membership, not `order.contains(n)`: that is a linear scan
+            // inside a filter over every node, so reporting a cycle was itself
+            // O(F²) — the quadratic the rest of this function just removed.
+            let placed: HashSet<SheetCell> = order.iter().copied().collect();
+            let stuck: Vec<SheetCell> = nodes.into_iter().filter(|n| !placed.contains(n)).collect();
             return Err(stuck);
         }
         Ok(order)
@@ -1141,6 +1267,191 @@ mod tests {
         assert!(!g.is_circular_at(outside));
         assert!(!g.is_circular_at(far));
         assert!(g.full_order_all().is_ok());
+    }
+
+    // ---- containment indexing (issue #59) ----
+
+    /// Ordering a range-heavy workbook must not be quadratic in formula count.
+    ///
+    /// `topo_sort` built edges with `for n in nodes { for m in nodes { ... } }`,
+    /// and the two range walks rescanned EVERY formula key per range precedent.
+    /// A workbook of thousands of `=SUM(A1:A1000000)` — trivially craftable,
+    /// and reachable from any opened file — therefore made recalculation
+    /// ordering O(F2), a CPU denial of service on load.
+    ///
+    /// The assertion is on the GROWTH RATE, not a wall-clock budget: doubling
+    /// the formula count must not roughly quadruple the time. A machine-speed
+    /// threshold would be flaky on a loaded CI runner, but the shape of the
+    /// curve is a property of the algorithm. Measured before the index at
+    /// F=2000/4000/8000: 11ms / 38ms / 142ms — ratios of 3.4x and 3.7x,
+    /// unmistakably quadratic. After: 2.7 / 5.7 / 10.9ms, ratios 2.1x and 1.9x.
+    /// The 3.0x bar sits clearly between the two.
+    #[test]
+    fn ordering_a_range_heavy_workbook_is_not_quadratic_in_formula_count() {
+        fn order_time(f: u32) -> std::time::Duration {
+            let mut g = DepGraph::new();
+            // Each formula sums a million-row range covering the DATA column,
+            // the shape the audit called out. Column 1 holds the formulas,
+            // column 0 is the summed data, so this is a wide fan-in with no
+            // cycle, and every range walk has every formula to reject.
+            let e = parse("=SUM(A1:A1000000)").unwrap();
+            for r in 0..f {
+                g.set_formula(cr(r, 1), &e);
+            }
+            let t = std::time::Instant::now();
+            let order = g
+                .full_order_all()
+                .expect("no cycle: formulas read column A");
+            let dt = t.elapsed();
+            assert_eq!(order.len() as u32, f, "every formula must be ordered");
+            dt
+        }
+
+        // Warm caches/allocator first so the smallest sample is not inflated,
+        // which would flatter the ratio.
+        let _ = order_time(1000);
+
+        let small = order_time(4000);
+        let large = order_time(8000);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 3.0,
+            "doubling the formula count multiplied ordering time by {ratio:.1}x \
+             ({small:?} -> {large:?}); quadratic growth is ~4x, so the \
+             containment index has regressed to a linear rescan"
+        );
+    }
+
+    /// A tall, narrow range must not cost more than a short one.
+    ///
+    /// This is the trap a row-major index falls into: `=SUM(A1:A1000000)` is
+    /// one column but a million rows, so an index that seeks to the row band
+    /// and scans it still touches every formula in those rows whatever their
+    /// column — the same full rescan, just reordered. Column-major makes the
+    /// walk output-sensitive, so range HEIGHT costs nothing.
+    #[test]
+    fn a_range_a_million_rows_tall_costs_no_more_than_a_short_one() {
+        fn order_time(range: &str) -> std::time::Duration {
+            let mut g = DepGraph::new();
+            let e = parse(range).unwrap();
+            // Formulas spread down column 1, i.e. INSIDE the tall range's row
+            // span but outside its column span. A row-major index visits all
+            // of them per lookup; a column-major one visits none.
+            for r in 0..6000 {
+                g.set_formula(cr(r, 1), &e);
+            }
+            let t = std::time::Instant::now();
+            g.full_order_all().expect("no cycle");
+            t.elapsed()
+        }
+
+        let _ = order_time("=SUM(A1:A10)");
+        let short = order_time("=SUM(A1:A10)");
+        let tall = order_time("=SUM(A1:A1000000)");
+
+        let ratio = tall.as_secs_f64() / short.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 4.0,
+            "a range 100,000x taller took {ratio:.1}x as long ({short:?} -> \
+             {tall:?}); range height must not enter the cost, or the index is \
+             scanning rows instead of columns"
+        );
+    }
+
+    /// The index must not change WHICH cells are found — only how fast.
+    ///
+    /// Guards the whole refactor: the old code asked `p.contains(f.cell)`
+    /// against every formula key, so the index is only a safe substitution if
+    /// it yields exactly that set. Checked against a brute-force rescan over
+    /// shapes chosen to hit the edges — a single cell, a one-row and
+    /// one-column strip, a rectangle, a range whose corners are reversed
+    /// (never normalized, must match nothing), and one that misses entirely.
+    #[test]
+    fn the_index_finds_exactly_the_cells_a_brute_force_rescan_would() {
+        let cells: Vec<SheetCell> = (0..12u32)
+            .flat_map(|r| (0..12u32).map(move |c| sc(S1, r * 2, c * 2)))
+            .chain([sc(S2, 4, 4), sc(S2, 0, 0)])
+            .collect();
+        let index = CellIndex::build(cells.iter().copied());
+
+        let shapes = [
+            Precedent::Cell(cr(4, 4)),
+            Precedent::Cell(cr(5, 5)),
+            Precedent::Range(cr(0, 0), cr(0, 22)),
+            Precedent::Range(cr(0, 0), cr(22, 0)),
+            Precedent::Range(cr(2, 2), cr(10, 8)),
+            Precedent::Range(cr(3, 3), cr(9, 7)),
+            // Reversed corners: the shared `contains` rejects everything, and
+            // the index must agree rather than silently normalizing.
+            Precedent::Range(cr(10, 8), cr(2, 2)),
+            Precedent::Range(cr(100, 100), cr(200, 200)),
+        ];
+
+        for sheet in [S1, S2] {
+            for p in &shapes {
+                let mut got: Vec<CellRef> = Vec::new();
+                index.for_each_in(sheet, p, |c| got.push(c));
+                got.sort_by_key(|c| (c.row, c.col));
+
+                let mut want: Vec<CellRef> = cells
+                    .iter()
+                    .filter(|f| f.sheet == sheet && p.contains(f.cell))
+                    .map(|f| f.cell)
+                    .collect();
+                want.sort_by_key(|c| (c.row, c.col));
+
+                assert_eq!(
+                    got, want,
+                    "index disagrees with a brute-force rescan for {p:?}"
+                );
+            }
+        }
+    }
+
+    /// A partial recalculation must not invent a cycle out of a formula it is
+    /// not recalculating.
+    ///
+    /// `topo_sort` runs on the INDUCED SUBGRAPH — just the affected cells — so
+    /// its containment index has to be built over `nodes`, not over every
+    /// formula in the workbook. Index the whole graph instead and a range
+    /// precedent still matches formulas OUTSIDE the subgraph: the edge is
+    /// recorded and the dependent's indegree incremented, but nothing in the
+    /// drain will ever decrement it, because the node it came from is not
+    /// being sorted. The dependent never reaches indegree 0, and Kahn's
+    /// leftover check reports it as STUCK IN A CYCLE.
+    ///
+    /// So the failure is not a slow recalculation — it is a spurious circular
+    /// reference on a workbook with no cycle in it. The performance work is
+    /// what introduced the index, so the scoping it depends on gets a test
+    /// that fails loudly if it is ever widened.
+    #[test]
+    fn recalculating_a_subgraph_does_not_report_an_unrelated_formula_as_a_cycle() {
+        // A5 is a CONSTANT FORMULA sitting inside the range B1 sums. It is a
+        // node in the graph, but it reads nothing, so editing A1 does not
+        // affect it — it is in the workbook index and NOT in the subgraph,
+        // which is exactly the gap that strands B1's indegree above zero.
+        // C1 is deliberately in column 2, OUTSIDE A1:A9, so B1 does not read
+        // it back and the workbook genuinely has no cycle.
+        let g = graph(&[
+            (cr(4, 0), "=99"),
+            (cr(0, 1), "=SUM(A1:A9)"),
+            (cr(0, 2), "=B1+1"),
+        ]);
+
+        let order = g.recalc_order(cr(0, 0)).expect(
+            "a formula inside the summed range that is not itself \
+                     affected is not a cycle",
+        );
+        assert_eq!(
+            order,
+            vec![cr(0, 1), cr(0, 2)],
+            "only B1 and C1 are affected, B1 first"
+        );
+
+        // The whole-workbook sort still orders the unaffected formula too.
+        let full = g.full_order_all().expect("no cycle anywhere in this sheet");
+        assert_eq!(full.len(), 3, "all three formulas must be ordered");
     }
 
     #[test]
