@@ -320,6 +320,17 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    /// Drive a ROW reorder (issue #17), the mirror of `move_columns`.
+    ///
+    /// Same justification: synthesising a row-header drag in pixels would test
+    /// drag arithmetic rather than whether a reorder preserves meaning. The
+    /// row-header GESTURE is covered separately by `click_row_header`.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.app.move_rows(from, count, to);
+        self.steps(2);
+        r
+    }
+
     /// Set the modifiers the NEXT frame reports on `RawInput.modifiers`.
     ///
     /// They lift after that frame, matching how the real app sees a held key.
@@ -7934,6 +7945,265 @@ xxx,yyy,zzz
             h.app().display(CellRef::new(tl.row, 1)),
             "gamma",
             "the selected row must hold the record whose number was painted"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17 scope item 4: ROW REORDER
+    //
+    // Implemented as option (a), a row MOVE, because nothing in the path is
+    // proportional to the row count — see Workbook::move_rows for the full
+    // argument. These tests pin the two things that argument rests on: the
+    // move is correct per record, and it does no per-row work.
+
+    #[test]
+    fn moving_a_row_puts_that_record_where_it_was_dropped() {
+        let (p, mut h) = structural_fixture("move_row.csv");
+
+        // Rows are alpha, beta, gamma, delta.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "delta");
+
+        // Move alpha (row 0) to sit after gamma.
+        h.move_rows(0, 1, 3).expect("move rows");
+
+        // Per-row identity, exactly. A SUM over the qty column would be 100
+        // before and after and would pass even if a row had been dropped.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "delta");
+        // The whole record moved, not just the column the drag started in.
+        assert_eq!(h.app().display(CellRef::new(2, 0)), "1", "alpha's id");
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "10", "alpha's qty");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn moving_a_row_backwards_works_too() {
+        let (p, mut h) = structural_fixture("move_row_back.csv");
+
+        // Move delta (row 3) up to the top.
+        h.move_rows(3, 1, 0).expect("move rows");
+
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "delta");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "40", "delta's qty");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_does_not_lose_or_duplicate_any_record() {
+        // The property a SUM cannot see. Collect every name after the move and
+        // assert the SET is unchanged and nothing repeats — a move that
+        // clobbered a row would still sum to 100.
+        let (p, mut h) = structural_fixture("move_row_set.csv");
+
+        h.move_rows(1, 2, 4).expect("move rows");
+
+        let mut names: Vec<String> = (0..4)
+            .map(|r| h.app().display(CellRef::new(r, 1)))
+            .collect();
+        let mut expected = vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+        ];
+        names.sort();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "a row move must permute the records, never lose or duplicate one"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_a_row_move() {
+        // The reorder analogue of the insert case: =C1 reads alpha's qty, and
+        // after alpha is dragged down the formula must follow it.
+        let (p, mut h) = structural_fixture("move_row_formula.csv");
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=C1").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "10",
+            "baseline: C1 is alpha's qty"
+        );
+
+        // Move alpha to the end. Its qty is now on display row 3.
+        h.move_rows(0, 1, 4).expect("move rows");
+        assert_eq!(h.app().display(CellRef::new(3, 2)), "10", "alpha moved");
+
+        // The formula moved with row 0's contents. It now lives on the row
+        // that took alpha's place, and must still read alpha's qty.
+        let found = (0..4u32).find_map(|r| {
+            h.app()
+                .formula_src_at_for_test(CellRef::new(r, 4))
+                .map(|s| (r, s))
+        });
+        let (row, src) = found.expect("the formula must still exist somewhere");
+        assert_eq!(src, "=C4", "the row reference must have been rewritten");
+        assert_eq!(
+            h.app().display(CellRef::new(row, 4)),
+            "10",
+            "and must still evaluate over alpha's qty, not whatever took row 1"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_is_one_undo_step() {
+        let (p, mut h) = structural_fixture("move_row_undo.csv");
+
+        for row in 0..=2u32 {
+            h.select(CellRef::new(row, 1), CellRef::new(row, 1));
+            h.type_text("x").step();
+            h.press_key(Key::Enter).steps(2);
+        }
+        let before = h.app().undo_depth();
+
+        h.move_rows(0, 1, 3).expect("move rows");
+        assert_eq!(
+            h.app().undo_depth(),
+            before + 1,
+            "a row move that relocated 3 overlay cells must still be ONE step"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_and_its_inverse_return_the_sheet_to_where_it_started() {
+        // Self-healing. If the runs did not coalesce, every drag-and-drag-back
+        // would leave the order permanently more fragmented and the user would
+        // walk into MAX_RUNS for work they had already undone.
+        let (p, mut h) = structural_fixture("move_row_inverse.csv");
+
+        h.move_rows(0, 1, 3).expect("move");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "alpha");
+        // alpha now sits at display 2; drag it home.
+        h.move_rows(2, 1, 0).expect("move back");
+
+        for (row, name) in [(0, "alpha"), (1, "beta"), (2, "gamma"), (3, "delta")] {
+            assert_eq!(
+                h.app().display(CellRef::new(row, 1)),
+                name,
+                "row {row} did not come back"
+            );
+        }
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_composes_with_an_active_search_filter() {
+        // THE composition constraint. `RowResolver` is the single row
+        // resolution path and composes the table filter, the search filter and
+        // sort; the display ORDER sits underneath it, inside `SheetView`. If a
+        // structural edit had introduced a second row mapping, this is where it
+        // would show: wrong records under correct row numbers, which is the bug
+        // this project already hit once and which no single-feature test could
+        // see.
+        //
+        // Six rows, three containing "open". A column delete must not disturb
+        // the filter, and the rows the filter kept must still be those rows.
+        let p = write_csv(
+            "structfilter.csv",
+            "status,note,qty\nopen,a,50\nclosed,b,99\nopen,c,10\nclosed,d,1\nopen,e,30\nclosed,f,70\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        h.toggle_filter_mode();
+        h.steps(2);
+
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "precondition: filter mode shows only the three 'open' rows; \
+             status: {}",
+            h.status()
+        );
+        assert_eq!(screen_row_numbers(&h), vec![1, 3, 5]);
+
+        // Delete the middle column while the filter is live.
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(crate::command::CommandId::DataDeleteColumn);
+
+        // The filter still holds the same three records, still under their own
+        // original row numbers.
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "the filter must survive a structural edit; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            screen_row_numbers(&h),
+            vec![1, 3, 5],
+            "row numbers must still name the original rows"
+        );
+        // And the qty column pulled left into the deleted column's place, per
+        // record — the decisive check that the two mappings composed rather
+        // than each doing its own thing.
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["50", "10", "30"],
+            "each filtered row must show ITS OWN qty after the column delete"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_move_composes_with_an_active_search_filter() {
+        // The other half: a display-order permutation underneath a filter.
+        let p = write_csv(
+            "movefilter.csv",
+            "status,qty\nopen,50\nclosed,99\nopen,10\nclosed,1\nopen,30\nclosed,70\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Move the LAST row to the front, before any filter is on.
+        h.move_rows(5, 1, 0).expect("move rows");
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["closed", "open", "closed", "open", "closed", "open"],
+            "setup: the last row moved to the front"
+        );
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        h.toggle_filter_mode();
+        h.steps(2);
+
+        // The filter runs over the REORDERED sheet, so it must find exactly
+        // the three 'open' records and pair each with its own qty.
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "the filter must see the reordered sheet; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["50", "10", "30"],
+            "each filtered row must carry ITS OWN qty through the reorder"
         );
 
         let _ = std::fs::remove_file(&p);

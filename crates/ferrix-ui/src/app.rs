@@ -4938,6 +4938,33 @@ impl FerrixApp {
         r
     }
 
+    /// Move rows as a display-order permutation (issue #17, scope item 4).
+    ///
+    /// A row MOVE, not an arbitrary permutation: see `Workbook::move_rows` for
+    /// why that is affordable at 200M rows and what the visible limit is. A
+    /// refusal lands in the status line rather than being swallowed.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.wb.move_rows(from, count, to);
+        match &r {
+            Ok(()) => {
+                let (runs, cap) = self.wb.row_order_runs();
+                // The run count is surfaced as it approaches the cap, so the
+                // user meets the limit as a warning rather than as a refusal
+                // out of nowhere.
+                self.status = if runs * 4 > cap {
+                    format!(
+                        "Moved {count} row(s) — {runs} of {cap} reorder steps tracked; \
+                         save and reopen to start from a clean order"
+                    )
+                } else {
+                    format!("Moved {count} row(s) to row {}", to + 1)
+                };
+            }
+            Err(e) => self.status = format!("Cannot move those rows: {e}"),
+        }
+        r
+    }
+
     // ---- structural edits: insert / delete row and column (issue #17) ----
     //
     // Each takes the span from the CURRENT SELECTION, so "Insert Row" with

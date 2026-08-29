@@ -273,6 +273,62 @@ impl ferrix_formula::remap::AxisMap for AxisShiftMap {
     }
 }
 
+/// Old display position -> new, for a MOVE of a contiguous span (issue #17).
+///
+/// ## Why this is arithmetic and not a `HashMap`
+///
+/// `remap_formulas_for_order` builds an explicit old->new map by walking every
+/// display position. For columns that is fine — a sheet has tens of them. For
+/// ROWS it is the whole problem restated: moving row 5 to row 100,000,000
+/// would build a hundred million map entries, which is exactly the per-row
+/// work `AxisOrder`'s run encoding exists to avoid. Worse, it would be O(rows)
+/// even when the sheet has three edits on it.
+///
+/// A move is a closed-form permutation, so this computes it instead of storing
+/// it: **zero allocation, O(1) per lookup, independent of how far the row
+/// travelled**. Combined with the fact that the callers iterate the SPARSE
+/// stores (the overlay's edits, the comment map) rather than the axis, a row
+/// move over a 200M-row sheet costs O(edits + runs) and nothing else.
+///
+/// That is why row reorder is implemented as a real move rather than being
+/// refused or declared out of scope: with this representation there is no
+/// 800 MB permutation to avoid. The only bound left is
+/// [`ferrix_core::AxisOrder::MAX_RUNS`], which refuses with a message the UI
+/// shows — a limit the user can see rather than one they can only feel.
+struct SpanMove {
+    from: u64,
+    count: u64,
+    to: u64,
+}
+
+impl ferrix_formula::remap::AxisMap for SpanMove {
+    fn map(&self, old: u32) -> Option<u32> {
+        let r = u64::from(old);
+        let (from, count, to) = (self.from, self.count, self.to);
+        let moved = if to > from {
+            // Forward: the span lands ending at `to`, and everything it
+            // jumped over shifts back by `count`.
+            if r >= from && r < from + count {
+                to - count + (r - from)
+            } else if r >= from + count && r < to {
+                r - count
+            } else {
+                r
+            }
+        } else {
+            // Backward: the span lands at `to`, pushing what was there down.
+            if r >= from && r < from + count {
+                to + (r - from)
+            } else if r >= to && r < from {
+                r + count
+            } else {
+                r
+            }
+        };
+        u32::try_from(moved).ok()
+    }
+}
+
 pub struct Workbook {
     /// The ACTIVE sheet's immutable base. Never present in `parked`.
     ///
@@ -1758,6 +1814,166 @@ impl Workbook {
         }
 
         changes
+    }
+
+    /// Move `count` rows starting at display position `from` to display
+    /// position `to` (issue #17, scope item 4).
+    ///
+    /// ## Why a MOVE, and not a refusal or an out-of-scope note
+    ///
+    /// The issue offered three options because an arbitrary permutation over
+    /// 200M rows is 800 MB. Neither of the pessimistic options is needed here,
+    /// because nothing in this path is proportional to the row count:
+    ///
+    /// * the permutation itself is [`ferrix_core::AxisOrder`]'s run encoding —
+    ///   a move splits at most three boundaries, so it is O(runs) and the runs
+    ///   count the user's edits, never the sheet's rows;
+    /// * the old->new position map is [`SpanMove`], closed-form arithmetic
+    ///   with no allocation at all — the trap here was building a `HashMap`
+    ///   the way the column path does, which for rows IS the 800 MB;
+    /// * every store that has to follow is sparse and is iterated over ITS OWN
+    ///   entries: the overlay's edits and the comment map. O(edits).
+    ///
+    /// So the cost of dragging one row over a 200M-row sheet is the same as
+    /// over a four-row one.
+    ///
+    /// ## The limit that does exist, and is visible
+    ///
+    /// Runs accumulate: each non-adjacent move can add up to two.
+    /// [`ferrix_core::AxisOrder::MAX_RUNS`] caps that and REFUSES beyond it,
+    /// returning an error this method passes to the caller and the UI puts in
+    /// the status line — rather than accepting the move and making every
+    /// subsequent lookup quietly slower. `coalesce` gives the runs back when a
+    /// move is undone or a row is dragged home, so the cap tracks how scrambled
+    /// the sheet actually is rather than how much the user has ever done.
+    ///
+    /// ## What does NOT follow a row move
+    ///
+    /// Merged regions and range formats are RECTANGLES, and a move cannot keep
+    /// a rectangle a rectangle: display rows 2:4 can become data rows 2, 7, 3.
+    /// They are deliberately left where they are, matching the existing
+    /// `move_columns` behaviour, rather than being silently redrawn over rows
+    /// they were never applied to.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        if count == 0 || from == to {
+            return Ok(());
+        }
+        let rows = self.view().row_count().max(1) as u64;
+
+        {
+            let order = self.order.rows_mut(rows);
+            order.ensure_len(rows);
+            order
+                .move_span(from, count, to)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mover = SpanMove { from, count, to };
+        let changes = self.relocate_rows_for_move(&mover);
+
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: CellRef::new(u32::try_from(to).unwrap_or(u32::MAX), 0),
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+        });
+        self.dirty = true;
+        self.recalc_all();
+        Ok(())
+    }
+
+    /// Relocate the row-keyed sparse stores for a row move, and rewrite every
+    /// formula's row references so they follow.
+    ///
+    /// Iterates the STORES, never the axis — that is what keeps a row move on
+    /// a 200M-row sheet O(edits).
+    fn relocate_rows_for_move(&mut self, mover: &SpanMove) -> Vec<CellChange> {
+        use ferrix_formula::remap::{remap_rows, AxisMap};
+
+        // Comments ride along, by the same map and for the same reason the
+        // column path gives: a note left on the pre-move coordinate would
+        // describe whatever record slid into that row.
+        if !self.comments.is_empty() {
+            let moved: Vec<(CellRef, ferrix_core::Comment)> = self
+                .comments
+                .iter()
+                .map(|(c, cm)| (c, cm.clone()))
+                .collect();
+            let relocated: Vec<(CellRef, ferrix_core::Comment)> = moved
+                .iter()
+                .filter_map(|(cell, cm)| {
+                    mover
+                        .map(cell.row)
+                        .map(|r| (CellRef::new(r, cell.col), cm.clone()))
+                })
+                .collect();
+            // Two phases: vacate every source before writing any destination,
+            // or a rotation clobbers a cell it has not read yet.
+            for (cell, _) in &moved {
+                self.comments.remove(*cell);
+            }
+            for (cell, cm) in relocated {
+                self.comments.set(cell, cm);
+            }
+        }
+
+        let existing: Vec<(CellRef, CellInput)> = self
+            .overlay
+            .edited_cells()
+            .map(|(c, i)| (*c, i.clone()))
+            .collect();
+        let mut changes = Vec::new();
+
+        for (cell, _) in &existing {
+            if let Some(prev) = self.overlay.clear(*cell) {
+                changes.push(CellChange {
+                    cell: *cell,
+                    before: Some(prev),
+                    after: None,
+                });
+            }
+        }
+
+        for (cell, input) in existing {
+            let Some(new_row) = mover.map(cell.row) else {
+                continue;
+            };
+            let dest = CellRef::new(new_row, cell.col);
+            let moved_input = match &input {
+                CellInput::Formula { src, .. } => CellInput::Formula {
+                    src: remap_rows(src, mover),
+                    cached: Value::Empty,
+                },
+                other => other.clone(),
+            };
+            let prev = self.overlay.set(dest, moved_input.clone());
+            changes.push(CellChange {
+                cell: dest,
+                before: prev,
+                after: Some(moved_input),
+            });
+        }
+
+        let sheet = self.active_sheet();
+        let touched: Vec<CellRef> = changes.iter().map(|c| c.cell).collect();
+        for cell in touched {
+            self.resync_graph_at(SheetCell::new(sheet, cell));
+        }
+
+        changes
+    }
+
+    /// How many runs the ROW order currently needs, and the cap.
+    ///
+    /// Exposed so the UI can show how close a session is to
+    /// [`ferrix_core::AxisOrder::MAX_RUNS`] instead of surprising the user at
+    /// it — the limit is meant to be seen, not felt.
+    pub fn row_order_runs(&self) -> (usize, usize) {
+        (
+            self.order.rows.as_ref().map_or(1, |o| o.run_count()),
+            ferrix_core::AxisOrder::MAX_RUNS,
+        )
     }
 
     /// How many undo entries are stacked. Exposed so tests can assert that a

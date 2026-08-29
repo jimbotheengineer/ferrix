@@ -1103,4 +1103,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_row_move_over_200m_rows_stays_a_handful_of_runs() {
+        // Issue #17 scope item 4. A row MOVE is affordable at this size
+        // precisely because it is O(runs): this is the measurement the choice
+        // of option (a) over "refuse above a threshold" rests on.
+        let mut o = AxisOrder::identity(200_000_000);
+        let before = o.heap_bytes();
+
+        o.move_span(5, 1, 150_000_000).unwrap();
+
+        assert_eq!(o.len(), 200_000_000, "no rows lost");
+        assert!(
+            o.run_count() <= 4,
+            "one row move needed {} runs",
+            o.run_count()
+        );
+        assert!(
+            o.heap_bytes() < before + 512,
+            "a row move over 200M rows allocated {} bytes; a Vec<u32> \
+             permutation would be 800MB",
+            o.heap_bytes() - before
+        );
+        // Exact at both ends, so "cheap" has not been bought with wrongness.
+        assert_eq!(o.data_of(149_999_999), Some(5));
+        assert_eq!(o.data_of(5), Some(6));
+        assert_eq!(o.data_of(199_999_999), Some(199_999_999));
+    }
 }
