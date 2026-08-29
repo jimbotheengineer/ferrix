@@ -382,6 +382,105 @@ impl Harness {
         self
     }
 
+    // ---- sizing, hiding, grouping (issue #29) ----
+    //
+    // Each of these drives the SAME plain method the gesture handler calls, for
+    // the reason `freeze_at_cursor` gives: a test about hiding semantics should
+    // not also be a test about where a border happens to be. The gesture itself
+    // is covered separately by `resize_drag_at_border`, which does go through
+    // real pixels.
+
+    pub fn set_col_width(&mut self, col: usize, w: f32) -> &mut Self {
+        self.app.set_col_width(col, w);
+        self.steps(2);
+        self
+    }
+
+    pub fn autofit_column(&mut self, col: usize) -> &mut Self {
+        self.app.autofit_column(col);
+        self.steps(2);
+        self
+    }
+
+    pub fn hide_column(&mut self, col: usize) -> &mut Self {
+        self.app.set_col_hidden(col, true);
+        self.steps(2);
+        self
+    }
+
+    pub fn unhide_column(&mut self, col: usize) -> &mut Self {
+        self.app.set_col_hidden(col, false);
+        self.steps(2);
+        self
+    }
+
+    pub fn hide_rows(&mut self, first: u32, last: u32) -> &mut Self {
+        self.app.hide_rows(first, last);
+        self.steps(2);
+        self
+    }
+
+    pub fn unhide_rows(&mut self, first: u32, last: u32) -> &mut Self {
+        self.app.unhide_rows(first, last);
+        self.steps(2);
+        self
+    }
+
+    pub fn set_row_height(&mut self, first: u32, last: u32, h: f32) -> &mut Self {
+        self.app.set_row_height(first, last, h);
+        self.steps(2);
+        self
+    }
+
+    pub fn group_rows(&mut self, first: u32, last: u32) -> Result<u8, String> {
+        let r = self.app.group_rows(first, last).map_err(|e| e.to_string());
+        self.steps(2);
+        r
+    }
+
+    pub fn toggle_row_group(&mut self, row: u32) -> Option<bool> {
+        let r = self.app.toggle_row_group(row);
+        self.steps(2);
+        r
+    }
+
+    /// Drag a column's right border by `dx` pixels, through REAL pointer
+    /// events, to prove the gesture reaches the operation.
+    ///
+    /// The border x is read back from the app's own painted geometry rather
+    /// than computed from constants, for the same reason `click_header` does.
+    pub fn drag_col_border(&mut self, col: usize, dx: f32) -> &mut Self {
+        self.step();
+        let (cx, cy) = self
+            .app
+            .header_center(col)
+            .unwrap_or_else(|| panic!("column {col} header is not on screen"));
+        let edge = cx + self.app.col_width(col) / 2.0;
+        // Press, MOVE, then release — each as its own frame. egui resolves a
+        // click against `interact_pos`, which only updates when a pointer move
+        // is delivered, so a press with no preceding move lands nowhere.
+        self.move_to(edge, cy).step();
+        self.press().step();
+        self.move_to(edge + dx, cy).step();
+        self.release().steps(2);
+        self
+    }
+
+    /// Double-click a column's right border — the autofit gesture.
+    pub fn double_click_col_border(&mut self, col: usize) -> &mut Self {
+        self.step();
+        let (cx, cy) = self
+            .app
+            .header_center(col)
+            .unwrap_or_else(|| panic!("column {col} header is not on screen"));
+        let edge = cx + self.app.col_width(col) / 2.0;
+        self.move_to(edge, cy).step();
+        self.click_at(edge, cy);
+        self.click_at(edge, cy);
+        self.steps(2);
+        self
+    }
+
     // ---- freeze / split / zoom (roadmap #6) ----
 
     /// Freeze at the cursor. Exposed for the same reason as

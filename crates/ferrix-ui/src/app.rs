@@ -213,6 +213,8 @@ pub struct FerrixApp {
     /// Outline toggle buttons the grid painted last frame — real paint output
     /// a test can assert the gutter against.
     last_outline_buttons: usize,
+    /// Where sizing is persisted, beside the base file.
+    sizing_path: Option<PathBuf>,
     /// Where each visible column header was painted last frame. Recorded from
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
@@ -524,6 +526,7 @@ impl FerrixApp {
             hidden_cols: std::collections::BTreeSet::new(),
             sizing_dirty: false,
             last_outline_buttons: 0,
+            sizing_path: None,
             header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
             last_frozen_rows: 0,
@@ -732,6 +735,13 @@ impl FerrixApp {
                 self.panes = crate::grid::Panes::default();
                 // The load succeeded, so this file is now the open one.
                 self.source_path = self.pending_path.take();
+                // Sizing lives beside the base file (issue #29). Loaded right
+                // after the source path is known, so the first painted frame
+                // already has the user's widths, hidden spans and outline —
+                // rather than painting defaults and snapping a frame later.
+                self.sizing_path = self.source_path.as_deref().map(ferrix_io::sizing_path_for);
+                self.set_sizing(ferrix_core::sizing::SheetSizing::new());
+                self.load_sizing_sidecar();
                 // The workbook we just built has the FILE's sheet name, which
                 // is only known now — so this is where the sheet's remembered
                 // zoom is adopted. Doing it at construction would read the
@@ -1109,6 +1119,13 @@ impl FerrixApp {
         self.edits_path = None;
         self.fingerprint = None;
         self.comments_path = None;
+        // Sizing belongs to the file that is closing. Leaving it would apply
+        // the last file's widths and hidden rows to the next one — the same
+        // class of bug as writing this workbook's edits into the previous
+        // file's sidecar.
+        self.sizing_path = None;
+        self.set_sizing(ferrix_core::sizing::SheetSizing::new());
+        self.sizing_dirty = false;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -1502,6 +1519,9 @@ impl FerrixApp {
         // early when there is nothing in the overlay, and a session that only
         // added a comment must not lose it to that early return.
         let comments_written = self.save_comments();
+        // Sizing, for exactly the same reason: resizing a column leaves the
+        // overlay empty, so it must be written before any early return.
+        let sizing_written = self.save_sizing();
         let comment_count = self.wb.comments.len();
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
@@ -1514,10 +1534,13 @@ impl FerrixApp {
                     fmt_int(comment_count),
                     if comment_count == 1 { "" } else { "s" }
                 )
+            } else if sizing_written && !self.sizing.is_empty() {
+                "Saved row and column sizing".into()
             } else {
                 "No edits to save".into()
             };
-            return comments_written && comment_count > 0;
+            return (comments_written && comment_count > 0)
+                || (sizing_written && !self.sizing.is_empty());
         }
         let t = std::time::Instant::now();
         match ferrix_io::edits::save_edits(&path, &self.wb.overlay, fp) {
@@ -3054,6 +3077,46 @@ impl FerrixApp {
             return false;
         };
         ferrix_io::save_comments(&path, &self.wb.comments).is_ok()
+    }
+
+    /// Persist the sizing sidecar beside the base file (issue #29).
+    ///
+    /// Written from `save_edits` unconditionally, like comments: a session
+    /// that only resized a column has an EMPTY overlay, and the edits path
+    /// returns early on that — so gating sizing behind it would silently
+    /// discard exactly the work this feature exists to keep.
+    pub fn save_sizing(&mut self) -> bool {
+        let Some(path) = self.sizing_path.clone() else {
+            return false;
+        };
+        // An empty sizing state writes an empty sidecar rather than skipping:
+        // the user may have RESET a width back to default, and leaving the old
+        // file in place would restore a size they explicitly removed.
+        let ok = ferrix_io::save_sizing(&path, &self.sizing).is_ok();
+        if ok {
+            self.sizing_dirty = false;
+        }
+        ok
+    }
+
+    /// Load the sizing sidecar for the file that was just opened.
+    pub fn load_sizing_sidecar(&mut self) {
+        let Some(path) = self.sizing_path.clone() else {
+            return;
+        };
+        // A corrupt or unreadable sidecar leaves sizing at its defaults rather
+        // than failing the whole load: the user's DATA is fine, and refusing
+        // to open a 10GB file because a layout file is damaged would be a poor
+        // trade.
+        if let Ok(Some(s)) = ferrix_io::load_sizing(&path) {
+            self.set_sizing(s);
+            self.sizing_dirty = false;
+        }
+    }
+
+    /// Whether sizing has unsaved changes.
+    pub fn sizing_is_dirty(&self) -> bool {
+        self.sizing_dirty
     }
 
     /// Merge the current selection, or unmerge if it already covers merges.
