@@ -130,7 +130,26 @@ pub enum ParseError {
     /// name the resolver knows. This is what `#NAME?` means.
     #[error("unknown name {0:?}")]
     UnknownName(String),
+    /// The expression nests deeper than [`MAX_PARSE_DEPTH`].
+    ///
+    /// The parser is recursive descent, so nesting depth is stack depth. A
+    /// formula of 100,000 nested parentheses is a dozen kilobytes of text and
+    /// would otherwise overflow the stack — which on a release build with
+    /// `panic = "unwind"` is still an abort, taking the user's unsaved edits
+    /// with it. A refusal is not a degradation here; it is the only outcome
+    /// that keeps the process alive.
+    #[error("formula nests {0} levels deep, over the {MAX_PARSE_DEPTH} limit")]
+    TooDeep(usize),
 }
+
+/// Deepest expression nesting the parser will build.
+///
+/// Excel's own limit is 64 levels of nested functions; this is set far above
+/// anything a human writes so that no real formula is refused, while staying
+/// two orders of magnitude below the depth that would exhaust the default
+/// 8 MB main-thread stack (each level costs on the order of a hundred bytes
+/// of frame across `parse_expr`/`parse_prefix`).
+pub const MAX_PARSE_DEPTH: usize = 256;
 
 /// Render a sheet name as it must appear inside a formula.
 ///
@@ -475,6 +494,7 @@ pub fn parse_with_names(
     let mut p = Parser {
         tokens,
         pos: 0,
+        depth: 0,
         resolve,
     };
     let expr = p.parse_expr(0)?;
@@ -487,6 +507,13 @@ pub fn parse_with_names(
 struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current recursion depth, bounded by [`MAX_PARSE_DEPTH`].
+    ///
+    /// Tracked on the struct rather than passed as an argument so that every
+    /// mutually recursive entry point shares one counter — `parse_expr` and
+    /// `parse_prefix` call each other, and two independent counters would
+    /// each stay under the limit while the stack went twice as deep.
+    depth: usize,
     /// Name table lookup. [`parse`] passes one that knows nothing, so a
     /// workbook with no names behaves exactly as it did before names existed.
     resolve: &'a dyn Fn(&str) -> Option<Expr>,
@@ -514,7 +541,22 @@ impl Parser<'_> {
     }
 
     /// Pratt loop: parse a prefix, then absorb operators of >= min_prec.
+    ///
+    /// Depth is counted HERE, around the whole recursive step, and restored
+    /// on the way out — including on the error path, so a refusal deep in one
+    /// argument does not leave the counter poisoned for its siblings.
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::TooDeep(MAX_PARSE_DEPTH + 1));
+        }
+        let out = self.parse_expr_inner(min_prec);
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let op = match self.peek() {
