@@ -697,23 +697,44 @@ impl Parser<'_> {
 
     fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix()?;
-        loop {
+        // Operators this loop absorbs into a single left-nested chain. Each one
+        // adds a level to the AST WITHOUT recursing, so `parse_expr`'s descent
+        // guard never sees it. We therefore charge each absorbed operator
+        // against the same depth budget and refund the whole run on the way
+        // out — otherwise a flat chain like `=1+1+1+...+1` builds an
+        // arbitrarily deep AST at recursion depth ~2, and a later unguarded
+        // recursive walk (eval_view, or depgraph's collect_precedents on
+        // workbook LOAD) overflows the stack and ABORTS the process, taking
+        // unsaved edits with it. Refuse it here, at parse time, before any
+        // such AST can escape the parser.
+        let mut absorbed = 0usize;
+        let result = loop {
             let op = match self.peek() {
                 Some(Token::Op(op)) => *op,
                 Some(Token::Plus) => BinOp::Add,
                 Some(Token::Minus) => BinOp::Sub,
-                _ => break,
+                _ => break Ok(lhs),
             };
             let prec = op.precedence();
             if prec < min_prec {
-                break;
+                break Ok(lhs);
             }
             self.pos += 1;
+            self.depth += 1;
+            absorbed += 1;
+            if self.depth > MAX_PARSE_DEPTH {
+                break Err(ParseError::TooDeep(MAX_PARSE_DEPTH + 1));
+            }
             let next_min = if op.right_assoc() { prec } else { prec + 1 };
-            let rhs = self.parse_expr(next_min)?;
-            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
-        }
-        Ok(lhs)
+            match self.parse_expr(next_min) {
+                Ok(rhs) => lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs)),
+                Err(e) => break Err(e),
+            }
+        };
+        // Refund the whole absorbed run, on success and on error alike, so a
+        // sibling expression starts from the same depth this one did.
+        self.depth -= absorbed;
+        result
     }
 
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
@@ -967,6 +988,57 @@ mod tests {
         assert!(
             parse(&formula).is_ok(),
             "100 siblings at depth 50 must parse; depth is per-path, not cumulative"
+        );
+    }
+
+    #[test]
+    fn a_flat_operator_chain_is_capped_like_nested_depth() {
+        // A left-associative operator chain (`=1+1+1+...`) is absorbed by
+        // parse_expr_inner's LOOP, not by recursion, so the descent-only depth
+        // guard used to miss it entirely: a ~200k-term chain parsed fine and
+        // then overflowed the stack in eval_view (and in depgraph's precedent
+        // walk on workbook LOAD) — an uncatchable process abort that takes
+        // unsaved edits down with it. The loop now charges each absorbed
+        // operator against MAX_PARSE_DEPTH, so the chain is refused at parse
+        // time before any pathological AST can escape.
+        let chain = format!("={}", vec!["1"; MAX_PARSE_DEPTH + 50].join("+"));
+        assert!(
+            matches!(parse(&chain), Err(ParseError::TooDeep(_))),
+            "a flat + chain past the depth limit must be refused, not left to \
+             overflow the eval/depgraph stack"
+        );
+
+        // The deepest still-allowed chain must build an AST whose left-nesting
+        // stays within the cap, so a downstream recursive walk cannot overflow.
+        let ok_chain = format!("={}", vec!["1"; MAX_PARSE_DEPTH - 2].join("+"));
+        let e = parse(&ok_chain).expect("a chain under the limit must parse");
+        let mut d = 0usize;
+        let mut cur = &e;
+        while let Expr::Binary(_, l, _) = cur {
+            d += 1;
+            cur = l;
+        }
+        assert!(
+            d < MAX_PARSE_DEPTH,
+            "the allowed AST's left-nesting ({d}) must stay under the cap"
+        );
+    }
+
+    #[test]
+    fn a_realistic_length_sum_chain_still_parses() {
+        // The control for the cap above: a chain a human might plausibly write
+        // (adding a couple dozen cells) must NOT be refused. Excel-style flat
+        // sums of this length are ordinary; only pathological lengths attack.
+        let realistic = format!(
+            "={}",
+            (1..=30)
+                .map(|i| format!("A{i}"))
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+        assert!(
+            parse(&realistic).is_ok(),
+            "a 30-term additive chain is an ordinary formula and must parse"
         );
     }
 
