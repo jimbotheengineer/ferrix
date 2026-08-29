@@ -22,6 +22,7 @@ pub mod merge;
 pub mod numfmt;
 pub mod order;
 pub mod overlay;
+pub mod protect;
 pub mod scene;
 pub mod search;
 pub mod selection;
@@ -43,6 +44,10 @@ pub use format::{
 };
 pub use order::{AxisOrder, OrderError, SheetOrder};
 pub use overlay::{CellInput, EditOverlay, OverlayChange};
+pub use protect::{
+    Action as ProtectAction, Allowances, CellLockState, Denied, LockMap, PasswordHash,
+    SheetProtection, StructureOp, WorkbookProtection,
+};
 pub use search::{
     replace_stream, IdSet, LookIn, Query, ReplaceOutcome, ReplaceReport, ReplaceSpec, SearchResults,
 };
