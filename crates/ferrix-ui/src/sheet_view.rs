@@ -138,9 +138,17 @@ impl<'a> SheetView<'a> {
         Self {
             base,
             overlay,
-            // Carrying an identity order would pay the mapping cost for
-            // nothing; drop it here so every read below stays on the fast path.
-            order: (!order.is_identity()).then_some(order),
+            // An untouched sheet has NEITHER axis materialised, and carrying
+            // an absent order would pay a mapping cost for nothing — so that
+            // case drops it and every read below stays on the fast path.
+            //
+            // A materialised-but-identity-shaped axis is NOT dropped. After a
+            // row removal at the END of the sheet the surviving runs are
+            // `[Run { data: 0, len: n }]`, which `is_identity` correctly
+            // reports as an identity MAPPING while the axis's LENGTH is the
+            // only remaining record that the sheet got shorter. Dropping it
+            // here would resurrect the removed rows in `row_count`.
+            order: (order.rows.is_some() || order.cols.is_some()).then_some(order),
         }
     }
 
@@ -235,7 +243,17 @@ impl<'a> SheetView<'a> {
     /// Rows, accounting for edits that extend past the base.
     #[inline]
     pub fn row_count(&self) -> usize {
-        self.base.row_count().max(self.overlay.extent().0)
+        // A ROW permutation defines how many display positions exist, which
+        // is not the same as how many data rows the base holds: removing
+        // rows (issue #34) drops display positions without erasing a byte of
+        // base data. Reading the base's count here instead would leave the
+        // removed rows addressable at the bottom of the sheet, painting as
+        // blanks under row numbers that no longer mean anything.
+        let displayed = match self.order.and_then(|o| o.rows.as_ref()) {
+            Some(a) => a.len() as usize,
+            None => self.base.row_count(),
+        };
+        displayed.max(self.overlay.extent().0)
     }
 
     #[inline]
@@ -615,6 +633,16 @@ impl ferrix_core::CellKeys for SheetView<'_> {
             Value::Text(id) => SortCell::Text(self.resolve(id)),
             Value::Error(e) => SortCell::Error(e.as_str()),
         }
+    }
+}
+
+/// Deduplication reads the SAME composite view the grid paints, so a row an
+/// edit made unique is unique to the dedupe too (issue #34). Streaming: one
+/// cell per key column per row, nothing retained.
+impl ferrix_core::DupeKeys for SheetView<'_> {
+    #[inline]
+    fn key_value(&self, row: u32, col: u32) -> Value {
+        self.get(CellRef::new(row, col))
     }
 }
 

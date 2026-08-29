@@ -30,6 +30,7 @@
 
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
 use ferrix_core::sizing::{HiddenRows, Outline};
+use ferrix_core::subtotal::{SubtotalCell, SubtotalPlan};
 use ferrix_core::{column_name, CellRef, RowFilter, Selection, SortOrder, Value};
 
 use std::collections::BTreeSet;
@@ -277,6 +278,16 @@ pub enum ScreenRow {
     /// extends the sheet through the overlay's own extent — but it holds no
     /// data, is in no filter's mapping, and carries no table decoration.
     Pad(u32),
+    /// A SYNTHETIC subtotal row (issue #34). Not a row of the sheet at all:
+    /// it is drawn from the group aggregates the plan already computed, it
+    /// holds no cell, and it is in no mapping below this stage. The payload
+    /// is the group index.
+    ///
+    /// `row()` reports the last DATA row of the group, so a caller that only
+    /// wants "roughly where am I" — scroll anchoring, the selection's row
+    /// range — gets a sane answer, while anything that must distinguish the
+    /// two matches on the variant.
+    Subtotal { group: usize, last_row: u32 },
 }
 
 impl ScreenRow {
@@ -284,12 +295,22 @@ impl ScreenRow {
     pub fn row(self) -> u32 {
         match self {
             ScreenRow::Data(r) | ScreenRow::Pad(r) => r,
+            ScreenRow::Subtotal { last_row, .. } => last_row,
         }
     }
 
     #[inline]
     pub fn is_pad(self) -> bool {
         matches!(self, ScreenRow::Pad(_))
+    }
+
+    /// True for a synthetic subtotal row. Callers that write, edit or export
+    /// must check this: a subtotal row is not a cell the user can type into,
+    /// and treating it as one would write into whatever row the mappings
+    /// below happen to resolve.
+    #[inline]
+    pub fn is_subtotal(self) -> bool {
+        matches!(self, ScreenRow::Subtotal { .. })
     }
 }
 
@@ -338,6 +359,20 @@ pub struct RowResolver<'a> {
     /// [`HiddenRows`] and `FerrixApp::hidden_index`, which projects underlying
     /// spans into view space when a sort or filter is also active.
     pub hidden: Option<&'a HiddenRows>,
+    /// Subtotal rows inserted at each change of a grouped column's value
+    /// (issue #34).
+    ///
+    /// A STAGE OF THIS RESOLVER, exactly like `hidden`, and for the same
+    /// reason: a second mapping consulted alongside this one would let a
+    /// caller pair a subtotal test with a row number from a different
+    /// transform, which is how this repo once painted wrong records under
+    /// correct row numbers.
+    ///
+    /// It sits ABOVE the sort/filter mappings — its input is a VISIBLE
+    /// position, not a data row — so sort and filter keep working untouched
+    /// underneath it, and dropping this field restores the exact original
+    /// view.
+    pub subtotals: Option<&'a SubtotalPlan>,
 }
 
 impl<'a> RowResolver<'a> {
@@ -347,11 +382,44 @@ impl<'a> RowResolver<'a> {
         if let Some(row) = self.pad.and_then(|p| p.data_row(r)) {
             return Some(ScreenRow::Pad(row));
         }
-        // Hiding is applied FIRST among the real transforms: it turns "the Nth
-        // row on screen" into "the Nth row that is not hidden", which is the
-        // index the filter and sort mappings are built over. Applying it after
-        // them would test a hidden row against an already-mapped index and
-        // skip the wrong record.
+        // Subtotals are applied FIRST among the real transforms, because they
+        // ADD screen rows: "the Nth row on screen" has to lose the synthetic
+        // rows before it means anything to the mappings below, exactly as
+        // hiding has to remove the hidden ones. A subtotal row short-circuits
+        // — it is in no mapping below this point, and feeding its index to
+        // one would alias onto an unrelated record.
+        let r = match self.subtotals {
+            Some(p) if !p.is_empty() => match p.resolve(r)? {
+                ferrix_core::SubRow::Data(v) => v,
+                ferrix_core::SubRow::Subtotal(g) => {
+                    // The group's last DATA row, resolved through the rest of
+                    // the stack so `row()` names a real record even under a
+                    // sort. One call, on the same path everything else uses.
+                    let last_row = p
+                        .groups()
+                        .get(g)
+                        .and_then(|grp| self.resolve_below(grp.last))
+                        .unwrap_or(0);
+                    return Some(ScreenRow::Subtotal { group: g, last_row });
+                }
+            },
+            _ => r,
+        };
+        self.resolve_below(r).map(ScreenRow::Data)
+    }
+
+    /// The stages below subtotals: hiding, then the filter/sort mappings.
+    ///
+    /// Split out so the subtotal stage can ask "what data row is visible
+    /// position N" through the SAME code the data path uses, rather than
+    /// re-deriving it.
+    #[inline]
+    fn resolve_below(&self, r: usize) -> Option<u32> {
+        // Hiding is applied FIRST among the mapping transforms: it turns "the
+        // Nth row on screen" into "the Nth row that is not hidden", which is
+        // the index the filter and sort mappings are built over. Applying it
+        // after them would test a hidden row against an already-mapped index
+        // and skip the wrong record.
         let r = match self.hidden {
             Some(h) if !h.is_empty() => h.nth_visible(r),
             _ => r,
@@ -360,7 +428,7 @@ impl<'a> RowResolver<'a> {
         // they kept, so its values are underlying rows and asking a filter
         // again would map an already-mapped index a second time.
         if let Some(s) = self.sort {
-            return s.underlying(r).map(ScreenRow::Data);
+            return s.underlying(r);
         }
         match self.filter {
             // Search filter active: it already indexes data rows.
@@ -371,7 +439,6 @@ impl<'a> RowResolver<'a> {
                 None => Some(r as u32),
             },
         }
-        .map(ScreenRow::Data)
     }
 
     /// Underlying row -> screen row, or `None` when the view hides it.
@@ -384,9 +451,9 @@ impl<'a> RowResolver<'a> {
             return Some(v);
         }
         // Mirror of `resolve`, in reverse order: undo the mappings first, then
-        // undo the hiding. A hidden row has no screen position at all, which
-        // is what stops the in-cell editor drawing over the row that took its
-        // place.
+        // undo the hiding, then re-add the subtotal rows. A hidden row has no
+        // screen position at all, which is what stops the in-cell editor
+        // drawing over the row that took its place.
         let pre_hide = if let Some(s) = self.sort {
             s.visible_of(row)?
         } else {
@@ -395,9 +462,13 @@ impl<'a> RowResolver<'a> {
                 None => row as usize,
             }
         };
-        match self.hidden {
-            Some(h) if !h.is_empty() => h.visible_index(pre_hide as u32),
-            _ => Some(pre_hide),
+        let pre_sub = match self.hidden {
+            Some(h) if !h.is_empty() => h.visible_index(pre_hide as u32)?,
+            _ => pre_hide,
+        };
+        match self.subtotals {
+            Some(p) if !p.is_empty() => p.screen_of(pre_sub),
+            _ => Some(pre_sub),
         }
     }
 
@@ -417,9 +488,14 @@ impl<'a> RowResolver<'a> {
         // Hidden rows shorten the view, so the scrollable extent — and with it
         // where the empty-row padding starts — has to shrink by the same
         // amount. Otherwise the last screen rows resolve past the end.
-        match self.hidden {
+        let visible = match self.hidden {
             Some(h) if !h.is_empty() => h.visible_count(mapped),
             _ => mapped,
+        };
+        // Subtotals LENGTHEN it, by one synthetic row per group.
+        match self.subtotals {
+            Some(p) if !p.is_empty() => visible + p.groups().len(),
+            _ => visible,
         }
     }
 }
@@ -577,6 +653,15 @@ pub struct GridResponse {
     /// can assert the gutter actually drew a control rather than trusting the
     /// model.
     pub outline_buttons: usize,
+    /// SUBTOTAL rows painted this frame, and the aggregate texts drawn on
+    /// them (issue #34).
+    ///
+    /// Real paint output, counted where they are drawn. `paint_text_count()`
+    /// cannot answer "did the subtotal actually render" — it moves whenever
+    /// any cell does — so these are counted separately and a test can assert
+    /// that removing the grouping takes them back to zero.
+    pub subtotal_rows: usize,
+    pub subtotal_texts: usize,
     /// Border EDGES drawn this frame (issue #28).
     ///
     /// Real paint output, counted at the point of drawing, and counted once
@@ -687,6 +772,10 @@ pub struct Grid<'a> {
     /// it permutes which underlying row each screen row shows and never moves
     /// a byte of data. Composed after the filters through [`RowResolver`].
     pub sort: Option<&'a ferrix_core::SortOrder>,
+    /// Active subtotal grouping (issue #34). A VIEW TRANSFORM in exactly the
+    /// shape `sort` is: nothing is inserted into the sheet, and it composes
+    /// through [`RowResolver`] rather than beside it.
+    pub subtotals: Option<&'a SubtotalPlan>,
     /// Zoom-scaled lengths. Everything the grid draws is sized from this, so
     /// zoom is one multiply at the layout level rather than a special case in
     /// every paint call.
@@ -1056,6 +1145,7 @@ impl<'a> Grid<'a> {
             table: self.table,
             pad: None,
             hidden: self.hidden_rows,
+            subtotals: self.subtotals,
         };
         let filtered_rows = unpadded.resolved_rows(data_rows);
         // Empty padding (issue #20) extends only the scrollable EXTENT. It is
@@ -1492,6 +1582,10 @@ impl<'a> Grid<'a> {
         // into the body and vice versa.
         let painter = ui.painter_at(grid_rect);
         painter.rect_filled(grid_rect, 0.0, th.bg);
+        // Subtotal paint counters (issue #34), incremented where the rows are
+        // actually drawn so they cannot claim a row that never rendered.
+        let mut subtotal_rows_painted = 0usize;
+        let mut subtotal_texts = 0usize;
         let band_clip = Rect::from_min_max(
             grid_rect.min,
             egui::pos2(grid_rect.max.x, grid_rect.min.y + band_h.max(0.0)),
@@ -1526,6 +1620,50 @@ impl<'a> Grid<'a> {
             } else {
                 Rect::from_min_max(egui::pos2(grid_rect.min.x, body_rect.min.y), grid_rect.max)
             };
+            // A SUBTOTAL row (issue #34) is synthetic: it holds no cell, so
+            // it is drawn from the plan's already-computed group aggregates
+            // and then skips the whole cell loop below. Reading `view.get()`
+            // at `row` here would paint the group's last record a second
+            // time under a row number that names no record at all.
+            if let (ScreenRow::Subtotal { group, .. }, Some(plan)) = (resolved, self.subtotals) {
+                let sp = painter.with_clip_rect(row_clip);
+                sp.rect_filled(row_rect, 0.0, th.accent_soft);
+                for &(c, x) in col_bands.iter() {
+                    let w = width_of(c);
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let Some(cell) = plan.cell(group, c as u32) else {
+                        continue;
+                    };
+                    let cr = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, row_h));
+                    let (text, align, at) = match cell {
+                        SubtotalCell::Label(s) => (
+                            s,
+                            Align2::LEFT_CENTER,
+                            egui::pos2(cr.min.x + 4.0, cr.center().y),
+                        ),
+                        SubtotalCell::Number(n) => (
+                            ferrix_core::format_number(n),
+                            Align2::RIGHT_CENTER,
+                            egui::pos2(cr.max.x - 4.0, cr.center().y),
+                        ),
+                        // A group with nothing numeric shows nothing, not 0 —
+                        // the same honesty rule `Agg::value` enforces.
+                        SubtotalCell::Blank => continue,
+                    };
+                    sp.text(
+                        at,
+                        align,
+                        text,
+                        FontId::proportional(11.5 * m.zoom),
+                        th.text,
+                    );
+                    subtotal_texts += 1;
+                }
+                subtotal_rows_painted += 1;
+                continue;
+            }
             let rp = painter.with_clip_rect(row_clip);
             if is_pad {
                 // Padding gets its own recessed fill and no zebra stripe, so
@@ -2341,8 +2479,16 @@ impl<'a> Grid<'a> {
             // Padding rows are hit-testable — that is the whole point of the
             // toggle: clicking one selects it so the user can type there, and
             // the resulting edit extends the sheet through the overlay.
-            let row = resolve_row(r)?.row();
-            Some(CellRef::new(row, c as u32))
+            let resolved = resolve_row(r)?;
+            // A SUBTOTAL row is not a cell (issue #34). Selecting it would put
+            // the cursor on the group's last record while the user is looking
+            // at a totals row, and typing would then edit that record — data
+            // changed under a row the user never aimed at. So the click lands
+            // nowhere, which is what a synthetic row deserves.
+            if resolved.is_subtotal() {
+                return None;
+            }
+            Some(CellRef::new(resolved.row(), c as u32))
         };
         if primary_clicked {
             clicked = pointer_pos.and_then(hit);
@@ -2699,6 +2845,32 @@ impl<'a> Grid<'a> {
             let row = resolved.row();
             // Recorded from the SAME walk that paints the row number, so the
             // reported "what is on screen" cannot disagree with what is.
+            // A SUBTOTAL row is skipped (issue #34): it is not a row of the
+            // sheet, so recording it here would make `painted_rows` — which
+            // tests and the cell editor read as "these records are on screen"
+            // — claim the group's last record twice.
+            if resolved.is_subtotal() {
+                if bi < body_row_start {
+                    frozen_row_count += 1;
+                }
+                // The gutter shows the group marker instead of a row number,
+                // because there IS no row number: naming the group's last
+                // record here would point the user at a record that is also
+                // drawn on its own line just above.
+                let rect = Rect::from_min_size(
+                    egui::pos2(outer.min.x, y),
+                    Vec2::new(m.row_header_w, row_h),
+                );
+                rhp.rect_filled(rect, 0.0, th.accent_soft);
+                rhp.text(
+                    egui::pos2(rect.max.x - 8.0 * m.zoom, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    "\u{2211}",
+                    FontId::proportional(11.5 * m.zoom),
+                    th.accent,
+                );
+                continue;
+            }
             painted_rows.push((r, row));
             if bi < body_row_start {
                 frozen_row_count += 1;
@@ -2854,6 +3026,8 @@ impl<'a> Grid<'a> {
             row_header_hitboxes,
             outline_toggle,
             outline_buttons,
+            subtotal_rows: subtotal_rows_painted,
+            subtotal_texts,
             border_segments,
             rotated_texts,
             wrapped_texts,

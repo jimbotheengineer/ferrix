@@ -278,6 +278,18 @@ registry! {
     DataChart { "data.chart", Some(Menu::Data), "📈 Chart…", None, false, None,
         "Chart the selected range." }
 
+    // ---- Data: issue #34 ----
+    //
+    // These are the user-facing half. Six features in this codebase landed
+    // model-complete and unreachable because the model was finished and the
+    // registry row was not, so the rows go in with the model.
+    DataRemoveDuplicates { "data.remove_duplicates", Some(Menu::Data), "🧹 Remove Duplicates", None, true, Some(Note::Selection),
+        "Drop rows whose selected columns repeat, keeping the FIRST of each. Streams a set of KEYS, never a copy of the data, and the whole run is one undo step." }
+    DataSubtotals { "data.subtotals", Some(Menu::Data), "Σ Subtotals — group by cursor column", None, false, None,
+        "Insert a subtotal at each change of value in the cursor's column. A VIEW only — no rows are inserted, sort and filter keep working, and running it again restores the original view exactly." }
+    DataConsolidate { "data.consolidate", Some(Menu::Data), "⊞ Consolidate sheets…", None, false, None,
+        "Aggregate the selected labelled range from every sheet by row and column key. Keys missing from a sheet are REPORTED, never silently zeroed." }
+
     // ---- View ----
     ViewFreezeRows { "view.freeze_rows", Some(Menu::View), "❄ Freeze rows above cursor", None, false, None,
         "Rows above the cursor stay put while the rest scrolls." }
@@ -374,6 +386,16 @@ impl Command {
             DataClearCircles if !st.has_circles => {
                 Some("No validation circles are drawn".to_string())
             }
+            // Nothing to group and nothing to dedupe on an empty sheet, and a
+            // consolidation of one sheet is a copy. Said out loud rather than
+            // hidden: a user who searches "consolidate" and finds nothing
+            // concludes the feature does not exist.
+            DataRemoveDuplicates | DataSubtotals if st.rows == 0 => {
+                Some("This sheet has no rows".to_string())
+            }
+            DataConsolidate if st.sheets < 2 => {
+                Some("Consolidate needs at least two sheets — this workbook has one".to_string())
+            }
             ViewUnfreeze if !st.frozen => Some("Nothing is frozen or split".to_string()),
             EditUndo if !st.can_undo => Some("Nothing to undo".to_string()),
             EditRedo if !st.can_redo => Some("Nothing to redo".to_string()),
@@ -429,6 +451,11 @@ pub struct CommandState {
     pub editing: bool,
     pub zoom: f32,
     pub selection_label: String,
+    /// Rows on the active sheet, and sheets in the workbook. Both are small
+    /// scalars the menu bar already has to hand, and both answer a
+    /// "why is this grey" question for issue #34's commands.
+    pub rows: usize,
+    pub sheets: usize,
 }
 
 /// Commands belonging to one menu, in registry order.
