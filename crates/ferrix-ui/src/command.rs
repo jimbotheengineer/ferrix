@@ -178,6 +178,19 @@ registry! {
     FormatMerge { "format.merge", Some(Menu::Format), "⬓ Merge / unmerge", None, true, None,
         "Merge the selection, or unmerge it if it is already merged." }
 
+    // ---- Data: protection (issue #42) ----
+    //
+    // In the Data menu rather than Format: locking a cell is a statement
+    // about who may change the data, not about how it looks.
+    DataLockCells { "data.lock_cells", Some(Menu::Data), "🔒 Lock cells", None, true, Some(Note::Selection),
+        "Mark the selection locked. Cells are locked by DEFAULT — the flag only bites once the sheet is protected." }
+    DataUnlockCells { "data.unlock_cells", Some(Menu::Data), "🔓 Unlock cells", None, false, None,
+        "Mark the selection editable even while the sheet is protected. This is how you leave input cells open on a protected form." }
+    DataProtectSheet { "data.protect_sheet", Some(Menu::Data), "🛡 Protect Sheet…", None, false, None,
+        "Refuse edits to locked cells, with granular allowances. Deters accidents; it is not encryption and does not resist anyone determined." }
+    DataProtectWorkbook { "data.protect_workbook", Some(Menu::Data), "🛡 Protect Workbook Structure…", None, false, None,
+        "Prevent sheets being added, deleted, renamed or reordered. Deters accidents; it is not encryption." }
+
     // ---- Formula ----
     FormulaTracePrecedents { "formula.trace_precedents", Some(Menu::Formula), "↖ Trace Precedents", Some("Ctrl+["), false, None,
         "Draw arrows from what this cell reads. Press again to walk one level further out." }

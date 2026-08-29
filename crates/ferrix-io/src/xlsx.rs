@@ -234,6 +234,16 @@ pub enum XlsxError {
     #[error("cannot write defined name {name:?}: {detail}")]
     DefinedName { name: String, detail: String },
 
+    /// Writing the `<workbookProtection>` element failed (issue #42).
+    ///
+    /// Its own variant because that element is injected into the package
+    /// AFTER `rust_xlsxwriter` has written it — see
+    /// [`crate::protect_xlsx::inject_workbook_protection`] — so a failure
+    /// there means "the file on disk may be missing its structure lock",
+    /// which is a different thing from a normal write failure.
+    #[error("writing workbook protection to {path}: {detail}")]
+    WorkbookProtection { path: String, detail: String },
+
     /// The file was refused, or failed mid-read, by the resource safeguards.
     ///
     /// Kept as its own variant rather than flattened into
@@ -662,6 +672,11 @@ pub struct SheetExport<'a> {
     /// Cell comments, written as legacy Excel notes — see
     /// [`crate::table_xlsx::write_comments`] for exactly what Excel shows.
     pub comments: Option<&'a ferrix_core::CommentMap>,
+    /// Sheet protection, written as `<sheetProtection>` plus one
+    /// `<protectedRange>` per unlocked rectangle (issue #42). See
+    /// [`crate::protect_xlsx`] — and read its "this is not security" note
+    /// before assuming this does anything an attacker would notice.
+    pub protection: Option<&'a ferrix_core::SheetProtection>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -673,6 +688,7 @@ impl<'a> SheetExport<'a> {
             tables: &[],
             merges: None,
             comments: None,
+            protection: None,
         }
     }
 
@@ -695,6 +711,14 @@ impl<'a> SheetExport<'a> {
 
     pub fn with_tables(mut self, tables: &'a [ferrix_core::Table]) -> Self {
         self.tables = tables;
+        self
+    }
+
+    /// Attach sheet protection. Writes `<sheetProtection>` and, for every
+    /// unlocked range, a `<protectedRange>` — Excel's "Allow Users to Edit
+    /// Ranges" list.
+    pub fn with_protection(mut self, prot: &'a ferrix_core::SheetProtection) -> Self {
+        self.protection = Some(prot);
         self
     }
 }
@@ -740,6 +764,21 @@ pub fn export_workbook_with_names(
     sheets: &[SheetExport],
     names: &NameTable,
 ) -> Result<(), XlsxError> {
+    export_workbook_full(path, sheets, names, &ferrix_core::WorkbookProtection::new())
+}
+
+/// [`export_workbook_with_names`] plus workbook-structure protection.
+///
+/// `rust_xlsxwriter` has no writer for `<workbookProtection>` at all, so that
+/// one element is injected into `xl/workbook.xml` after the package is
+/// written, by rewriting the zip entry in place. Everything else still goes
+/// through the library.
+pub fn export_workbook_full(
+    path: impl AsRef<Path>,
+    sheets: &[SheetExport],
+    names: &NameTable,
+    wb_protection: &ferrix_core::WorkbookProtection,
+) -> Result<(), XlsxError> {
     if sheets.is_empty() {
         return Err(XlsxError::NoSheets);
     }
@@ -774,6 +813,11 @@ pub fn export_workbook_with_names(
         let ws = if s.tables.is_empty()
             && s.merges.is_none_or(|m| m.is_empty())
             && s.comments.is_none_or(|c| c.is_empty())
+            // Protection also needs the buffering writer: `<protectedRange>`
+            // is emitted from a list the worksheet accumulates, and the
+            // constant-memory writer has already flushed its header by the
+            // time the ranges are known.
+            && s.protection.is_none()
         {
             wb.add_worksheet_with_constant_memory()
         } else {
@@ -790,9 +834,15 @@ pub fn export_workbook_with_names(
         if let Some(c) = s.comments {
             crate::table_xlsx::write_comments(ws, c).map_err(write_err)?;
         }
+        if let Some(p) = s.protection {
+            crate::protect_xlsx::write_protection(ws, p).map_err(write_err)?;
+        }
     }
     write_defined_names(&mut wb, names)?;
     wb.save(path).map_err(write_err)?;
+    if wb_protection.is_active() {
+        crate::protect_xlsx::inject_workbook_protection(path, wb_protection)?;
+    }
     Ok(())
 }
 

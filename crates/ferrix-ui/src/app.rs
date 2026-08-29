@@ -67,6 +67,11 @@ struct Loaded {
     /// Defined names read from the source. Only xlsx carries any; CSV yields
     /// an empty table, which costs nothing.
     names: ferrix_formula::NameTable,
+    /// Sheet protection read from the source, by workbook-order sheet index
+    /// (issue #42). Empty for CSV and for any xlsx that has none.
+    protection: Vec<(usize, ferrix_core::SheetProtection)>,
+    /// Workbook-structure protection read from the source.
+    wb_protection: ferrix_core::WorkbookProtection,
 }
 
 type LoadResult = Result<Loaded, String>;
@@ -395,6 +400,8 @@ pub struct FerrixApp {
     /// `None` is the common case and costs nothing: no dialog, no solver, and
     /// the paint path never looks at it.
     goal_seek: Option<GoalSeekState>,
+    /// The Protect Sheet / Protect Workbook dialog (issue #42), when open.
+    protect_dialog: Option<crate::protect_panel::ProtectDialog>,
 
     /// The command palette (issue #40).
     ///
@@ -575,6 +582,7 @@ impl FerrixApp {
             cond: None,
             cond_warning: None,
             goal_seek: None,
+            protect_dialog: None,
             // Recency is restored before the first frame, so the palette's
             // ranking is right the first time it is opened rather than after
             // the first command of the session.
@@ -682,6 +690,20 @@ impl FerrixApp {
                 // Workbook and would otherwise discard them.
                 let restored_comments = loaded_comments.len();
                 self.wb.comments = loaded_comments;
+                // Protection read from the file, for the same reason (issue
+                // #42). Only the ACTIVE sheet's is adopted, matching how
+                // comments and merges are handled; the workbook-structure
+                // flags are global and always apply. Honouring the flags we
+                // find is the whole point of the issue — an imported
+                // protected sheet must not silently become editable.
+                self.wb.adopt_protection(
+                    loaded
+                        .protection
+                        .iter()
+                        .find(|(i, _)| *i == 0)
+                        .map(|(_, p)| p.clone()),
+                    loaded.wb_protection,
+                );
                 if let Some(w) = loaded.edit_warning {
                     self.status = format!("Saved edits not applied — {w}");
                 } else if let Some(n) = restored_count {
@@ -792,7 +814,12 @@ impl FerrixApp {
         let report = self.wb.commit_edit(cell, &raw);
         self.focus = Focus::Grid;
 
-        self.status = if let Some(err) = &report.parse_error {
+        self.status = if let Some(denied) = &report.denied {
+            // Issue #42: a refused edit MUST say why. Doing nothing silently
+            // is the failure mode the acceptance criterion names, and it is
+            // indistinguishable from a broken keyboard.
+            format!("{} not changed — {denied}", cell.to_a1())
+        } else if let Some(err) = &report.parse_error {
             format!("{}: {err}", cell.to_a1())
         } else if report.circular {
             format!("{}: circular reference", cell.to_a1())
@@ -3156,6 +3183,15 @@ impl FerrixApp {
     /// depend on the row count. A single cell stays a cell override, which is
     /// what makes the common case cheap to look up while painting.
     pub fn apply_typography(&mut self, f: impl Fn(&mut ferrix_core::format::Typography)) {
+        // Issue #42: "format cells" is a granular allowance.
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::FormatCells)
+        {
+            self.status = format!("Formatting refused — {d}");
+            return;
+        }
         let (a, b) = self.selection.bounds();
         let single = a == b;
 
@@ -3416,6 +3452,235 @@ impl FerrixApp {
     /// Close the dialog, KEEPING whatever the run applied.
     pub fn goal_seek_close(&mut self) {
         self.goal_seek = None;
+    }
+
+    // ---- protection (issue #42) ----
+    //
+    // Every one of these is the SAME entry point the menu and the palette
+    // reach through `run_command`, so a test that drives them drives the
+    // production path rather than a parallel one.
+
+    /// Mark the selection locked (the default state).
+    pub fn lock_selection(&mut self) {
+        let (tl, br) = self.selection.bounds();
+        let range = ferrix_core::TableRange::new(tl.row, tl.col, br.row, br.col);
+        self.wb.protection_mut().lock_range(range);
+        let enforced = self.wb.protection().is_enabled();
+        self.status = if enforced {
+            format!(
+                "{} locked — this sheet is protected, so edits there are refused",
+                range.to_a1()
+            )
+        } else {
+            format!(
+                "{} locked — but this sheet is not protected yet, so the lock does nothing. \
+                 Data ▸ Protect Sheet to make it bite.",
+                range.to_a1()
+            )
+        };
+    }
+
+    /// Mark the selection unlocked (editable while protected).
+    pub fn unlock_selection(&mut self) {
+        let (tl, br) = self.selection.bounds();
+        let range = ferrix_core::TableRange::new(tl.row, tl.col, br.row, br.col);
+        self.wb.protection_mut().unlock_range(range);
+        self.status = format!(
+            "{} unlocked — editable even while the sheet is protected",
+            range.to_a1()
+        );
+    }
+
+    /// Open the Protect Sheet dialog — or, if the sheet is already protected,
+    /// the Unprotect one.
+    pub fn protect_sheet_open(&mut self) {
+        use crate::protect_panel::{ProtectDialog, ProtectTarget};
+        self.protect_dialog = Some(if self.wb.protection().is_enabled() {
+            ProtectDialog::unprotect(ProtectTarget::Sheet)
+        } else {
+            ProtectDialog::for_sheet(*self.wb.protection().allow())
+        });
+    }
+
+    pub fn protect_workbook_open(&mut self) {
+        use crate::protect_panel::{ProtectDialog, ProtectTarget};
+        self.protect_dialog = Some(if self.wb.workbook_protection().structure_locked() {
+            ProtectDialog::unprotect(ProtectTarget::Workbook)
+        } else {
+            ProtectDialog::for_workbook()
+        });
+    }
+
+    pub fn protect_dialog_is_open(&self) -> bool {
+        self.protect_dialog.is_some()
+    }
+
+    pub fn protect_dialog_state(&self) -> Option<&crate::protect_panel::ProtectDialog> {
+        self.protect_dialog.as_ref()
+    }
+
+    pub fn protect_dialog_state_mut(&mut self) -> Option<&mut crate::protect_panel::ProtectDialog> {
+        self.protect_dialog.as_mut()
+    }
+
+    pub fn protect_dialog_close(&mut self) {
+        self.protect_dialog = None;
+    }
+
+    /// Apply the dialog — the same call its Apply button makes.
+    ///
+    /// Returns false and leaves the dialog open when an unprotect was refused,
+    /// so a wrong password does not silently close the window.
+    pub fn protect_dialog_apply(&mut self) -> bool {
+        use crate::protect_panel::ProtectTarget;
+        let Some(d) = self.protect_dialog.take() else {
+            return false;
+        };
+        match (d.target, d.unprotecting) {
+            (ProtectTarget::Sheet, false) => {
+                let hash = d.hash();
+                self.wb.protection_mut().protect(d.allow, hash);
+                self.status = format!(
+                    "Sheet protected — {}",
+                    crate::protect_panel::DETERRENT_SHORT
+                );
+                true
+            }
+            (ProtectTarget::Sheet, true) => {
+                let expected = self.wb.protection().hash();
+                if !d.unlock_matches(expected) {
+                    let mut d = d;
+                    d.message = Some(
+                        "That password does not match the one stored in this file. \
+                         (A 16-bit hash cannot really check a password — Ferrix asks \
+                         because Excel does.)"
+                            .to_string(),
+                    );
+                    self.protect_dialog = Some(d);
+                    return false;
+                }
+                self.wb.protection_mut().unprotect();
+                self.status = "Sheet unprotected — every cell is editable again".to_string();
+                true
+            }
+            (ProtectTarget::Workbook, false) => {
+                let hash = d.hash();
+                self.wb.workbook_protection_mut().protect_structure(hash);
+                self.status = format!(
+                    "Workbook structure protected — sheets cannot be added, deleted, renamed \
+                     or reordered. {}",
+                    crate::protect_panel::DETERRENT_SHORT
+                );
+                true
+            }
+            (ProtectTarget::Workbook, true) => {
+                let expected = self.wb.workbook_protection().hash();
+                if !d.unlock_matches(expected) {
+                    let mut d = d;
+                    d.message = Some("That password does not match.".to_string());
+                    self.protect_dialog = Some(d);
+                    return false;
+                }
+                self.wb.workbook_protection_mut().unprotect();
+                self.status = "Workbook structure unprotected".to_string();
+                true
+            }
+        }
+    }
+
+    /// What the status bar says about the cell under the cursor.
+    ///
+    /// Surfacing the "locked but not yet protected" state is an explicit
+    /// acceptance criterion — it is the thing that trips people up.
+    pub fn cursor_lock_note(&self) -> &'static str {
+        let cell = self.wb.merges.resolve(self.selection.cursor);
+        self.wb.protection().state_of(cell).explain()
+    }
+
+    /// Draw the Protect dialog. Kept beside the other windows in this file.
+    fn show_protect_dialog(&mut self, ctx: &egui::Context) {
+        use crate::protect_panel::DETERRENT_NOTICE;
+        let Some(mut d) = self.protect_dialog.take() else {
+            return;
+        };
+        let th = self.theme;
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+
+        egui::Window::new(d.title())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                // THE NOTICE. First thing in the window, in full, always.
+                ui.label(RichText::new(DETERRENT_NOTICE).color(th.error).size(12.0));
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                if d.unprotecting {
+                    ui.label("Password (if the file has one):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.password)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                } else {
+                    ui.label(RichText::new(
+                        "Cells are LOCKED by default. Only the ranges you explicitly \
+                         unlock (Data ▸ Unlock cells) stay editable once this is on.",
+                    ));
+                    ui.add_space(6.0);
+                    ui.label("Password to unprotect (optional):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.password)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                    if d.target == crate::protect_panel::ProtectTarget::Sheet {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Allow users of this sheet to:").strong());
+                        for (label, flag) in d.allowance_rows() {
+                            ui.checkbox(flag, label);
+                        }
+                    } else {
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Sheets cannot be added, deleted, renamed or reordered while this \
+                             is on.",
+                        );
+                    }
+                }
+
+                if let Some(msg) = &d.message {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(msg).color(th.error));
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let label = if d.unprotecting {
+                        "Unprotect"
+                    } else {
+                        "Protect"
+                    };
+                    if ui.button(label).clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        self.protect_dialog = Some(d);
+        if cancel || !open {
+            self.protect_dialog = None;
+        } else if apply {
+            self.protect_dialog_apply();
+        }
     }
 
     /// The format the grid should paint with THIS FRAME.
@@ -3740,6 +4005,16 @@ impl FerrixApp {
         else {
             return;
         };
+        self.export_xlsx_to(&path);
+    }
+
+    /// The body of the xlsx export, with the file picker factored out.
+    ///
+    /// Split so a test can drive the REAL export the menu item runs. Testing
+    /// `ferrix_io::export_workbook_full` directly would pass even if this
+    /// method called a variant that silently dropped protection — which is
+    /// exactly the bug this split exists to catch (issue #42).
+    pub fn export_xlsx_to(&mut self, path: &std::path::Path) {
         // Only the in-RAM path can be handed to the writer; a mapped base has
         // no `Sheet` to give it.
         let BaseData::Memory(sheet) = &*self.wb.base else {
@@ -3748,12 +4023,20 @@ impl FerrixApp {
                     .into();
             return;
         };
-        self.status = match ferrix_io::export_workbook_with_names(
-            &path,
+        // Protection must survive the round trip (issue #42): a workbook
+        // opened with a protected sheet and re-exported must still be
+        // protected, including a password hash we only ever saw as a hash.
+        // `export_workbook_full` is the variant that writes
+        // `<sheetProtection>` and injects `<workbookProtection>`; the
+        // plain `_with_names` call this used to make silently stripped both.
+        self.status = match ferrix_io::export_workbook_full(
+            path,
             &[ferrix_io::SheetExport::new("Sheet1", sheet)
                 .with_formulas(&self.wb.overlay)
-                .with_tables(&self.tables)],
+                .with_tables(&self.tables)
+                .with_protection(self.wb.protection())],
             &self.wb.names,
+            self.wb.workbook_protection(),
         ) {
             Ok(()) => format!(
                 "Exported {} table(s), {} name(s) → {}",
@@ -4482,7 +4765,11 @@ impl FerrixApp {
             None => {}
         }
         if let Some((id, to)) = reorder {
-            let _ = self.wb.reorder_sheet(id, to);
+            // A drag that lands nowhere must say why (issue #42): a tab that
+            // silently springs back reads as a broken drag, not as a refusal.
+            if let Err(e) = self.wb.reorder_sheet(id, to) {
+                self.status = format!("Reorder refused — {e}");
+            }
         }
         if let Some(id) = switch_to {
             self.switch_sheet(id);
@@ -4589,6 +4876,17 @@ impl FerrixApp {
     /// dirty the workbook and must not push an undo entry. The user undoes a
     /// sort by clicking the header again.
     pub fn sort_by_column(&mut self, col: usize, additive: bool) {
+        // Issue #42: sorting is one of the granular allowances. Sorting a
+        // protected sheet reorders every row under the author's locked cells,
+        // so it is gated even though it moves no data of its own.
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::Sort)
+        {
+            self.status = format!("Sort refused — {d}");
+            return;
+        }
         // An open edit belongs to a row whose screen position is about to
         // change underneath it; commit rather than let it land elsewhere.
         if self.editing.is_some() {
@@ -5424,6 +5722,10 @@ impl FerrixApp {
             C::FormulaNames => self.names_open = true,
             C::DataGoalSeek => self.goal_seek_open(),
             C::DataChart => self.open_chart(),
+            C::DataLockCells => self.lock_selection(),
+            C::DataUnlockCells => self.unlock_selection(),
+            C::DataProtectSheet => self.protect_sheet_open(),
+            C::DataProtectWorkbook => self.protect_workbook_open(),
             C::ViewFreezeRows => self.freeze_at_cursor(true, false),
             C::ViewFreezeCols => self.freeze_at_cursor(false, true),
             C::ViewFreezeBoth => self.freeze_at_cursor(true, true),
@@ -5969,6 +6271,9 @@ impl FerrixApp {
 
         // --- Goal Seek (issue #35) ---
         self.show_goal_seek(ctx);
+
+        // --- Protect Sheet / Workbook (issue #42) ---
+        self.show_protect_dialog(ctx);
 
         // --- search bar ---
         if self.search_open {
@@ -6935,6 +7240,10 @@ where
             sheet_name: stem,
             extra_sheets: Vec::new(),
             first_formulas: None,
+            // A delimited file carries no protection: the concept exists only
+            // in the xlsx package (issue #42).
+            protection: Vec::new(),
+            wb_protection: ferrix_core::WorkbookProtection::default(),
             edits_path: restored_edits.path,
             fingerprint: restored_edits.fingerprint,
             comments_path: restored_edits.comments_path,
@@ -7000,6 +7309,9 @@ where
         sheet_name: stem,
         extra_sheets: Vec::new(),
         first_formulas: None,
+        // As above: no protection concept in a delimited source.
+        protection: Vec::new(),
+        wb_protection: ferrix_core::WorkbookProtection::default(),
         edits_path: restored_edits.path,
         fingerprint: restored_edits.fingerprint,
         comments_path: restored_edits.comments_path,
@@ -7071,6 +7383,10 @@ where
             sheet_name: stem,
             extra_sheets: Vec::new(),
             first_formulas: None,
+            // Parquet/Arrow carry no protection: it is an xlsx package
+            // concept (issue #42).
+            protection: Vec::new(),
+            wb_protection: ferrix_core::WorkbookProtection::default(),
             edits_path: restored.path,
             fingerprint: restored.fingerprint,
             comments_path: restored.comments_path,
@@ -7111,6 +7427,9 @@ where
         base: BaseData::Memory(sheet),
         sheet_name: stem,
         extra_sheets: Vec::new(),
+        // As above: no protection concept in Parquet/Arrow.
+        protection: Vec::new(),
+        wb_protection: ferrix_core::WorkbookProtection::default(),
         first_formulas: None,
         edits_path: restored.path,
         fingerprint: restored.fingerprint,
@@ -7137,6 +7456,16 @@ fn load_xlsx(path: &Path) -> LoadResult {
     // the per-sheet import never opens. A file with no names yields an empty
     // table rather than an error.
     let names = ferrix_io::import_defined_names(path).unwrap_or_default();
+    // Protection lives in each sheet's own `<sheetProtection>` element and in
+    // xl/workbook.xml's `<workbookProtection>` — neither of which the cell
+    // import opens (issue #42). A file with none yields empty/default rather
+    // than an error, so unprotected workbooks are unaffected.
+    let protection: Vec<(usize, ferrix_core::SheetProtection)> = ferrix_io::import_protection(path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.sheet_index, p.protection))
+        .collect();
+    let wb_protection = ferrix_io::import_workbook_protection(path).unwrap_or_default();
     // Comments live in xl/comments*.xml, which neither calamine nor the
     // per-sheet import opens. Only the FIRST sheet's are adopted, because the
     // workbook holds one comment map for the ACTIVE sheet — the same
@@ -7194,6 +7523,8 @@ fn load_xlsx(path: &Path) -> LoadResult {
         sheet_name: first.name,
         extra_sheets,
         first_formulas: Some(first.formulas),
+        protection,
+        wb_protection,
         // Sidecar edits are a CSV/mmap concept: an xlsx carries its own
         // formulas, and pairing a sidecar with a re-saved workbook would be a
         // silent mismatch waiting to happen.
@@ -7452,6 +7783,57 @@ mod tests {
     /// A temp .xlsx that deletes itself, so a failed assert cannot leave a
     /// stray file behind for the next run to trip over.
     struct TempXlsx(PathBuf);
+
+    /// Issue #42: the EXPORT the menu item runs must preserve protection.
+    ///
+    /// Asserts through `export_xlsx_to` — the production path — rather than
+    /// through `ferrix_io::export_workbook_full`. That distinction is the
+    /// whole point: the io layer's own tests passed for the entire time this
+    /// method was calling `export_workbook_with_names`, which writes no
+    /// `<sheetProtection>` at all, so a protected workbook silently exported
+    /// unprotected. Re-importing is what proves the bytes carry it.
+    #[test]
+    fn exporting_preserves_sheet_and_workbook_protection() {
+        let mut app = FerrixApp::new(None);
+        app.wb.commit_edit(CellRef::new(0, 0), "1");
+
+        let secret = ferrix_core::PasswordHash::of("hunter2");
+        app.wb
+            .protection_mut()
+            .protect(ferrix_core::Allowances::default(), secret);
+        app.wb.workbook_protection_mut().protect_structure(secret);
+
+        let tmp = TempXlsx::new("protect-roundtrip");
+        app.export_xlsx_to(tmp.path());
+        assert!(
+            tmp.path().exists(),
+            "export did not write a file; status: {}",
+            app.status
+        );
+
+        let sheets = ferrix_io::import_protection(tmp.path()).expect("re-import protection");
+        let sp = sheets
+            .iter()
+            .find(|p| p.sheet_index == 0)
+            .map(|p| &p.protection)
+            .expect("the exported sheet must carry a <sheetProtection> element");
+        assert!(
+            sp.is_enabled(),
+            "the re-imported sheet is unprotected — export stripped it"
+        );
+        assert_eq!(
+            sp.hash(),
+            secret,
+            "the password hash must survive the round trip"
+        );
+
+        let wbp =
+            ferrix_io::import_workbook_protection(tmp.path()).expect("re-import wb protection");
+        assert!(
+            wbp.structure_locked(),
+            "workbook structure protection was stripped by export"
+        );
+    }
 
     impl TempXlsx {
         fn new(tag: &str) -> Self {

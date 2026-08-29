@@ -21,6 +21,7 @@ pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
 pub mod pool;
+pub mod protect_xlsx;
 pub mod safeguard;
 pub mod table_xlsx;
 pub mod xlsx;
@@ -40,6 +41,10 @@ pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
+pub use protect_xlsx::{
+    import_protection, import_protection_guarded, import_workbook_protection,
+    inject_workbook_protection, write_protection, ImportedProtection,
+};
 pub use safeguard::{
     inspect_archive, open_checked, safe_entry_path, safe_extract_path, ArchiveReport, Limits,
     SafeguardError,
@@ -48,9 +53,10 @@ pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
 };
 pub use xlsx::{
-    export_workbook, export_workbook_with_names, export_xlsx, export_xlsx_with_formulas,
-    export_xlsx_with_tables, import_defined_names, import_xlsx, import_xlsx_full, ImportStats,
-    ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS, XLSX_MAX_ROWS,
+    export_workbook, export_workbook_full, export_workbook_with_names, export_xlsx,
+    export_xlsx_with_formulas, export_xlsx_with_tables, import_defined_names, import_xlsx,
+    import_xlsx_full, ImportStats, ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS,
+    XLSX_MAX_ROWS,
 };
 
 /// Files at or above this size are converted and memory-mapped rather than

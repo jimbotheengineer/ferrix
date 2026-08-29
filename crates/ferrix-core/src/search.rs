@@ -479,12 +479,23 @@ pub struct ReplaceReport {
     pub examined: usize,
     pub outcome: ReplaceOutcome,
     pub millis: u128,
+    /// Matches left untouched because the cell is protected (issue #42).
+    ///
+    /// Reported rather than swallowed: a Replace All that quietly skipped a
+    /// locked column would leave the user believing every match had been
+    /// rewritten.
+    pub protected_skipped: usize,
 }
 
 impl ReplaceReport {
     pub fn describe(&self) -> String {
         let cells = if self.applied == 1 { "cell" } else { "cells" };
-        match self.outcome {
+        let skipped = match self.protected_skipped {
+            0 => String::new(),
+            1 => " · 1 match skipped: protected cell".to_string(),
+            n => format!(" · {n} matches skipped: protected cells"),
+        };
+        let body = match self.outcome {
             ReplaceOutcome::Completed => {
                 format!("Replaced {} {} in {} ms", self.applied, cells, self.millis)
             }
@@ -496,7 +507,8 @@ impl ReplaceReport {
                 "Replaced {} {} — stopped at the memory budget; run again for the rest",
                 self.applied, cells
             ),
-        }
+        };
+        format!("{body}{skipped}")
     }
 }
 
@@ -567,6 +579,9 @@ where
         examined,
         outcome,
         millis: t.elapsed().as_millis(),
+        // This generic driver knows nothing about protection; the workbook's
+        // own `replace_all` is where the sheet's lock state is reachable.
+        protected_skipped: 0,
     }
 }
 
