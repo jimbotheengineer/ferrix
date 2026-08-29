@@ -1570,10 +1570,16 @@ impl<'a> Grid<'a> {
                 // what a decorated 200-row one does. A cell no scope decorates
                 // gets `CellDecor::default()`, whose every field is `None`, and
                 // the paint path below is then byte-for-byte what it was.
-                let cd = match decor_plan_of(c).filter(|_| !is_pad) {
-                    Some(plan) => sheet_fmt
-                        .map(|f| f.resolve_decor(cref, plan))
-                        .unwrap_or_default(),
+                //
+                // Resolved whenever the sheet has ANY decoration, even when
+                // this column's plan is empty: a per-cell override lives in
+                // neither column nor range scope and so contributes no plan
+                // entry, and gating on a non-empty plan silently dropped
+                // every single-cell border. `resolve_decor` consults the
+                // override map itself, which is why it is handed an empty
+                // slice rather than skipped.
+                let cd = match sheet_fmt.filter(|f| f.has_decor() && !is_pad) {
+                    Some(f) => f.resolve_decor(cref, decor_plan_of(c).unwrap_or(&[])),
                     None => ferrix_core::CellDecor::default(),
                 };
                 // Issue #38: show formulas. The SOURCE replaces the value for
