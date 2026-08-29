@@ -153,7 +153,13 @@ fn header_is_valid(path: &Path) -> bool {
 }
 
 /// Per-column spill file, written as we stream.
-struct Spill {
+///
+/// Visible to the crate because `compact.rs` writes the SAME `.ferrix` layout
+/// from a different source (an existing cache plus an edit overlay). Sharing
+/// the writer is deliberate: two independent encoders for one on-disk format
+/// is how the two drift apart and one of them starts producing files the
+/// reader mis-parses.
+pub(crate) struct Spill {
     tags: BufWriter<File>,
     nums: Option<BufWriter<File>>,
     strs: Option<BufWriter<File>>,
@@ -167,7 +173,7 @@ struct Spill {
 }
 
 impl Spill {
-    fn new(dir: &Path, idx: usize) -> Result<Self, ConvertError> {
+    pub(crate) fn new(dir: &Path, idx: usize) -> Result<Self, ConvertError> {
         let tags_path = dir.join(format!("c{idx}.tags"));
         let nums_path = dir.join(format!("c{idx}.nums"));
         let strs_path = dir.join(format!("c{idx}.strs"));
@@ -215,7 +221,7 @@ impl Spill {
         Ok(())
     }
 
-    fn push_empty(&mut self) -> Result<(), ConvertError> {
+    pub(crate) fn push_empty(&mut self) -> Result<(), ConvertError> {
         self.tags.write_all(&[ValueTag::Empty as u8])?;
         if let Some(n) = &mut self.nums {
             n.write_all(&0f64.to_le_bytes())?;
@@ -227,7 +233,7 @@ impl Spill {
         Ok(())
     }
 
-    fn push_number(&mut self, v: f64) -> Result<(), ConvertError> {
+    pub(crate) fn push_number(&mut self, v: f64) -> Result<(), ConvertError> {
         self.ensure_nums()?;
         self.tags.write_all(&[ValueTag::Number as u8])?;
         self.nums.as_mut().unwrap().write_all(&v.to_le_bytes())?;
@@ -238,7 +244,7 @@ impl Spill {
         Ok(())
     }
 
-    fn push_bool(&mut self, b: bool) -> Result<(), ConvertError> {
+    pub(crate) fn push_bool(&mut self, b: bool) -> Result<(), ConvertError> {
         self.ensure_nums()?;
         self.tags.write_all(&[ValueTag::Bool as u8])?;
         let v = if b { 1f64 } else { 0f64 };
@@ -250,7 +256,7 @@ impl Spill {
         Ok(())
     }
 
-    fn push_text(&mut self, id: u32) -> Result<(), ConvertError> {
+    pub(crate) fn push_text(&mut self, id: u32) -> Result<(), ConvertError> {
         self.ensure_strs()?;
         self.tags.write_all(&[ValueTag::Text as u8])?;
         self.strs.as_mut().unwrap().write_all(&id.to_le_bytes())?;
@@ -261,7 +267,28 @@ impl Spill {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<FinishedSpill, ConvertError> {
+    /// Append an error cell.
+    ///
+    /// The CSV converter never produces one — a CSV has no way to spell
+    /// `#DIV/0!` as a typed value — but the format has always had the tag and
+    /// a baked-in formula result can be an error, so the writer must be able
+    /// to emit it. Stored in the numeric section as its stable code, exactly
+    /// how `MappedSheet::get` reads it back.
+    pub(crate) fn push_error(&mut self, code: u8) -> Result<(), ConvertError> {
+        self.ensure_nums()?;
+        self.tags.write_all(&[ValueTag::Error as u8])?;
+        self.nums
+            .as_mut()
+            .unwrap()
+            .write_all(&(code as f64).to_le_bytes())?;
+        if let Some(s) = &mut self.strs {
+            s.write_all(&0u32.to_le_bytes())?;
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<FinishedSpill, ConvertError> {
         self.tags.flush()?;
         if let Some(mut n) = self.nums.take() {
             n.flush()?;
@@ -278,7 +305,7 @@ impl Spill {
     }
 }
 
-struct FinishedSpill {
+pub(crate) struct FinishedSpill {
     tags_path: PathBuf,
     nums_path: Option<PathBuf>,
     strs_path: Option<PathBuf>,
@@ -710,7 +737,12 @@ fn parse_block_parallel(
 }
 
 /// Stitch spill files and the arena into the final `.ferrix` layout.
-fn assemble(
+///
+/// Shared with `compact.rs`. The file is fsync'd before this returns, so a
+/// caller that renames it into place has a durable file to rename — without
+/// that the rename can land in the directory while the contents are still
+/// only in the page cache.
+pub(crate) fn assemble(
     dest: &Path,
     spills: &[FinishedSpill],
     arena: &StringArena,
@@ -804,6 +836,7 @@ fn assemble(
         d.write_to(&mut f)?;
     }
     f.flush()?;
+    f.sync_all()?;
 
     Ok(f.metadata()?.len())
 }
