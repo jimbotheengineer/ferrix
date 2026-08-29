@@ -4914,6 +4914,102 @@ impl FerrixApp {
         r
     }
 
+    // ---- structural edits: insert / delete row and column (issue #17) ----
+    //
+    // Each takes the span from the CURRENT SELECTION, so "Insert Row" with
+    // three rows selected inserts three — the behaviour every spreadsheet has.
+    // Each is one undo step, and each reports what it did in the status line
+    // so a refusal (see `AxisOrder::MAX_RUNS`) is visible rather than silent.
+
+    /// Rows the selection spans, as `(first, count)` in display space.
+    fn selected_row_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.row_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    /// Columns the selection spans, as `(first, count)` in display space.
+    fn selected_col_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.col_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    pub fn insert_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .insert_rows(at, count)
+            .map(|()| format!("Inserted {count} row(s) at row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .delete_rows(at, count)
+            .map(|()| format!("Deleted {count} row(s) from row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn insert_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.insert_columns(at, count).map(|()| {
+            format!(
+                "Inserted {count} column(s) at {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.delete_columns(at, count).map(|()| {
+            format!(
+                "Deleted {count} column(s) from {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    /// Report a structural edit and refresh the derived view state.
+    ///
+    /// A REFUSAL IS SHOWN, not swallowed. `AxisOrder` refuses an edit that
+    /// would fragment the display order past its cap, and the whole point of
+    /// that cap is that the user sees the limit rather than feeling it as
+    /// unexplained slowness.
+    fn apply_structural(&mut self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(msg) => {
+                self.status = msg;
+                // The sheet's extent changed, so anything derived from it —
+                // the row count in the status bar, the table filter mask —
+                // has to be recomputed rather than left describing the old
+                // shape.
+                let rows = self.wb.view().row_count();
+                self.stats_rows = rows;
+                self.refresh_tables();
+                self.clamp_selection_to_sheet();
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = format!("Cannot do that: {e}"),
+        }
+    }
+
+    /// Pull the selection back inside the sheet after a delete shrinks it.
+    ///
+    /// Without this, deleting the last row leaves the cursor addressing a row
+    /// that no longer exists, and the next keystroke would extend the sheet to
+    /// recreate it.
+    fn clamp_selection_to_sheet(&mut self) {
+        let view = self.wb.view();
+        let last_row = view.row_count().saturating_sub(1) as u32;
+        let last_col = view.col_count().saturating_sub(1) as u32;
+        let clamp = |c: CellRef| CellRef::new(c.row.min(last_row), c.col.min(last_col));
+        self.selection = Selection::new(clamp(self.selection.anchor), clamp(self.selection.cursor));
+    }
+
     /// Whether a load is still in flight.
     pub fn is_loading(&self) -> bool {
         self.loading
@@ -7075,6 +7171,13 @@ impl FerrixApp {
             C::FormulaTraceClear => self.clear_trace(),
             C::FormulaNames => self.names_open = true,
             C::DataGoalSeek => self.goal_seek_open(),
+            // Issue #17. These go through the same selection-span methods the
+            // harness tests drive, so the menu item and the test exercise one
+            // path rather than two.
+            C::DataInsertRow => self.insert_rows_at_selection(),
+            C::DataDeleteRow => self.delete_rows_at_selection(),
+            C::DataInsertColumn => self.insert_columns_at_selection(),
+            C::DataDeleteColumn => self.delete_columns_at_selection(),
             C::DataChart => self.open_chart(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),

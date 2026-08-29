@@ -1308,6 +1308,67 @@ impl SheetFormat {
         self.ranges.retain(|r| !r.is_empty());
     }
 
+    /// Relocate every formatting scope for a row/column INSERT or DELETE.
+    ///
+    /// All three scopes have to move together, and each moves differently:
+    ///
+    /// * **column formats** are keyed by a single column index, so they follow
+    ///   `map`; a deleted column's format is dropped with it.
+    /// * **ranges** are rectangles and follow `map_span`, so inserting inside a
+    ///   formatted block extends the format over the new blank cells — which is
+    ///   what a user means by inserting a row into a formatted table.
+    /// * **cell overrides** are per-cell and follow `map` on the shifted axis.
+    ///
+    /// Missing any one of these leaves formatting keyed to the pre-change
+    /// coordinate: the colours stay on screen column B while the numbers they
+    /// were describing moved to C. Cost is O(scopes), never O(rows) — a rule
+    /// over a 200M-row column is still one entry here.
+    pub fn shift_axis(&mut self, shift: crate::order::AxisShift, axis_is_row: bool) {
+        // Column formats only care about a COLUMN shift.
+        if !axis_is_row && !self.columns.is_empty() {
+            let old = std::mem::take(&mut self.columns);
+            for (col, fmt) in old {
+                if let Some(dest) = shift.map(col) {
+                    self.columns.insert(dest, fmt);
+                }
+            }
+        }
+        if !self.ranges.is_empty() {
+            let old = std::mem::take(&mut self.ranges);
+            self.ranges = old
+                .into_iter()
+                .filter_map(|mut rf| {
+                    let r = rf.range;
+                    let moved = if axis_is_row {
+                        shift
+                            .map_span(r.first_row, r.last_row)
+                            .map(|(a, b)| TableRange::new(a, r.first_col, b, r.last_col))
+                    } else {
+                        shift
+                            .map_span(r.first_col, r.last_col)
+                            .map(|(a, b)| TableRange::new(r.first_row, a, r.last_row, b))
+                    };
+                    rf.range = moved?;
+                    Some(rf)
+                })
+                .collect();
+        }
+        if !self.overrides.is_empty() {
+            let old = std::mem::take(&mut self.overrides);
+            for ((row, col), ov) in old {
+                let dest = if axis_is_row {
+                    shift.map(row).map(|r| (r, col))
+                } else {
+                    shift.map(col).map(|c| (row, c))
+                };
+                if let Some(key) = dest {
+                    self.overrides.insert(key, ov);
+                }
+            }
+        }
+        self.prune();
+    }
+
     // --- reordering ---
 
     /// Move a column rule one place later (towards winning) or earlier.

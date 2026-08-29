@@ -195,6 +195,48 @@ impl MergeMap {
             .flat_map(|(_, v)| v)
             .any(|r| intersects(*r, range))
     }
+
+    /// Relocate every merged region for a row/column INSERT or DELETE.
+    ///
+    /// A merge is a RECTANGLE, so it cannot be remapped one coordinate at a
+    /// time: `AxisShift::map_span` moves both edges together, which is what
+    /// makes "insert a row inside a merged block grows the block" and "delete
+    /// the rows a merge covered removes the merge" come out right.
+    ///
+    /// A region whose rows or columns are entirely deleted is DROPPED. Keeping
+    /// it would leave a rectangle claiming cells that now hold different
+    /// records — the anchor would blank a live cell and refuse edits to it.
+    ///
+    /// Returns how many regions were dropped, so the caller can tell the user.
+    pub fn shift_axis(&mut self, shift: crate::order::AxisShift, axis_is_row: bool) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        let all: Vec<TableRange> = self.regions().copied().collect();
+        self.by_row.clear();
+        self.len = 0;
+        self.tallest = 0;
+        let mut dropped = 0usize;
+        for r in all {
+            let moved = if axis_is_row {
+                shift
+                    .map_span(r.first_row, r.last_row)
+                    .map(|(a, b)| TableRange::new(a, r.first_col, b, r.last_col))
+            } else {
+                shift
+                    .map_span(r.first_col, r.last_col)
+                    .map(|(a, b)| TableRange::new(r.first_row, a, r.last_row, b))
+            };
+            match moved {
+                // A shift can collapse a 2x2 merge into a single cell, which
+                // `merge` refuses as degenerate. That refusal is correct: a
+                // one-cell merge is not a merge, so it is dropped too.
+                Some(m) if self.merge(m).is_ok() => {}
+                _ => dropped += 1,
+            }
+        }
+        dropped
+    }
 }
 
 fn contains(r: TableRange, c: CellRef) -> bool {

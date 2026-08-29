@@ -222,6 +222,25 @@ registry! {
     FormulaNames { "formula.names", Some(Menu::Formula), "🏷 Name Manager…", None, true, None,
         "Define, edit and scope named ranges." }
 
+    // ---- Data: structural edits (issue #17) ----
+    //
+    // In the Data menu because inserting a row changes the DATA's shape, not
+    // its appearance. Each acts on the selection's span, so selecting three
+    // rows and choosing Insert Row inserts three.
+    //
+    // These are registry rows AND `run_command` arms on purpose: this repo has
+    // shipped six model-complete, unreachable features, and an engine method
+    // with no dispatch arm is exactly that shape. The harness tests drive
+    // `run_command`, so a missing arm fails a test rather than shipping.
+    DataInsertRow { "data.insert_row", Some(Menu::Data), "⬆ Insert row(s)", None, true, Some(Note::Selection),
+        "Insert blank rows above the selection. Permutes the display order only — the columnar file on disk is never rewritten." }
+    DataDeleteRow { "data.delete_row", Some(Menu::Data), "⌫ Delete row(s)", None, false, None,
+        "Delete the selected rows. Formulas referring to them become #REF! rather than silently reading a neighbour." }
+    DataInsertColumn { "data.insert_column", Some(Menu::Data), "⬅ Insert column(s)", None, false, None,
+        "Insert blank columns left of the selection. Formula references follow the shift, so =SUM(B1:B10) keeps summing the same data." }
+    DataDeleteColumn { "data.delete_column", Some(Menu::Data), "⌦ Delete column(s)", None, false, None,
+        "Delete the selected columns. Formulas referring to them become #REF! rather than silently reading a neighbour." }
+
     // ---- Data ----
     DataGoalSeek { "data.goal_seek", Some(Menu::Data), "🎯 Goal Seek…", None, false, None,
         "Set a formula cell to a target value by changing one input cell. The whole run is a single undo step." }

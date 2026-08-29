@@ -320,6 +320,19 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    /// Run a registry command by id — the REAL dispatch path (issue #17).
+    ///
+    /// Structural-edit tests go through this rather than calling the workbook
+    /// method, because the failure this repo keeps shipping is a complete
+    /// engine with no way to reach it. Driving `run_command` means a missing
+    /// `run_command` arm or a missing registry row fails a test instead of
+    /// shipping as an invisible feature.
+    pub fn run_command(&mut self, id: crate::command::CommandId) -> &mut Self {
+        self.app.run_command(id);
+        self.steps(2);
+        self
+    }
+
     // ---- clipboard interop and Paste Special (issue #30) ----
     //
     // Copy goes through the REAL Ctrl+C path, so what these tests read back is
@@ -7312,6 +7325,370 @@ xxx,yyy,zzz
             "Paste Special must be reachable from the command palette, not \
              only from a test calling paste_special_open directly"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17: insert / delete row and column
+    //
+    // Every assertion below is per-cell identity at an exact coordinate, never
+    // a total. SUM is order-independent, so a sum-based assertion passes even
+    // when rows have been reordered or dropped — precisely the bug a structural
+    // edit introduces. These read the value AT a coordinate and the formula's
+    // RESULT, so a shift that loses a record fails.
+
+    /// Four rows whose values identify themselves, so a misplaced row is
+    /// obvious rather than absorbed into an aggregate.
+    fn structural_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        (p, h)
+    }
+
+    #[test]
+    fn inserting_a_row_pushes_every_later_record_down_by_one() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_row.csv");
+
+        // Baseline, per row. If this drifts the fixture changed, not the code.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "gamma");
+
+        // Insert one row at display row 1 (where "beta" is).
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        // The new row reads EMPTY — it addresses no base data at all, rather
+        // than showing whatever record used to be there.
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "",
+            "the inserted row must be blank, not a duplicate of its neighbour"
+        );
+        // Everything above is untouched, everything below moved down by one.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "beta");
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(4, 1)), "delta");
+        // And the qty column moved with its name — a per-axis bug would slide
+        // one column and not the other.
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "20");
+        assert_eq!(h.app().display(CellRef::new(4, 2)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_row_removes_that_record_and_no_other() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("del_row.csv");
+
+        // Delete display row 1 = "beta".
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataDeleteRow);
+
+        // "beta" is gone and "gamma" took its place. A test that only checked
+        // the row COUNT, or a SUM, would pass here even if the wrong record
+        // had been dropped.
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "gamma",
+            "deleting beta's row must pull gamma up, not delta"
+        );
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "delta");
+        assert_eq!(h.app().display(CellRef::new(1, 2)), "30");
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn inserting_a_column_pushes_every_later_column_right() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_col.csv");
+
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "10");
+
+        // Insert one column at display column 1 (where "name" is).
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataInsertColumn);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "",
+            "the inserted column must read empty"
+        );
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1", "id stays put");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(0, 3)), "10");
+        // gamma's row moved the same way — a column shift must apply to every
+        // row, not just the one the cursor was on.
+        assert_eq!(h.app().display(CellRef::new(2, 2)), "gamma");
+        assert_eq!(h.app().display(CellRef::new(2, 3)), "30");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_column_removes_that_column_and_no_other() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("del_col.csv");
+
+        // Delete display column 1 = "name".
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "10",
+            "deleting the name column must pull qty left"
+        );
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "40");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_an_insert_shifts_it() {
+        use crate::command::CommandId;
+        // THE acceptance criterion. =SUM(C2:C5) sums the qty column; after a
+        // column is inserted to its left the qty data lives at D, and the
+        // formula must follow it. The formula's own result is the thing under
+        // test here, and it is pinned alongside the rewritten reference TEXT
+        // and a per-cell identity check.
+        let (p, mut h) = structural_fixture("ins_col_formula.csv");
+
+        // Put the formula somewhere the insert will not move it into: column E.
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(C1:C4)");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "100",
+            "baseline: 10+20+30+40"
+        );
+
+        // Insert a column at A — everything, including the qty column, shifts
+        // one to the right.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertColumn);
+
+        // The qty data is now at display column 3 (D).
+        assert_eq!(h.app().display(CellRef::new(0, 3)), "10");
+        // The formula moved to F (display column 5) and STILL reads 100. If
+        // the reference had not been rewritten it would now sum the name
+        // column and produce 0.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 5)),
+            "100",
+            "the formula must follow its data across the insert"
+        );
+        assert_eq!(
+            h.app()
+                .formula_src_at_for_test(CellRef::new(0, 5))
+                .as_deref(),
+            Some("=SUM(D1:D4)"),
+            "the reference text itself must have been rewritten"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_reading_a_deleted_column_becomes_ref_error_not_wrong_data() {
+        use crate::command::CommandId;
+        // Clamping a broken reference onto a neighbour would silently sum a
+        // DIFFERENT column and look entirely plausible. A visible #REF! is the
+        // whole point.
+        let (p, mut h) = structural_fixture("del_col_formula.csv");
+
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(C1:C4)");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "100");
+
+        // Delete the qty column the formula reads.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        let src = h.app().formula_src_at_for_test(CellRef::new(0, 3));
+        assert!(
+            src.as_deref().is_some_and(|s| s.contains("#REF!")),
+            "a reference to a deleted column must become #REF!, got {src:?}"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_formula_still_reads_the_same_data_after_a_row_insert() {
+        use crate::command::CommandId;
+        let (p, mut h) = structural_fixture("ins_row_formula.csv");
+
+        // A formula in a column the insert does not move, reading a row below
+        // the insertion point.
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=C3");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "30",
+            "baseline: C3 is gamma's qty"
+        );
+
+        // Insert a row above gamma.
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        eprintln!(
+            "DBG src={:?}",
+            h.app().formula_src_at_for_test(CellRef::new(0, 4))
+        );
+        // gamma's qty is now on display row 3, i.e. C4 in A1 notation.
+        assert_eq!(h.app().display(CellRef::new(3, 2)), "30");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "30",
+            "the formula must still read gamma's qty, not the blank row"
+        );
+        assert_eq!(
+            h.app()
+                .formula_src_at_for_test(CellRef::new(0, 4))
+                .as_deref(),
+            Some("=C4"),
+            "the row reference must have been rewritten"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_edit_overlay_cell_follows_the_row_it_was_typed_into() {
+        use crate::command::CommandId;
+        // The side-table trap: routing base reads through the order while
+        // leaving the sparse overlay keyed by the pre-change coordinate slides
+        // the user's own typed value onto a different record.
+        let (p, mut h) = structural_fixture("overlay_follows.csv");
+
+        // Type a marker into gamma's row.
+        h.select(CellRef::new(2, 1), CellRef::new(2, 1));
+        h.type_text("EDITED");
+        h.step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "EDITED");
+
+        // Insert a row above it.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        assert_eq!(
+            h.app().display(CellRef::new(3, 1)),
+            "EDITED",
+            "the typed value must move down with its row"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(2, 1)),
+            "beta",
+            "and must NOT be left behind on the record that took its place"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_is_exactly_one_undo_step() {
+        use crate::command::CommandId;
+        // A per-cell undo entry would make undoing an insert on a wide sheet
+        // take dozens of Ctrl+Z presses.
+        let (p, mut h) = structural_fixture("one_undo.csv");
+
+        // Several overlay edits, so the insert has real work to relocate.
+        for row in 0..=2u32 {
+            h.select(CellRef::new(row, 1), CellRef::new(row, 1));
+            h.type_text("x").step();
+            h.press_key(Key::Enter).steps(2);
+        }
+        let before = h.app().undo_depth();
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+
+        assert_eq!(
+            h.app().undo_depth(),
+            before + 1,
+            "an insert that relocated 3 overlay cells must still be ONE step"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn structural_edits_are_reachable_from_the_command_registry() {
+        use crate::command::{CommandId, REGISTRY};
+        // The wiring assertion. Six features in this repo landed model-complete
+        // and unreachable; a registry row is what makes a command discoverable
+        // from both the menu bar and the palette.
+        for id in [
+            CommandId::DataInsertRow,
+            CommandId::DataDeleteRow,
+            CommandId::DataInsertColumn,
+            CommandId::DataDeleteColumn,
+        ] {
+            let row = REGISTRY.iter().find(|c| c.id == id);
+            let row = row.unwrap_or_else(|| panic!("{id:?} has no registry row"));
+            assert!(row.menu.is_some(), "{id:?} must appear in a menu");
+            assert!(!row.hint.is_empty(), "{id:?} must explain itself");
+        }
+    }
+
+    #[test]
+    fn deleting_the_selected_span_deletes_all_of_it() {
+        use crate::command::CommandId;
+        // The span comes from the SELECTION, so selecting two rows deletes two.
+        // A hard-coded count of 1 would pass a single-row test and silently do
+        // the wrong thing here.
+        let (p, mut h) = structural_fixture("del_span.csv");
+
+        h.select(CellRef::new(0, 0), CellRef::new(1, 0));
+        h.run_command(CommandId::DataDeleteRow);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "gamma",
+            "both alpha and beta must be gone"
+        );
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "delta");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_structural_edit_does_not_rewrite_the_file_on_disk() {
+        use crate::command::CommandId;
+        // THE .ferrix constraint: a display-order permutation must not touch
+        // the source. Asserted on the real file's bytes, not on a model of it.
+        let (p, mut h) = structural_fixture("no_rewrite.csv");
+        let before = std::fs::read(&p).expect("fixture readable");
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataInsertRow);
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.run_command(CommandId::DataDeleteColumn);
+
+        let after = std::fs::read(&p).expect("fixture still readable");
+        assert_eq!(
+            before, after,
+            "insert/delete must permute the display order, never rewrite the source file"
+        );
+
         let _ = std::fs::remove_file(&p);
     }
 }
