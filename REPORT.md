@@ -2,6 +2,12 @@
 
 Branch: `feat/freeze-zoom`  ·  Clone: `C:/Users/Error/projects/ferrix-view`
 
+**Commits (newest last):**
+- `5437ae2` feat(ui): freeze panes, split view and zoom (roadmap #6)
+- `0b678d5` test(ui): harness tests for freeze, split, zoom; fix zoom persistence
+
+**HEAD: `0b678d5`** — working tree clean, all three gates green.
+
 ## Status
 
 Implementation complete and building; all three gates green (see Gates below).
