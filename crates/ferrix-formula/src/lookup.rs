@@ -602,7 +602,10 @@ fn xlookup<S: CellSource + ?Sized>(args: &[Expr], src: &S) -> Result<Value, Erro
     }
     let match_mode = opt_int(args, 4, src, 0)?;
     let search_mode = opt_int(args, 5, src, 1)?;
-    if !matches!(match_mode, -1 | 0 | 1 | 2) || !matches!(search_mode, -2 | -1 | 1 | 2) {
+    // Clippy prefers the range spelling for match_mode; search_mode stays an
+    // OR pattern because 0 is deliberately NOT a valid search mode (Excel has
+    // no search_mode 0) and a range would quietly admit it.
+    if !matches!(match_mode, -1..=2) || !matches!(search_mode, -2 | -1 | 1 | 2) {
         return Err(ErrorKind::Value);
     }
 

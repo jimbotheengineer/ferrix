@@ -106,11 +106,13 @@ fn calls_are_supported(e: &Expr) -> bool {
     match e {
         Expr::Call(name, args) => {
             let upper = name.to_ascii_uppercase();
-            // Date/time functions are dispatched by name out of
-            // `ferrix_formula::datetime`, so they are asked directly rather
-            // than duplicated into the list above — one source of truth.
+            // The family modules are asked DIRECTLY rather than having their
+            // names copied into the list above — one source of truth, so a
+            // function added to a family is importable the same day and
+            // cannot drift out of sync with `eval_call`.
             (SUPPORTED_FUNCTIONS.contains(&upper.as_str())
-                || ferrix_formula::datetime::is_date_fn(&upper))
+                || ferrix_formula::datetime::is_date_fn(&upper)
+                || ferrix_formula::lookup::is_lookup_fn(&upper))
                 && args.iter().all(calls_are_supported)
         }
         Expr::Unary(_, a) => calls_are_supported(a),
@@ -126,6 +128,68 @@ fn calls_are_supported(e: &Expr) -> bool {
 /// Can Ferrix keep this formula source as a live formula?
 fn formula_is_supported(src: &str) -> bool {
     ferrix_formula::parse(src).is_ok_and(|e| calls_are_supported(&e))
+}
+
+/// OOXML's marker for a function newer than the file format's original
+/// function set.
+///
+/// Excel writes `XLOOKUP` into the XML as `_xlfn.XLOOKUP`, and a file that
+/// omits the prefix shows `#NAME?` in Excel — so the EXPORT side must keep it
+/// (rust_xlsxwriter adds it for us). The import side has to strip it again,
+/// or every future function comes back as an unparseable name and gets
+/// silently downgraded to its cached value: the sheet looks perfect until the
+/// data underneath changes and the dead formula never recalculates.
+///
+/// `_xlfn._xlws.` is the same idea for worksheet-only functions and is
+/// handled by stripping `_xlws.` after `_xlfn.`.
+const FUTURE_FN_PREFIXES: &[&str] = &["_xlfn._xlws.", "_xlfn.", "_xlws."];
+
+/// Remove OOXML future-function prefixes from formula source text.
+///
+/// Text INSIDE string literals is left alone — a formula may legitimately
+/// contain the characters `_xlfn.` in a string, and rewriting there would
+/// corrupt data rather than normalise a function name.
+///
+/// Returns `Cow::Borrowed` when there is nothing to strip, which is the
+/// overwhelmingly common case, so an import of a prefix-free workbook pays
+/// one scan and no allocation.
+fn strip_future_fn_prefixes(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("_xl") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let mut in_string = false;
+    while !rest.is_empty() {
+        if in_string {
+            // Copy through to the closing quote. `""` is an escaped quote
+            // inside an Excel string, and falls out naturally: the closing
+            // quote ends the string and the next one opens a new one.
+            match rest.find('"') {
+                Some(i) => {
+                    out.push_str(&rest[..=i]);
+                    rest = &rest[i + 1..];
+                    in_string = false;
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(p) = FUTURE_FN_PREFIXES.iter().find(|p| rest.starts_with(**p)) {
+            rest = &rest[p.len()..];
+            continue;
+        }
+        let c = rest.chars().next().expect("non-empty");
+        if c == '"' {
+            in_string = true;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,8 +326,11 @@ fn build_sheet(
         if error_from_str(src).is_some() {
             continue;
         }
-        // xlsx stores the body without the leading '='.
-        let src = format!("={src}");
+        // xlsx stores the body without the leading '='. Future-function
+        // prefixes (`_xlfn.XLOOKUP`) are normalised away here, at the file
+        // boundary, so nothing downstream — parser, evaluator, dep graph —
+        // ever has to know the on-disk spelling exists.
+        let src = format!("={}", strip_future_fn_prefixes(src));
         if !formula_is_supported(&src) {
             // An Excel function Ferrix does not implement, or a structured
             // table reference. Keep the cached value, drop the formula.
@@ -970,15 +1037,19 @@ mod tests {
 
     #[test]
     fn unsupported_formulas_degrade_to_their_cached_value() {
-        // VLOOKUP is not in the Ferrix grammar. Excel's cached result must
-        // still land, and the loss must be reported rather than hidden.
+        // XMATCH is not implemented by the Ferrix evaluator. Excel's cached
+        // result must still land, and the loss must be reported rather than
+        // hidden.
+        //
+        // (This test used VLOOKUP until issue #23 implemented it. The example
+        // had to change; the property did not.)
         let mut sheet = Sheet::new("s");
         sheet.set(CellRef::new(0, 0), Value::Number(7.0));
         let mut fx = EditOverlay::new();
         fx.set(
             CellRef::new(0, 1),
             CellInput::Formula {
-                src: "=VLOOKUP(A1,A1:A1,1,FALSE)".to_string(),
+                src: "=XMATCH(A1,A1:A1,0)".to_string(),
                 cached: Value::Number(7.0),
             },
         );
@@ -1102,8 +1173,12 @@ mod tests {
             );
         }
         // And the converse: an unimplemented name parses but is not accepted.
-        assert!(ferrix_formula::parse("=VLOOKUP(A1,A1:A1,1)").is_ok());
-        assert!(!formula_is_supported("=VLOOKUP(A1,A1:A1,1)"));
+        // (VLOOKUP filled this role until issue #23 implemented it.)
+        assert!(ferrix_formula::parse("=XMATCH(A1,A1:A1,0)").is_ok());
+        assert!(!formula_is_supported("=XMATCH(A1,A1:A1,0)"));
+        // The lookup family, by contrast, must now be accepted — a workbook
+        // using it would otherwise lose its formulas on load.
+        assert!(formula_is_supported("=VLOOKUP(A1,A1:A1,1,FALSE)"));
     }
 
     #[test]
@@ -1111,10 +1186,16 @@ mod tests {
         // The check must recurse — an unknown function buried in an argument
         // is just as fatal on recalc as one at the top level.
         assert!(formula_is_supported("=IF(A1>0,SUM(A1:A5),ABS(A2))"));
-        assert!(!formula_is_supported("=SUM(A1,VLOOKUP(A1,B1:B2,1))"));
+        assert!(!formula_is_supported("=SUM(A1,XMATCH(A1,B1:B2,0))"));
         assert!(!formula_is_supported("=-CONCATENATE(A1,A2)"));
         // Case-insensitive, like Excel.
         assert!(formula_is_supported("=sum(A1:A5)"));
+        // A lookup nested in an argument is fine now, and a lookup wrapping
+        // an unimplemented call is still not.
+        assert!(formula_is_supported("=SUM(A1,VLOOKUP(A1,B1:B2,1,FALSE))"));
+        assert!(!formula_is_supported(
+            "=VLOOKUP(XMATCH(A1,B1:B2,0),B1:B2,1,FALSE)"
+        ));
     }
 
     #[test]
@@ -1442,6 +1523,261 @@ mod tests {
             col.format.is_date(),
             "computed column lost its date format: {:?}",
             col.format
+        );
+    }
+
+    // ----------------------------------------------- lookup round trips ---
+
+    /// Issue #23 acceptance criterion: a workbook using each lookup function
+    /// must reload with cached values matching.
+    ///
+    /// "Matching" is checked three ways, because each catches a different
+    /// failure and the weakest of them would pass against a broken import:
+    ///
+    /// 1. The cached value in the reimported sheet equals what was exported.
+    ///    Alone this proves nothing about the formula — Excel's cached value
+    ///    survives even when the formula is dropped entirely.
+    /// 2. The formula came back as a LIVE formula with byte-identical source.
+    ///    This is the one that fails if `calls_are_supported` does not know
+    ///    the lookup family: the import would keep the cached number and
+    ///    silently discard the formula, and check 1 would still pass.
+    /// 3. Re-evaluating the reimported formula against the reimported sheet
+    ///    reproduces the cached value. This is the actual round trip: file,
+    ///    parser and evaluator all agreeing.
+    #[test]
+    fn lookup_formulas_round_trip_with_matching_cached_values() {
+        // Data block, columns A..C: keys 10..50, names, payloads 1..5.
+        let mut sheet = Sheet::new("Lookups");
+        let names = ["alpha", "bravo", "charlie", "delta", "echo"];
+        for r in 0..5u32 {
+            sheet.set(CellRef::new(r, 0), Value::Number((r as f64 + 1.0) * 10.0));
+            sheet.set_text(CellRef::new(r, 1), names[r as usize]);
+            sheet.set(CellRef::new(r, 2), Value::Number(r as f64 + 1.0));
+        }
+
+        // One formula per function in the family, each with an independently
+        // worked-out answer. Placed in column E so they cannot collide with
+        // the data they read.
+        let cases: &[(&str, Value)] = &[
+            ("=VLOOKUP(30,A1:C5,3,FALSE)", Value::Number(3.0)),
+            ("=VLOOKUP(35,A1:C5,3,TRUE)", Value::Number(3.0)),
+            ("=HLOOKUP(10,A1:C1,1,FALSE)", Value::Number(10.0)),
+            ("=MATCH(40,A1:A5,0)", Value::Number(4.0)),
+            ("=MATCH(35,A1:A5,1)", Value::Number(3.0)),
+            ("=INDEX(A1:C5,2,3)", Value::Number(2.0)),
+            ("=INDEX(A1:A5,4,0)", Value::Number(40.0)),
+            ("=XLOOKUP(50,A1:A5,C1:C5)", Value::Number(5.0)),
+            ("=XLOOKUP(99,A1:A5,C1:C5,-1)", Value::Number(-1.0)),
+            ("=CHOOSE(2,7,8,9)", Value::Number(8.0)),
+            ("=INDIRECT(\"C4\")", Value::Number(4.0)),
+            // Composed, because that is what real workbooks contain.
+            ("=INDEX(C1:C5,MATCH(20,A1:A5,0))", Value::Number(2.0)),
+            // An error result must survive as an error, not as a blank.
+            (
+                "=VLOOKUP(999,A1:C5,3,FALSE)",
+                Value::Error(ErrorKind::NotAvailable),
+            ),
+        ];
+
+        let mut fx = EditOverlay::new();
+        for (i, (src, cached)) in cases.iter().enumerate() {
+            fx.set(
+                CellRef::new(i as u32, 4),
+                CellInput::Formula {
+                    src: (*src).to_string(),
+                    cached: *cached,
+                },
+            );
+        }
+
+        // Before writing anything: the cached values we claim are correct
+        // really are what this engine computes. A round trip that preserves a
+        // WRONG cached value perfectly is not evidence of anything.
+        for (src, cached) in cases {
+            let expr = ferrix_formula::parse(src).expect("fixture formula parses");
+            assert_eq!(
+                ferrix_formula::eval(&expr, &sheet),
+                *cached,
+                "{src} does not actually evaluate to its declared cached value"
+            );
+        }
+
+        let tmp = TempXlsx::new("lookuproundtrip");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("Lookups", &sheet).with_formulas(&fx)],
+        )
+        .expect("export");
+
+        let back = import_xlsx_full(tmp.path()).expect("import");
+        let got = &back[0];
+
+        assert_eq!(
+            got.stats.formulas_kept,
+            cases.len(),
+            "every lookup formula must come back as a live formula, not be \
+             downgraded to its cached value; {} were dropped",
+            got.stats.formulas_dropped
+        );
+
+        for (i, (src, cached)) in cases.iter().enumerate() {
+            let cell = CellRef::new(i as u32, 4);
+
+            // 1. The cached value survived the file.
+            let reloaded = got.sheet.get(cell);
+            match cached {
+                Value::Text(_) => unreachable!("no text cases in this fixture"),
+                other => assert_eq!(
+                    reloaded, *other,
+                    "{src} reloaded with cached value {reloaded:?}, wanted {other:?}"
+                ),
+            }
+
+            // 2. The formula came back, byte-identical.
+            let Some(CellInput::Formula { src: back_src, .. }) = got.formulas.get(cell) else {
+                panic!("{src} did not survive as a formula");
+            };
+            assert_eq!(back_src, src, "formula text drifted across the trip");
+
+            // 3. Re-evaluating the reimported formula against the reimported
+            //    sheet reproduces the cached value.
+            let expr = ferrix_formula::parse(back_src).expect("reparses");
+            assert_eq!(
+                ferrix_formula::eval(&expr, &got.sheet),
+                *cached,
+                "{src} re-evaluated to something other than its cached value"
+            );
+        }
+    }
+
+    /// The import allowlist must be derived from the family predicate, not
+    /// copied from it. A hand-maintained list drifts, and the drift is
+    /// invisible: the formula is silently replaced by its cached value, which
+    /// looks completely correct until the data underneath it changes.
+    #[test]
+    fn the_import_allowlist_tracks_the_lookup_family_predicate() {
+        for name in [
+            "VLOOKUP", "HLOOKUP", "INDEX", "MATCH", "XLOOKUP", "CHOOSE", "INDIRECT",
+        ] {
+            assert!(
+                ferrix_formula::lookup::is_lookup_fn(name),
+                "{name} is no longer claimed by the lookup family; this test \
+                 and the import allowlist both need revisiting"
+            );
+            // A minimal well-formed call for each, only to prove the import
+            // path accepts the NAME.
+            let probe = format!("={name}(A1,A1:B2,1)");
+            if ferrix_formula::parse(&probe).is_ok() {
+                assert!(
+                    formula_is_supported(&probe),
+                    "{probe} parses but the xlsx importer would drop it, so a \
+                     workbook using {name} loses its formulas on load"
+                );
+            }
+        }
+        // And a function nobody implements must still be refused, or the
+        // importer would keep a formula that evaluates to #NAME?.
+        assert!(
+            !formula_is_supported("=XMATCH(A1,A1:A2)"),
+            "an unimplemented function must not be imported as a live formula"
+        );
+    }
+
+    /// `XLOOKUP` is written into OOXML as `_xlfn.XLOOKUP`, so an importer that
+    /// does not strip the prefix loses every XLOOKUP formula to its cached
+    /// value — a workbook that looks right and never recalculates.
+    ///
+    /// This was a real defect found by the round-trip test above: export was
+    /// already correct (rust_xlsxwriter adds the prefix, and a file WITHOUT
+    /// it shows #NAME? in Excel), import was not.
+    #[test]
+    fn future_function_prefixes_are_stripped_on_import() {
+        assert_eq!(
+            strip_future_fn_prefixes("_xlfn.XLOOKUP(50,A1:A5,C1:C5)"),
+            "XLOOKUP(50,A1:A5,C1:C5)"
+        );
+        assert_eq!(
+            strip_future_fn_prefixes("_xlfn._xlws.FILTER(A1:A5,B1:B5)"),
+            "FILTER(A1:A5,B1:B5)"
+        );
+        // Nested occurrences, not just a leading one.
+        assert_eq!(
+            strip_future_fn_prefixes("SUM(_xlfn.XLOOKUP(1,A1:A2,B1:B2),2)"),
+            "SUM(XLOOKUP(1,A1:A2,B1:B2),2)"
+        );
+        // A formula with nothing to strip comes back untouched and unallocated.
+        let plain = "VLOOKUP(30,A1:C5,3,FALSE)";
+        assert!(matches!(
+            strip_future_fn_prefixes(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(strip_future_fn_prefixes(plain), plain);
+        // Text inside a STRING LITERAL is data, not a function name, and must
+        // survive intact — stripping there would corrupt the user's content.
+        assert_eq!(
+            strip_future_fn_prefixes(r#"CONCAT("_xlfn.","x")"#),
+            r#"CONCAT("_xlfn.","x")"#
+        );
+        // ...and a prefix after a closed string is still stripped, i.e. the
+        // scanner really tracks string state rather than giving up.
+        assert_eq!(
+            strip_future_fn_prefixes(r#"IF(A1="_xlfn.",_xlfn.XLOOKUP(1,A1:A2,B1:B2),0)"#),
+            r#"IF(A1="_xlfn.",XLOOKUP(1,A1:A2,B1:B2),0)"#
+        );
+    }
+
+    /// End-to-end proof of the same thing: the exported file really does
+    /// contain the prefixed spelling (so Excel accepts it), and the import
+    /// really does turn it back into a live formula.
+    #[test]
+    fn an_exported_xlookup_carries_the_ooxml_prefix_and_still_reimports() {
+        let mut sheet = Sheet::new("X");
+        for r in 0..3u32 {
+            sheet.set(CellRef::new(r, 0), Value::Number(r as f64));
+            sheet.set(CellRef::new(r, 1), Value::Number(r as f64 * 100.0));
+        }
+        let mut fx = EditOverlay::new();
+        fx.set(
+            CellRef::new(0, 3),
+            CellInput::Formula {
+                src: "=XLOOKUP(2,A1:A3,B1:B3)".to_string(),
+                cached: Value::Number(200.0),
+            },
+        );
+
+        let tmp = TempXlsx::new("xlfnprefix");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("X", &sheet).with_formulas(&fx)],
+        )
+        .expect("export");
+
+        // The file on disk must carry the prefix; without it Excel shows
+        // #NAME?, so an "improvement" that strips it on export would be a
+        // regression this test catches.
+        let mut wb: Xlsx<_> = calamine::open_workbook(tmp.path()).expect("open");
+        let formulas = wb.worksheet_formula("X").expect("formulas");
+        let on_disk: Vec<String> = formulas
+            .used_cells()
+            .map(|(_, _, s)| s.to_string())
+            .collect();
+        assert!(
+            on_disk.iter().any(|s| s.contains("_xlfn.XLOOKUP")),
+            "exported file does not spell XLOOKUP as _xlfn.XLOOKUP; Excel \
+             would show #NAME?. Found: {on_disk:?}"
+        );
+
+        // And it still comes back as a live formula on our side.
+        let back = import_xlsx_full(tmp.path()).expect("import");
+        let got = &back[0];
+        assert_eq!(got.stats.formulas_dropped, 0);
+        let Some(CellInput::Formula { src, .. }) = got.formulas.get(CellRef::new(0, 3)) else {
+            panic!("the XLOOKUP did not survive as a formula");
+        };
+        assert_eq!(src, "=XLOOKUP(2,A1:A3,B1:B3)");
+        assert_eq!(
+            ferrix_formula::eval(&ferrix_formula::parse(src).unwrap(), &got.sheet),
+            Value::Number(200.0)
         );
     }
 }
