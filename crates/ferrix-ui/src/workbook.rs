@@ -97,6 +97,11 @@ pub enum GoalSeekError {
     /// Checked with [`ferrix_formula::depgraph::DepGraph::depends_on_at`]
     /// before a single recalculation runs.
     NotDependent,
+    /// The changing cell holds a formula. Goal Seek would have to overwrite it
+    /// with a bare number to search, which is silent data loss — and the value
+    /// of a computed cell is not ours to choose. Refused before anything is
+    /// written, like [`GoalSeekError::NotDependent`].
+    ChangingCellIsFormula,
 }
 
 /// Outcome of a completed Goal Seek run.
@@ -1323,6 +1328,217 @@ impl Workbook {
                 n
             }
         }
+    }
+
+    // ------------------------------------------------------------- goal seek
+
+    /// Beyond this magnitude a candidate is called divergent and the search
+    /// stops.
+    ///
+    /// This is the guard that makes "a divergent case terminates rather than
+    /// spinning" true for the right reason. The iteration cap alone bounds the
+    /// wall clock, but a secant search chasing an unreachable target grows its
+    /// step geometrically, and long before iteration 100 the candidates are
+    /// numerically meaningless — evaluating `=B1*B1` at 1e200 overflows to
+    /// infinity and every subsequent step is arithmetic on infinities. Cutting
+    /// out at a value no spreadsheet input plausibly holds keeps the reported
+    /// "closest value found" a real number the user can read.
+    const GOAL_SEEK_DIVERGENCE_LIMIT: f64 = 1e12;
+
+    /// Try one candidate value for the changing cell and read the target back.
+    ///
+    /// Writes STRAIGHT to the overlay and recalculates only what depends on
+    /// the changing cell — no undo entry, no dirty flag, no coalescing state.
+    /// See [`Workbook::goal_seek`] for why the search must not go through
+    /// `commit_edit`.
+    ///
+    /// Returns `None` when the target did not evaluate to a number (text, an
+    /// error value, or a cycle), which the caller treats as "no gradient to
+    /// follow" rather than as a value of zero.
+    fn goal_seek_probe(&mut self, at: SheetCell, target: CellRef, x: f64) -> Option<f64> {
+        self.overlay
+            .set(at.cell, CellInput::Literal(Value::Number(x)));
+        // The changing cell is a literal for the whole search (a formula there
+        // is refused up front), so it has no precedents of its own to resync —
+        // only its dependents need re-evaluating.
+        match self.graph.recalc_order_at(at) {
+            Ok(order) => {
+                for dep in order {
+                    self.eval_one_at(dep);
+                }
+            }
+            Err(_) => return None,
+        }
+        self.view().get(target).as_number()
+    }
+
+    /// Restore the changing cell and everything downstream of it to whatever
+    /// the overlay held before the search started.
+    fn goal_seek_restore(&mut self, at: SheetCell, before: Option<CellInput>) {
+        self.overlay.restore(at.cell, before);
+        self.resync_graph_at(at);
+        if let Ok(order) = self.graph.recalc_order_at(at) {
+            for dep in order {
+                self.eval_one_at(dep);
+            }
+        }
+    }
+
+    /// Set `target` to `target_value` by changing `changing`. Both cells are
+    /// on the ACTIVE sheet. Issue #35.
+    ///
+    /// Uses the secant method: it needs no derivative, converges fast on the
+    /// linear and near-linear models spreadsheets are mostly made of, and
+    /// degrades to "no progress" rather than to a wrong answer when the model
+    /// is flat.
+    ///
+    /// ## Why the search does not go through `commit_edit`
+    ///
+    /// The whole run has to be ONE undo step. The search tries up to
+    /// [`GOAL_SEEK_MAX_ITERS`] candidates, and `commit_edit` pushes an undo
+    /// entry per call. Coalescing would fold most of them together — same
+    /// cell, inside [`COALESCE_WINDOW`] — but that is a timing accident, not a
+    /// guarantee: one recalculation slower than a second, entirely plausible
+    /// on a large sheet, would silently split the run into two undo steps and
+    /// leave the user's first Ctrl+Z landing on an intermediate guess.
+    ///
+    /// So the search writes candidates straight into the overlay through
+    /// [`Workbook::goal_seek_probe`], touching no history at all. When it
+    /// finishes it restores the pre-search state exactly, then makes a single
+    /// real `commit_edit` of the winning value, bracketed by `end_edit_run` so
+    /// it can neither fold into the keystroke before it nor absorb the one
+    /// after. That one entry records the original value as its `before` and
+    /// every dependent's original cache as its side effects, so undo rewinds
+    /// the entire run — which is exactly what the dialog's Cancel button does.
+    ///
+    /// ## Scale
+    ///
+    /// Nothing here is per row. The search holds a handful of `f64`s and one
+    /// saved `CellInput`; each probe recalculates the dependents of the
+    /// changing cell, which is a property of the formula graph, not of the
+    /// sheet's height.
+    pub fn goal_seek(
+        &mut self,
+        target: CellRef,
+        target_value: f64,
+        changing: CellRef,
+    ) -> Result<GoalSeekReport, GoalSeekError> {
+        let sheet = self.active_sheet();
+        let ta = SheetCell::new(sheet, target);
+        let ca = SheetCell::new(sheet, changing);
+
+        // THE CHEAP REFUSAL, before a single recalculation. One precedent walk
+        // answers "could any value of B move A at all?"; if nothing links them
+        // then 100 recalcs would only prove it slowly and then blame the user
+        // for a non-convergence that was never their arithmetic's fault.
+        if !self.graph.depends_on_at(ta, ca) {
+            return Err(GoalSeekError::NotDependent);
+        }
+        // Overwriting a formula with a number is data loss, and the changing
+        // cell's value is not ours to choose when the sheet already computes
+        // it. Excel refuses this for the same reason.
+        if self.overlay.has_formula(changing) {
+            return Err(GoalSeekError::ChangingCellIsFormula);
+        }
+
+        let before = self.overlay.get(changing).cloned();
+        let x0 = self.view().get(changing).as_number().unwrap_or(0.0);
+        // The second sample the secant needs, scaled off the starting value so
+        // it is meaningful whether B holds 0.01 or 1e9, with a floor so a
+        // starting value of exactly 0 still produces two distinct samples.
+        let step = (x0.abs() * 0.01).max(1e-4);
+
+        let mut iterations = 0usize;
+        let mut converged = false;
+        let mut best_x = x0;
+        let mut best_a: Option<f64> = None;
+        let mut best_err = f64::INFINITY;
+        // The previous (x, f(x)) sample; `None` on the first pass.
+        let mut prev: Option<(f64, f64)> = None;
+        let mut next = x0;
+
+        for _ in 0..GOAL_SEEK_MAX_ITERS {
+            let x = next;
+            iterations += 1;
+            let Some(a) = self.goal_seek_probe(ca, target, x) else {
+                // The target stopped being a number. There is no gradient to
+                // follow, so stop and report the best real approach so far
+                // rather than iterate on nonsense.
+                break;
+            };
+            let f = a - target_value;
+            let err = f.abs();
+            // Track the CLOSEST approach, not merely the last one: a
+            // non-converged run must report a value it actually reached.
+            if err < best_err {
+                best_err = err;
+                best_x = x;
+                best_a = Some(a);
+            }
+            if err < GOAL_SEEK_EPSILON {
+                converged = true;
+                break;
+            }
+
+            let nx = match prev {
+                // First pass: no secant line yet, so take the offset sample.
+                None => x + step,
+                Some((px, pf)) => {
+                    let denom = f - pf;
+                    if denom == 0.0 {
+                        // Two different inputs, identical output: the target
+                        // is flat in this cell over this interval, so there is
+                        // no direction to move in. Stop instead of dividing by
+                        // zero and chasing an infinity.
+                        break;
+                    }
+                    x - f * (x - px) / denom
+                }
+            };
+            prev = Some((x, f));
+            if !nx.is_finite() || nx.abs() > Self::GOAL_SEEK_DIVERGENCE_LIMIT {
+                break;
+            }
+            next = nx;
+        }
+
+        // Put the sheet back exactly as the user left it BEFORE recording the
+        // one real edit, so `commit_edit` captures the pre-Goal-Seek value as
+        // its `before` and the pre-Goal-Seek caches as its side effects. Skip
+        // this and undo would rewind to the last probe instead.
+        self.goal_seek_restore(ca, before);
+
+        let Some(probe_a) = best_a else {
+            // Not one candidate made the target a number, so there is no
+            // winning value to commit. The sheet is already restored and the
+            // undo stack is untouched.
+            return Ok(GoalSeekReport {
+                converged: false,
+                iterations,
+                target: target_value,
+                final_b: x0,
+                final_a: None,
+            });
+        };
+
+        // `{}` on f64 prints the shortest representation that parses back to
+        // the same bits, so the committed text re-reads as exactly the value
+        // that was probed.
+        self.end_edit_run();
+        self.commit_edit(changing, &format!("{best_x}"));
+        self.end_edit_run();
+
+        // Read the target back from the committed state rather than trusting
+        // the probe: this is the number the user will actually see.
+        let final_a = self.view().get(target).as_number().or(Some(probe_a));
+
+        Ok(GoalSeekReport {
+            converged,
+            iterations,
+            target: target_value,
+            final_b: best_x,
+            final_a,
+        })
     }
 
     pub fn undo(&mut self) -> Option<CellRef> {
@@ -3298,5 +3514,271 @@ mod tests {
             Err(NameError::Duplicate(_))
         ));
         assert_eq!(w.names.len(), 1);
+    }
+
+    // --- Goal Seek (issue #35) -------------------------------------------
+    //
+    // What each of these would say if `goal_seek` did nothing at all: every
+    // one asserts on a NUMBER the solver had to compute, or on an undo depth
+    // that only a committed edit can produce. A no-op solver fails all of
+    // them.
+
+    #[test]
+    fn goal_seek_hits_a_linear_target() {
+        let mut w = wb();
+        let b = CellRef::new(0, 1); // B1, the changing cell
+        let a = CellRef::new(0, 2); // C1 = B1*3 + 4, the target
+        w.commit_edit(b, "1");
+        w.commit_edit(a, "=B1*3+4");
+        assert_eq!(val(&w, 0, 2), Value::Number(7.0), "setup");
+
+        let rep = w.goal_seek(a, 25.0, b).expect("A depends on B");
+
+        assert!(rep.converged, "a linear model must converge: {rep:?}");
+        // B must be 7 (7*3+4 = 25), not merely "some number".
+        assert!(
+            (rep.final_b - 7.0).abs() < 1e-6,
+            "changing cell should land on 7, got {}",
+            rep.final_b
+        );
+        assert!((rep.final_a.expect("numeric") - 25.0).abs() < GOAL_SEEK_EPSILON);
+        // And the SHEET, not just the report, must hold the answer.
+        let on_sheet = val(&w, 0, 1).as_number().expect("B1 is a number");
+        assert!((on_sheet - 7.0).abs() < 1e-6, "sheet holds {on_sheet}");
+        assert!((val(&w, 0, 2).as_number().unwrap() - 25.0).abs() < GOAL_SEEK_EPSILON);
+    }
+
+    #[test]
+    fn goal_seek_refuses_when_the_target_does_not_depend_on_the_changing_cell() {
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let a = CellRef::new(0, 2);
+        w.commit_edit(b, "1");
+        w.commit_edit(a, "=A1*3"); // reads A1, NOT B1
+        let before_depth = w.undo_depth();
+        let before_a = val(&w, 0, 2);
+
+        let err = w.goal_seek(a, 999.0, b).expect_err("must refuse");
+        assert_eq!(err, GoalSeekError::NotDependent);
+        // Refusal is total: no edit, no history, no recalculated value.
+        assert_eq!(val(&w, 0, 1), Value::Number(1.0), "B1 untouched");
+        assert_eq!(val(&w, 0, 2), before_a, "the target never moved");
+        assert_eq!(w.undo_depth(), before_depth, "no undo entry was pushed");
+    }
+
+    #[test]
+    fn goal_seek_works_several_hops_downstream() {
+        // E1 <- D1 <- C1 <- B1. E1 never mentions B1, so this only works if
+        // the dependency check and the recalculation both go transitive.
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let e = CellRef::new(0, 4);
+        w.commit_edit(b, "2");
+        w.commit_edit(CellRef::new(0, 2), "=B1*2"); // C1
+        w.commit_edit(CellRef::new(0, 3), "=C1+10"); // D1
+        w.commit_edit(e, "=D1*5"); // E1 = ((B1*2)+10)*5
+        assert_eq!(val(&w, 0, 4), Value::Number(70.0), "setup");
+
+        // Want E1 = 200 => D1 = 40 => C1 = 30 => B1 = 15.
+        let rep = w.goal_seek(e, 200.0, b).expect("E1 depends on B1");
+        assert!(rep.converged, "{rep:?}");
+        assert!(
+            (rep.final_b - 15.0).abs() < 1e-6,
+            "B1 should be 15, got {}",
+            rep.final_b
+        );
+        assert!((val(&w, 0, 4).as_number().unwrap() - 200.0).abs() < GOAL_SEEK_EPSILON);
+        // The intermediate cells must have been recalculated too, not left
+        // stale at their setup values.
+        assert!((val(&w, 0, 2).as_number().unwrap() - 30.0).abs() < 1e-6);
+        assert!((val(&w, 0, 3).as_number().unwrap() - 40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn goal_seek_is_exactly_one_undo_step_and_undo_restores_b() {
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let a = CellRef::new(0, 2);
+        w.commit_edit(b, "1");
+        w.commit_edit(a, "=B1*3+4");
+        w.end_edit_run();
+        let depth_before = w.undo_depth();
+
+        let rep = w.goal_seek(a, 25.0, b).expect("depends");
+        assert!(rep.converged);
+        // The whole run — however many probes it took — is ONE entry.
+        assert_eq!(
+            w.undo_depth(),
+            depth_before + 1,
+            "goal seek ran {} iterations and must still be a single undo step",
+            rep.iterations
+        );
+        assert!(rep.iterations > 1, "setup: the search really did iterate");
+
+        w.undo();
+        // One undo puts B1 AND the dependent target back where they started.
+        assert_eq!(val(&w, 0, 1), Value::Number(1.0), "B1 restored by one undo");
+        assert_eq!(val(&w, 0, 2), Value::Number(7.0), "target restored too");
+        assert_eq!(w.undo_depth(), depth_before, "no leftover probe entries");
+    }
+
+    #[test]
+    fn goal_seek_reports_the_closest_value_rather_than_claiming_success() {
+        // C1 = B1*B1 + 5 has a minimum of 5, so a target of 1 is unreachable.
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let c = CellRef::new(0, 2);
+        w.commit_edit(b, "3");
+        w.commit_edit(c, "=B1*B1+5");
+
+        let rep = w.goal_seek(c, 1.0, b).expect("C1 depends on B1");
+        assert!(
+            !rep.converged,
+            "an unreachable target must NOT be reported as converged: {rep:?}"
+        );
+        let got = rep.final_a.expect("a number was reached");
+        // The honest answer is the closest approach it actually reached. The
+        // true infimum is 5 (at B1 = 0) and is approached asymptotically, so
+        // pin the properties that matter rather than an exact landing point:
+        //  * it never claims to have reached 1;
+        //  * it cannot report a value BELOW 5, which the model cannot produce;
+        //  * it is much closer than where it started (B1 = 3 gives 14).
+        assert!(
+            got >= 5.0,
+            "reported {got}, which C1 = B1*B1+5 can never produce"
+        );
+        assert!(
+            (got - 1.0).abs() > 1.0,
+            "must not pretend it reached the target: {got}"
+        );
+        let start_err = (14.0f64 - 1.0).abs();
+        assert!(
+            (got - 1.0).abs() < start_err,
+            "the closest approach ({got}) must beat the starting value (14)"
+        );
+        assert!(
+            (got - 5.0).abs() < 0.5,
+            "should get near the reachable minimum of 5, got {got}"
+        );
+        assert!(
+            rep.final_b.abs() < 0.5,
+            "closest approach is near B1 = 0, got {}",
+            rep.final_b
+        );
+        // The sheet must agree with the report.
+        assert!((val(&w, 0, 2).as_number().unwrap() - got).abs() < 1e-6);
+        assert!((val(&w, 0, 1).as_number().unwrap() - rep.final_b).abs() < 1e-9);
+    }
+
+    #[test]
+    fn goal_seek_terminates_on_a_divergent_target() {
+        // C1 = 1/B1 + 1000 can never reach 0: as the secant pushes B1 away
+        // the value tends to 1000 and the step diverges. This must stop, not
+        // spin, and must stop at or under the iteration cap.
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let c = CellRef::new(0, 2);
+        w.commit_edit(b, "1");
+        w.commit_edit(c, "=1/B1+1000");
+
+        let start = std::time::Instant::now();
+        let rep = w.goal_seek(c, 0.0, b).expect("C1 depends on B1");
+        let elapsed = start.elapsed();
+
+        assert!(!rep.converged, "0 is unreachable: {rep:?}");
+        assert!(
+            rep.iterations <= GOAL_SEEK_MAX_ITERS,
+            "the cap must hold: {} iterations",
+            rep.iterations
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a divergent search must terminate promptly, took {elapsed:?}"
+        );
+        // Whatever it reports must be a real, finite number the user can read.
+        assert!(rep.final_b.is_finite(), "final_b = {}", rep.final_b);
+        assert!(rep.final_a.expect("numeric").is_finite());
+    }
+
+    #[test]
+    fn goal_seek_refuses_to_overwrite_a_formula_in_the_changing_cell() {
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let c = CellRef::new(0, 2);
+        w.commit_edit(b, "=A1+1"); // B1 is COMPUTED
+        w.commit_edit(c, "=B1*3");
+        let depth = w.undo_depth();
+
+        let err = w.goal_seek(c, 100.0, b).expect_err("must refuse");
+        assert_eq!(err, GoalSeekError::ChangingCellIsFormula);
+        // The formula must still be there, character for character.
+        assert_eq!(
+            w.view().edit_text(b),
+            "=A1+1",
+            "the changing cell's formula must survive the refusal"
+        );
+        assert_eq!(w.undo_depth(), depth);
+    }
+
+    #[test]
+    fn goal_seek_starting_from_zero_still_finds_a_second_sample() {
+        // A secant needs two distinct x values. Starting at exactly 0 with a
+        // purely proportional step would give 0 twice and divide by zero.
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let c = CellRef::new(0, 2);
+        w.commit_edit(b, "0");
+        w.commit_edit(c, "=B1*4");
+
+        let rep = w.goal_seek(c, 12.0, b).expect("depends");
+        assert!(rep.converged, "{rep:?}");
+        assert!(
+            (rep.final_b - 3.0).abs() < 1e-6,
+            "B1 should be 3, got {}",
+            rep.final_b
+        );
+    }
+
+    #[test]
+    fn goal_seek_sees_through_a_range_precedent() {
+        // C1 = SUM(A1:A10); A3 is inside that range, so changing A3 moves C1
+        // even though C1 names no individual cell.
+        let mut w = wb();
+        let a3 = CellRef::new(2, 0); // base value 3
+        let c = CellRef::new(0, 2);
+        w.commit_edit(c, "=SUM(A1:A10)");
+        assert_eq!(val(&w, 0, 2), Value::Number(55.0), "setup");
+
+        let rep = w.goal_seek(c, 100.0, a3).expect("C1 depends on A3");
+        assert!(rep.converged, "{rep:?}");
+        // 55 - 3 + x = 100 => x = 48.
+        assert!(
+            (rep.final_b - 48.0).abs() < 1e-6,
+            "A3 should be 48, got {}",
+            rep.final_b
+        );
+        assert!((val(&w, 0, 2).as_number().unwrap() - 100.0).abs() < GOAL_SEEK_EPSILON);
+    }
+
+    #[test]
+    fn a_failed_goal_seek_leaves_the_sheet_exactly_as_it_was() {
+        // The refusal paths are cheap, but the SEARCH path also has to be
+        // clean when it never finds a number: no probe value may survive.
+        let mut w = wb();
+        let b = CellRef::new(0, 1);
+        let c = CellRef::new(0, 2);
+        w.commit_edit(b, "5");
+        w.commit_edit(c, "=B1&\"x\""); // text: never a number
+        let depth = w.undo_depth();
+
+        let rep = w.goal_seek(c, 10.0, b).expect("C1 does depend on B1");
+        assert!(!rep.converged);
+        assert_eq!(rep.final_a, None, "the target never produced a number");
+        assert_eq!(
+            val(&w, 0, 1),
+            Value::Number(5.0),
+            "B1 must be back at its original value, not at a leftover probe"
+        );
+        assert_eq!(w.undo_depth(), depth, "nothing to undo when nothing landed");
     }
 }
