@@ -707,14 +707,21 @@ mod tests {
         assert_eq!(p.cols, 5);
     }
 
-    /// The same property from the file side, with an answer that CHANGES if
-    /// the tail is read.
+    /// The end-to-end shape, over a real 64 MB file on disk.
     ///
-    /// The first 128 KiB are semicolon-delimited; the remaining ~64 MB are
-    /// comma-delimited and outnumber them 500:1. A whole-file detector answers
-    /// "comma". A bounded-prefix detector answers "semicolon". Only one of
-    /// those assertions can pass, so the test cannot be satisfied by a
-    /// detector that ignores the bound.
+    /// HONEST SCOPE: this is corroborating, not the primary proof. Mutation
+    /// check performed: replacing `reader.take(PREFIX_BYTES)` with
+    /// `take(u64::MAX)` does NOT fail this test, because the later
+    /// `buf.truncate` still clips the buffer and the 64 MB read comes back
+    /// from page cache inside the time budget. The tests that DO fail under
+    /// that mutation are `detection_never_reads_past_the_prefix` and
+    /// `preview_never_reads_past_the_prefix`, whose readers panic when asked
+    /// for byte PREFIX_BYTES + 1 — those are the bound's real proof.
+    ///
+    /// What this one adds: the whole path works on an actual large file, the
+    /// prefix genuinely decides the answer (the tail is comma-delimited and
+    /// outnumbers the head 500:1, so a detector that WEIGHTED the tail would
+    /// answer "comma"), and the wall clock stays far under a second.
     #[test]
     fn delimiter_detection_ignores_everything_past_the_prefix() {
         let p = scratch().join("prefix_vs_tail.csv");
