@@ -80,7 +80,7 @@ pub fn call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value
         "MEDIAN" => buffered(args, src, median_of),
         "MODE" | "MODE.SNGL" => buffered(args, src, mode_of),
         "STDEV.P" | "STDEV.S" | "VAR.P" | "VAR.S" => spread(name, args, src),
-        "PERCENTILE.INC" => two_arg(args, src, |vals, k| percentile_of(vals, k)),
+        "PERCENTILE.INC" => two_arg(args, src, percentile_of),
         "QUARTILE.INC" => two_arg(args, src, |vals, q| {
             // Excel truncates the quart argument; 0..=4 only.
             let q = q.trunc();

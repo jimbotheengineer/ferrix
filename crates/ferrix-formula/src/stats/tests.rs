@@ -433,5 +433,7 @@ fn buffer_cap_refuses_rather_than_truncating() {
     };
     assert_eq!(collect_capped(&args, &s, 3).unwrap_err(), ErrorKind::Num);
     assert_eq!(collect_capped(&args, &s, 5).unwrap().len(), 5);
-    assert!(MAX_BUFFERED_VALUES >= 10_000_000, "must cover a 10M column");
+    // The documented promise: the cap covers the 10M-row column the issue
+    // names, so that case answers rather than refusing.
+    const _: () = assert!(MAX_BUFFERED_VALUES >= 10_000_000);
 }
