@@ -126,6 +126,10 @@ pub enum ParseError {
     BadSheetRef(String),
     #[error("trailing input after expression: {0:?}")]
     Trailing(String),
+    /// A bare word that is neither a function call, a cell reference, nor a
+    /// name the resolver knows. This is what `#NAME?` means.
+    #[error("unknown name {0:?}")]
+    UnknownName(String),
 }
 
 /// Render a sheet name as it must appear inside a formula.
@@ -446,9 +450,33 @@ fn lex_sheet_qualified(
 
 /// Parse a formula. Accepts an optional leading `=`.
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
+    parse_with_names(input, &|_| None)
+}
+
+/// Parse a formula, resolving bare identifiers through a name table.
+///
+/// `resolve` is handed the identifier (upper-cased by the tokenizer; name
+/// lookup is case-insensitive) and returns the expression the name stands for.
+/// Resolution happens HERE, at parse time, so `SUM(Sales)` and
+/// `SUM(Sheet1!$B$2:$B$1000)` produce identical trees — which is what keeps
+/// the columnar aggregation fast path in [`crate::eval`] firing, and keeps a
+/// name over a 200M-row range exactly as cheap as the explicit range. Carrying
+/// an `Expr::Name` through to evaluation instead would force the dependency
+/// graph and every fast-path match to learn about names.
+///
+/// A word the resolver does not know is [`ParseError::UnknownName`], which
+/// callers surface as `#NAME?`.
+pub fn parse_with_names(
+    input: &str,
+    resolve: &dyn Fn(&str) -> Option<Expr>,
+) -> Result<Expr, ParseError> {
     let body = input.strip_prefix('=').unwrap_or(input);
     let tokens = tokenize(body)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        resolve,
+    };
     let expr = p.parse_expr(0)?;
     if p.pos < p.tokens.len() {
         return Err(ParseError::Trailing(format!("{:?}", p.tokens[p.pos])));
@@ -456,12 +484,15 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
     Ok(expr)
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    /// Name table lookup. [`parse`] passes one that knows nothing, so a
+    /// workbook with no names behaves exactly as it did before names existed.
+    resolve: &'a dyn Fn(&str) -> Option<Expr>,
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -564,24 +595,36 @@ impl Parser {
                 }
             }
             Token::Ident(name) => {
-                self.expect(&Token::LParen, "( after function name")?;
-                let mut args = Vec::new();
-                if matches!(self.peek(), Some(Token::RParen)) {
-                    self.pos += 1;
+                // A following `(` makes it a function call; otherwise it is a
+                // defined name, and the name table gets the first look.
+                // Falling through to UnknownName (which the workbook renders
+                // as #NAME?) only AFTER the table has been consulted is what
+                // "resolution happens in the parser" means.
+                if !matches!(self.peek(), Some(Token::LParen)) {
+                    match (self.resolve)(&name) {
+                        Some(expr) => expr,
+                        None => return Err(ParseError::UnknownName(name)),
+                    }
                 } else {
-                    loop {
-                        args.push(self.parse_expr(0)?);
-                        match self.next() {
-                            Some(Token::Comma) => continue,
-                            Some(Token::RParen) => break,
-                            Some(t) => {
-                                return Err(ParseError::Expected(", or )", format!("{t:?}")))
+                    self.expect(&Token::LParen, "( after function name")?;
+                    let mut args = Vec::new();
+                    if matches!(self.peek(), Some(Token::RParen)) {
+                        self.pos += 1;
+                    } else {
+                        loop {
+                            args.push(self.parse_expr(0)?);
+                            match self.next() {
+                                Some(Token::Comma) => continue,
+                                Some(Token::RParen) => break,
+                                Some(t) => {
+                                    return Err(ParseError::Expected(", or )", format!("{t:?}")))
+                                }
+                                None => return Err(ParseError::UnexpectedEnd),
                             }
-                            None => return Err(ParseError::UnexpectedEnd),
                         }
                     }
+                    Expr::Call(name, args)
                 }
-                Expr::Call(name, args)
             }
             Token::LParen => {
                 let inner = self.parse_expr(0)?;
@@ -1036,6 +1079,109 @@ mod tests {
                 "SUM".into(),
                 vec![Expr::Range(CellRef::new(0, 0), CellRef::new(9, 0))]
             )
+        );
+    }
+
+    // --- defined names ----------------------------------------------------
+
+    /// A resolver that knows exactly one name.
+    fn one_name(ident: &'static str, target: &'static str) -> impl Fn(&str) -> Option<Expr> {
+        move |w: &str| {
+            w.eq_ignore_ascii_case(ident)
+                .then(|| parse(target).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_name_parses_to_the_very_same_tree_as_the_range_it_stands_for() {
+        // THE acceptance criterion, at the parser level: =SUM(Sales) must be
+        // indistinguishable from =SUM(Sheet1!B2:B1000) after parsing, so the
+        // columnar fast path fires identically for both.
+        let r = one_name("SALES", "=Sheet1!B2:B1000");
+        assert_eq!(
+            parse_with_names("=SUM(Sales)", &r).unwrap(),
+            parse("=SUM(Sheet1!B2:B1000)").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_reported_rather_than_guessed_at() {
+        let r = one_name("SALES", "=Sheet1!B2:B1000");
+        assert_eq!(
+            parse_with_names("=SUM(Revenue)", &r).unwrap_err(),
+            ParseError::UnknownName("REVENUE".into())
+        );
+        // And with no name table at all, every bare word is unknown.
+        assert_eq!(
+            parse("=Sales").unwrap_err(),
+            ParseError::UnknownName("SALES".into())
+        );
+    }
+
+    #[test]
+    fn name_lookup_is_case_insensitive() {
+        let r = one_name("SALES", "=Sheet1!B2:B4");
+        for spelling in ["Sales", "SALES", "sales", "sAlEs"] {
+            assert!(
+                parse_with_names(&format!("={spelling}"), &r).is_ok(),
+                "{spelling} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_may_stand_for_a_constant_or_a_single_cell() {
+        let rate = one_name("RATE", "=0.96");
+        assert_eq!(parse_with_names("=A1*Rate", &rate).unwrap(), {
+            Expr::Binary(
+                BinOp::Mul,
+                Box::new(Expr::Ref(CellRef::new(0, 0))),
+                Box::new(Expr::Number(0.96)),
+            )
+        });
+        let anchor = one_name("ANCHOR", "=Sheet1!$C$3");
+        assert_eq!(
+            parse_with_names("=Anchor", &anchor).unwrap(),
+            Expr::XRef("Sheet1".into(), CellRef::new(2, 2))
+        );
+    }
+
+    #[test]
+    fn function_names_still_win_over_the_name_table() {
+        // A resolver that would happily claim SUM must never be consulted for
+        // `SUM(`, or every builtin could be shadowed by a stray name.
+        let greedy = |_: &str| Some(Expr::Number(1.0));
+        assert_eq!(
+            parse_with_names("=SUM(A1:A2)", &greedy).unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::Range(CellRef::new(0, 0), CellRef::new(1, 0))]
+            )
+        );
+    }
+
+    #[test]
+    fn cell_references_still_win_over_the_name_table() {
+        // The tokenizer resolves A1 as a reference before the parser ever sees
+        // an Ident, so a resolver cannot hijack it.
+        let greedy = |_: &str| Some(Expr::Number(1.0));
+        assert_eq!(
+            parse_with_names("=A1", &greedy).unwrap(),
+            Expr::Ref(CellRef::new(0, 0))
+        );
+        assert_eq!(
+            parse_with_names("=TRUE", &greedy).unwrap(),
+            Expr::Bool(true)
+        );
+    }
+
+    #[test]
+    fn a_resolved_name_participates_in_surrounding_expressions() {
+        let r = one_name("SALES", "=Sheet1!B2:B4");
+        // Postfix and infix operators must apply to the resolved tree.
+        assert_eq!(
+            parse_with_names("=SUM(Sales)+1", &r).unwrap(),
+            parse("=SUM(Sheet1!B2:B4)+1").unwrap()
         );
     }
 }
