@@ -19,8 +19,9 @@
 //! `FERRIX_CONFIG_DIR` overrides all of it, which is also what lets the tests
 //! exercise the real round-trip against a temp directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::recent::RecentEntry;
 use crate::theme::ThemeMode;
 
 /// Everything persisted between runs.
@@ -37,12 +38,22 @@ pub struct Prefs {
     /// Autosave cadence in seconds. `None` means "not configured", and the
     /// app uses `DEFAULT_AUTOSAVE_SECS`. Zero disables autosave entirely.
     pub autosave_secs: Option<u64>,
-    /// Zoom level per sheet, keyed by sheet NAME rather than by `SheetId`.
+    /// Zoom level per sheet, keyed by `(workbook path, sheet name)`.
     ///
     /// Ids are assigned per run and mean nothing across a restart; the name is
     /// what the user recognises and what survives reopening the file. Only
     /// sheets the user actually zoomed appear, so the default costs nothing.
-    pub zoom: Vec<(String, f32)>,
+    ///
+    /// The workbook path is part of the key (issue #45). Keyed on the sheet
+    /// name ALONE, every workbook with a sheet called `Sheet1` — which is most
+    /// of them — shared one zoom, so zooming into one file silently re-zoomed
+    /// every other file the user opened. The entries are
+    /// `(workbook path, sheet name, zoom)`; an in-memory workbook with no file
+    /// behind it yet uses an empty path, which is a key like any other.
+    pub zoom: Vec<(String, String, f32)>,
+    /// Recently opened files, newest first, with the session to restore for
+    /// each. Capped at `recent::MAX_RECENT` (issue #45).
+    pub recent: Vec<RecentEntry>,
 }
 
 impl Prefs {
@@ -61,23 +72,26 @@ impl Prefs {
 }
 
 impl Prefs {
-    /// Zoom remembered for a sheet, or 100% when it was never set.
-    pub fn zoom_of(&self, sheet: &str) -> f32 {
+    /// Zoom remembered for a sheet of a particular workbook, or 100% when it
+    /// was never set.
+    pub fn zoom_of(&self, book: &Path, sheet: &str) -> f32 {
+        let book = book.display().to_string();
         self.zoom
             .iter()
-            .find(|(n, _)| n == sheet)
-            .map(|&(_, z)| crate::grid::clamp_zoom(z))
+            .find(|(b, n, _)| b == &book && n == sheet)
+            .map(|&(_, _, z)| crate::grid::clamp_zoom(z))
             .unwrap_or(1.0)
     }
 
-    /// Remember a sheet's zoom. 100% is the default, so it is REMOVED rather
-    /// than stored — otherwise the file would accrue an entry for every sheet
-    /// the user ever glanced at.
-    pub fn set_zoom(&mut self, sheet: &str, zoom: f32) {
+    /// Remember a sheet's zoom within a workbook. 100% is the default, so it
+    /// is REMOVED rather than stored — otherwise the file would accrue an
+    /// entry for every sheet the user ever glanced at.
+    pub fn set_zoom(&mut self, book: &Path, sheet: &str, zoom: f32) {
+        let book = book.display().to_string();
         let z = crate::grid::clamp_zoom(zoom);
-        self.zoom.retain(|(n, _)| n != sheet);
+        self.zoom.retain(|(b, n, _)| !(b == &book && n == sheet));
         if (z - 1.0).abs() > 1e-4 {
-            self.zoom.push((sheet.to_string(), z));
+            self.zoom.push((book, sheet.to_string(), z));
         }
     }
 }
@@ -137,20 +151,40 @@ impl Prefs {
                 // cadence — never zero, which would silently disable
                 // autosave because of a typo in a config file.
                 "autosave_secs" => out.autosave_secs = v.parse::<u64>().ok(),
-                // `zoom.<sheet name> = 2` — one line per zoomed sheet. A name
-                // containing '=' still parses: `split_once` takes the FIRST
-                // '=', and the key is everything before it.
+                // `zoom.<path>|<sheet name> = 2` — one line per zoomed sheet
+                // of one workbook. Both halves are percent-escaped by
+                // `recent::encode_component`, so the '|' that splits them, and
+                // any '=' or space inside either half, cannot be confused with
+                // the format's own punctuation. A Windows drive letter's colon
+                // and its backslashes pass through unescaped and readable.
                 k2 if k2.starts_with("zoom.") => {
-                    let name = k2.trim_start_matches("zoom.").trim().trim_matches('"');
+                    let key = k2.trim_start_matches("zoom.").trim().trim_matches('"');
+                    // BACKWARD COMPATIBILITY: an old-format `zoom.<sheet>`
+                    // line has no '|' and therefore names no workbook. There
+                    // is nothing to migrate it to — attaching it to a guessed
+                    // workbook would re-create the exact cross-file bleed this
+                    // keying exists to stop — so it is DROPPED. The user loses
+                    // one remembered zoom, re-zooms once, and is right after.
+                    let Some((book, name)) = key.split_once('|') else {
+                        continue;
+                    };
+                    let book = crate::recent::decode_component(book);
+                    let name = crate::recent::decode_component(name);
                     if let Ok(z) = v.parse::<f32>() {
                         if !name.is_empty() {
-                            out.set_zoom(name, z);
+                            out.set_zoom(Path::new(&book), &name, z);
                         }
                     }
+                }
+                // `recent.<n>.<field> = ...` — the recent-files list and the
+                // session remembered for each entry (issue #45).
+                k2 if k2.starts_with("recent.") => {
+                    crate::recent::parse_line(&mut out.recent, k2.trim(), v);
                 }
                 _ => {}
             }
         }
+        crate::recent::drop_placeholders(&mut out.recent);
         out
     }
 
@@ -163,25 +197,60 @@ impl Prefs {
         if let Some(secs) = self.autosave_secs {
             s.push_str(&format!("autosave_secs = {secs}\n"));
         }
-        for (name, z) in &self.zoom {
-            // Newlines in a sheet name would forge a second key, so they are
-            // dropped rather than written — a preference file must never be
-            // able to inject a setting the user did not choose.
-            let name = name.replace(['\n', '\r'], " ");
-            s.push_str(&format!("zoom.{name} = {z}\n"));
+        for (book, name, z) in &self.zoom {
+            // Escaping covers the newline case too: a name carrying a newline
+            // would otherwise forge a second key, and a preference file must
+            // never be able to inject a setting the user did not choose.
+            let book = crate::recent::encode_component(book);
+            let name = crate::recent::encode_component(name);
+            s.push_str(&format!("zoom.{book}|{name} = {z}\n"));
         }
+        s.push_str(&crate::recent::to_text(&self.recent));
         s
     }
 
     /// Best-effort write. A failure to persist a preference is not worth
     /// interrupting the user over, so the error is returned for logging and
     /// otherwise dropped by the caller.
+    ///
+    /// The write is ATOMIC: the bytes go to a sibling temp file which is
+    /// flushed and fsync'd, then renamed into place. This follows the
+    /// discipline `ferrix_io::edits::write_atomic` already established for the
+    /// edit sidecar, and for the same reason — a crash partway through must
+    /// leave the PREVIOUS complete file, never a prefix of the new one. A
+    /// half-written prefs file parses into a mixture of old and new settings
+    /// that looks plausible and is wrong.
     pub fn save(&self) -> std::io::Result<()> {
         let Some(dir) = config_dir() else {
             return Ok(());
         };
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(FILE), self.to_text())
+        let path = dir.join(FILE);
+        // A sibling of the destination, so the rename stays within one
+        // filesystem and is therefore atomic. The pid keeps two Ferrix
+        // processes from writing the same temp file at once.
+        let tmp = dir.join(format!("{FILE}.{}.tmp", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(self.to_text().as_bytes())?;
+            f.flush()?;
+            // fsync before the rename: without it the rename can land in the
+            // directory while the bytes are still only in the page cache, and
+            // a power loss leaves a correctly-named empty file — the very
+            // truncation this dance exists to prevent.
+            f.sync_all()?;
+        }
+        // Windows will not rename onto an existing file.
+        let _ = std::fs::remove_file(&path);
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Do not leave scratch behind in the user's config directory.
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -209,6 +278,7 @@ mod tests {
                         show_empty_rows,
                         autosave_secs,
                         zoom: Vec::new(),
+                        recent: Vec::new(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -220,7 +290,15 @@ mod tests {
                     theme,
                     show_empty_rows,
                     autosave_secs: Some(45),
-                    zoom: vec![("Sheet1".into(), 2.0), ("quarterly report".into(), 0.5)],
+                    // Keyed on (workbook path, sheet name) since #45. Two
+                    // different books both with a "Sheet1" is the case the
+                    // old sheet-name-only key collapsed into one.
+                    zoom: vec![
+                        ("C:\\books\\a.xlsx".into(), "Sheet1".into(), 2.0),
+                        ("/mnt/b.csv".into(), "quarterly report".into(), 0.5),
+                        ("/mnt/c.csv".into(), "Sheet1".into(), 3.0),
+                    ],
+                    recent: vec![crate::recent::RecentEntry::new("/mnt/b.csv")],
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -283,7 +361,8 @@ mod tests {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
             autosave_secs: None,
-            zoom: vec![("Sheet1".into(), 3.0)],
+            zoom: vec![("/a.csv".into(), "Sheet1".into(), 3.0)],
+            recent: Vec::new(),
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -310,7 +389,8 @@ mod tests {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
             autosave_secs: Some(45),
-            zoom: vec![("Sheet1".into(), 2.0)],
+            zoom: vec![("/a.csv".into(), "Sheet1".into(), 2.0)],
+            recent: vec![crate::recent::RecentEntry::new("/a.csv")],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

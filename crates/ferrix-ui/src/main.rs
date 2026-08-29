@@ -7,6 +7,7 @@ mod grid;
 #[cfg(test)]
 mod harness;
 mod prefs;
+mod recent;
 mod sheet_view;
 mod table_view;
 mod theme;
