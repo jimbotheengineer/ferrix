@@ -640,6 +640,14 @@ pub struct Grid<'a> {
     /// drag started at and the width it started from. Owned by the APP between
     /// press and release, so the gesture survives the release frame.
     pub col_resizing: Option<(usize, f32, f32)>,
+    /// Show formula SOURCE instead of computed values (issue #38, Ctrl+`).
+    ///
+    /// A flag, not a precomputed map of text. The source is fetched with
+    /// `view.edit_text(cell)` inside the paint loop, for the cells being
+    /// painted and no others — so a 200M-row sheet in this mode costs exactly
+    /// what a viewport of formula sources costs, and materialising every
+    /// formula in the sheet never happens.
+    pub show_formulas: bool,
 }
 
 fn sheet_c32(c: ferrix_core::Rgb) -> egui::Color32 {
@@ -1310,28 +1318,53 @@ impl<'a> Grid<'a> {
                 }
 
                 let value = view.get(cref);
-                if !matches!(value, Value::Empty) {
-                    let (mut text, mut color, align) = match value {
-                        Value::Number(n) => (
-                            ferrix_core::format_number(n),
-                            th.number,
-                            Align2::RIGHT_CENTER,
+                // Issue #38: show formulas. The SOURCE replaces the value for
+                // this cell only, pulled here in the paint loop for a cell
+                // that is already being drawn — so the mode costs a viewport
+                // of strings, not a sheet of them.
+                let formula_src = (self.show_formulas && !is_pad)
+                    .then(|| view.edit_text(cref))
+                    .filter(|s| !s.is_empty());
+                if formula_src.is_some() || !matches!(value, Value::Empty) {
+                    let (mut text, mut color, align) = match &formula_src {
+                        // Left-aligned monospace-ish source, in the accent for
+                        // a real formula and ordinary ink for a literal, so
+                        // "which cells are computed" is answerable at a glance
+                        // — the reason to turn the mode on at all.
+                        Some(src) => (
+                            src.clone(),
+                            if view.has_formula(cref) {
+                                th.accent
+                            } else {
+                                th.text
+                            },
+                            Align2::LEFT_CENTER,
                         ),
-                        Value::Bool(b) => (
-                            if b { "TRUE" } else { "FALSE" }.to_string(),
-                            th.text_dim,
-                            Align2::CENTER_CENTER,
-                        ),
-                        Value::Text(id) => {
-                            (view.resolve(id).to_string(), th.text, Align2::LEFT_CENTER)
-                        }
-                        Value::Error(e) => (e.to_string(), th.error, Align2::RIGHT_CENTER),
-                        Value::Empty => unreachable!(),
+                        None => match value {
+                            Value::Number(n) => (
+                                ferrix_core::format_number(n),
+                                th.number,
+                                Align2::RIGHT_CENTER,
+                            ),
+                            Value::Bool(b) => (
+                                if b { "TRUE" } else { "FALSE" }.to_string(),
+                                th.text_dim,
+                                Align2::CENTER_CENTER,
+                            ),
+                            Value::Text(id) => {
+                                (view.resolve(id).to_string(), th.text, Align2::LEFT_CENTER)
+                            }
+                            Value::Error(e) => (e.to_string(), th.error, Align2::RIGHT_CENTER),
+                            Value::Empty => unreachable!(),
+                        },
                     };
 
                     // A table column's number format replaces the default
                     // rendering, and a conditional rule may recolour the text.
-                    if let Some(d) = &decor {
+                    // Skipped entirely in show-formulas mode: a number format
+                    // that rewrites `1234.5` as `$1,234.50` would overwrite
+                    // the very source text the mode exists to reveal.
+                    if let Some(d) = decor.as_ref().filter(|_| formula_src.is_none()) {
                         if let Some(t) = &d.text {
                             text.clone_from(t);
                         }
@@ -1343,7 +1376,7 @@ impl<'a> Grid<'a> {
                     // cells it matches: it is the more specific instruction the
                     // user just gave, and the editor's live preview would be a
                     // lie if a table underneath could swallow it.
-                    if let Some(s) = &sheet_style {
+                    if let Some(s) = sheet_style.as_ref().filter(|_| formula_src.is_none()) {
                         if let Some(c) = s.text {
                             color = sheet_c32(c);
                         }

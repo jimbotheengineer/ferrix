@@ -786,6 +786,73 @@ impl Harness {
     pub fn frames(&self) -> u64 {
         self.frame
     }
+
+    // ---- formula bar upgrades (issue #38) ----
+
+    /// Ctrl+` — the real chord, with the modifier on `RawInput.modifiers`
+    /// where the app actually reads it.
+    pub fn toggle_show_formulas(&mut self) -> &mut Self {
+        self.ctrl(Key::Backtick).steps(2);
+        self
+    }
+
+    /// F4 — a bare keypress, delivered to whichever editor holds focus.
+    pub fn press_f4(&mut self) -> &mut Self {
+        self.press_key(Key::F4).steps(2);
+        self
+    }
+
+    /// Park the caret at a BYTE offset inside the live editor, then press F4.
+    ///
+    /// The caret is the one thing a headless test cannot express as a
+    /// keystroke: egui puts it wherever the last click landed, and clicking
+    /// inside a TextEdit at a character offset is pixel arithmetic over the
+    /// font's metrics. Everything else about F4 — the chord, the rewrite, the
+    /// commit — goes through the real path.
+    pub fn f4_at(&mut self, byte: usize) -> &mut Self {
+        self.app.set_edit_caret(byte);
+        self.press_f4()
+    }
+
+    /// The formula bar's live text.
+    pub fn formula_bar_text(&self) -> String {
+        self.app.formula_bar_text().to_string()
+    }
+
+    /// Reference outlines PAINTED by the last frame, as (rect, colour).
+    pub fn ref_outlines(&mut self) -> Vec<(egui::Rect, egui::Color32)> {
+        self.step();
+        self.app.ref_outlines().to_vec()
+    }
+
+    /// Text actually rendered by the last frame, read out of the tessellated
+    /// output.
+    ///
+    /// This is the assertion "show formulas" needs: a mode flag can be stored
+    /// perfectly while the paint path never reads it, and a shape COUNT moves
+    /// for a dozen unrelated reasons. What is on the screen is the galley
+    /// text, so that is what this returns.
+    pub fn painted_texts(&mut self) -> Vec<String> {
+        let raw = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, self.screen)),
+            events: std::mem::take(&mut self.events),
+            modifiers: self.pending_modifiers,
+            ..Default::default()
+        };
+        self.pending_modifiers = Modifiers::default();
+        let app = &mut self.app;
+        let out = self.ctx.run(raw, |ctx| app.frame(ctx));
+        self.frame += 1;
+        self.last_shapes = out.shapes.len();
+        let mut texts = Vec::new();
+        for s in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &s.shape {
+                texts.push(t.galley.text().to_string());
+            }
+        }
+        self.last_texts = texts.len();
+        texts
+    }
 }
 
 #[cfg(test)]
@@ -5107,6 +5174,390 @@ xxx,yyy,zzz
         );
         // And it really ran: the zoom actually changed.
         assert!(h.app().zoom() > 1.0, "run_command dispatched nothing");
+
+        crate::prefs::set_test_config_dir(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================= formula bar upgrades (issue #38) =================
+
+    /// Fixture with a formula in it, so every #38 test starts from a sheet
+    /// where "value" and "source" are actually different strings.
+    fn fbar_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "file never loaded"
+        );
+        // C1 = SUM(C2:C4). The values column is 10/20/30/40, so the computed
+        // value (90) and the source text are unmistakably different.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.app_mut().set_formula_input("=SUM(C2:C4)");
+        h.app_mut().commit_formula_bar_for_test();
+        h.steps(2);
+        (p, h)
+    }
+
+    /// F4 through the running app: the chord, the caret, the rewrite.
+    ///
+    /// Asserts on the FORMULA TEXT after each press, so a dead F4 leaves the
+    /// text unchanged and fails on the first assertion rather than passing on
+    /// something incidental.
+    #[test]
+    fn f4_cycles_the_reference_under_the_caret_through_the_real_app() {
+        let (p, mut h) = fbar_fixture("fbar_f4.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(0, 0), Some("=A2+$B$3"));
+        h.steps(2);
+
+        // Caret parked just after A2 — the reference the user is on.
+        let want = ["=$A$2+$B$3", "=A$2+$B$3", "=$A2+$B$3", "=A2+$B$3"];
+        for (i, expect) in want.iter().enumerate() {
+            let caret = h.app().edit_caret();
+            h.f4_at(if i == 0 { 3 } else { caret });
+            let (_, text) = h.app().editing_for_test().expect("still editing");
+            assert_eq!(
+                &text,
+                expect,
+                "press {} of the F4 cycle; status: {}",
+                i + 1,
+                h.status()
+            );
+        }
+        // And the OTHER reference's markers survived all four presses — the
+        // assertion that catches an AST round trip.
+        let (_, text) = h.app().editing_for_test().unwrap();
+        assert!(
+            text.ends_with("+$B$3"),
+            "F4 unpinned a reference it never touched: {text}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// F4 in the FORMULA BAR, which is a different editor with its own caret.
+    #[test]
+    fn f4_works_in_the_formula_bar_too() {
+        let (p, mut h) = fbar_fixture("fbar_f4_bar.csv");
+        h.app_mut().focus_formula_bar_for_test();
+        h.app_mut().set_formula_input("=SUM($D$1:$D$9)+E5");
+        h.steps(2);
+        h.f4_at(18); // just after E5
+        assert_eq!(
+            h.formula_bar_text(),
+            "=SUM($D$1:$D$9)+$E$5",
+            "F4 in the bar; status: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Ctrl+` must change what is PAINTED, not just a flag.
+    ///
+    /// Asserted on the galley text of the frame's own tessellated output: a
+    /// mode that is stored but never read by the paint path shows the value
+    /// `90` here and fails.
+    #[test]
+    fn ctrl_backtick_paints_formula_source_instead_of_the_value() {
+        let (p, mut h) = fbar_fixture("fbar_show.csv");
+        // Move the cursor AWAY from C1 using the REAL arrow-key path, which
+        // resyncs the formula bar. `painted_texts` reads the whole frame and
+        // the formula bar always shows the selected cell's source, so with C1
+        // selected the source is legitimately on screen before any toggle and
+        // the precondition below would fail against a working app. Note
+        // `set_selection_for_test` is NOT enough here: it assigns the
+        // selection directly and never resyncs the bar, so the stale
+        // `=SUM(C2:C4)` stays painted.
+        h.press_key(Key::ArrowDown).steps(2);
+
+        let before = h.painted_texts();
+        assert!(
+            before.iter().any(|t| t == "90"),
+            "the computed value should be on screen first: {before:?}"
+        );
+        assert!(
+            !before.iter().any(|t| t.contains("SUM(C2:C4)")),
+            "the source must NOT be on screen before the toggle"
+        );
+
+        h.toggle_show_formulas();
+        assert!(h.app().showing_formulas(), "the toggle did not take");
+
+        let after = h.painted_texts();
+        assert!(
+            after.iter().any(|t| t.contains("=SUM(C2:C4)")),
+            "Ctrl+` did not reach the paint path — nothing on screen shows the \
+             source: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|t| t == "90"),
+            "the computed value is still painted alongside the source: {after:?}"
+        );
+
+        // ...and back.
+        h.toggle_show_formulas();
+        let back = h.painted_texts();
+        assert!(
+            back.iter().any(|t| t == "90") && !back.iter().any(|t| t.contains("SUM(C2:C4)")),
+            "toggling off did not restore values: {back:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Per SHEET, not global. Turning it on for one sheet must leave the
+    /// other showing values.
+    #[test]
+    fn show_formulas_is_remembered_per_sheet() {
+        let (p, mut h) = fbar_fixture("fbar_show_sheets.csv");
+        let first = h.app().workbook().active_sheet();
+        h.toggle_show_formulas();
+        assert!(h.app().showing_formulas_on(first));
+
+        h.app_mut().add_sheet_for_test();
+        h.steps(2);
+        let second = h.app().workbook().active_sheet();
+        assert_ne!(first, second, "a second sheet was not created");
+        assert!(
+            !h.app().showing_formulas(),
+            "the new sheet inherited the other sheet's view mode"
+        );
+        assert!(
+            h.app().showing_formulas_on(first),
+            "the first sheet forgot its own mode"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The scale invariant. Show-formulas must render from the VIEWPORT: a
+    /// reference to a whole 200M-row column must not make the mode
+    /// materialise a formula per row.
+    ///
+    /// Asserted as a bound on how many text shapes the frame emits, which is
+    /// what "viewport only" means observably. A per-row implementation would
+    /// emit orders of magnitude more (or hang long before the assertion).
+    #[test]
+    fn show_formulas_paints_only_the_viewport() {
+        let p = write_csv("fbar_scale.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.app_mut().set_formula_input("=SUM(A1:A200000000)");
+        h.app_mut().commit_formula_bar_for_test();
+        h.steps(2);
+
+        h.toggle_show_formulas();
+        let texts = h.painted_texts();
+        assert!(
+            texts.iter().any(|t| t.contains("A200000000")),
+            "the mode is not painting the source at all: {texts:?}"
+        );
+        assert!(
+            texts.len() < 2000,
+            "show-formulas painted {} text shapes — that is not a viewport",
+            texts.len()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Coloured range highlighting: one outline per reference, each a
+    /// different colour, and only while editing.
+    ///
+    /// Reads the outlines the frame ACTUALLY painted, so a highlight that is
+    /// computed and dropped reports as absent.
+    #[test]
+    fn editing_a_formula_outlines_each_reference_in_its_own_colour() {
+        let (p, mut h) = fbar_fixture("fbar_outline.csv");
+        assert!(
+            h.ref_outlines().is_empty(),
+            "outlines must not be painted when nothing is being edited"
+        );
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(0, 0), Some("=B1+C2:C3+A3"));
+        h.steps(2);
+
+        let outlines = h.ref_outlines();
+        assert_eq!(
+            outlines.len(),
+            3,
+            "one outline per reference (B1, C2:C3, A3); got {outlines:?}"
+        );
+        let colors: std::collections::HashSet<_> = outlines.iter().map(|(_, c)| *c).collect();
+        assert_eq!(colors.len(), 3, "the three outlines share a colour");
+        // The RANGE is taller than the single cells: an outline that covered
+        // only C2 would have the same height as B1's.
+        assert!(
+            outlines[1].0.height() > outlines[0].0.height() + 1.0,
+            "C2:C3 was outlined as one cell, not as a range: {outlines:?}"
+        );
+
+        // A literal is not a formula, so nothing is outlined.
+        h.app_mut().cancel_edit_for_test();
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(0, 0), Some("A1 is a label"));
+        h.steps(2);
+        assert!(
+            h.ref_outlines().is_empty(),
+            "a cell of plain text must not sprout reference outlines"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Dragging a highlighted outline rewrites THAT reference and leaves the
+    /// rest of the formula alone.
+    ///
+    /// Driven as a real press-move-release over the outline's painted centre,
+    /// read back from the app — not at hard-coded pixels.
+    #[test]
+    fn dragging_a_reference_outline_rewrites_that_reference() {
+        let (p, mut h) = fbar_fixture("fbar_drag.csv");
+        h.select(CellRef::new(3, 0), CellRef::new(3, 0));
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(3, 0), Some("=A1+$C$1"));
+        h.steps(2);
+
+        let outlines = h.ref_outlines();
+        assert_eq!(outlines.len(), 2, "expected two outlines: {outlines:?}");
+        let from = outlines[0].0.center();
+        // One row down, in the same column: the target is B1's neighbour A2.
+        let (tx, ty) = h
+            .app()
+            .cell_center(CellRef::new(1, 0))
+            .expect("A2 must be on screen");
+
+        h.drag((from.x, from.y), (tx, ty));
+        h.steps(2);
+
+        let (_, text) = h.app().editing_for_test().expect("still editing");
+        assert_eq!(
+            text,
+            "=A2+$C$1",
+            "dragging the first outline down one row must rewrite only that \
+             reference; status: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Escape restores the pre-edit text EXACTLY — including the hard case,
+    /// where the edit began by typing over the cell and the first keystroke
+    /// has already replaced everything.
+    #[test]
+    fn escape_restores_the_pre_edit_text_even_when_typing_started_the_edit() {
+        let (p, mut h) = fbar_fixture("fbar_escape.csv");
+        let cell = CellRef::new(0, 2);
+        h.select(cell, cell);
+        h.steps(2);
+        let before_value = h.app().display(cell);
+        let before_source = h.app().edit_text(cell);
+        assert_eq!(before_source, "=SUM(C2:C4)", "fixture did not take");
+
+        // TYPING over the cell: the seed is the character typed, so the old
+        // source now exists only in the pre-edit snapshot.
+        h.type_text("9").steps(2);
+        let (_, buf) = h
+            .app()
+            .editing_for_test()
+            .expect("typing must start an edit");
+        assert_eq!(buf, "9", "typing must replace the cell, as Excel does");
+
+        h.press_key(Key::Escape).steps(2);
+        assert!(
+            h.app().editing_for_test().is_none(),
+            "Escape must end the edit"
+        );
+        assert_eq!(
+            h.app().edit_text(cell),
+            before_source,
+            "Escape did not restore the cell's formula"
+        );
+        assert_eq!(h.app().display(cell), before_value, "the value changed");
+        assert_eq!(
+            h.formula_bar_text(),
+            before_source,
+            "the formula bar was left showing the abandoned edit"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Escape after an F2 edit that was then modified — the same contract,
+    /// reached by a different door.
+    #[test]
+    fn escape_restores_the_pre_edit_text_after_f2() {
+        let (p, mut h) = fbar_fixture("fbar_escape_f2.csv");
+        let cell = CellRef::new(0, 2);
+        h.select(cell, cell);
+        h.steps(2);
+        h.press_key(Key::F2).steps(2);
+        h.type_text("+1").steps(2);
+        let (_, buf) = h.app().editing_for_test().unwrap();
+        assert_eq!(buf, "=SUM(C2:C4)+1", "F2 must seed with the source");
+
+        h.press_key(Key::Escape).steps(2);
+        assert_eq!(
+            h.app().edit_text(cell),
+            "=SUM(C2:C4)",
+            "Escape did not undo the in-progress change"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The multi-line bar: dragging the handle makes the panel TALLER, and
+    /// the height survives a restart.
+    ///
+    /// Asserted on the panel's real laid-out height, so a stored row count
+    /// that never reaches layout fails here.
+    #[test]
+    fn the_formula_bar_expands_and_its_height_survives_a_restart() {
+        let _guard = prefs_guard();
+        let dir = std::env::temp_dir().join(format!("ferrix-fbar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev = crate::prefs::set_test_config_dir(Some(dir.clone()));
+
+        let p = write_csv("fbar_rows.csv", SAMPLE);
+        let tall_h;
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            h.steps(2);
+            assert_eq!(h.app().formula_bar_rows(), 1, "the default is one row");
+            let short = h.app().formula_bar_height();
+            assert!(short > 0.0, "the bar never laid out");
+
+            h.app_mut().set_formula_bar_rows(5);
+            h.steps(2);
+            tall_h = h.app().formula_bar_height();
+            assert!(
+                tall_h > short + 20.0,
+                "the bar did not actually grow: {short} -> {tall_h}"
+            );
+
+            // A multi-line bar really does hold a newline, which a
+            // single-line TextEdit would refuse.
+            h.app_mut().set_formula_input("=1+\n2");
+            h.steps(2);
+            assert!(
+                h.formula_bar_text().contains('\n'),
+                "the expanded bar dropped the newline"
+            );
+        }
+        {
+            let mut h2 = Harness::new(Some(&p));
+            assert!(h2.step_until(200, |a| a.row_count() > 0));
+            h2.steps(2);
+            assert_eq!(
+                h2.app().formula_bar_rows(),
+                5,
+                "the formula bar height did not survive a restart"
+            );
+            assert!(
+                (h2.app().formula_bar_height() - tall_h).abs() < 2.0,
+                "restored the number but not the height"
+            );
+        }
 
         crate::prefs::set_test_config_dir(prev);
         let _ = std::fs::remove_dir_all(&dir);

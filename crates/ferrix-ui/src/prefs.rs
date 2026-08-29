@@ -29,7 +29,7 @@ use crate::theme::ThemeMode;
 /// `PartialEq` but not `Eq`: `zoom` is an f32. Comparisons here are exact by
 /// design — a zoom is only ever one of a fixed set of stops, or a value that
 /// round-tripped through this file's own formatting.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     /// `None` means "never chosen" — the caller then follows the OS.
     pub theme: Option<ThemeMode>,
@@ -58,6 +58,28 @@ pub struct Prefs {
     /// command SLUGS rather than indices — a registry reorder must not
     /// silently reassign somebody's history to different commands.
     pub recent_commands: Vec<String>,
+    /// Issue #38: how many text rows tall the formula bar is. 1 is the
+    /// classic single-line bar.
+    ///
+    /// This is why `Prefs` no longer derives `Default`: a derived default
+    /// would be ZERO rows, i.e. a formula bar with no formula bar in it. The
+    /// default has to be 1, and a hand-written impl is the only way to say so
+    /// once rather than at every construction site.
+    pub formula_bar_rows: usize,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            show_empty_rows: false,
+            autosave_secs: None,
+            zoom: Vec::new(),
+            recent: Vec::new(),
+            recent_commands: Vec::new(),
+            formula_bar_rows: 1,
+        }
+    }
 }
 
 impl Prefs {
@@ -157,6 +179,14 @@ pub(crate) fn set_test_config_dir(dir: Option<PathBuf>) -> Option<PathBuf> {
     TEST_CONFIG_DIR.with(|d| std::mem::replace(&mut *d.borrow_mut(), dir))
 }
 
+/// Formula bar height bounds, in text rows (issue #38).
+///
+/// The floor is 1 because a zero-row bar cannot be dragged back open. The
+/// ceiling exists because the bar is a `TopBottomPanel`: an unbounded drag
+/// would push the grid off the bottom of the window entirely.
+pub const MIN_FORMULA_BAR_ROWS: usize = 1;
+pub const MAX_FORMULA_BAR_ROWS: usize = 12;
+
 fn prefs_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join(FILE))
 }
@@ -190,6 +220,14 @@ impl Prefs {
                 // falls back to the OS preference rather than to a guess.
                 "theme" => out.theme = ThemeMode::parse(v),
                 "show_empty_rows" => out.show_empty_rows = v == "true",
+                // Clamped on the way IN, not just on the way out: a hand-edited
+                // `formula_bar_rows = 0` must not produce an invisible formula
+                // bar the user then cannot use to fix anything.
+                "formula_bar_rows" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        out.formula_bar_rows = n.clamp(MIN_FORMULA_BAR_ROWS, MAX_FORMULA_BAR_ROWS);
+                    }
+                }
                 // A malformed number leaves this None, i.e. the default
                 // cadence — never zero, which would silently disable
                 // autosave because of a typo in a config file.
@@ -249,6 +287,7 @@ impl Prefs {
             s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
         }
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
+        s.push_str(&format!("formula_bar_rows = {}\n", self.formula_bar_rows));
         if let Some(secs) = self.autosave_secs {
             s.push_str(&format!("autosave_secs = {secs}\n"));
         }
@@ -337,6 +376,22 @@ pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 mod tests {
     use super::*;
 
+    /// Issue #38. A missing line must leave the bar at its usable default,
+    /// and a hand-edited nonsense value must not be able to produce a formula
+    /// bar with no rows in it — which the user could then never drag open.
+    #[test]
+    fn formula_bar_height_defaults_to_one_row_and_is_clamped_on_read() {
+        assert_eq!(Prefs::parse("theme = \"dark\"").formula_bar_rows, 1);
+        assert_eq!(Prefs::parse("formula_bar_rows = 0").formula_bar_rows, 1);
+        assert_eq!(
+            Prefs::parse("formula_bar_rows = 9999").formula_bar_rows,
+            MAX_FORMULA_BAR_ROWS
+        );
+        assert_eq!(Prefs::parse("formula_bar_rows = 5").formula_bar_rows, 5);
+        // Garbage leaves the default rather than zeroing the bar.
+        assert_eq!(Prefs::parse("formula_bar_rows = tall").formula_bar_rows, 1);
+    }
+
     #[test]
     fn round_trips_through_text() {
         for theme in [None, Some(ThemeMode::Dark), Some(ThemeMode::Light)] {
@@ -349,6 +404,7 @@ mod tests {
                         zoom: Vec::new(),
                         recent: Vec::new(),
                         recent_commands: Vec::new(),
+                        formula_bar_rows: 1,
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -372,6 +428,9 @@ mod tests {
                     // Recency travels in the same file; a round trip that
                     // omits it cannot catch the writer dropping it.
                     recent_commands: vec!["view.zoom_in".into(), "file.save".into()],
+                    // Issue #38 travels in the same file; a round trip that
+                    // omits it cannot catch the writer dropping it.
+                    formula_bar_rows: 4,
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -437,6 +496,7 @@ mod tests {
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 3.0)],
             recent: Vec::new(),
             recent_commands: Vec::new(),
+            formula_bar_rows: 1,
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -466,6 +526,9 @@ mod tests {
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 2.0)],
             recent: vec![crate::recent::RecentEntry::new("/a.csv")],
             recent_commands: vec!["data.goal_seek".into(), "view.theme".into()],
+            // Issue #38: the formula bar's height is part of the same
+            // restart-survival criterion as the theme.
+            formula_bar_rows: 3,
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

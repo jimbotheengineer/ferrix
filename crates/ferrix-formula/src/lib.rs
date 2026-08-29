@@ -11,6 +11,7 @@ pub mod fill;
 pub mod lookup;
 pub mod names;
 pub mod parser;
+pub mod refedit;
 pub mod refscan;
 pub mod remap;
 pub mod stats;
