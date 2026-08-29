@@ -75,13 +75,14 @@
 //! single sheet rather than the whole workbook. Given the xlsx row cap, the
 //! worst case is bounded and modest compared to the datasets Ferrix targets.
 
-use std::io::Read;
 use std::path::Path;
 
 use calamine::{Data, Reader, Xlsx};
-use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Sheet, Value};
+use ferrix_core::{CancelToken, CellInput, CellRef, EditOverlay, ErrorKind, Sheet, Value};
 use ferrix_formula::{DefinedName, Expr, NameScope, NameTable};
 use rust_xlsxwriter::{Formula, Workbook};
+
+use crate::safeguard::{self, Limits, PartBudget, SafeguardError};
 
 /// Excel's hard worksheet row limit.
 pub const XLSX_MAX_ROWS: usize = 1_048_576;
@@ -232,6 +233,15 @@ pub enum XlsxError {
     /// Excel refused a defined name — it breaks one of its naming rules.
     #[error("cannot write defined name {name:?}: {detail}")]
     DefinedName { name: String, detail: String },
+
+    /// The file was refused, or failed mid-read, by the resource safeguards.
+    ///
+    /// Kept as its own variant rather than flattened into
+    /// [`XlsxError::TableParse`] so a caller can tell "this file is hostile
+    /// or truncated" from "this file is fine but Ferrix does not understand
+    /// part of it", and so the failing part name survives to the UI.
+    #[error(transparent)]
+    Safeguard(#[from] SafeguardError),
 }
 
 /// A worksheet as it came out of a workbook.
@@ -269,6 +279,31 @@ pub fn import_xlsx(path: impl AsRef<Path>) -> Result<Vec<(String, Sheet)>, XlsxE
 
 /// Import every worksheet, keeping formulas the Ferrix parser accepts.
 pub fn import_xlsx_full(path: impl AsRef<Path>) -> Result<Vec<ImportedSheet>, XlsxError> {
+    import_xlsx_guarded(path, &Limits::measured(), None)
+}
+
+/// Import under explicit resource limits, cancellably.
+///
+/// This is the real entry point; [`import_xlsx_full`] is it with a measured
+/// budget and no cancel token. Three things happen before calamine is handed
+/// the file, in this order:
+///
+/// 1. The zip central directory is vetted — declared expansion ratio,
+///    declared total, entry count, entry paths. Nothing is extracted, so a
+///    bomb costs a directory read rather than a decompression.
+/// 2. The largest declared part is checked against the per-part cap, because
+///    calamine materializes one worksheet's `Range` at a time and that is
+///    the allocation that would blow up.
+/// 3. Only then is the workbook opened.
+///
+/// Cancellation is polled between sheets and, for large sheets, between
+/// cells. A cancelled import returns [`SafeguardError::Cancelled`] and every
+/// sheet built so far is dropped — the caller receives no partial workbook.
+pub fn import_xlsx_guarded(
+    path: impl AsRef<Path>,
+    limits: &Limits,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<ImportedSheet>, XlsxError> {
     let path = path.as_ref();
     let disp = path.display().to_string();
     let read_err = |e: calamine::XlsxError| XlsxError::Read {
@@ -276,36 +311,78 @@ pub fn import_xlsx_full(path: impl AsRef<Path>) -> Result<Vec<ImportedSheet>, Xl
         source: Box::new(e),
     };
 
+    // Vet the package from its central directory, before calamine builds a
+    // decompressor. The archive handle is dropped immediately: this is a
+    // check, not the read path.
+    {
+        let (_zip, report) = safeguard::open_checked(path, limits)?;
+        if report.largest_part_bytes > limits.max_part_bytes {
+            return Err(SafeguardError::PartTooLarge {
+                path: disp.clone(),
+                part: report.largest_part.clone(),
+                declared: report.largest_part_bytes,
+                limit: limits.max_part_bytes,
+            }
+            .into());
+        }
+    }
+
     let mut wb: Xlsx<_> = calamine::open_workbook(path).map_err(read_err)?;
     let names = wb.sheet_names();
     if names.is_empty() {
         return Err(XlsxError::NoSheets);
     }
 
+    let cancelled = |part: &str| -> XlsxError {
+        SafeguardError::Cancelled {
+            path: disp.clone(),
+            part: part.to_string(),
+        }
+        .into()
+    };
+
     let mut out = Vec::with_capacity(names.len());
     for name in names {
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            // `out` is dropped here. A cancelled import yields no sheets at
+            // all rather than the prefix that happened to finish.
+            return Err(cancelled(&name));
+        }
         // One sheet resident at a time — peak memory is the largest sheet,
         // not the whole workbook.
         let range = wb.worksheet_range(&name).map_err(read_err)?;
         // Formulas are a separate pass; a workbook with none costs nothing.
         let formulas = wb.worksheet_formula(&name).map_err(read_err)?;
-        out.push(build_sheet(&name, &range, &formulas));
+        match build_sheet(&name, &range, &formulas, cancel) {
+            Some(s) => out.push(s),
+            None => return Err(cancelled(&name)),
+        }
     }
     Ok(out)
 }
 
+/// How many cells pass between cancellation polls while building a sheet.
+const CELL_CANCEL_POLL: usize = 8192;
+
+/// Build one sheet. `None` means cancellation was observed; the half-built
+/// sheet is dropped rather than returned.
 fn build_sheet(
     name: &str,
     range: &calamine::Range<Data>,
     formulas: &calamine::Range<String>,
-) -> ImportedSheet {
+    cancel: Option<&CancelToken>,
+) -> Option<ImportedSheet> {
     let mut sheet = Sheet::new(name);
     let mut overlay = EditOverlay::new();
     let mut stats = ImportStats::default();
 
     // `used_cells` yields positions relative to the range's own origin.
     let (r0, c0) = range.start().unwrap_or((0, 0));
-    for (r, c, data) in range.used_cells() {
+    for (n, (r, c, data)) in range.used_cells().enumerate() {
+        if cancel.is_some() && n % CELL_CANCEL_POLL == 0 && cancel.is_some_and(|c| c.is_cancelled())
+        {
+            return None;
+        }
         let cell = CellRef::new(r0 + r as u32, c0 + c as u32);
         let value = data_to_value(data, &mut sheet);
         if value.is_empty() {
@@ -316,7 +393,11 @@ fn build_sheet(
     }
 
     let (fr0, fc0) = formulas.start().unwrap_or((0, 0));
-    for (r, c, src) in formulas.used_cells() {
+    for (n, (r, c, src)) in formulas.used_cells().enumerate() {
+        if cancel.is_some() && n % CELL_CANCEL_POLL == 0 && cancel.is_some_and(|c| c.is_cancelled())
+        {
+            return None;
+        }
         if src.is_empty() {
             continue;
         }
@@ -350,12 +431,12 @@ fn build_sheet(
         stats.formulas_kept += 1;
     }
 
-    ImportedSheet {
+    Some(ImportedSheet {
         name: name.to_string(),
         sheet,
         formulas: overlay,
         stats,
-    }
+    })
 }
 
 fn data_to_value(data: &Data, sheet: &mut Sheet) -> Value {
@@ -423,54 +504,64 @@ fn cell_error_to_kind(e: &calamine::CellErrorType) -> ErrorKind {
 /// Built-in names (`_xlnm.Print_Area` and friends) are skipped: they are
 /// Excel print settings, not user ranges, and Ferrix has no equivalent.
 pub fn import_defined_names(path: impl AsRef<Path>) -> Result<NameTable, XlsxError> {
+    import_defined_names_guarded(path, &Limits::measured(), None)
+}
+
+/// [`import_defined_names`] under explicit limits, cancellably.
+///
+/// ## The bug this replaces
+///
+/// The previous reader matched `Ok(Event::Eof) | Err(_) => break` — a parse
+/// ERROR and a clean end of file were the same thing. A `xl/workbook.xml`
+/// truncated after two of its five `<definedName>` elements therefore
+/// imported as a workbook with two names and no complaint anywhere. That is
+/// silent data loss dressed as a successful import, and it is why every
+/// reader in this crate now separates the two.
+pub fn import_defined_names_guarded(
+    path: impl AsRef<Path>,
+    limits: &Limits,
+    cancel: Option<&CancelToken>,
+) -> Result<NameTable, XlsxError> {
     let path = path.as_ref();
     let disp = path.display().to_string();
-    let io_err = |e: std::io::Error| XlsxError::Read {
-        path: disp.clone(),
-        source: Box::new(calamine::XlsxError::Io(e)),
-    };
-    let zip_err = |msg: String| XlsxError::TableParse {
-        path: disp.clone(),
-        detail: msg,
+
+    let (mut zip, _report) = safeguard::open_checked(path, limits)?;
+    const PART: &str = "xl/workbook.xml";
+    let mut budget = PartBudget::new(disp.clone(), limits);
+    let xml = {
+        let f = zip
+            .by_name(PART)
+            .map_err(|e| SafeguardError::PartUnreadable {
+                path: disp.clone(),
+                part: PART.to_string(),
+                detail: e.to_string(),
+            })?;
+        let declared = f.size();
+        budget.read(f, declared, PART)?
     };
 
-    let file = std::fs::File::open(path).map_err(io_err)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
-    let mut xml = Vec::new();
-    {
-        let mut f = zip
-            .by_name("xl/workbook.xml")
-            .map_err(|e| zip_err(e.to_string()))?;
-        f.read_to_end(&mut xml).map_err(io_err)?;
-    }
-
-    let sheet_order = workbook_sheet_names(&xml);
+    let sheet_order = workbook_sheet_names(&xml, &disp)?;
     let mut table = NameTable::new();
-    let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
-    let mut buf = Vec::new();
     let mut pending: Option<(String, Option<usize>)> = None;
     let mut text = String::new();
 
-    loop {
-        match rd.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(ref e))
-                if e.local_name().as_ref() == b"definedName" =>
-            {
+    safeguard::scan_part(&xml, &disp, PART, cancel, |ev| {
+        use quick_xml::events::Event as E;
+        match ev {
+            E::Start(e) if e.local_name().as_ref() == b"definedName" => {
                 let Some(name) = xattr(e, b"name") else {
-                    continue;
+                    return Ok(());
                 };
                 let local = xattr(e, b"localSheetId").and_then(|v| v.parse::<usize>().ok());
                 pending = Some((name, local));
                 text.clear();
             }
-            Ok(quick_xml::events::Event::Text(t)) if pending.is_some() => {
+            E::Text(t) if pending.is_some() => {
                 if let Ok(s) = t.xml10_content() {
                     text.push_str(&s);
                 }
             }
-            Ok(quick_xml::events::Event::End(ref e))
-                if e.local_name().as_ref() == b"definedName" =>
-            {
+            E::End(e) if e.local_name().as_ref() == b"definedName" => {
                 if let Some((name, local)) = pending.take() {
                     // `_xlnm.*` are Excel's own print/filter settings.
                     if !name.starts_with("_xlnm") {
@@ -485,35 +576,32 @@ pub fn import_defined_names(path: impl AsRef<Path>) -> Result<NameTable, XlsxErr
                     }
                 }
             }
-            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
             _ => {}
         }
-        buf.clear();
-    }
+        Ok(())
+    })?;
     Ok(table)
 }
 
 /// Sheet names in `xl/workbook.xml` order — what `localSheetId` indexes.
-fn workbook_sheet_names(xml: &[u8]) -> Vec<String> {
+///
+/// Errors rather than stopping short on malformed XML: a truncated
+/// `<sheets>` list would shift every `localSheetId`, silently re-scoping
+/// names onto the wrong sheets.
+fn workbook_sheet_names(xml: &[u8], path: &str) -> Result<Vec<String>, SafeguardError> {
     let mut out = Vec::new();
-    let mut rd = quick_xml::Reader::from_reader(xml);
-    let mut buf = Vec::new();
-    loop {
-        match rd.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Empty(ref e))
-            | Ok(quick_xml::events::Event::Start(ref e))
-                if e.local_name().as_ref() == b"sheet" =>
-            {
+    safeguard::scan_part(xml, path, "xl/workbook.xml", None, |ev| {
+        use quick_xml::events::Event as E;
+        if let E::Empty(e) | E::Start(e) = ev {
+            if e.local_name().as_ref() == b"sheet" {
                 if let Some(n) = xattr(e, b"name") {
                     out.push(n);
                 }
             }
-            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
-            _ => {}
         }
-        buf.clear();
-    }
-    out
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// Read an attribute by local name, resolving XML entities.
@@ -1203,7 +1291,20 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push("ferrix-xlsx-definitely-missing.xlsx");
         let err = import_xlsx(&p).unwrap_err();
-        assert!(matches!(err, XlsxError::Read { .. }), "got {err:?}");
+        // The safeguards now open the package before calamine does, so a
+        // missing file is reported by them. What matters is that it is a
+        // clean error naming the file, not a panic.
+        assert!(
+            matches!(
+                err,
+                XlsxError::Safeguard(SafeguardError::PartUnreadable { .. })
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("definitely-missing"),
+            "the error must name the file it could not open: {err}"
+        );
     }
 
     #[test]

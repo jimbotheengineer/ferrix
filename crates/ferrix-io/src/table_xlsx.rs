@@ -59,7 +59,6 @@
 //! inspecting the emitted XML — not "opened in Excel and confirmed".
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 
 use ferrix_core::merge::MergeMap;
@@ -73,7 +72,20 @@ use rust_xlsxwriter::{
     Format, Note, Worksheet,
 };
 
+use crate::safeguard::{self, Limits, SafeguardError};
 use crate::xlsx::XlsxError;
+
+/// Read every part of an `.xlsx` under the resource safeguards.
+///
+/// Replaces three copies of a loop that did
+/// `Vec::with_capacity(entry.size())` — sizing an allocation directly from a
+/// number the file chose. A 40 KB archive claiming a 4 GB entry aborted the
+/// process on the reserve, before a byte was decompressed.
+fn read_package(path: &Path, limits: &Limits) -> Result<HashMap<String, Vec<u8>>, SafeguardError> {
+    let disp = path.display().to_string();
+    let (mut zip, _report) = safeguard::open_checked(path, limits)?;
+    safeguard::read_all_parts(&mut zip, &disp, limits, None)
+}
 
 /// Sentinel bound meaning "any finite number", used to express a bare
 /// [`ColumnType::Number`] as a real Excel `decimal` validation. Excel accepts
@@ -615,54 +627,26 @@ pub struct ImportedMerge {
 pub fn import_merges(path: impl AsRef<Path>) -> Result<Vec<ImportedMerge>, XlsxError> {
     let path = path.as_ref();
     let disp = path.display().to_string();
-    let io_err = |e: std::io::Error| XlsxError::Read {
-        path: disp.clone(),
-        source: Box::new(calamine::XlsxError::Io(e)),
-    };
-    let zip_err = |msg: String| XlsxError::TableParse {
-        path: disp.clone(),
-        detail: msg,
-    };
+    let parts = read_package(path, &Limits::measured())?;
 
-    let file = std::fs::File::open(path).map_err(io_err)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
-
-    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| zip_err(e.to_string()))?;
-        if !f.is_file() {
-            continue;
-        }
-        let name = f.name().to_string();
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut buf).map_err(io_err)?;
-        parts.insert(name, buf);
-    }
-
-    let sheet_paths = worksheet_paths(&parts);
+    let sheet_paths = worksheet_paths(&parts, &disp)?;
     let mut out = Vec::new();
     for (sheet_index, sp) in sheet_paths.iter().enumerate() {
         let Some(xml) = parts.get(sp) else { continue };
-        let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
-        let mut buf = Vec::new();
-        loop {
-            match rd.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Empty(ref e))
-                | Ok(quick_xml::events::Event::Start(ref e)) => {
-                    if e.local_name().as_ref() == b"mergeCell" {
-                        if let Some(r) = attr(e, b"ref").and_then(|r| TableRange::from_a1(&r)) {
-                            out.push(ImportedMerge {
-                                sheet_index,
-                                range: r,
-                            });
-                        }
+        safeguard::scan_part(xml, &disp, sp, None, |ev| {
+            use quick_xml::events::Event as E;
+            if let E::Empty(e) | E::Start(e) = ev {
+                if e.local_name().as_ref() == b"mergeCell" {
+                    if let Some(r) = attr(e, b"ref").and_then(|r| TableRange::from_a1(&r)) {
+                        out.push(ImportedMerge {
+                            sheet_index,
+                            range: r,
+                        });
                     }
                 }
-                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
-                _ => {}
             }
-            buf.clear();
-        }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -777,36 +761,15 @@ pub fn write_comments(
 pub fn import_comments(path: impl AsRef<Path>) -> Result<Vec<ImportedComment>, XlsxError> {
     let path = path.as_ref();
     let disp = path.display().to_string();
-    let io_err = |e: std::io::Error| XlsxError::Read {
-        path: disp.clone(),
-        source: Box::new(calamine::XlsxError::Io(e)),
-    };
-    let zip_err = |msg: String| XlsxError::TableParse {
-        path: disp.clone(),
-        detail: msg,
-    };
-
-    let file = std::fs::File::open(path).map_err(io_err)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
-    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| zip_err(e.to_string()))?;
-        if !f.is_file() {
-            continue;
-        }
-        let name = f.name().to_string();
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut buf).map_err(io_err)?;
-        parts.insert(name, buf);
-    }
+    let parts = read_package(path, &Limits::measured())?;
 
     let mut out = Vec::new();
-    for (sheet_index, sp) in worksheet_paths(&parts).iter().enumerate() {
+    for (sheet_index, sp) in worksheet_paths(&parts, &disp)?.iter().enumerate() {
         // The comments part is reached through the WORKSHEET's relationships,
         // not by guessing `comments{n}.xml` matches sheet n. Excel numbers the
         // parts by the order sheets that *have* comments appear, so sheet 3
         // may own comments1.xml.
-        let rels = rels_for(&parts, sp);
+        let rels = rels_for(&parts, sp, &disp)?;
         let Some(target) = rels
             .values()
             .find(|t| t.contains("comments") && t.ends_with(".xml"))
@@ -816,7 +779,7 @@ pub fn import_comments(path: impl AsRef<Path>) -> Result<Vec<ImportedComment>, X
         let Some(xml) = parts.get(target) else {
             continue;
         };
-        for (cell, comment) in parse_comments_part(xml) {
+        for (cell, comment) in parse_comments_part(xml, &disp, target)? {
             out.push(ImportedComment {
                 sheet_index,
                 cell,
@@ -833,11 +796,13 @@ pub fn import_comments(path: impl AsRef<Path>) -> Result<Vec<ImportedComment>, X
 /// ...</text>` — so every `<t>` inside one `<comment>` is concatenated. Taking
 /// only the first would silently truncate any note Excel split into runs, and
 /// Excel splits on the smallest formatting change.
-fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
+fn parse_comments_part(
+    xml: &[u8],
+    path: &str,
+    part: &str,
+) -> Result<Vec<(CellRef, Comment)>, SafeguardError> {
     let mut authors: Vec<String> = Vec::new();
     let mut out = Vec::new();
-    let mut rd = quick_xml::Reader::from_reader(xml);
-    let mut buf = Vec::new();
 
     let mut in_authors = false;
     let mut in_author = false;
@@ -846,9 +811,10 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
     let mut text = String::new();
     let mut author_text = String::new();
 
-    loop {
-        match rd.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(ref e)) => match e.local_name().as_ref() {
+    safeguard::scan_part(xml, path, part, None, |ev| {
+        use quick_xml::events::Event as E;
+        match ev {
+            E::Start(e) => match e.local_name().as_ref() {
                 b"authors" => in_authors = true,
                 b"author" if in_authors => {
                     in_author = true;
@@ -865,7 +831,7 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
                 b"t" => in_t = true,
                 _ => {}
             },
-            Ok(quick_xml::events::Event::Text(ref t)) => {
+            E::Text(t) => {
                 let s = t.decode().map(|c| c.into_owned()).unwrap_or_default();
                 if in_author {
                     author_text.push_str(&s);
@@ -878,7 +844,11 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
             // them would silently DELETE every `<`, `&` and `>` a user typed
             // into a note, which is exactly the kind of quiet corruption an
             // annotation must never suffer.
-            Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+            //
+            // `scan_part` has already refused anything that is not one of the
+            // five predefined entities or a numeric character reference, so
+            // by the time this arm runs the reference is known-safe.
+            E::GeneralRef(r) => {
                 let Some(dst) = (if in_author {
                     Some(&mut author_text)
                 } else if in_t {
@@ -886,8 +856,7 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
                 } else {
                     None
                 }) else {
-                    buf.clear();
-                    continue;
+                    return Ok(());
                 };
                 if let Ok(Some(ch)) = r.resolve_char_ref() {
                     dst.push(ch);
@@ -898,19 +867,11 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
                         Ok("gt") => dst.push('>'),
                         Ok("quot") => dst.push('"'),
                         Ok("apos") => dst.push('\''),
-                        // An entity no XML spreadsheet writer emits. Keeping
-                        // the raw `&name;` is closer to the truth than
-                        // dropping it.
-                        Ok(other) => {
-                            dst.push('&');
-                            dst.push_str(other);
-                            dst.push(';');
-                        }
-                        Err(_) => {}
+                        Ok(_) | Err(_) => {}
                     }
                 }
             }
-            Ok(quick_xml::events::Event::End(ref e)) => match e.local_name().as_ref() {
+            E::End(e) => match e.local_name().as_ref() {
                 b"authors" => in_authors = false,
                 b"author" if in_author => {
                     in_author = false;
@@ -939,12 +900,11 @@ fn parse_comments_part(xml: &[u8]) -> Vec<(CellRef, Comment)> {
                 }
                 _ => {}
             },
-            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
             _ => {}
         }
-        buf.clear();
-    }
-    out
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// Every table found in a workbook, with the worksheet it belongs to.
@@ -966,46 +926,29 @@ pub struct ImportedTable {
 pub fn import_tables(path: impl AsRef<Path>) -> Result<Vec<ImportedTable>, XlsxError> {
     let path = path.as_ref();
     let disp = path.display().to_string();
-    let io_err = |e: std::io::Error| XlsxError::Read {
-        path: disp.clone(),
-        source: Box::new(calamine::XlsxError::Io(e)),
-    };
-    let zip_err = |msg: String| XlsxError::TableParse {
-        path: disp.clone(),
-        detail: msg,
-    };
 
-    let file = std::fs::File::open(path).map_err(io_err)?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
+    // Read the whole package into memory up front, under the safeguards. An
+    // xlsx is bounded by Excel's own limits and this avoids fighting the
+    // archive's borrow of itself while chasing relationships across parts.
+    let parts = read_package(path, &Limits::measured())?;
 
-    // Read the whole package into memory up front. An xlsx is bounded by
-    // Excel's own limits and this avoids fighting the archive's borrow of
-    // itself while chasing relationships across parts.
-    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| zip_err(e.to_string()))?;
-        if !f.is_file() {
-            continue;
-        }
-        let name = f.name().to_string();
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut buf).map_err(io_err)?;
-        parts.insert(name, buf);
-    }
-
-    let styles = parse_styles(parts.get("xl/styles.xml").map(Vec::as_slice));
-    let sheet_paths = worksheet_paths(&parts);
+    let styles = parse_styles(
+        parts.get("xl/styles.xml").map(Vec::as_slice),
+        &disp,
+        "xl/styles.xml",
+    )?;
+    let sheet_paths = worksheet_paths(&parts, &disp)?;
 
     let mut out = Vec::new();
     for (sheet_index, sheet_path) in sheet_paths.iter().enumerate() {
         let Some(xml) = parts.get(sheet_path) else {
             continue;
         };
-        let sheet = parse_worksheet(xml, &styles);
+        let sheet = parse_worksheet(xml, &styles, &disp, sheet_path)?;
         if sheet.table_rels.is_empty() {
             continue;
         }
-        let rels = rels_for(&parts, sheet_path);
+        let rels = rels_for(&parts, sheet_path, &disp)?;
         for rid in &sheet.table_rels {
             let Some(target) = rels.get(rid) else {
                 continue;
@@ -1013,7 +956,7 @@ pub fn import_tables(path: impl AsRef<Path>) -> Result<Vec<ImportedTable>, XlsxE
             let Some(table_xml) = parts.get(target) else {
                 continue;
             };
-            let mut table = parse_table_part(table_xml)?;
+            let mut table = parse_table_part(table_xml, &disp, target)?;
             apply_sheet_decorations(&mut table, &sheet);
             out.push(ImportedTable { sheet_index, table });
         }
@@ -1026,36 +969,45 @@ pub fn import_tables(path: impl AsRef<Path>) -> Result<Vec<ImportedTable>, XlsxE
 /// Follows `xl/workbook.xml` -> `xl/_rels/workbook.xml.rels` rather than
 /// guessing `sheet1.xml, sheet2.xml, ...`: the numbering is a convention, not
 /// a guarantee, and a workbook that has had sheets deleted breaks it.
-fn worksheet_paths(parts: &HashMap<String, Vec<u8>>) -> Vec<String> {
-    let Some(xml) = parts.get("xl/workbook.xml") else {
-        return Vec::new();
+///
+/// A malformed `xl/workbook.xml` is an ERROR here, not a short list. The
+/// index this returns is what every `sheet_index` in the results refers to,
+/// so silently returning three sheets for a five-sheet workbook would
+/// misattribute every merge, comment and table in the last two.
+fn worksheet_paths(
+    parts: &HashMap<String, Vec<u8>>,
+    path: &str,
+) -> Result<Vec<String>, SafeguardError> {
+    const PART: &str = "xl/workbook.xml";
+    let Some(xml) = parts.get(PART) else {
+        return Ok(Vec::new());
     };
-    let rels = rels_for(parts, "xl/workbook.xml");
+    let rels = rels_for(parts, PART, path)?;
     let mut ids = Vec::new();
-    let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
-    let mut buf = Vec::new();
-    while let Ok(ev) = rd.read_event_into(&mut buf) {
-        match ev {
-            quick_xml::events::Event::Empty(e) | quick_xml::events::Event::Start(e) => {
-                if e.local_name().as_ref() == b"sheet" {
-                    if let Some(id) = attr(&e, b"id").or_else(|| attr(&e, b"r:id")) {
-                        ids.push(id);
-                    }
+    safeguard::scan_part(xml, path, PART, None, |ev| {
+        use quick_xml::events::Event as E;
+        if let E::Empty(e) | E::Start(e) = ev {
+            if e.local_name().as_ref() == b"sheet" {
+                if let Some(id) = attr(e, b"id").or_else(|| attr(e, b"r:id")) {
+                    ids.push(id);
                 }
             }
-            quick_xml::events::Event::Eof => break,
-            _ => {}
         }
-        buf.clear();
-    }
-    ids.iter()
+        Ok(())
+    })?;
+    Ok(ids
+        .iter()
         .filter_map(|id| rels.get(id).cloned())
         .filter(|p| p.contains("worksheets/"))
-        .collect()
+        .collect())
 }
 
 /// Resolve a part's `_rels` file into id -> absolute part path.
-fn rels_for(parts: &HashMap<String, Vec<u8>>, part: &str) -> HashMap<String, String> {
+fn rels_for(
+    parts: &HashMap<String, Vec<u8>>,
+    part: &str,
+    path: &str,
+) -> Result<HashMap<String, String>, SafeguardError> {
     let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
     let rel_path = if dir.is_empty() {
         format!("_rels/{file}.rels")
@@ -1064,25 +1016,20 @@ fn rels_for(parts: &HashMap<String, Vec<u8>>, part: &str) -> HashMap<String, Str
     };
     let mut map = HashMap::new();
     let Some(xml) = parts.get(&rel_path) else {
-        return map;
+        return Ok(map);
     };
-    let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
-    let mut buf = Vec::new();
-    while let Ok(ev) = rd.read_event_into(&mut buf) {
-        match ev {
-            quick_xml::events::Event::Empty(e) | quick_xml::events::Event::Start(e) => {
-                if e.local_name().as_ref() == b"Relationship" {
-                    if let (Some(id), Some(target)) = (attr(&e, b"Id"), attr(&e, b"Target")) {
-                        map.insert(id, normalise_target(dir, &target));
-                    }
+    safeguard::scan_part(xml, path, &rel_path, None, |ev| {
+        use quick_xml::events::Event as E;
+        if let E::Empty(e) | E::Start(e) = ev {
+            if e.local_name().as_ref() == b"Relationship" {
+                if let (Some(id), Some(target)) = (attr(e, b"Id"), attr(e, b"Target")) {
+                    map.insert(id, normalise_target(dir, &target));
                 }
             }
-            quick_xml::events::Event::Eof => break,
-            _ => {}
         }
-        buf.clear();
-    }
-    map
+        Ok(())
+    })?;
+    Ok(map)
 }
 
 /// Turn a relationship target into a package-absolute path, resolving the
@@ -1156,11 +1103,9 @@ fn builtin_format(id: u32) -> Option<&'static str> {
     })
 }
 
-fn parse_styles(xml: Option<&[u8]>) -> Styles {
+fn parse_styles(xml: Option<&[u8]>, path: &str, part: &str) -> Result<Styles, SafeguardError> {
     let mut styles = Styles::default();
-    let Some(xml) = xml else { return styles };
-    let mut rd = quick_xml::Reader::from_reader(xml);
-    let mut buf = Vec::new();
+    let Some(xml) = xml else { return Ok(styles) };
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
     let mut in_cell_xfs = false;
     let mut in_dxfs = false;
@@ -1168,12 +1113,13 @@ fn parse_styles(xml: Option<&[u8]>) -> Styles {
     let mut cur_dxf: (Option<Rgb>, Option<Rgb>) = (None, None);
     let mut xf_ids: Vec<u32> = Vec::new();
 
-    // `while let Ok(..)` rather than a match with an `Err(_) => break` arm:
-    // a malformed part is treated as ending there, which is the same
-    // degradation as EOF and keeps the rest of the workbook importable.
-    while let Ok(ev) = rd.read_event_into(&mut buf) {
+    // A malformed styles part is an ERROR, not a stopping point. Truncating
+    // `<cellXfs>` shifts every later style index, so the previous "treat it
+    // like EOF" behaviour rendered columns with the WRONG number format
+    // rather than reporting that the file was damaged.
+    safeguard::scan_part(xml, path, part, None, |ev| {
         use quick_xml::events::Event as E;
-        match &ev {
+        match ev {
             E::Start(e) | E::Empty(e) => {
                 let empty = matches!(ev, E::Empty(_));
                 match e.local_name().as_ref() {
@@ -1221,11 +1167,10 @@ fn parse_styles(xml: Option<&[u8]>) -> Styles {
                 }
                 _ => {}
             },
-            E::Eof => break,
             _ => {}
         }
-        buf.clear();
-    }
+        Ok(())
+    })?;
 
     styles.xf_formats = xf_ids
         .into_iter()
@@ -1237,7 +1182,7 @@ fn parse_styles(xml: Option<&[u8]>) -> Styles {
                 .unwrap_or_else(|| "General".to_string())
         })
         .collect();
-    styles
+    Ok(styles)
 }
 
 /// Everything a worksheet part contributes to a table's definition.
@@ -1261,10 +1206,13 @@ struct ParsedValidation {
     tag: Option<FerrixTag>,
 }
 
-fn parse_worksheet(xml: &[u8], styles: &Styles) -> SheetDecorations {
+fn parse_worksheet(
+    xml: &[u8],
+    styles: &Styles,
+    path: &str,
+    part: &str,
+) -> Result<SheetDecorations, SafeguardError> {
     let mut out = SheetDecorations::default();
-    let mut rd = quick_xml::Reader::from_reader(xml);
-    let mut buf = Vec::new();
 
     // dataValidation state
     let mut dv: Option<PartialDv> = None;
@@ -1273,12 +1221,13 @@ fn parse_worksheet(xml: &[u8], styles: &Styles) -> SheetDecorations {
     let mut cf: Option<PartialCf> = None;
     let mut text_target: Option<TextTarget> = None;
 
-    // `while let Ok(..)` rather than a match with an `Err(_) => break` arm:
-    // a malformed part is treated as ending there, which is the same
-    // degradation as EOF and keeps the rest of the workbook importable.
-    while let Ok(ev) = rd.read_event_into(&mut buf) {
+    // A malformed worksheet part is an ERROR, not a stopping point. The
+    // previous `while let Ok(..)` treated a truncated sheet exactly like a
+    // complete one and returned whatever decorations happened to be parsed
+    // first — a table silently losing its validations and conditional rules.
+    safeguard::scan_part(xml, path, part, None, |ev| {
         use quick_xml::events::Event as E;
-        match &ev {
+        match ev {
             E::Start(e) | E::Empty(e) => {
                 let is_empty = matches!(ev, E::Empty(_));
                 match e.local_name().as_ref() {
@@ -1388,12 +1337,11 @@ fn parse_worksheet(xml: &[u8], styles: &Styles) -> SheetDecorations {
                 }
                 _ => {}
             },
-            E::Eof => break,
             _ => {}
         }
-        buf.clear();
-    }
-    out
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 enum TextTarget {
@@ -1579,9 +1527,7 @@ fn finish_cf(c: PartialCf, cols: &[u32], styles: &Styles, out: &mut SheetDecorat
 }
 
 /// Parse `xl/tables/tableN.xml` into a bare [`Table`].
-fn parse_table_part(xml: &[u8]) -> Result<Table, XlsxError> {
-    let mut rd = quick_xml::Reader::from_reader(xml);
-    let mut buf = Vec::new();
+fn parse_table_part(xml: &[u8], path: &str, part: &str) -> Result<Table, XlsxError> {
     let mut name = String::new();
     let mut range = None;
     let mut header_rows = 1u32;
@@ -1592,19 +1538,10 @@ fn parse_table_part(xml: &[u8]) -> Result<Table, XlsxError> {
     let mut style: Option<String> = None;
     let mut columns: Vec<TableColumn> = Vec::new();
 
-    loop {
-        let ev = match rd.read_event_into(&mut buf) {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(XlsxError::TableParse {
-                    path: "table part".into(),
-                    detail: e.to_string(),
-                })
-            }
-        };
+    safeguard::scan_part(xml, path, part, None, |ev| {
         use quick_xml::events::Event as E;
-        match &ev {
-            E::Start(e) | E::Empty(e) => match e.local_name().as_ref() {
+        if let E::Start(e) | E::Empty(e) = ev {
+            match e.local_name().as_ref() {
                 b"table" => {
                     name = attr(e, b"displayName")
                         .or_else(|| attr(e, b"name"))
@@ -1630,12 +1567,10 @@ fn parse_table_part(xml: &[u8]) -> Result<Table, XlsxError> {
                     columns.push(c);
                 }
                 _ => {}
-            },
-            E::Eof => break,
-            _ => {}
+            }
         }
-        buf.clear();
-    }
+        Ok(())
+    })?;
 
     let Some(range) = range else {
         return Err(XlsxError::TableParse {

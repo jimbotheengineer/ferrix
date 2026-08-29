@@ -20,6 +20,7 @@ pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
 pub mod pool;
+pub mod safeguard;
 pub mod table_xlsx;
 pub mod xlsx;
 
@@ -33,6 +34,10 @@ pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
+pub use safeguard::{
+    inspect_archive, open_checked, safe_entry_path, safe_extract_path, ArchiveReport, Limits,
+    SafeguardError,
+};
 pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
 };

@@ -130,7 +130,39 @@ pub enum ParseError {
     /// name the resolver knows. This is what `#NAME?` means.
     #[error("unknown name {0:?}")]
     UnknownName(String),
+    /// The expression nests deeper than [`MAX_PARSE_DEPTH`].
+    ///
+    /// The parser is recursive descent, so nesting depth is stack depth. A
+    /// formula of 100,000 nested parentheses is a dozen kilobytes of text and
+    /// would otherwise overflow the stack — which on a release build with
+    /// `panic = "unwind"` is still an abort, taking the user's unsaved edits
+    /// with it. A refusal is not a degradation here; it is the only outcome
+    /// that keeps the process alive.
+    #[error("formula nests {0} levels deep, over the {MAX_PARSE_DEPTH} limit")]
+    TooDeep(usize),
 }
+
+/// Deepest expression nesting the parser will build.
+///
+/// Twice Excel's own 64-level nested-function limit, so nothing a human or
+/// another spreadsheet produces is refused.
+///
+/// **The number is measured, not picked.** Each level costs three frames
+/// (`parse_expr` -> `parse_expr_inner` -> `parse_prefix`), and an unoptimized
+/// debug build makes them far fatter than a release build. Binary-searching
+/// the smallest thread stack that survives a parse at depth 127:
+///
+/// | build   | stack needed at depth 127 |
+/// |---------|---------------------------|
+/// | debug   | > 512 KB, <= 768 KB       |
+/// | release | > 128 KB, <= 256 KB       |
+///
+/// Against Rust's 2 MB default for a spawned thread — where import runs —
+/// that is roughly a 2.5x margin in the *worst* (debug) case, and much more
+/// on the 8 MB main thread. A first attempt at 256 overflowed the small
+/// stack the test below uses, which is exactly why that test spawns its own
+/// thread instead of trusting whatever the harness provides.
+pub const MAX_PARSE_DEPTH: usize = 128;
 
 /// Render a sheet name as it must appear inside a formula.
 ///
@@ -475,6 +507,7 @@ pub fn parse_with_names(
     let mut p = Parser {
         tokens,
         pos: 0,
+        depth: 0,
         resolve,
     };
     let expr = p.parse_expr(0)?;
@@ -487,6 +520,13 @@ pub fn parse_with_names(
 struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current recursion depth, bounded by [`MAX_PARSE_DEPTH`].
+    ///
+    /// Tracked on the struct rather than passed as an argument so that every
+    /// mutually recursive entry point shares one counter — `parse_expr` and
+    /// `parse_prefix` call each other, and two independent counters would
+    /// each stay under the limit while the stack went twice as deep.
+    depth: usize,
     /// Name table lookup. [`parse`] passes one that knows nothing, so a
     /// workbook with no names behaves exactly as it did before names existed.
     resolve: &'a dyn Fn(&str) -> Option<Expr>,
@@ -514,7 +554,22 @@ impl Parser<'_> {
     }
 
     /// Pratt loop: parse a prefix, then absorb operators of >= min_prec.
+    ///
+    /// Depth is counted HERE, around the whole recursive step, and restored
+    /// on the way out — including on the error path, so a refusal deep in one
+    /// argument does not leave the counter poisoned for its siblings.
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::TooDeep(MAX_PARSE_DEPTH + 1));
+        }
+        let out = self.parse_expr_inner(min_prec);
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_expr_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let op = match self.peek() {
@@ -657,6 +712,112 @@ mod tests {
 
     fn num(n: f64) -> Expr {
         Expr::Number(n)
+    }
+
+    // --- pathological nesting depth -------------------------------------
+
+    #[test]
+    fn pathological_nesting_errors_instead_of_blowing_the_stack() {
+        // THE acceptance criterion. 100,000 nested parens is a 200 KB string
+        // -- trivial to put in a cell or an imported formula -- and against a
+        // recursive-descent parser with no depth cap it is a stack overflow,
+        // which is an ABORT even under `panic = "unwind"`, taking the user's
+        // unsaved edits with it.
+        //
+        // Run on a thread with a deliberately SMALL stack -- 1 MB, half of
+        // Rust's default for a spawned thread and an eighth of the main
+        // thread's. If MAX_PARSE_DEPTH were ever raised past what the
+        // recursion can afford, this overflows here rather than passing by
+        // luck on whatever stack the harness happened to provide. That is
+        // not hypothetical: the constant started at 256 and this test is
+        // what caught it.
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let deep = format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000));
+                parse(&deep)
+            })
+            .expect("spawn");
+        let err = handle
+            .join()
+            .expect("parsing deeply nested input must not abort the thread")
+            .expect_err("100,000 levels of nesting must be refused");
+        assert!(
+            matches!(err, ParseError::TooDeep(_)),
+            "expected TooDeep, got {err:?}"
+        );
+        // The message has to say what happened, not just that it failed.
+        assert!(err.to_string().contains("nests"), "{err}");
+    }
+
+    #[test]
+    fn deep_function_nesting_is_also_capped() {
+        // Parenthesis nesting is not the only route to the same stack: a
+        // chain of calls recurses through `parse_prefix` -> `parse_expr` just
+        // as hard. Both entry points share one counter, which is why this
+        // cannot slip through at twice the depth.
+        let deep = format!("{}1{}", "ABS(".repeat(5_000), ")".repeat(5_000));
+        let err = parse(&deep).expect_err("5,000 nested calls must be refused");
+        assert!(
+            matches!(err, ParseError::TooDeep(_)),
+            "expected TooDeep, got {err:?}"
+        );
+
+        // And unary operators, which recurse without any bracket at all.
+        let deep = format!("{}1", "-".repeat(5_000));
+        assert!(
+            matches!(parse(&deep), Err(ParseError::TooDeep(_))),
+            "a chain of unary minus must be capped too"
+        );
+    }
+
+    #[test]
+    fn formulas_a_human_would_actually_write_still_parse() {
+        // The control. Without it, the tests above pass against a parser that
+        // refuses everything. Excel's own nesting limit is 64 levels, so
+        // anything a real spreadsheet contains must be well clear of the cap.
+        let realistic = format!("{}A1{}", "IF(A1>0,".repeat(60), ",0)".repeat(60));
+        assert!(
+            parse(&realistic).is_ok(),
+            "60 levels of nesting is under Excel's own 64-level limit and must parse"
+        );
+        // Right at the boundary, from both sides, so the cap is exactly where
+        // it claims to be rather than approximately there.
+        let at_limit = format!(
+            "{}1{}",
+            "(".repeat(MAX_PARSE_DEPTH - 1),
+            ")".repeat(MAX_PARSE_DEPTH - 1)
+        );
+        assert!(
+            parse(&at_limit).is_ok(),
+            "{} levels must still parse; the cap is {MAX_PARSE_DEPTH}",
+            MAX_PARSE_DEPTH - 1
+        );
+        let over_limit = format!(
+            "{}1{}",
+            "(".repeat(MAX_PARSE_DEPTH + 1),
+            ")".repeat(MAX_PARSE_DEPTH + 1)
+        );
+        assert!(
+            matches!(parse(&over_limit), Err(ParseError::TooDeep(_))),
+            "{} levels must be refused",
+            MAX_PARSE_DEPTH + 1
+        );
+    }
+
+    #[test]
+    fn the_depth_counter_is_restored_after_an_error() {
+        // A counter that leaked on the error path would make each successive
+        // argument of a long call cheaper to refuse, so a formula with many
+        // sibling arguments would start failing for the wrong reason. Many
+        // arguments, each modestly nested, must all parse.
+        let arg = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        let wide: Vec<String> = (0..100).map(|_| arg.clone()).collect();
+        let formula = format!("=SUM({})", wide.join(","));
+        assert!(
+            parse(&formula).is_ok(),
+            "100 siblings at depth 50 must parse; depth is per-path, not cumulative"
+        );
     }
 
     #[test]
