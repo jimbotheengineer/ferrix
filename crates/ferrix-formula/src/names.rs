@@ -434,6 +434,36 @@ pub fn rename_in_formula(src: &str, old: &str, new: &str) -> String {
     })
 }
 
+/// Every bare word in `src` that could be a defined name, upper-cased.
+///
+/// This is what the dependency graph records so a rename or a delete can find
+/// its dependents without rescanning the whole workbook's text. It is
+/// deliberately *syntactic* — a word here need not be defined — because the
+/// point is to catch a formula that will START referencing a name the moment
+/// one is defined, as well as one that already does.
+///
+/// Duplicates are collapsed; a formula mentioning `Sales` twice is one
+/// dependency edge, not two.
+pub fn names_in(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in refscan::scan(src) {
+        let word = &src[w.start..w.end];
+        if refscan::parse_ref(word).is_some() {
+            continue;
+        }
+        // TRUE/FALSE are literals the tokenizer resolves before the name table
+        // is ever consulted, so they can never be name references.
+        let upper = word.to_ascii_uppercase();
+        if upper == "TRUE" || upper == "FALSE" {
+            continue;
+        }
+        if !out.contains(&upper) {
+            out.push(upper);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
