@@ -432,6 +432,67 @@ impl Harness {
         &self.app
     }
 
+    // ---- conditional formatting (roadmap #11) ----
+
+    /// Open the New Rule dialog on the current selection.
+    ///
+    /// Exposed for the same reason as `freeze_at_cursor`: the Format menu item
+    /// only exists at a pixel that moves with the theme and window width, and
+    /// a test about RULE SEMANTICS should not be a test about where a menu
+    /// opens. This is the exact entry point the menu item calls. Everything
+    /// that follows — filling the form, pressing OK, pressing Cancel — goes
+    /// through the real dialog.
+    pub fn cond_new_rule(&mut self) -> &mut Self {
+        self.app.cond_new_rule();
+        self.steps(2);
+        self
+    }
+
+    pub fn cond_manage(&mut self) -> &mut Self {
+        self.app.cond_manage();
+        self.steps(2);
+        self
+    }
+
+    /// Edit the dialog's form the way the widgets would, then let the preview
+    /// settle. `f` receives the live form, so a test says "op is >, value is
+    /// 50" rather than synthesising keystrokes into a text field.
+    pub fn cond_form(&mut self, f: impl FnOnce(&mut crate::cond_format::RuleForm)) -> &mut Self {
+        if let Some(st) = self.app.cond_state_mut() {
+            f(&mut st.form);
+        }
+        self.steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL OK button, at wherever it was actually painted.
+    ///
+    /// Not a call to the commit handler: this is a genuine move-then-click at
+    /// the button's reported rect, so a dialog whose OK is disabled, covered,
+    /// or never drawn fails the test instead of passing it.
+    pub fn cond_click_ok(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .cond_state()
+            .and_then(|s| s.ok_rect)
+            .expect("the rule form's OK button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL Cancel button.
+    pub fn cond_click_cancel(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .cond_state()
+            .and_then(|s| s.cancel_rect)
+            .expect("the rule form's Cancel button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
     /// The status line — the app's own account of what it just did.
     pub fn status(&self) -> &str {
         self.app.status_text()
@@ -3263,7 +3324,113 @@ xxx,yyy,zzz
         // the loaded sheet's extent.
         assert_eq!(
             h.app().comment_text(CellRef::new(199_999_999, 2)),
-            Some("bottom")
+            Some("bottom"),
+            "a comment at row 200M must survive at its true address"
+        );
+    }
+
+    // ============ conditional formatting editor (roadmap #11) ==============
+    //
+    // Every assertion below is on what the app RESOLVES for a specific cell,
+    // or on the rule count, or on the whole SheetFormat compared for equality.
+    // None of them is on a status string or on "a rule is in a list" — those
+    // pass against an editor that stores rules nothing ever reads, which is
+    // exactly the dead-feature shape a previous UI test here missed.
+
+    /// Twelve numeric rows, so a threshold has both matching and non-matching
+    /// cells and a top/bottom-N has a meaningful window.
+    const NUMS: &str = "id,qty\n1,5\n2,150\n3,7\n4,200\n5,9\n6,3\n7,180\n8,1\n9,120\n10,4\n";
+
+    fn numeric_app(name: &str) -> (Harness, std::path::PathBuf) {
+        let p = write_csv(name, NUMS);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+        (h, p)
+    }
+
+    #[test]
+    fn creating_a_threshold_rule_restyles_matching_cells_and_leaves_others_alone() {
+        // The headline behaviour. B2 is 150 and must end up filled; B1 is 5 and
+        // must end up exactly as plain as it started. Asserting BOTH is what
+        // separates a working rule from a rule that paints everything.
+        let (mut h, p) = numeric_app("cf_threshold.csv");
+        let hit = CellRef::new(1, 1); // 150
+        let miss = CellRef::new(0, 1); // 5
+        let window = 0..10;
+
+        assert!(
+            h.app().resolved_style(hit, window.clone()).is_plain(),
+            "precondition: nothing is styled before the rule exists"
+        );
+
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 100.0;
+            f.fill = ferrix_core::Rgb(0x11, 0x22, 0x33);
+            f.text = ferrix_core::Rgb(0x44, 0x55, 0x66);
+        });
+        h.cond_click_ok();
+
+        let after_hit = h.app().resolved_style(hit, window.clone());
+        let after_miss = h.app().resolved_style(miss, window.clone());
+
+        assert_eq!(
+            after_hit.fill,
+            Some(ferrix_core::Rgb(0x11, 0x22, 0x33)),
+            "150 > 100: the rule must reach the cell's resolved style"
+        );
+        assert_eq!(after_hit.text, Some(ferrix_core::Rgb(0x44, 0x55, 0x66)));
+        assert!(
+            after_miss.is_plain(),
+            "5 > 100 is false, so this cell must be untouched; got {after_miss:?}"
+        );
+        assert_eq!(h.app().rule_count(), 1, "exactly one rule was created");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_live_preview_shows_the_rule_before_it_is_committed() {
+        // The preview is the feature's whole selling point, and it is also the
+        // easiest thing to fake. So: the cell must resolve STYLED while the
+        // dialog is open, and the store must still be empty at that moment.
+        let (mut h, p) = numeric_app("cf_preview.csv");
+        let hit = CellRef::new(1, 1);
+        let window = 0..10;
+
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 100.0;
+            f.fill = ferrix_core::Rgb(0xDE, 0xAD, 0xBE);
+        });
+
+        assert_eq!(
+            h.app().resolved_style(hit, window.clone()).fill,
+            Some(ferrix_core::Rgb(0xDE, 0xAD, 0xBE)),
+            "the grid must show the pending rule while the dialog is open"
+        );
+        assert_eq!(
+            h.app().rule_count(),
+            0,
+            "a PREVIEW must not have written anything to the store"
+        );
+
+        // Turning the preview off must take it straight back off the grid.
+        if let Some(st) = h.app_mut().cond_state_mut() {
+            st.preview = false;
+        }
+        h.steps(2);
+        assert!(
+            h.app().resolved_style(hit, window).is_plain(),
+            "unchecking live preview must stop previewing"
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -3304,6 +3471,108 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&side);
+    }
+
+    #[test]
+    fn cancelling_the_dialog_leaves_the_sheet_exactly_as_it_was() {
+        // Cancel is the action that must be INCAPABLE of changing anything.
+        // The whole SheetFormat is compared, not a spot check, so a stray
+        // entry anywhere in any scope fails this.
+        let (mut h, p) = numeric_app("cf_cancel.csv");
+        let hit = CellRef::new(1, 1);
+        let window = 0..10;
+
+        // Start from a sheet that already HAS a rule: "cancel changed nothing"
+        // is a much weaker claim on an empty store than on a populated one.
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Lt;
+            f.value = 6.0;
+            f.fill = ferrix_core::Rgb(0x01, 0x02, 0x03);
+        });
+        h.cond_click_ok();
+        let before = h.app().format_snapshot();
+        let before_style = h.app().resolved_style(hit, window.clone());
+        assert_eq!(h.app().rule_count(), 1);
+
+        // Now open a second rule, fill it in, watch it preview — and cancel.
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 100.0;
+            f.fill = ferrix_core::Rgb(0xFF, 0x00, 0xFF);
+        });
+        assert_eq!(
+            h.app().resolved_style(hit, window.clone()).fill,
+            Some(ferrix_core::Rgb(0xFF, 0x00, 0xFF)),
+            "precondition: the rule being cancelled was genuinely previewing, \
+             otherwise this test proves nothing"
+        );
+
+        h.cond_click_cancel();
+
+        assert!(!h.app().cond_is_open(), "Cancel must close the dialog");
+        assert_eq!(
+            h.app().format_snapshot(),
+            before,
+            "Cancel must leave the sheet's formatting byte-identical"
+        );
+        assert_eq!(
+            h.app().resolved_style(hit, window),
+            before_style,
+            "and the cell must resolve exactly as it did before"
+        );
+        assert_eq!(h.app().rule_count(), 1, "the cancelled rule was not stored");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reordering_two_overlapping_rules_changes_which_one_wins() {
+        // Two rules that both match 150. Precedence is the ONLY thing deciding
+        // what the user sees, so ▼ must visibly change the resolved fill.
+        let (mut h, p) = numeric_app("cf_order.csv");
+        let hit = CellRef::new(1, 1); // 150 — matches both rules
+        let window = 0..10;
+        let red = ferrix_core::Rgb(0xFF, 0x00, 0x00);
+        let blue = ferrix_core::Rgb(0x00, 0x00, 0xFF);
+
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        for fill in [red, blue] {
+            h.cond_new_rule();
+            h.cond_form(move |f| {
+                f.kind = crate::cond_format::RuleKind::Threshold;
+                f.op = ferrix_core::CmpOp::Gt;
+                f.value = 100.0;
+                f.fill = fill;
+            });
+            h.cond_click_ok();
+        }
+        assert_eq!(h.app().rule_count(), 2);
+        assert_eq!(
+            h.app().resolved_style(hit, window.clone()).fill,
+            Some(blue),
+            "the LATER rule wins, matching apply_cell's own precedence"
+        );
+
+        // Move the red rule (index 0) later. Same mutation the ▼ button makes.
+        let target = h.app().cond_state().expect("manage list is open").target;
+        let moved = target.move_rule(h.app_mut().format_mut_for_test(), 0, 1);
+        assert!(moved, "the reorder must actually happen");
+        h.steps(2);
+
+        assert_eq!(
+            h.app().resolved_style(hit, window).fill,
+            Some(red),
+            "after the reorder the OTHER rule must win — order IS the behaviour"
+        );
+        assert_eq!(
+            h.app().rule_count(),
+            2,
+            "reordering must not add or drop rules"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -3335,6 +3604,175 @@ xxx,yyy,zzz
         );
         assert_eq!(h.comment_marker_count(), 0);
         let _ = std::fs::remove_file(&side);
+    }
+
+    #[test]
+    fn a_topbottom_rule_surfaces_the_xlsx_lossy_warning_in_the_editor() {
+        // TopBottom has no lossless xlsx mapping. The user must learn that in
+        // the dialog — the whole reason `rule_survives_xlsx` is public.
+        let (mut h, p) = numeric_app("cf_lossy.csv");
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+
+        // A threshold survives export, so nothing should be warned about yet.
+        h.cond_form(|f| f.kind = crate::cond_format::RuleKind::Threshold);
+        let benign = h
+            .app()
+            .cond_state()
+            .map(|s| crate::cond_format::xlsx_warning(&s.form.to_rule()));
+        assert_eq!(
+            benign,
+            Some(None),
+            "warning about a rule that DOES survive would train users to ignore it"
+        );
+
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::TopBottom;
+            f.top = true;
+            f.n = 3;
+        });
+        let warn = h
+            .app()
+            .cond_state()
+            .and_then(|s| crate::cond_format::xlsx_warning(&s.form.to_rule()))
+            .expect("TopBottom must warn while it is still being edited");
+        assert!(
+            warn.contains("DROPPED") && warn.to_lowercase().contains("xlsx"),
+            "the warning must say what actually happens on export: {warn}"
+        );
+
+        // And it must survive the commit, into the status the user keeps.
+        h.cond_click_ok();
+        let kept = h.app().cond_warning().unwrap_or_default().to_string();
+        assert!(
+            kept.contains("DROPPED"),
+            "the lossy warning must outlive the dialog; got {kept:?}"
+        );
+        assert!(
+            h.status().contains("Top 3"),
+            "and the status must name the rule that was made; got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_rule_on_a_100k_row_column_stores_exactly_one_entry() {
+        // THE scale invariant. Asserted on the RULE COUNT and the heap, never
+        // on cells: a per-cell implementation would pass any test that counted
+        // painted cells and fail this one, which is the point.
+        let (mut h, p) = numeric_app("cf_scale.csv");
+
+        h.select(CellRef::new(0, 1), CellRef::new(99_999, 1));
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 100.0;
+        });
+        h.cond_click_ok();
+
+        assert_eq!(
+            h.app().rule_count(),
+            1,
+            "100,000 rows must cost ONE rule entry, not one per row"
+        );
+        let heap = h.app().format_snapshot().heap_bytes();
+        assert!(
+            heap < 4096,
+            "a 100k-row rule must not cost real memory; heap_bytes was {heap}"
+        );
+        assert_eq!(
+            h.app().format_snapshot().override_count(),
+            0,
+            "nothing may leak into the per-cell override map"
+        );
+
+        // Still a live rule, not a cheap no-op: the cell it covers is styled.
+        assert!(
+            !h.app().resolved_style(CellRef::new(1, 1), 0..10).is_plain(),
+            "the one stored entry must still actually apply"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_rule_changes_what_the_frame_actually_paints() {
+        // The resolved style is the model's answer; this is the SCREEN's. A
+        // fill is an extra rect per matching cell, so the frame's shape count
+        // must go up when the rule lands and back down when it is removed.
+        let (mut h, p) = numeric_app("cf_paint.csv");
+
+        // Baseline AFTER the selection is made: a multi-cell selection paints
+        // its own range fill, so measuring before it would credit the rule
+        // with shapes the selection drew.
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        let baseline = h.paint_shape_count();
+
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            // Matches every row, so the change is unambiguous rather than one
+            // rect that could hide in frame-to-frame noise.
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 0.0;
+            f.fill = ferrix_core::Rgb(0x20, 0x80, 0x20);
+        });
+        h.cond_click_ok();
+        // Close the dialog so its own chrome is not what changed the count.
+        h.app_mut().cond_close_for_test();
+        let with_rule = h.paint_shape_count();
+
+        assert!(
+            with_rule > baseline,
+            "a fill on 10 cells must add shapes to the frame: {baseline} -> {with_rule}"
+        );
+
+        let target = h.app().selection();
+        let t =
+            crate::cond_format::CondTarget::from_selection(target.bounds().0, target.bounds().1);
+        assert!(t.remove(h.app_mut().format_mut_for_test(), 0));
+        h.steps(2);
+        let removed = h.paint_shape_count();
+        assert_eq!(
+            removed, baseline,
+            "deleting the rule must put the frame back exactly where it started"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn manage_finds_the_column_rules_when_the_user_has_clicked_one_cell() {
+        // A rule made on the whole column, then one cell selected. Telling the
+        // user "no rules here" reads as data loss and is the most likely way
+        // for this dialog to lie.
+        let (mut h, p) = numeric_app("cf_manage.csv");
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+        if let Some(st) = h.app_mut().cond_state_mut() {
+            st.target = st.target.widen(); // "Entire column"
+        }
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.value = 100.0;
+        });
+        h.cond_click_ok();
+        assert_eq!(h.app().rule_count(), 1);
+
+        // Now select a single cell inside that column and manage.
+        h.select(CellRef::new(3, 1), CellRef::new(3, 1));
+        h.cond_manage();
+        let st = h.app().cond_state().expect("manage must be open");
+        assert_eq!(
+            st.target,
+            crate::cond_format::CondTarget::Column(1),
+            "Manage must find the column's rules rather than reporting none"
+        );
+        assert_eq!(
+            st.target.rules(&h.app().format_snapshot()).len(),
+            1,
+            "and it must list the rule that is actually there"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

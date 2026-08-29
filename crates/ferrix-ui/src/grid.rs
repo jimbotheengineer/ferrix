@@ -560,6 +560,10 @@ pub struct Grid<'a> {
     pub panes: &'a mut Panes,
 }
 
+fn sheet_c32(c: ferrix_core::Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
 impl<'a> Grid<'a> {
     /// Screen rect of a cell, or None when it is scrolled out of view. The
     /// editor uses this to place its TextEdit exactly over the cell.
@@ -740,6 +744,19 @@ impl<'a> Grid<'a> {
         // is delivered. A synthetic click with no preceding move lands nowhere
         // and looks like a broken grid. Send a move first, or test by hand.
         let interact_rect = Rect::from_min_max(body_origin, outer.max);
+        // A click that egui has already given to a floating window (a modal,
+        // a menu, a combo popup) must NOT also reach the grid underneath.
+        //
+        // The grid hand-hit-tests raw pointer state rather than going through
+        // a widget Response, so without this check pressing "OK" in a dialog
+        // ALSO lands on whatever cell happens to be behind the button — which
+        // silently collapses the user's selection at the exact moment they
+        // are acting on it. That is how the conditional-format editor's second
+        // rule ended up on a different range than its first.
+        //
+        // Secondary clicks are gated too: a right-click on the comment context
+        // menu must not simultaneously re-target the cell beneath it.
+        let over_window = ui.ctx().is_pointer_over_area() && !ui.ui_contains_pointer();
         let (
             pointer_pos,
             wheel,
@@ -750,14 +767,19 @@ impl<'a> Grid<'a> {
             secondary_clicked,
         ) = ui.ctx().input(|i| {
             (
-                i.pointer.interact_pos(),
-                i.raw_scroll_delta,
-                i.pointer.primary_clicked(),
-                i.pointer.primary_pressed(),
+                i.pointer.interact_pos().filter(|_| !over_window),
+                if over_window {
+                    egui::Vec2::ZERO
+                } else {
+                    i.raw_scroll_delta
+                },
+                i.pointer.primary_clicked() && !over_window,
+                i.pointer.primary_pressed() && !over_window,
                 i.pointer
-                    .button_double_clicked(egui::PointerButton::Primary),
-                i.pointer.primary_down(),
-                i.pointer.button_clicked(egui::PointerButton::Secondary),
+                    .button_double_clicked(egui::PointerButton::Primary)
+                    && !over_window,
+                i.pointer.primary_down() && !over_window,
+                i.pointer.button_clicked(egui::PointerButton::Secondary) && !over_window,
             )
         });
         let drag_pos = pointer_pos;
@@ -913,6 +935,72 @@ impl<'a> Grid<'a> {
                 .is_ok()
         };
 
+        // --- sheet-wide conditional formatting ---
+        //
+        // Built once per VISIBLE COLUMN per frame (~30 calls), never per cell
+        // and never over the whole sheet. A column with no rules contributes
+        // an empty plan, which costs one BTreeMap probe; a rule over a 200M-row
+        // column is one entry here exactly as it is one entry in storage.
+        //
+        // The window-dependent rules (colour scales, data bars, top/bottom-N)
+        // are evaluated against the rows ACTUALLY ON SCREEN, which is the same
+        // documented approximation `TableDecor::prepare` makes. See `RuleEval`.
+        let sheet_fmt = self.format;
+        let mut sheet_plans: Vec<(
+            usize,
+            Vec<ferrix_core::PlanEntry<'a>>,
+            Vec<ferrix_core::RuleEval>,
+            bool,
+        )> = Vec::new();
+        if let Some(fmt) = sheet_fmt {
+            // Underlying rows on screen, resolved once and shared by every
+            // column's window scan rather than re-resolved per column.
+            let mut window_rows: Vec<u32> = Vec::new();
+            let mut have_rows = false;
+            let mut vals: Vec<f64> = Vec::new();
+            let mut scratch: Vec<f64> = Vec::new();
+            for &(c, _) in &col_bands {
+                let mut plan: Vec<ferrix_core::PlanEntry<'a>> = Vec::new();
+                fmt.plan(c as u32, &mut plan);
+                let needs_text = ferrix_core::SheetFormat::plan_needs_text(&plan);
+                let mut evals: Vec<ferrix_core::RuleEval> = Vec::new();
+                if ferrix_core::SheetFormat::plan_needs_window(&plan) {
+                    if !have_rows {
+                        for &(r, _) in &row_bands {
+                            if let Some(sr) = resolve_row(r) {
+                                if !sr.is_pad() {
+                                    window_rows.push(sr.row());
+                                }
+                            }
+                        }
+                        have_rows = true;
+                    }
+                    vals.clear();
+                    for &r in &window_rows {
+                        if let Value::Number(n) = view.get(CellRef::new(r, c as u32)) {
+                            vals.push(n);
+                        }
+                    }
+                    for e in &plan {
+                        // `for_rule` reorders its slice (`select_nth_unstable`),
+                        // so each rule gets its own copy of the window.
+                        scratch.clear();
+                        scratch.extend_from_slice(&vals);
+                        evals.push(ferrix_core::RuleEval::for_rule(e.rule, &mut scratch));
+                    }
+                }
+                sheet_plans.push((c, plan, evals, needs_text));
+            }
+        }
+        // Column -> index into `sheet_plans`, so the per-cell lookup is an
+        // array index rather than a linear probe over the visible columns.
+        let plan_of = |c: usize| -> Option<&(
+            usize,
+            Vec<ferrix_core::PlanEntry<'a>>,
+            Vec<ferrix_core::RuleEval>,
+            bool,
+        )> { sheet_plans.iter().find(|(cc, ..)| *cc == c) };
+
         // --- paint ---
         //
         // The painter covers the whole grid, band included. Per-band clipping
@@ -1014,6 +1102,39 @@ impl<'a> Grid<'a> {
                     .filter(|_| !is_pad)
                     .map(|t| t.cell(view, cref))
                     .filter(|d| !d.is_plain());
+
+                // Sheet-wide conditional formatting, resolved from the plan
+                // built once for this column above. Allocates nothing per cell
+                // except the display text a text rule asked for, and only when
+                // one is actually configured.
+                let sheet_style = match plan_of(c).filter(|(_, p, ..)| !p.is_empty()) {
+                    Some((_, plan, evals, needs_text)) if !is_pad => {
+                        let v = view.get(cref);
+                        let text = if *needs_text {
+                            view.display(cref)
+                        } else {
+                            String::new()
+                        };
+                        sheet_fmt
+                            .map(|f| f.resolve(cref, &v, &text, plan, evals))
+                            .filter(|s| !s.is_plain())
+                    }
+                    _ => None,
+                };
+
+                if let Some(s) = &sheet_style {
+                    if let Some(fill) = s.fill {
+                        painter.rect_filled(cell_rect, 0.0, sheet_c32(fill));
+                    }
+                    if let Some((frac, color)) = s.bar {
+                        let inner = cell_rect.shrink2(Vec2::new(1.5, 3.0));
+                        let bar = Rect::from_min_size(
+                            inner.min,
+                            Vec2::new(inner.width() * frac, inner.height()),
+                        );
+                        painter.rect_filled(bar, 1.0, sheet_c32(color));
+                    }
+                }
 
                 if let Some(d) = &decor {
                     if d.banded {
@@ -1123,6 +1244,15 @@ impl<'a> Grid<'a> {
                             color = c;
                         }
                     }
+                    // A sheet-level rule wins over the table's colour on the
+                    // cells it matches: it is the more specific instruction the
+                    // user just gave, and the editor's live preview would be a
+                    // lie if a table underneath could swallow it.
+                    if let Some(s) = &sheet_style {
+                        if let Some(c) = s.text {
+                            color = sheet_c32(c);
+                        }
+                    }
 
                     // A formula cell gets a subtle marker so it is
                     // distinguishable from a typed-in literal.
@@ -1156,6 +1286,9 @@ impl<'a> Grid<'a> {
                     }
                     if let Some(d) = &decor {
                         d.typography.apply_to(&mut ty);
+                    }
+                    if let Some(s) = &sheet_style {
+                        s.typography.apply_to(&mut ty);
                     }
                     // Resolved against the ZOOMED default, so an unstyled cell
                     // grows with the zoom and a cell with an explicit point
