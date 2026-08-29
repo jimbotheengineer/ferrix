@@ -22,6 +22,7 @@ pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
 pub mod pool;
+pub mod print;
 pub mod protect_xlsx;
 pub mod safeguard;
 pub mod sizing_sidecar;
