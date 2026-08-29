@@ -1,10 +1,11 @@
 //! Cross-family composition tests for the formula function library.
 //!
-//! Each of the text (#24), date (#25) and statistical (#26) families landed on
-//! its own branch, in its own module, behind its own guarded arm in
-//! `eval_call`'s match. Every one of those branches was individually green —
-//! and no single one of them could exercise the thing that only exists after
-//! all three are merged: **one dispatch table shared by three modules**.
+//! Each of the text (#24), date (#25), statistical (#26) and lookup (#23)
+//! families landed on its own branch, in its own module, behind its own
+//! guarded arm in `eval_call`'s match. Every one of those branches was
+//! individually green — and no single one of them could exercise the thing
+//! that only exists after they are merged: **one dispatch table shared by
+//! four modules**.
 //!
 //! That seam is exactly where a silent defect would live. `eval_call` matches
 //! guard arms IN ORDER, so if two families claimed the same name, or if one
@@ -54,11 +55,11 @@ fn fixture() -> Sheet {
     s
 }
 
-/// The three families must all still be reachable through the ONE match in
+/// The four families must all still be reachable through the ONE match in
 /// `eval_call`. If a merge dropped an arm, or an earlier guard swallowed a
 /// later family's names, the corresponding line here returns `#NAME?`.
 #[test]
-fn all_three_function_families_are_reachable_through_one_dispatch() {
+fn every_function_family_is_reachable_through_one_dispatch() {
     let s = fixture();
 
     // text (#24)
@@ -67,6 +68,16 @@ fn all_three_function_families_are_reachable_through_one_dispatch() {
     assert_eq!(num(&s, "=YEAR(C1)"), 2024.0);
     // statistics (#26)
     assert_eq!(num(&s, "=MEDIAN(A1:A5)"), 30.0);
+    // lookup (#23) — one function from each shape the family has: a table
+    // search, a position search, a direct address, a runtime reference, and
+    // an argument selector.
+    assert_eq!(num(&s, "=VLOOKUP(30,A1:A5,1,FALSE)"), 30.0);
+    assert_eq!(num(&s, "=HLOOKUP(10,A1:A1,1,FALSE)"), 10.0);
+    assert_eq!(num(&s, "=MATCH(40,A1:A5,0)"), 4.0);
+    assert_eq!(num(&s, "=INDEX(A1:A5,2,1)"), 20.0);
+    assert_eq!(num(&s, "=XLOOKUP(50,A1:A5,A1:A5)"), 50.0);
+    assert_eq!(num(&s, "=CHOOSE(2,7,8)"), 8.0);
+    assert_eq!(num(&s, "=INDIRECT(\"A3\")"), 30.0);
     // and the pre-existing built-ins were not displaced by the new guard arms
     assert_eq!(num(&s, "=SUM(A1:A5)"), 150.0);
     assert_eq!(num(&s, "=COUNTIF(A1:A5,\">20\")"), 3.0);
@@ -124,6 +135,13 @@ fn no_function_name_is_claimed_by_more_than_one_family() {
         "RANK",
         "LARGE",
         "SMALL",
+        "VLOOKUP",
+        "HLOOKUP",
+        "INDEX",
+        "MATCH",
+        "XLOOKUP",
+        "CHOOSE",
+        "INDIRECT",
     ]
     .to_vec();
 
@@ -132,6 +150,7 @@ fn no_function_name_is_claimed_by_more_than_one_family() {
             ("text", crate::text::is_text_fn(name)),
             ("datetime", crate::datetime::is_date_fn(name)),
             ("stats", crate::stats::is_stat_fn(name)),
+            ("lookup", crate::lookup::is_lookup_fn(name)),
         ];
         let owners: Vec<&str> = claims.iter().filter(|(_, y)| *y).map(|(m, _)| *m).collect();
         assert_eq!(
@@ -140,6 +159,66 @@ fn no_function_name_is_claimed_by_more_than_one_family() {
             "{name} is claimed by {owners:?}; exactly one module must own each name, \
              because eval_call's guard arms match in order and the first claimant wins"
         );
+    }
+}
+
+/// No family may claim a name the *evaluator itself* already handles by a
+/// direct string arm. Those arms sit ABOVE every guard, so an over-claim here
+/// is invisible at runtime — right up until someone reorders the match and
+/// `SUM` starts routing into a family module.
+#[test]
+fn no_family_claims_a_name_the_evaluator_handles_directly() {
+    // Every literal name matched in `eval_call` before the guard arms.
+    let builtins = [
+        "SUM",
+        "COUNT",
+        "AVERAGE",
+        "MIN",
+        "MAX",
+        "ABS",
+        "SQRT",
+        "ROUND",
+        "FLOOR",
+        "CEILING",
+        "INT",
+        "LN",
+        "LOG10",
+        "EXP",
+        "IF",
+        "AND",
+        "OR",
+        "NOT",
+        "SUMIF",
+        "AVERAGEIF",
+        "COUNTIF",
+        "SUMIFS",
+        "AVERAGEIFS",
+        "COUNTIFS",
+        "IFERROR",
+        "IFNA",
+        "NA",
+        "ISBLANK",
+        "ISNUMBER",
+        "ISTEXT",
+        "ISERROR",
+        "ISERR",
+        "ISNA",
+        "ERROR.TYPE",
+    ];
+    for name in builtins {
+        for (module, claimed) in [
+            ("text", crate::text::is_text_fn(name)),
+            ("datetime", crate::datetime::is_date_fn(name)),
+            ("stats", crate::stats::is_stat_fn(name)),
+            ("lookup", crate::lookup::is_lookup_fn(name)),
+        ] {
+            assert!(
+                !claimed,
+                "{module} claims {name}, which eval_call already handles by a \
+                 direct arm; the guard is shadowed today and would silently \
+                 hijack the builtin the moment the arms are reordered"
+            );
+        }
     }
 }
 
@@ -164,7 +243,32 @@ fn the_families_compose_as_arguments_to_one_another() {
     assert_eq!(text(&s, "=CONCAT(\"Y\",TEXT(YEAR(C1),\"0\"))"), "Y2024");
 }
 
-/// An unknown name must still fall through all three guard arms to `#NAME?`.
+/// The lookup family (#23) specifically must compose with the other three,
+/// in both directions. A lookup that only worked on literal arguments, or
+/// whose result could not feed another family, would pass every test in
+/// `lookup/tests.rs` and fail here.
+#[test]
+fn lookup_composes_with_the_other_families() {
+    let s = fixture();
+
+    // stats -> lookup: a computed median used as the lookup key.
+    assert_eq!(num(&s, "=MATCH(MEDIAN(A1:A5),A1:A5,0)"), 3.0);
+    // text -> lookup: a computed subscript.
+    assert_eq!(num(&s, "=INDEX(A1:A5,LEN(\"abcd\"),1)"), 40.0);
+    // lookup -> text: a looked-up number rendered by the text formatter.
+    assert_eq!(text(&s, "=TEXT(XLOOKUP(20,A1:A5,A1:A5),\"0.00\")"), "20.00");
+    // lookup -> date: INDEX pulling the date serial, YEAR reading it.
+    assert_eq!(num(&s, "=YEAR(INDEX(C1:C1,1,1))"), 2024.0);
+    // lookup -> stats: a lookup result as an order-statistic subscript.
+    assert_eq!(num(&s, "=LARGE(A1:A5,CHOOSE(2,9,1))"), 50.0);
+    // text -> lookup, through INDIRECT's runtime string: the reference is
+    // BUILT by the text family and consumed by the lookup family.
+    assert_eq!(num(&s, "=INDIRECT(CONCAT(\"A\",\"4\"))"), 40.0);
+    // and a builtin still wraps a lookup: IFNA catching the family's #N/A.
+    assert_eq!(num(&s, "=IFNA(VLOOKUP(999,A1:A5,1,FALSE),-1)"), -1.0);
+}
+
+/// An unknown name must still fall through every guard arm to `#NAME?`.
 /// If any family's predicate returned true too eagerly this would come back as
 /// some other error, or worse, a plausible-looking value.
 #[test]
@@ -172,4 +276,9 @@ fn an_unknown_function_still_falls_through_to_a_name_error() {
     let s = fixture();
     assert_eq!(v(&s, "=NOTAFUNCTION(A1)"), Value::Error(ErrorKind::Name));
     assert_eq!(v(&s, "=LEFTISH(B1,2)"), Value::Error(ErrorKind::Name));
+    // Near-misses of the lookup family's own names, which an over-broad
+    // prefix/contains-style predicate would swallow.
+    assert_eq!(v(&s, "=VLOOKUPX(A1)"), Value::Error(ErrorKind::Name));
+    assert_eq!(v(&s, "=LOOKUP(A1,A1:A5)"), Value::Error(ErrorKind::Name));
+    assert_eq!(v(&s, "=INDEXOF(A1)"), Value::Error(ErrorKind::Name));
 }
