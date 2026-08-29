@@ -42,6 +42,13 @@ impl MappedSheet {
 
         let header = Header::parse(&mmap)?;
 
+        // Every section's [offset, offset+size) must fit inside the mapping.
+        // `size` is computed from header COUNTS, so the multiplications that
+        // derive it (count * element_size) are themselves attacker-controlled
+        // and must not overflow: a wrapped product would be small enough to
+        // pass this check while the real span runs off the end of the mapping,
+        // turning a later slice into an out-of-bounds panic. `checked_mul`
+        // makes an overflowing count fail HERE, as a clean format error.
         let check = |off: u64, size: u64| -> Result<(), FormatError> {
             if off == crate::format::ABSENT {
                 return Ok(());
@@ -51,21 +58,29 @@ impl MappedSheet {
             }
             Ok(())
         };
+        // Compute `count * elem` with overflow rejected up front. An overflow
+        // is a corrupt/hostile header, so it maps to the same OutOfBounds
+        // error rather than wrapping into a deceptively small size.
+        let span = |count: u64, elem: u64| -> Result<u64, FormatError> {
+            count
+                .checked_mul(elem)
+                .ok_or(FormatError::OutOfBounds { off: count, len })
+        };
 
         check(
             header.col_table_off,
-            header.cols as u64 * COL_DESC_BYTES as u64,
+            span(header.cols as u64, COL_DESC_BYTES as u64)?,
         )?;
         check(header.arena_data_off, header.arena_data_len)?;
-        check(header.arena_spans_off, header.arena_spans * 8)?;
+        check(header.arena_spans_off, span(header.arena_spans, 8)?)?;
 
         let mut columns = Vec::with_capacity(header.cols as usize);
         for i in 0..header.cols as usize {
             let off = header.col_table_off as usize + i * COL_DESC_BYTES;
             let d = ColumnDesc::parse(&mmap[off..])?;
             check(d.tags_off, d.len)?;
-            check(d.nums_off, d.len * 8)?;
-            check(d.strs_off, d.len * 4)?;
+            check(d.nums_off, span(d.len, 8)?)?;
+            check(d.strs_off, span(d.len, 4)?)?;
             columns.push(d);
         }
 
@@ -661,6 +676,40 @@ mod tests {
             Err(FormatError::BadMagic) | Err(FormatError::Truncated)
         ));
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_header_count_that_overflows_the_bounds_math_is_rejected_not_panicked() {
+        // A crafted header whose `arena_spans` count, times 8, wraps u64 back
+        // to a small value would slip past the offset bounds-check and then
+        // drive an out-of-bounds mmap read (a panic — a DoS) or a giant
+        // Vec::with_capacity (an allocation ABORT, which even panic=unwind
+        // cannot catch, taking unsaved edits with it). `open` must instead
+        // return a clean OutOfBounds error.
+        //
+        // Build a real .ferrix, then overwrite the arena_spans field (header
+        // bytes 56..64, little-endian u64) with a value V such that V*8 wraps:
+        // V = u64::MAX/8 + 1 gives V*8 == 0 (mod 2^64).
+        let (m, s, d) = mapped("overflow.csv", "h\nalpha\nbeta\n");
+        drop(m); // release the mapping so we can rewrite the file on Windows
+
+        let mut bytes = std::fs::read(&d).unwrap();
+        assert!(bytes.len() >= 64, "header must be present");
+        let evil: u64 = (u64::MAX / 8) + 1; // evil * 8 == 0
+        bytes[56..64].copy_from_slice(&evil.to_le_bytes());
+        std::fs::write(&d, &bytes).unwrap();
+
+        let r = MappedSheet::open(&d);
+        assert!(
+            matches!(r, Err(FormatError::OutOfBounds { .. })),
+            "an overflowing arena_spans count must be rejected as OutOfBounds, \
+             got {}",
+            match r {
+                Ok(_) => "Ok(sheet) — the overflow was NOT caught".to_string(),
+                Err(e) => format!("{e:?}"),
+            }
+        );
+        cleanup(s, d);
     }
 
     #[test]
