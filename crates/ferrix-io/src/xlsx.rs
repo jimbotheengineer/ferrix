@@ -118,7 +118,14 @@ fn calls_are_supported(e: &Expr) -> bool {
         }
         Expr::Unary(_, a) => calls_are_supported(a),
         Expr::Binary(_, a, b) => calls_are_supported(a) && calls_are_supported(b),
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::Range(_, _) => true,
+        Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_)
+        | Expr::Ref(_)
+        | Expr::Range(_, _)
+        // A `#REF!` constant is a real thing a broken formula holds; it must
+        // survive the round trip rather than being dropped as unsupported.
+        | Expr::Error(_) => true,
         // Cross-sheet references are supported now that workbooks hold every
         // sheet; whether the named sheet actually exists is resolved when the
         // workbook builds its dependency graph, not here. The same is true of

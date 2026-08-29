@@ -38,6 +38,21 @@ pub trait CellSource {
         Value::Error(ErrorKind::Ref)
     }
 
+    /// Resolve an interned string that came from a named sibling sheet.
+    ///
+    /// A [`Value::Text`] carries a [`ferrix_core::StrId`] into the arena of
+    /// the sheet it was read from. Resolving one of those through [`resolve`],
+    /// which addresses the HOME sheet, returns a different string entirely or
+    /// none at all — silently, and only for text. That is precisely how a
+    /// `SUMIF` over a cross-sheet criteria range matched nothing while looking
+    /// perfectly well-formed.
+    ///
+    /// [`resolve`]: CellSource::resolve
+    fn resolve_in(&self, _sheet: &str, id: ferrix_core::StrId) -> &str {
+        // A source with no siblings has one arena, so this is the same thing.
+        self.resolve(id)
+    }
+
     /// Is `sheet` a name this source can resolve? Drives `#REF!` reporting for
     /// ranges, which cannot signal an error through their return type.
     fn has_sheet(&self, _sheet: &str) -> bool {
@@ -103,6 +118,8 @@ pub fn eval(expr: &Expr, sheet: &Sheet) -> Value {
 pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
     match expr {
         Expr::Number(n) => Value::Number(*n),
+        // A `#REF!` written into the text by a delete evaluates to itself.
+        Expr::Error(e) => Value::Error(*e),
         Expr::Bool(b) => Value::Bool(*b),
         Expr::Text(_) => Value::Error(ErrorKind::Value),
         Expr::Ref(cell) => src.get(*cell),
@@ -709,6 +726,28 @@ fn scalar_of<S: CellSource + ?Sized>(v: Value, src: &S) -> Scalar<'_> {
     }
 }
 
+/// Borrow a cell of `spec` as a matcher input, resolving text against the
+/// arena of the sheet it actually came from.
+///
+/// The sheet-aware counterpart to [`scalar_of`], and the one every criteria
+/// scan uses: a text cell read from `Sheet2!A1` carries a `StrId` into
+/// Sheet2's arena, and resolving it against the home sheet yields the wrong
+/// string (or none), so every text criterion over a cross-sheet range
+/// silently matched nothing.
+#[inline]
+fn spec_scalar<'a, S: CellSource + ?Sized>(
+    spec: &RangeSpec<'_>,
+    src: &'a S,
+    dr: u32,
+    dc: u32,
+) -> Scalar<'a> {
+    let v = spec_get(spec, src, dr, dc);
+    match (v, spec.sheet) {
+        (Value::Text(id), Some(sh)) => Scalar::Text(src.resolve_in(sh, id)),
+        (v, _) => scalar_of(v, src),
+    }
+}
+
 /// Compile a criteria argument once, before any scanning starts.
 fn criterion_of<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Result<Criterion, ErrorKind> {
     match arg {
@@ -722,6 +761,22 @@ fn criterion_of<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Result<Criterion
             Value::Empty => Ok(Criterion::parse("")),
             Value::Error(e) => Err(e),
         },
+    }
+}
+
+/// Why an argument could not be read as a range.
+///
+/// A literal `#REF!` keeps its OWN error kind rather than being flattened to
+/// `#VALUE!`: after a sheet delete, `=SUMIF(#REF!,"North")` must say the
+/// reference is gone, not that the argument was the wrong type.
+#[inline]
+fn range_arg_error(arg: &Expr) -> ErrorKind {
+    match arg {
+        Expr::Error(e) => *e,
+        // A 3-D reference is a stack of rectangles, so it has no single
+        // origin to resize a value range against; Excel refuses it too.
+        Expr::X3D(_, _, _, _) => ErrorKind::Value,
+        _ => ErrorKind::Value,
     }
 }
 
@@ -753,7 +808,7 @@ fn eval_if_single<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) ->
         return Value::Error(ErrorKind::Value);
     }
     let Some(range) = range_spec(&args[0], src) else {
-        return Value::Error(ErrorKind::Value);
+        return Value::Error(range_arg_error(&args[0]));
     };
     let crit = match criterion_of(&args[1], src) {
         Ok(c) => c,
@@ -764,7 +819,7 @@ fn eval_if_single<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) ->
     let values = match args.get(2) {
         Some(a) => match range_spec(a, src) {
             Some(s) => Some(s),
-            None => return Value::Error(ErrorKind::Value),
+            None => return Value::Error(range_arg_error(a)),
         },
         None => None,
     };
@@ -777,7 +832,7 @@ fn eval_if_single<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) ->
     let mut t = Tally::default();
     for dc in 0..range.cols {
         for dr in 0..range.rows {
-            if !crit.matches(scalar_of(spec_get(&range, src, dr, dc), src)) {
+            if !crit.matches(spec_scalar(&range, src, dr, dc)) {
                 continue;
             }
             match values {
@@ -811,7 +866,7 @@ fn eval_ifs<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value
     let values = if wants_values {
         match range_spec(&args[0], src) {
             Some(s) => Some(s),
-            None => return Value::Error(ErrorKind::Value),
+            None => return Value::Error(range_arg_error(&args[0])),
         }
     } else {
         None
@@ -825,7 +880,7 @@ fn eval_ifs<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value
     for i in 0..n_pairs {
         let a = pairs_from + i * 2;
         let Some(spec) = range_spec(&args[a], src) else {
-            return Value::Error(ErrorKind::Value);
+            return Value::Error(range_arg_error(&args[a]));
         };
         // Excel requires every criteria range to be the same shape; a
         // mismatch is #VALUE!, never a silently truncated scan.
@@ -854,7 +909,7 @@ fn eval_ifs<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value
     for dc in 0..shape.cols {
         'row: for dr in 0..shape.rows {
             for (spec, crit) in specs.iter().zip(crits.iter()) {
-                if !crit.matches(scalar_of(spec_get(spec, src, dr, dc), src)) {
+                if !crit.matches(spec_scalar(spec, src, dr, dc)) {
                     continue 'row;
                 }
             }
@@ -930,6 +985,11 @@ fn count_3d<S: CellSource + ?Sized>(
 fn arg_error<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Option<ErrorKind> {
     const MAX_SCAN: usize = 100_000;
     match arg {
+        // A `#REF!` the delete path wrote into the formula text. Without this
+        // arm `=SUM(#REF!)` folds to zero — a plausible-looking total from a
+        // reference that no longer exists, which is the exact failure the
+        // whole break-the-text design is there to prevent.
+        Expr::Error(e) => Some(*e),
         Expr::Range(start, end) => {
             let r1 = (end.row as usize + 1).min(src.row_count().max(1));
             let span = r1.saturating_sub(start.row as usize);

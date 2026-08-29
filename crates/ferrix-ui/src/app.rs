@@ -5035,7 +5035,7 @@ impl FerrixApp {
     fn delete_sheet(&mut self, id: ferrix_core::SheetId) {
         let name = self.wb.sheet_name(id).unwrap_or("").to_string();
         match self.wb.delete_sheet(id) {
-            Ok(()) => {
+            Ok(broken) => {
                 // Deleting may have changed which sheet is active.
                 let state = self.wb.view_state();
                 self.scroll = state.scroll;
@@ -5044,7 +5044,14 @@ impl FerrixApp {
                 let view = self.wb.view();
                 self.stats_rows = view.row_count();
                 self.stats_cols = view.col_count();
-                self.status = format!("Deleted sheet {name}");
+                // Say out loud how many formulas the delete broke. A silent
+                // sheet full of fresh #REF! is exactly the surprise the
+                // "report lossy operations" rule exists to prevent.
+                self.status = match broken {
+                    0 => format!("Deleted sheet {name}"),
+                    1 => format!("Deleted sheet {name}; 1 formula now #REF!"),
+                    n => format!("Deleted sheet {name}; {n} formulas now #REF!"),
+                };
                 self.sync_formula_bar();
             }
             Err(e) => self.status = e.to_string(),

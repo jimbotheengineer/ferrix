@@ -480,6 +480,63 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> String {
     out
 }
 
+/// Replace every reference to sheet `gone` with `#REF!`, in the SOURCE TEXT.
+///
+/// Used when a sheet is deleted. The whole qualified reference goes —
+/// `=Sheet2!A1*2` becomes `=#REF!*2` — because a bare `#REF!A1` is neither
+/// valid nor meaningful; what broke is the reference, not just its sheet.
+///
+/// Both endpoints of a 3-D span are checked, and breaking either one breaks
+/// the whole reference: half a run is a wrong answer that looks right.
+///
+/// String literals are skipped, exactly as in [`rename_sheet_in_formula`]:
+/// deleting a sheet must not rewrite the user's text.
+pub fn break_sheet_in_formula(src: &str, gone: &str) -> String {
+    // Right to left, so an earlier span's offsets stay valid.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for q in refscan::qualifiers(src) {
+        let hit = q.first.eq_ignore_ascii_case(gone)
+            || q.last
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(gone));
+        if !hit {
+            continue;
+        }
+        // The qualifier plus the reference it qualifies — including a range's
+        // far endpoint, so `Sheet2!A1:B9` collapses to one `#REF!` rather than
+        // leaving `#REF!:B9` behind.
+        spans.push((q.start, reference_end(src, q.end)));
+    }
+    spans.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    let mut out = src.to_string();
+    for (s, e) in spans {
+        out.replace_range(s..e, crate::remap::REF_ERROR);
+    }
+    out
+}
+
+/// Index one past the reference that starts at `at` (just after a `!`),
+/// following a `:` into a range's far endpoint.
+fn reference_end(src: &str, at: usize) -> usize {
+    let b = src.as_bytes();
+    let word_end = |mut i: usize| {
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'$') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = word_end(at);
+    if b.get(i) == Some(&b':') {
+        let after = word_end(i + 1);
+        // Only when the far side really is a bare reference; `Sheet2!A1:X!B1`
+        // is two references and the second must be left for its own pass.
+        if after > i + 1 && b.get(after) != Some(&b'!') {
+            i = after;
+        }
+    }
+    i
+}
+
 /// Does this formula's SOURCE TEXT reference the sheet `name`?
 ///
 /// String literals do not count, for the same reason they are not rewritten.

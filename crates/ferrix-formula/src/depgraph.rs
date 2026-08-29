@@ -122,7 +122,7 @@ pub fn collect_precedents(expr: &Expr, out: &mut Vec<Precedent>) {
                 collect_precedents(a, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
     }
 }
 
@@ -167,7 +167,7 @@ pub fn collect_precedents_scoped(
                 collect_precedents_scoped(a, home, sheets, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
     }
 }
 

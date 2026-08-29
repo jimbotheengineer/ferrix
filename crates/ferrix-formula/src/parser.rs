@@ -45,6 +45,14 @@ pub enum Token {
         abs_col: bool,
         abs_row: bool,
     },
+    /// A literal error constant, currently only `#REF!`.
+    ///
+    /// A deleted column, row or SHEET rewrites the formula TEXT to put
+    /// `#REF!` where the reference was (see [`crate::remap`] and
+    /// [`crate::names::break_sheet_in_formula`]). Without a token for it, that
+    /// rewritten text would fail to parse and the cell would show `#NAME?` —
+    /// blaming an unknown name for what is really a broken reference.
+    Error(ferrix_core::ErrorKind),
     Ident(String),
     LParen,
     RParen,
@@ -123,6 +131,8 @@ pub enum Expr {
     /// as it stood when the formula was typed, so inserting a sheet between
     /// the endpoints would silently fail to be included.
     X3D(String, String, CellRef, CellRef),
+    /// A literal error constant, e.g. the `#REF!` a delete leaves behind.
+    Error(ferrix_core::ErrorKind),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -339,6 +349,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     .parse::<f64>()
                     .map_err(|_| ParseError::BadChar('.', start))?;
                 out.push(Token::Number(n));
+            }
+            b'#' => {
+                // `#REF!` — the only error constant a Ferrix rewrite writes
+                // into formula text. Every other error is stored as a cell
+                // VALUE rather than as formula source, so none of them ever
+                // reach the tokenizer.
+                const REF: &str = "#REF!";
+                if input.len() >= i + REF.len() && input[i..i + REF.len()].eq_ignore_ascii_case(REF)
+                {
+                    out.push(Token::Error(ferrix_core::ErrorKind::Ref));
+                    i += REF.len();
+                } else {
+                    let ch = input[i..].chars().next().unwrap_or('?');
+                    return Err(ParseError::BadChar(ch, i));
+                }
             }
             b'\'' => {
                 // A quoted sheet name: 'My Sheet'!A1, with '' as an escaped
@@ -703,6 +728,7 @@ impl Parser<'_> {
             Token::Number(n) => Expr::Number(n),
             Token::Text(s) => Expr::Text(s),
             Token::Bool(b) => Expr::Bool(b),
+            Token::Error(e) => Expr::Error(e),
             Token::Ref { cell, .. } => {
                 // A colon here means this is a range.
                 if matches!(self.peek(), Some(Token::Colon)) {
