@@ -198,6 +198,17 @@ pub struct DepGraph {
     /// `=SUM(Sales)` while `Sales` is undefined is exactly the formula that
     /// must be revisited when `Sales` is later defined.
     name_uses: HashMap<SheetCell, Vec<String>>,
+    /// formula cell -> the SHEET NAMES its SOURCE TEXT mentions.
+    ///
+    /// Kept for the same reason `name_uses` is, and it is NOT derivable from
+    /// `precedents`: a formula naming a sheet that does not exist has no edges
+    /// at all, and that is precisely the formula a rename has to find — it is
+    /// the one showing `#REF!` that a rename could repair, and the one a
+    /// delete just broke.
+    ///
+    /// Bounded by the number of qualifiers in a formula, which is a property
+    /// of the formula's text, never of the sheet's height.
+    sheet_uses: HashMap<SheetCell, Vec<String>>,
 }
 
 impl DepGraph {
@@ -226,6 +237,7 @@ impl DepGraph {
     pub fn remove_at(&mut self, at: SheetCell) {
         self.precedents.remove(&at);
         self.name_uses.remove(&at);
+        self.sheet_uses.remove(&at);
     }
 
     /// Forget every formula belonging to `sheet` — used when a sheet is
@@ -233,6 +245,7 @@ impl DepGraph {
     pub fn remove_sheet(&mut self, sheet: SheetId) {
         self.precedents.retain(|k, _| k.sheet != sheet);
         self.name_uses.retain(|k, _| k.sheet != sheet);
+        self.sheet_uses.retain(|k, _| k.sheet != sheet);
     }
 
     // --- defined names ----------------------------------------------------
@@ -283,6 +296,42 @@ impl DepGraph {
                 }
             }
         }
+    }
+
+    // --- sheet uses -------------------------------------------------------
+
+    /// Record which SHEETS a formula's source text names.
+    ///
+    /// Called with the raw text, not the tree, because a formula naming a
+    /// sheet that does not exist parses to an `XRef` the graph then drops —
+    /// leaving no trace of the name anywhere in the edges.
+    pub fn set_sheet_uses(&mut self, at: SheetCell, src: &str) {
+        let sheets = crate::names::sheets_in(src);
+        if sheets.is_empty() {
+            self.sheet_uses.remove(&at);
+        } else {
+            self.sheet_uses.insert(at, sheets);
+        }
+    }
+
+    /// The sheets a formula names, in the spelling written.
+    pub fn sheet_uses_at(&self, at: SheetCell) -> &[String] {
+        self.sheet_uses.get(&at).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Every formula in the workbook whose TEXT names `sheet`.
+    ///
+    /// This is what a sheet rename rewrites and what a sheet delete breaks.
+    /// Sorted, so a rename produces a deterministic sequence of edits.
+    pub fn cells_using_sheet(&self, sheet: &str) -> Vec<SheetCell> {
+        let mut v: Vec<SheetCell> = self
+            .sheet_uses
+            .iter()
+            .filter(|(_, names)| names.iter().any(|n| n.eq_ignore_ascii_case(sheet)))
+            .map(|(at, _)| *at)
+            .collect();
+        v.sort();
+        v
     }
 
     /// Every formula cell registered for `sheet`.
@@ -991,5 +1040,149 @@ mod tests {
         g.set_name_uses(other, "=Sales");
         g.remove_sheet(S1);
         assert!(g.cells_using_name("Sales").is_empty());
+    }
+
+    // --- 3-D references across a sheet run (issue #43) ---
+
+    #[test]
+    fn a_three_d_reference_becomes_one_precedent_per_sheet_in_the_run() {
+        // THE scale property: a 3-D range is one RECTANGLE per sheet, never
+        // one edge per cell. `Sheet1:Sheet3!A1:A1000000` must be 3 entries.
+        let at = sc(S1, 0, 5);
+        let g = wb_graph(&[(at, "=SUM(Sheet1:Sheet3!A1:A1000000)")]);
+        let ps = g.precedents_at(at).expect("registered");
+        assert_eq!(ps.len(), 3, "one rectangle per sheet in the run: {ps:?}");
+        let sheets: Vec<SheetId> = ps.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sheets, vec![S1, S2, S3]);
+        for (_, p) in ps {
+            assert_eq!(*p, Precedent::Range(cr(0, 0), cr(999_999, 0)));
+        }
+    }
+
+    #[test]
+    fn a_three_d_run_written_backwards_covers_the_same_sheets() {
+        let at = sc(S1, 0, 5);
+        let g = wb_graph(&[(at, "=SUM(Sheet3:Sheet1!A1)")]);
+        let sheets: Vec<SheetId> = g
+            .precedents_at(at)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(sheets, vec![S1, S2, S3], "tab order decides, not spelling");
+    }
+
+    #[test]
+    fn a_partial_three_d_run_covers_only_its_own_sheets() {
+        // The control for the test above: if `span` ignored its endpoints and
+        // always returned every sheet, that test would pass anyway.
+        let at = sc(S1, 0, 5);
+        let g = wb_graph(&[(at, "=SUM(Sheet1:Sheet2!A1)")]);
+        let sheets: Vec<SheetId> = g
+            .precedents_at(at)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(sheets, vec![S1, S2], "Sheet3 is outside the run");
+    }
+
+    #[test]
+    fn a_three_d_run_with_a_missing_endpoint_contributes_no_edges() {
+        // Half a run is a wrong answer that looks right; #REF! is the honest
+        // one, and it is reached by the formula having no edges at all.
+        let at = sc(S1, 0, 5);
+        let g = wb_graph(&[(at, "=SUM(Sheet1:Nowhere!A1)")]);
+        assert!(
+            g.precedents_at(at).unwrap().is_empty(),
+            "a broken run must not silently cover part of the workbook"
+        );
+    }
+
+    #[test]
+    fn editing_a_sheet_inside_a_three_d_run_recalculates_the_formula() {
+        // The dependency-graph half of the acceptance criterion: the MIDDLE
+        // sheet of the run is not named in the formula text at all, so only
+        // real tab-order resolution can produce this edge.
+        let total = sc(S1, 0, 5);
+        let g = wb_graph(&[(total, "=SUM(Sheet1:Sheet3!A1)")]);
+        for sheet in [S1, S2, S3] {
+            assert_eq!(
+                g.direct_dependents_at(sc(sheet, 0, 0)),
+                vec![total],
+                "editing A1 on this sheet must recalculate the 3-D total"
+            );
+        }
+        // And a cell OUTSIDE the referenced rectangle must not.
+        assert!(g.direct_dependents_at(sc(S2, 4, 4)).is_empty());
+    }
+
+    #[test]
+    fn a_cycle_through_a_three_d_run_is_detected() {
+        // Sheet2!B1 sums A1:A9 on every sheet of the run; Sheet1!A1 reads
+        // Sheet2!B1. That is a genuine two-node loop, and it only exists
+        // because the 3-D run really reaches into Sheet1 — with no per-sheet
+        // edges there would be no cycle to find.
+        let total = sc(S2, 0, 1);
+        let feeder = sc(S1, 0, 0);
+        let g = wb_graph(&[(total, "=SUM(Sheet1:Sheet3!A1:A9)"), (feeder, "=Sheet2!B1")]);
+        assert!(g.is_circular_at(total), "the loop closes through the run");
+        assert!(g.is_circular_at(feeder));
+        assert!(
+            g.full_order_all().is_err(),
+            "a cycle must be reported, not sorted into some arbitrary order"
+        );
+
+        // The control: move the FEEDER out of the run's rectangle (D1 is not
+        // in A1:A9) and the very same shape is no longer a cycle.
+        let outside = sc(S2, 50, 1);
+        let far = sc(S1, 0, 3);
+        let g = wb_graph(&[(outside, "=SUM(Sheet1:Sheet3!A1:A9)"), (far, "=Sheet2!B51")]);
+        assert!(!g.is_circular_at(outside));
+        assert!(!g.is_circular_at(far));
+        assert!(g.full_order_all().is_ok());
+    }
+
+    #[test]
+    fn sheet_uses_are_recorded_from_the_text_and_found_again() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 2);
+        // A sheet that does NOT exist: the graph drops the edge, so only the
+        // recorded text use can find this formula for a later rename.
+        g.set_formula_at(at, &parse("=Nowhere!A1").unwrap(), &names());
+        g.set_sheet_uses(at, "=Nowhere!A1");
+        assert!(
+            g.precedents_at(at).unwrap().is_empty(),
+            "an unresolvable sheet contributes no edges"
+        );
+        assert_eq!(g.sheet_uses_at(at), ["Nowhere"]);
+        assert_eq!(g.cells_using_sheet("nowhere"), vec![at]);
+        assert!(g.cells_using_sheet("Sheet2").is_empty());
+    }
+
+    #[test]
+    fn sheet_uses_record_both_endpoints_of_a_run() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 0);
+        g.set_sheet_uses(at, "=SUM(Sheet1:Sheet3!A1)+\"Sheet2\"");
+        assert_eq!(g.sheet_uses_at(at), ["Sheet1", "Sheet3"]);
+        assert!(
+            g.cells_using_sheet("Sheet2").is_empty(),
+            "a sheet named only inside a string literal is not a use"
+        );
+    }
+
+    #[test]
+    fn dropping_a_formula_drops_its_sheet_uses_too() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 0);
+        g.set_sheet_uses(at, "=Sheet2!A1");
+        g.remove_at(at);
+        assert!(g.cells_using_sheet("Sheet2").is_empty());
+
+        let other = sc(S1, 5, 5);
+        g.set_sheet_uses(other, "=Sheet2!A1");
+        g.remove_sheet(S1);
+        assert!(g.cells_using_sheet("Sheet2").is_empty());
     }
 }

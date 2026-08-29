@@ -5057,8 +5057,14 @@ impl FerrixApp {
         };
         let name = std::mem::take(&mut self.rename_buffer);
         match self.wb.rename_sheet(id, &name) {
-            Ok(()) => {
-                self.status = format!("Renamed sheet to {}", name.trim());
+            Ok(rewritten) => {
+                // Say how many formulas followed the rename. Silence would
+                // leave the user unable to tell a rewrite from a no-op.
+                self.status = match rewritten {
+                    0 => format!("Renamed sheet to {}", name.trim()),
+                    1 => format!("Renamed sheet to {}; 1 formula updated", name.trim()),
+                    n => format!("Renamed sheet to {}; {n} formulas updated", name.trim()),
+                };
                 self.sync_formula_bar();
             }
             // Refused (blank or duplicate): say why and keep the old name.

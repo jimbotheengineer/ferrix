@@ -434,6 +434,83 @@ pub fn rename_in_formula(src: &str, old: &str, new: &str) -> String {
     })
 }
 
+/// Rewrite every SHEET QUALIFIER naming `old` in `src` to `new`.
+///
+/// ## The asymmetry with a defined-name rename
+///
+/// [`rename_in_formula`] rewrites bare WORDS, and that is safe because a bare
+/// word resolving to a name has no other possible meaning in a formula. A
+/// sheet name does not have that property: it can also appear inside a STRING
+/// LITERAL, where it is data the user typed —
+///
+/// ```text
+/// =Sheet2!A1 & " (from Sheet2)"
+/// ```
+///
+/// Renaming `Sheet2` to `Q1` must produce `=Q1!A1 & " (from Sheet2)"`. The
+/// literal is the user's text, and rewriting it would silently corrupt data
+/// rather than repoint a reference. [`refscan::qualifiers`] skips string
+/// literals for exactly this reason, and this function only ever splices over
+/// the byte spans it reports.
+///
+/// Both endpoints of a 3-D span (`Sheet1:Sheet3!A1`) are candidates, so
+/// renaming either end follows.
+///
+/// Textual, never an AST round trip: re-rendering a parsed formula would drop
+/// every `$` the user wrote (see [`crate::refscan`]).
+pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> String {
+    let quoted = quote_sheet_name(new);
+    // Right to left, so an earlier span's offsets stay valid.
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    for q in refscan::qualifiers(src) {
+        if q.first.eq_ignore_ascii_case(old) {
+            edits.push(q.first_span);
+        }
+        if let (Some(last), Some(span)) = (q.last.as_deref(), q.last_span) {
+            if last.eq_ignore_ascii_case(old) {
+                edits.push(span);
+            }
+        }
+    }
+    edits.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    let mut out = src.to_string();
+    for (s, e) in edits {
+        out.replace_range(s..e, &quoted);
+    }
+    out
+}
+
+/// Does this formula's SOURCE TEXT reference the sheet `name`?
+///
+/// String literals do not count, for the same reason they are not rewritten.
+pub fn references_sheet(src: &str, name: &str) -> bool {
+    refscan::qualifiers(src).iter().any(|q| {
+        q.first.eq_ignore_ascii_case(name)
+            || q.last
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Every sheet a formula's SOURCE TEXT names, in the spelling written.
+///
+/// Recorded beside the graph's edges so a rename or a delete can find its
+/// dependent formulas without rescanning the whole workbook — the same trick
+/// [`names_in`] plays for defined names, and for the same reason: a formula
+/// whose sheet no longer resolves has no edges at all, so the edge list cannot
+/// be what finds it.
+pub fn sheets_in(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for q in refscan::qualifiers(src) {
+        for name in std::iter::once(q.first.clone()).chain(q.last.clone()) {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
 /// Every bare word in `src` that could be a defined name, upper-cased.
 ///
 /// This is what the dependency graph records so a rename or a delete can find
@@ -761,5 +838,124 @@ mod tests {
             t.set_target("Sales", &NameScope::Workbook, "))"),
             Err(NameError::BadTarget(_, _))
         ));
+    }
+
+    // --- renaming a SHEET inside formula text (issue #43) ---
+
+    #[test]
+    fn renaming_a_sheet_rewrites_its_qualifiers() {
+        assert_eq!(
+            rename_sheet_in_formula("=Sheet2!A1*2", "Sheet2", "Summary"),
+            "=Summary!A1*2"
+        );
+        // Every occurrence, and case-insensitively — `sheet2!` names Sheet2.
+        assert_eq!(
+            rename_sheet_in_formula("=Sheet2!A1+sheet2!B2", "Sheet2", "Q1"),
+            "=Q1!A1+Q1!B2"
+        );
+        // A sheet the rename does not concern is untouched.
+        assert_eq!(
+            rename_sheet_in_formula("=Sheet3!A1", "Sheet2", "Q1"),
+            "=Sheet3!A1"
+        );
+    }
+
+    #[test]
+    fn a_sheet_name_inside_a_string_literal_is_never_rewritten() {
+        // THE ASYMMETRY vs a defined-name rename, and the criterion this
+        // whole function exists for. The same word appears twice: once as a
+        // reference, once as the user's data. Only the first may move.
+        let src = "=Sheet2!A1 & \" (from Sheet2)\"";
+        let out = rename_sheet_in_formula(src, "Sheet2", "Q1");
+        assert_eq!(
+            out, "=Q1!A1 & \" (from Sheet2)\"",
+            "the reference must follow the rename and the literal must not"
+        );
+        assert!(
+            out.contains("\" (from Sheet2)\""),
+            "the string literal was corrupted: {out}"
+        );
+        // A formula that mentions the sheet ONLY in text is left alone
+        // entirely — byte for byte.
+        let only_text = "=\"Sheet2 total\"&A1";
+        assert_eq!(
+            rename_sheet_in_formula(only_text, "Sheet2", "Q1"),
+            only_text,
+            "no qualifier here, so nothing may change"
+        );
+        assert!(!references_sheet(only_text, "Sheet2"));
+    }
+
+    #[test]
+    fn a_renamed_sheet_is_requoted_only_when_it_needs_it() {
+        // Renaming to a name with a space must gain quotes, or the formula
+        // stops parsing.
+        assert_eq!(
+            rename_sheet_in_formula("=Sheet2!A1", "Sheet2", "My Sheet"),
+            "='My Sheet'!A1"
+        );
+        // And renaming AWAY from a quoted name must drop them.
+        assert_eq!(
+            rename_sheet_in_formula("='My Sheet'!A1", "My Sheet", "Data"),
+            "=Data!A1"
+        );
+        // An interior quote is doubled, matching the tokenizer.
+        assert_eq!(
+            rename_sheet_in_formula("=Sheet2!A1", "Sheet2", "Bob's"),
+            "='Bob''s'!A1"
+        );
+    }
+
+    #[test]
+    fn renaming_a_sheet_keeps_every_dollar_marker() {
+        // The whole reason this is textual. An AST round trip would silently
+        // unpin all four references.
+        let src = "=SUM(Sheet2!$A$1:$A$9)+Sheet2!$B1+Sheet2!C$2";
+        assert_eq!(
+            rename_sheet_in_formula(src, "Sheet2", "Q1"),
+            "=SUM(Q1!$A$1:$A$9)+Q1!$B1+Q1!C$2"
+        );
+    }
+
+    #[test]
+    fn renaming_follows_either_endpoint_of_a_three_d_span() {
+        assert_eq!(
+            rename_sheet_in_formula("=SUM(Sheet1:Sheet3!A1)", "Sheet3", "Last"),
+            "=SUM(Sheet1:Last!A1)"
+        );
+        assert_eq!(
+            rename_sheet_in_formula("=SUM(Sheet1:Sheet3!A1)", "Sheet1", "First"),
+            "=SUM(First:Sheet3!A1)"
+        );
+        // A sheet in the MIDDLE of the run is not named in the text, so the
+        // text does not change — the run still covers it by tab order.
+        assert_eq!(
+            rename_sheet_in_formula("=SUM(Sheet1:Sheet3!A1)", "Sheet2", "Middle"),
+            "=SUM(Sheet1:Sheet3!A1)"
+        );
+    }
+
+    #[test]
+    fn renaming_a_sheet_that_is_not_mentioned_is_byte_identical() {
+        // A no-op rename must not churn spacing, case or anything else.
+        let src = "= SUM( $A$1 : A9 ) + \"Sheet9!\" + LOG10(B2)";
+        assert_eq!(rename_sheet_in_formula(src, "Sheet9", "Other"), src);
+    }
+
+    #[test]
+    fn sheets_in_reports_qualifiers_and_skips_literals() {
+        assert_eq!(sheets_in("=Sheet2!A1"), vec!["Sheet2".to_string()]);
+        assert_eq!(
+            sheets_in("=SUM(Sheet1:Sheet3!A1)"),
+            vec!["Sheet1".to_string(), "Sheet3".to_string()]
+        );
+        // Duplicates collapse; a formula naming a sheet twice is one use.
+        assert_eq!(
+            sheets_in("=Sheet2!A1+sheet2!B1"),
+            vec!["Sheet2".to_string()]
+        );
+        // Text is not a reference.
+        assert!(sheets_in("=\"Sheet2\"&A1").is_empty());
+        assert!(sheets_in("=A1+B2").is_empty());
     }
 }

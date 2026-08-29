@@ -1367,6 +1367,161 @@ mod tests {
         );
     }
 
+    // --- 3-D references across a sheet run (issue #43) ---
+
+    fn cr(row: u32, col: u32) -> CellRef {
+        CellRef::new(row, col)
+    }
+
+    #[test]
+    fn parses_a_three_d_single_cell_reference() {
+        // THE acceptance criterion at the parser level.
+        assert_eq!(
+            parse("=Sheet1:Sheet3!A1").unwrap(),
+            Expr::X3D("Sheet1".into(), "Sheet3".into(), cr(0, 0), cr(0, 0)),
+            "a single-cell 3-D reference is the degenerate 1x1 rectangle"
+        );
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet1".into(),
+                    "Sheet3".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn parses_a_three_d_range() {
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!A1:B10)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet1".into(),
+                    "Sheet3".into(),
+                    cr(0, 0),
+                    cr(9, 1)
+                )]
+            )
+        );
+        // Corners are normalised, exactly as a 2-D range's are.
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!B10:A1)").unwrap(),
+            parse("=SUM(Sheet1:Sheet3!A1:B10)").unwrap()
+        );
+    }
+
+    #[test]
+    fn three_d_endpoints_may_be_quoted() {
+        assert_eq!(
+            parse("=SUM('Q1 2024':'Q4 2024'!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Q1 2024".into(),
+                    "Q4 2024".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+        // Mixed quoting, and `''` as an escaped quote in the second name.
+        assert_eq!(
+            parse("=SUM(Start:'Bob''s Data'!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Start".into(),
+                    "Bob's Data".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn a_three_d_run_written_backwards_keeps_the_names_as_written() {
+        // The parser does NOT reorder the endpoints: which way round the run
+        // goes is a tab-order question, and only the workbook knows the tab
+        // order. Reordering here would be a guess.
+        assert_eq!(
+            parse("=SUM(Sheet3:Sheet1!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet3".into(),
+                    "Sheet1".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn a_plain_range_is_never_mistaken_for_a_three_d_span() {
+        // THE regression the `:` lookahead could easily cause. If `A1:B4`
+        // were read as the span `A1`..`B4`, every ordinary range in the
+        // workbook would stop being a range.
+        assert_eq!(
+            parse("=SUM(A1:B4)").unwrap(),
+            Expr::Call("SUM".into(), vec![Expr::Range(cr(0, 0), cr(3, 1))])
+        );
+        // A requalified same-sheet range stays a 2-D XRange, not a span.
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:Sheet2!B4)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::XRange("Sheet2".into(), cr(0, 0), cr(3, 1))]
+            )
+        );
+        // And a bare cross-sheet range is unaffected.
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:B4)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::XRange("Sheet2".into(), cr(0, 0), cr(3, 1))]
+            )
+        );
+    }
+
+    #[test]
+    fn a_colon_without_a_following_bang_is_not_a_span() {
+        // `Total:B4` is a name-to-cell range the parser must not silently
+        // reinterpret as a sheet run. Without the `!` requirement the
+        // qualifier scanner would eat `Total:B4` whole.
+        assert!(
+            !matches!(parse("=SUM(Total:B4)"), Ok(Expr::Call(_, _))),
+            "a bare name is not a sheet qualifier"
+        );
+        // The tokenizer must not have produced a SheetSpan for it either.
+        assert!(!tokenize("Total:B4")
+            .unwrap()
+            .iter()
+            .any(|t| matches!(t, Token::SheetSpan { .. })));
+    }
+
+    #[test]
+    fn tokenizes_a_three_d_span_with_absolute_markers() {
+        assert_eq!(
+            tokenize("Sheet1:Sheet3!$B$2").unwrap(),
+            vec![Token::SheetSpan {
+                first: "Sheet1".into(),
+                last: "Sheet3".into(),
+                cell: cr(1, 1),
+                abs_col: true,
+                abs_row: true
+            }],
+            "the tokenizer still records the $ markers a rewrite needs"
+        );
+    }
+
     // --- defined names ----------------------------------------------------
 
     /// A resolver that knows exactly one name.

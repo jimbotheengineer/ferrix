@@ -623,27 +623,76 @@ impl Workbook {
         Ok(id)
     }
 
-    /// Rename a sheet. Refuses blank names and duplicates.
+    /// Rename a sheet, REWRITING the source text of every formula that names
+    /// it. Refuses blank names and duplicates.
     ///
-    /// Formula SOURCES that name the old sheet are deliberately NOT rewritten;
-    /// `sheet_id_by_name` resolves through the current name list, so a formula
-    /// pointing at a renamed sheet becomes a `#REF!` on next recalc rather
-    /// than silently rebinding to whatever later takes that name. Rewriting
-    /// sources is a bigger change than this issue asks for, and getting it
-    /// half-right is worse than being explicit.
-    pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<(), SheetError> {
+    /// ## Why the text is rewritten, and where it deliberately is not
+    ///
+    /// Leaving formulas alone would turn every reference into `#REF!` the
+    /// moment a tab was renamed, which is not what any spreadsheet does and
+    /// not what the user asked for — they renamed a tab, not their formulas.
+    ///
+    /// The rewrite is TEXTUAL, through
+    /// [`ferrix_formula::names::rename_sheet_in_formula`], never an AST round
+    /// trip: the parser discards the `$` markers the tokenizer recorded, so
+    /// re-rendering would silently unpin every absolute reference in the
+    /// workbook.
+    ///
+    /// And it is deliberately narrower than a defined-name rename. A sheet
+    /// name can also appear inside a STRING LITERAL, where it is the user's
+    /// data — `=Sheet2!A1&" from Sheet2"` must become `=Q1!A1&" from Sheet2"`,
+    /// with the literal untouched. The scanner skips literals for exactly this
+    /// reason.
+    ///
+    /// Returns how many formulas were rewritten.
+    pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<usize, SheetError> {
         self.check_structure(ferrix_core::StructureOp::RenameSheet)?;
         let name = self.validate_name(name, Some(id))?;
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
         let old = std::mem::replace(&mut self.sheets[idx].name, name.clone());
+        if old == name {
+            return Ok(0);
+        }
         // A defined name scoped to this sheet, or pointing into it, must
         // follow the rename or it would silently address a sheet that no
         // longer exists.
         self.names.rename_sheet(&old, &name);
+
+        // Only formulas whose TEXT names the old sheet — found through the
+        // graph's recorded sheet uses rather than by rescanning the workbook,
+        // which would be O(workbook) on every rename.
+        let cells = self.graph.cells_using_sheet(&old);
+        let mut rewritten = 0usize;
+        for at in cells {
+            let Some(src) = self
+                .overlay_of(at.sheet)
+                .and_then(|o| o.get(at.cell))
+                .and_then(|i| i.formula_src())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let new_src = ferrix_formula::names::rename_sheet_in_formula(&src, &old, &name);
+            if new_src == src {
+                continue;
+            }
+            if let Some(ov) = self.overlay_of_mut(at.sheet) {
+                let cached = ov.value(at.cell).unwrap_or(Value::Empty);
+                ov.set(
+                    at.cell,
+                    CellInput::Formula {
+                        src: new_src,
+                        cached,
+                    },
+                );
+            }
+            rewritten += 1;
+        }
+
         self.dirty = true;
         self.rebuild_graph_and_recalc();
         self.dirty = true;
-        Ok(())
+        Ok(rewritten)
     }
 
     /// Delete a sheet and everything it stored. The last sheet cannot go.
@@ -1110,6 +1159,10 @@ impl Workbook {
             // a formula reading `=SUM(Sales)` while `Sales` is undefined is
             // exactly the one that must be revisited when it is defined.
             self.graph.set_name_uses(*at, src);
+            // Sheet qualifiers, for the same reason: a formula naming a sheet
+            // that does not exist has NO edges, so the edge list could never
+            // find it for a later rename or delete.
+            self.graph.set_sheet_uses(*at, src);
         }
         // Evaluate in dependency order so a formula referencing another
         // formula sees an up-to-date value rather than a stale cache.
@@ -1403,6 +1456,7 @@ impl Workbook {
                 // the one that must be revisited when it is defined, so its
                 // name use has to survive the failed parse.
                 self.graph.set_name_uses(at, src);
+                self.graph.set_sheet_uses(at, src);
             }
             _ => {
                 // No longer a formula (or cleared): drop its edges.
@@ -2335,6 +2389,7 @@ impl Workbook {
                 // them: a formula naming something undefined must still be
                 // findable when that name is later defined.
                 self.graph.set_name_uses(at, &src);
+                self.graph.set_sheet_uses(at, &src);
             }
             None => self.graph.remove_at(at),
         }

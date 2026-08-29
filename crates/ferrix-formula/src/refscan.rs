@@ -257,6 +257,19 @@ pub fn qualifiers(src: &str) -> Vec<Qualifier> {
             i = skip_quoted(b, i).unwrap_or(b.len());
             continue;
         }
+        // Consume a whole word before moving on. Advancing one byte would
+        // restart the qualifier parse in the MIDDLE of a word, and a suffix
+        // can look like a qualifier its whole word is not: in
+        // `Sheet1!A1:Sheet1!B4` the tail `1:Sheet1!` reads as the 3-D span
+        // `1`..`Sheet1`, which would hide the `A1` reference entirely.
+        if b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] == b'.')
+            {
+                i += 1;
+            }
+            continue;
+        }
         i += 1;
     }
     out
@@ -467,5 +480,92 @@ mod tests {
         let src = "=SUM($A$1:A1)*LOG10(B2)+\"text\"";
         let ws = scan(src);
         assert_eq!(rewrite(src, &ws, |_, _| None), src);
+    }
+
+    // --- sheet qualifiers (issue #43) ---
+
+    fn quals(src: &str) -> Vec<(String, Option<String>)> {
+        qualifiers(src)
+            .into_iter()
+            .map(|q| (q.first, q.last))
+            .collect()
+    }
+
+    #[test]
+    fn finds_bare_and_quoted_sheet_qualifiers() {
+        assert_eq!(quals("=Sheet1!A1"), vec![("Sheet1".into(), None)]);
+        assert_eq!(quals("='Q1 2024'!A1"), vec![("Q1 2024".into(), None)]);
+        // `''` is an escaped quote inside the name.
+        assert_eq!(
+            quals("='Bob''s Data'!A1"),
+            vec![("Bob's Data".into(), None)]
+        );
+        assert_eq!(
+            quals("=Sheet1!A1+Sheet2!B2"),
+            vec![("Sheet1".into(), None), ("Sheet2".into(), None)]
+        );
+    }
+
+    #[test]
+    fn finds_both_endpoints_of_a_three_d_span() {
+        assert_eq!(
+            quals("=SUM(Sheet1:Sheet3!A1)"),
+            vec![("Sheet1".into(), Some("Sheet3".into()))]
+        );
+        assert_eq!(
+            quals("=SUM('Q1 2024':'Q4 2024'!A1)"),
+            vec![("Q1 2024".into(), Some("Q4 2024".into()))]
+        );
+    }
+
+    #[test]
+    fn a_sheet_name_inside_a_string_literal_is_not_a_qualifier() {
+        // THE asymmetry a sheet rename lives or dies by. `"Sheet2!"` is the
+        // user's text; rewriting it would corrupt data rather than repoint a
+        // reference.
+        assert_eq!(
+            quals("=Sheet2!A1&\" from Sheet2!\""),
+            vec![("Sheet2".into(), None)],
+            "only the real qualifier may be reported"
+        );
+        assert!(quals("=\"Sheet2!A1\"").is_empty());
+    }
+
+    #[test]
+    fn a_two_d_range_is_not_read_as_a_three_d_span() {
+        // `Sheet1!A1:B4` — the `:` belongs to the RANGE, not to a sheet run.
+        // If it were misread, `A1` would disappear from the scanner's output
+        // and no reference rewrite could ever see it again.
+        assert_eq!(quals("=Sheet1!A1:B4"), vec![("Sheet1".into(), None)]);
+        assert_eq!(words("=Sheet1!A1:B4"), vec!["A1", "B4"]);
+        // Requalified far corner: two qualifiers, both endpoints scanned.
+        assert_eq!(
+            quals("=Sheet1!A1:Sheet1!B4"),
+            vec![("Sheet1".into(), None), ("Sheet1".into(), None)]
+        );
+        assert_eq!(words("=Sheet1!A1:Sheet1!B4"), vec!["A1", "B4"]);
+    }
+
+    #[test]
+    fn a_three_d_spans_endpoint_names_are_not_scanned_as_references() {
+        // `Q1` in `'Q1 2024':'Q4 2024'!A1` is a perfectly valid reference
+        // spelling. Scanning it would let a column remap silently rename the
+        // sheet the formula points at.
+        assert_eq!(words("=SUM(Sheet1:Sheet3!A1)"), vec!["A1"]);
+        assert_eq!(words("=SUM('Q1 2024':'Q4 2024'!A1:B9)"), vec!["A1", "B9"]);
+    }
+
+    #[test]
+    fn qualifier_spans_cover_the_names_as_written() {
+        let src = "=SUM('Q1 2024':Sheet3!A1)";
+        let q = &qualifiers(src)[0];
+        assert_eq!(
+            &src[q.first_span.0..q.first_span.1],
+            "'Q1 2024'",
+            "the span must include the quotes so a rename can re-quote"
+        );
+        let last = q.last_span.expect("3-D span has a second endpoint");
+        assert_eq!(&src[last.0..last.1], "Sheet3");
+        assert_eq!(&src[q.start..q.end], "'Q1 2024':Sheet3!");
     }
 }
