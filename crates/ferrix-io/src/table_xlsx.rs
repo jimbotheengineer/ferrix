@@ -87,6 +87,30 @@ fn read_package(path: &Path, limits: &Limits) -> Result<HashMap<String, Vec<u8>>
     safeguard::read_all_parts(&mut zip, &disp, limits, None)
 }
 
+/// [`read_package`] for sibling modules that read the raw OOXML — currently
+/// [`crate::protect_xlsx`]. Re-exported rather than duplicated so the
+/// safeguards (declared-size checks, part budget, zip-slip) apply once.
+pub(crate) fn read_package_for(
+    path: &Path,
+    limits: &Limits,
+) -> Result<HashMap<String, Vec<u8>>, SafeguardError> {
+    read_package(path, limits)
+}
+
+/// [`worksheet_paths`] for sibling modules. Same reason.
+pub(crate) fn worksheet_paths_for(
+    parts: &HashMap<String, Vec<u8>>,
+    path: &str,
+) -> Result<Vec<String>, SafeguardError> {
+    worksheet_paths(parts, path)
+}
+
+/// [`attr`] for sibling modules. Same reason: entity handling and the
+/// `normalized_value` workaround must not be reimplemented per module.
+pub(crate) fn attr_for(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+    attr(e, name)
+}
+
 /// Sentinel bound meaning "any finite number", used to express a bare
 /// [`ColumnType::Number`] as a real Excel `decimal` validation. Excel accepts
 /// a rule this wide and it does exactly what the column type means: reject

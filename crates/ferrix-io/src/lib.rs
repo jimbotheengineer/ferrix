@@ -20,6 +20,7 @@ pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
 pub mod pool;
+pub mod protect_xlsx;
 pub mod safeguard;
 pub mod table_xlsx;
 pub mod xlsx;
