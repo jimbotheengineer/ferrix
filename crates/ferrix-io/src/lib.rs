@@ -24,6 +24,7 @@ pub mod pool;
 pub mod protect_xlsx;
 pub mod safeguard;
 pub mod sizing_sidecar;
+pub mod sniff;
 pub mod table_xlsx;
 pub mod xlsx;
 
@@ -51,6 +52,10 @@ pub use safeguard::{
     SafeguardError,
 };
 pub use sizing_sidecar::{load_sizing, save_sizing, sizing_path_for, SizeSidecarError};
+pub use sniff::{
+    encoding_for_label, preview_bytes, preview_path, sniff_bytes, sniff_path, Detection, Preview,
+    CANDIDATE_DELIMITERS, CANDIDATE_QUOTES, ENCODING_CHOICES, PREFIX_BYTES, PREVIEW_ROWS,
+};
 pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
 };

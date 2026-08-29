@@ -32,6 +32,17 @@ pub struct CsvOptions {
     pub has_headers: bool,
     /// Cap on rows read; `None` means the whole file.
     pub max_rows: Option<usize>,
+    /// Quote character (issue #31). RFC 4180 says `"`, but exports from other
+    /// tools use `'`, and a file quoted with `'` parsed as if it were quoted
+    /// with `"` splits every embedded delimiter into a spurious column.
+    pub quote: u8,
+    /// Records discarded before anything else — a title block or export
+    /// banner ahead of the real header row (issue #31).
+    pub skip_rows: usize,
+    /// Source encoding. `None` means "the bytes are UTF-8", which is the
+    /// historical behaviour and stays the zero-cost path: only a `Some` that
+    /// is not UTF-8 makes the loader transcode.
+    pub encoding: Option<&'static encoding_rs::Encoding>,
 }
 
 impl Default for CsvOptions {
@@ -40,6 +51,9 @@ impl Default for CsvOptions {
             delimiter: b',',
             has_headers: true,
             max_rows: None,
+            quote: b'"',
+            skip_rows: 0,
+            encoding: None,
         }
     }
 }
@@ -85,34 +99,58 @@ pub fn load_csv(path: &Path, opts: CsvOptions) -> Result<(Sheet, LoadStats), Csv
     // SAFETY: we only read from the mapping, and the file is not truncated
     // underneath us during the load.
     let mmap = unsafe { Mmap::map(&file)? };
-    let data: &[u8] = &mmap;
-    if data.is_empty() {
+    let raw: &[u8] = &mmap;
+    if raw.is_empty() {
         return Err(CsvError::Empty);
     }
+    let mapped_bytes = raw.len();
+
+    // Transcode ONLY when the caller named a non-UTF-8 encoding (issue #31).
+    // The default path is untouched: `Cow::Borrowed` over the mapping, no
+    // copy, no allocation, exactly the bytes the parser saw before.
+    //
+    // Scale note: a transcode does materialise the file as UTF-8 in heap, so
+    // it costs roughly one extra file-size. That is acceptable HERE and only
+    // here — `load_csv` is the in-RAM path, taken only for files the budget
+    // already admitted at ~1.2x (see `lib.rs::should_use_mmap`). The
+    // out-of-core converter does not transcode, which is why the wizard's
+    // encoding override is documented as applying to the in-RAM path.
+    let decoded = decode_to_utf8(raw, opts.encoding);
+    let data: &[u8] = &decoded;
 
     let start = std::time::Instant::now();
     let mut cursor = 0usize;
 
-    // Headers come from the first record, parsed on this thread.
+    // A preamble is discarded before anything else: the header row is the
+    // first record AFTER it, not the first record in the file.
+    for _ in 0..opts.skip_rows {
+        if cursor >= data.len() {
+            break;
+        }
+        let end = find_record_end(data, cursor, opts.quote);
+        cursor = skip_newline(data, end);
+    }
+
+    // Headers come from the first remaining record, parsed on this thread.
     let mut headers: Vec<String> = Vec::new();
-    if opts.has_headers {
-        let end = find_record_end(data, 0);
-        let line = &data[0..end];
-        headers = split_record(line, opts.delimiter)
+    if opts.has_headers && cursor < data.len() {
+        let end = find_record_end(data, cursor, opts.quote);
+        let line = &data[cursor..end];
+        headers = split_record(line, opts.delimiter, opts.quote)
             .into_iter()
             .map(|f| String::from_utf8_lossy(&f).trim().to_string())
             .collect();
         cursor = skip_newline(data, end);
     }
 
-    let body = &data[cursor..];
+    let body = &data[cursor.min(data.len())..];
     let n_chunks = rayon::current_num_threads().max(1);
-    let bounds = chunk_bounds(body, n_chunks);
+    let bounds = chunk_bounds_quoted(body, n_chunks, opts.quote);
 
     // Parse chunks in parallel; each produces column-major fields.
     let results: Vec<ChunkResult> = bounds
         .par_iter()
-        .map(|&(s, e)| parse_chunk(&body[s..e], opts.delimiter))
+        .map(|&(s, e)| parse_chunk(&body[s..e], opts.delimiter, opts.quote))
         .collect();
 
     // Merge: build the sheet by concatenating chunks in order.
@@ -167,12 +205,41 @@ pub fn load_csv(path: &Path, opts: CsvOptions) -> Result<(Sheet, LoadStats), Csv
     let stats = LoadStats {
         rows: sheet.row_count(),
         cols: sheet.col_count(),
-        bytes: data.len(),
+        // The SOURCE size, not the transcoded size — throughput is about how
+        // fast the file on disk was consumed.
+        bytes: mapped_bytes,
         parse_millis: start.elapsed().as_millis(),
         chunks: bounds.len(),
     };
 
     Ok((sheet, stats))
+}
+
+/// Bytes as UTF-8, borrowing when no conversion is needed (issue #31).
+///
+/// `None` and `UTF-8` both borrow. Anything else transcodes; malformed input
+/// becomes U+FFFD rather than an error, because refusing to open a file over
+/// one bad byte helps nobody.
+fn decode_to_utf8<'a>(
+    raw: &'a [u8],
+    encoding: Option<&'static encoding_rs::Encoding>,
+) -> std::borrow::Cow<'a, [u8]> {
+    let Some(enc) = encoding else {
+        return std::borrow::Cow::Borrowed(raw);
+    };
+    if enc == encoding_rs::UTF_8 {
+        // Still strip a BOM: left in place it becomes part of the first
+        // header cell, so `id` arrives as `\u{feff}id` and no formula
+        // referencing that column ever matches.
+        return match raw.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+            Some(rest) => std::borrow::Cow::Borrowed(rest),
+            None => std::borrow::Cow::Borrowed(raw),
+        };
+    }
+    match enc.decode(raw) {
+        (std::borrow::Cow::Borrowed(s), _, _) => std::borrow::Cow::Borrowed(s.as_bytes()),
+        (std::borrow::Cow::Owned(s), _, _) => std::borrow::Cow::Owned(s.into_bytes()),
+    }
 }
 
 /// Split `data` into approximately `n` chunks that each begin at a record
@@ -184,6 +251,17 @@ pub fn load_csv(path: &Path, opts: CsvOptions) -> Result<(Sheet, LoadStats), Csv
 /// reach them. That pass is a simple byte loop (multiple GB/s) and is cheap
 /// relative to the parallel parse it enables.
 pub(crate) fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
+    chunk_bounds_quoted(data, n, b'"')
+}
+
+/// `chunk_bounds` with a configurable quote character (issue #31).
+///
+/// The quote character is a parameter rather than a constant because parity
+/// has to be tracked with the SAME character the field splitter will use. A
+/// file quoted with `'` chunked as if it were quoted with `"` puts boundaries
+/// inside quoted fields, which is the exact class of corruption the
+/// single-pass design exists to avoid.
+pub(crate) fn chunk_bounds_quoted(data: &[u8], n: usize, quote: u8) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return vec![];
     }
@@ -197,21 +275,21 @@ pub(crate) fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
     let mut in_quotes = false;
 
     for (i, &b) in data.iter().enumerate() {
-        match b {
-            b'"' => in_quotes = !in_quotes,
-            // Guard collapsed into the match arm; a failed guard falls through
-            // to the `_` arm, which is the same no-op as before.
-            b'\n' if !in_quotes && i + 1 > next_target && i + 1 > start => {
-                bounds.push((start, i + 1));
-                start = i + 1;
-                while next_target <= start {
-                    next_target += target;
-                }
-                if bounds.len() + 1 >= n {
-                    break;
-                }
+        if b == quote {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        // Guard collapsed into the condition; a failed guard is the same
+        // no-op as before.
+        if b == b'\n' && !in_quotes && i + 1 > next_target && i + 1 > start {
+            bounds.push((start, i + 1));
+            start = i + 1;
+            while next_target <= start {
+                next_target += target;
             }
-            _ => {}
+            if bounds.len() + 1 >= n {
+                break;
+            }
         }
     }
     if start < data.len() {
@@ -222,29 +300,31 @@ pub(crate) fn chunk_bounds(data: &[u8], n: usize) -> Vec<(usize, usize)> {
 
 /// Index just past the end of the record starting at `from` (exclusive of the
 /// newline itself).
-fn find_record_end(data: &[u8], from: usize) -> usize {
+fn find_record_end(data: &[u8], from: usize, quote: u8) -> usize {
     let mut i = from;
     let mut in_quotes = false;
     while i < data.len() {
-        match data[i] {
-            b'"' => in_quotes = !in_quotes,
-            b'\n' if !in_quotes => {
-                // Trim a preceding \r for CRLF files.
-                return if i > from && data[i - 1] == b'\r' {
-                    i - 1
-                } else {
-                    i
-                };
-            }
-            _ => {}
+        let b = data[i];
+        if b == quote {
+            in_quotes = !in_quotes;
+        } else if b == b'\n' && !in_quotes {
+            // Trim a preceding CR for CRLF files.
+            return if i > from && data[i - 1] == CR {
+                i - 1
+            } else {
+                i
+            };
         }
         i += 1;
     }
     data.len()
 }
 
+/// The carriage return byte, named so a patch tool cannot mangle the escape.
+const CR: u8 = 13;
+
 fn skip_newline(data: &[u8], mut pos: usize) -> usize {
-    if pos < data.len() && data[pos] == b'\r' {
+    if pos < data.len() && data[pos] == CR {
         pos += 1;
     }
     if pos < data.len() && data[pos] == b'\n' {
@@ -253,8 +333,9 @@ fn skip_newline(data: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Split one record into fields, handling RFC-4180 quoting and `""` escapes.
-fn split_record(line: &[u8], delim: u8) -> Vec<Vec<u8>> {
+/// Split one record into fields, handling RFC-4180 quoting and doubled-quote
+/// escapes with a configurable quote character.
+fn split_record(line: &[u8], delim: u8, quote: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut field = Vec::new();
     let mut i = 0;
@@ -262,9 +343,9 @@ fn split_record(line: &[u8], delim: u8) -> Vec<Vec<u8>> {
     while i < line.len() {
         let b = line[i];
         if in_quotes {
-            if b == b'"' {
-                if i + 1 < line.len() && line[i + 1] == b'"' {
-                    field.push(b'"');
+            if b == quote {
+                if i + 1 < line.len() && line[i + 1] == quote {
+                    field.push(quote);
                     i += 2;
                     continue;
                 }
@@ -272,11 +353,11 @@ fn split_record(line: &[u8], delim: u8) -> Vec<Vec<u8>> {
             } else {
                 field.push(b);
             }
-        } else if b == b'"' {
+        } else if b == quote {
             in_quotes = true;
         } else if b == delim {
             out.push(std::mem::take(&mut field));
-        } else if b != b'\r' {
+        } else if b != CR {
             field.push(b);
         }
         i += 1;
@@ -286,13 +367,13 @@ fn split_record(line: &[u8], delim: u8) -> Vec<Vec<u8>> {
 }
 
 /// Parse a chunk into column-major typed fields.
-fn parse_chunk(data: &[u8], delim: u8) -> ChunkResult {
+fn parse_chunk(data: &[u8], delim: u8, quote: u8) -> ChunkResult {
     let mut fields: Vec<Vec<FieldValue>> = Vec::new();
     let mut rows = 0usize;
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let end = find_record_end(data, pos);
+        let end = find_record_end(data, pos, quote);
         let line = &data[pos..end];
         pos = skip_newline(data, if end < data.len() { end } else { data.len() });
         // A trailing newline yields one empty record; skip it.
@@ -302,7 +383,7 @@ fn parse_chunk(data: &[u8], delim: u8) -> ChunkResult {
             }
             continue;
         }
-        let cells = split_record(line, delim);
+        let cells = split_record(line, delim, quote);
         if fields.len() < cells.len() {
             // A later row is wider: back-fill the new columns with Empty.
             let pad = rows;
@@ -372,7 +453,7 @@ mod tests {
 
     #[test]
     fn split_handles_quotes_and_escapes() {
-        let fields = split_record(br#"a,"b,c","say ""hi""",d"#, b',');
+        let fields = split_record(br#"a,"b,c","say ""hi""",d"#, b',', b'"');
         let as_str: Vec<String> = fields
             .iter()
             .map(|f| String::from_utf8_lossy(f).into_owned())
@@ -382,7 +463,7 @@ mod tests {
 
     #[test]
     fn split_handles_empty_fields() {
-        let fields = split_record(b"a,,c,", b',');
+        let fields = split_record(b"a,,c,", b',', b'"');
         assert_eq!(fields.len(), 4);
         assert!(fields[1].is_empty());
         assert!(fields[3].is_empty());
