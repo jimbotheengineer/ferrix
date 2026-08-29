@@ -4796,6 +4796,10 @@ impl FerrixApp {
                 // the same reason protection does: a sheet the user bordered
                 // and re-exported must still have its borders.
                 .with_format(&self.wb.format)
+                // Sparklines (issue #36) survive as `<extLst>` groups. A group
+                // Excel cannot express is reported below rather than silently
+                // dropped.
+                .with_sparklines(&self.wb.sparklines)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
@@ -4846,6 +4850,14 @@ impl FerrixApp {
         }
         for (_, ov) in self.wb.format.overrides() {
             push(&ov.decor, &mut out);
+        }
+        // Sparklines (issue #36), same contract: a group Excel cannot express
+        // is reported HERE, in the editor, rather than discovered after the
+        // file is opened.
+        for m in ferrix_io::sparkline_xlsx_loss(&self.wb.sparklines) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
         }
         out
     }
@@ -9721,6 +9733,57 @@ mod tests {
         assert!(
             wbp.structure_locked(),
             "workbook structure protection was stripped by export"
+        );
+    }
+
+    /// Issue #36: the EXPORT the menu item runs must carry sparklines.
+    ///
+    /// Asserts through `export_xlsx_to` -- the production path -- for exactly
+    /// the reason the protection test above gives. `sparkline_xlsx`'s own
+    /// tests would keep passing if `export_xlsx_to` never called
+    /// `.with_sparklines(..)`, and the file would come back with none.
+    /// Re-importing is what proves the bytes carry it.
+    #[test]
+    fn exporting_preserves_sparkline_groups() {
+        let mut app = FerrixApp::new(None);
+        // Four numeric source columns over two rows.
+        for r in 0..2u32 {
+            for c in 0..4u32 {
+                app.wb
+                    .commit_edit(CellRef::new(r, c), &format!("{}", r * 4 + c + 1));
+            }
+        }
+        app.set_selection_for_test(CellRef::new(0, 0), CellRef::new(1, 3));
+        // Through the REGISTRY dispatch, not `add_sparkline`.
+        app.run_command(crate::command::CommandId::FormatSparkColumn);
+        assert_eq!(app.sparkline_group_count(), 1, "status: {}", app.status);
+
+        let tmp = TempXlsx::new("spark-roundtrip");
+        app.export_xlsx_to(tmp.path());
+        assert!(
+            tmp.path().exists(),
+            "export did not write a file; status: {}",
+            app.status
+        );
+
+        let back = ferrix_io::import_sparklines(tmp.path()).expect("re-import sparklines");
+        assert_eq!(
+            back.len(),
+            1,
+            "the re-imported workbook has no sparkline group -- export stripped it"
+        );
+        assert_eq!(
+            back[0].group.kind,
+            ferrix_core::SparkKind::Column,
+            "the TYPE must survive, not just the geometry"
+        );
+        assert_eq!(
+            back[0].group.target,
+            ferrix_core::TableRange::new(0, 4, 1, 4)
+        );
+        assert_eq!(
+            (back[0].group.src_first_col, back[0].group.src_last_col),
+            (0, 3)
         );
     }
 
