@@ -15,6 +15,7 @@ pub mod comment_sidecar;
 pub mod compact;
 pub mod convert;
 pub mod csv;
+pub mod decor_xlsx;
 pub mod edits;
 pub mod export;
 pub mod format;
@@ -39,6 +40,7 @@ pub use convert::{
     ConvertStats,
 };
 pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
+pub use decor_xlsx::{decor_survives_xlsx, decor_xlsx_loss, MAX_RANGE_CELLS};
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;

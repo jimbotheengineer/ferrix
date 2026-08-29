@@ -4347,18 +4347,62 @@ impl FerrixApp {
             &[ferrix_io::SheetExport::new("Sheet1", sheet)
                 .with_formulas(&self.wb.overlay)
                 .with_tables(&self.tables)
+                // Cell decoration (issue #28) must survive the round trip for
+                // the same reason protection does: a sheet the user bordered
+                // and re-exported must still have its borders.
+                .with_format(&self.wb.format)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
         ) {
-            Ok(()) => format!(
-                "Exported {} table(s), {} name(s) → {}",
-                self.tables.len(),
-                self.wb.names.len(),
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            Ok(()) => {
+                // Report what will NOT look the same in Excel, the way
+                // `rule_survives_xlsx` does — the user learns here rather
+                // than after opening the file.
+                let lossy = self.decor_export_warnings();
+                let base = format!(
+                    "Exported {} table(s), {} name(s) → {}",
+                    self.tables.len(),
+                    self.wb.names.len(),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                match lossy.first() {
+                    None => base,
+                    Some(first) if lossy.len() == 1 => format!("{base} — note: {first}"),
+                    Some(first) => format!(
+                        "{base} — note: {first} (and {} more formatting caveat(s))",
+                        lossy.len() - 1
+                    ),
+                }
+            }
             Err(e) => format!("Export failed: {e}"),
         };
+    }
+
+    /// Everything about this sheet's decoration that xlsx cannot carry
+    /// exactly, deduped, in the [`ferrix_io::decor_xlsx_loss`] shape.
+    ///
+    /// Public because the export dialog wants it BEFORE writing, not only in
+    /// the status line afterwards.
+    pub fn decor_export_warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push = |d: &ferrix_core::CellDecor, out: &mut Vec<String>| {
+            for m in ferrix_io::decor_xlsx_loss(d) {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        };
+        for (_, cf) in self.wb.format.columns() {
+            push(&cf.decor, &mut out);
+        }
+        for rf in self.wb.format.ranges() {
+            push(&rf.decor, &mut out);
+        }
+        for (_, ov) in self.wb.format.overrides() {
+            push(&ov.decor, &mut out);
+        }
+        out
     }
 
     /// Install structured tables over the current sheet and refresh everything

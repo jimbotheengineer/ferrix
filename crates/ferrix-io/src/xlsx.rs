@@ -680,6 +680,12 @@ pub struct SheetExport<'a> {
     /// Row heights, column widths, hidden spans and outline groups (issue
     /// #29), written as `<cols>` attributes and per-`<row>` attributes.
     pub sizing: Option<&'a ferrix_core::sizing::SheetSizing>,
+    /// Sheet-wide formatting, for its cell DECORATION (issue #28): borders,
+    /// alignment, indent, wrap, shrink and rotation. Written as real
+    /// `xl/styles.xml` records — see [`crate::decor_xlsx`], and read its
+    /// note on why a column-scope decoration is one `<col>` record while a
+    /// range-scope one is capped.
+    pub format: Option<&'a ferrix_core::SheetFormat>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -693,6 +699,7 @@ impl<'a> SheetExport<'a> {
             comments: None,
             protection: None,
             sizing: None,
+            format: None,
         }
     }
 
@@ -729,6 +736,12 @@ impl<'a> SheetExport<'a> {
     /// Attach row/column sizing, hiding and outline grouping.
     pub fn with_sizing(mut self, sizing: &'a ferrix_core::sizing::SheetSizing) -> Self {
         self.sizing = Some(sizing);
+        self
+    }
+
+    /// Attach sheet formatting, so cell decoration reaches `xl/styles.xml`.
+    pub fn with_format(mut self, format: &'a ferrix_core::SheetFormat) -> Self {
+        self.format = Some(format);
         self
     }
 }
@@ -836,6 +849,13 @@ pub fn export_workbook_full(
             // time the ranges are known.
             && s.protection.is_none()
             && s.sizing.is_none_or(|z| z.is_empty())
+            // Decoration joins them (issue #28): a cell format is applied to
+            // a cell AFTER it is written, and the constant-memory writer has
+            // already flushed that row — the format would be silently dropped
+            // and the file would come back with no borders at all. A sheet
+            // with no decoration keeps the streaming writer, so the 10GB
+            // export path is unchanged.
+            && s.format.is_none_or(|f| !f.has_decor())
         {
             wb.add_worksheet_with_constant_memory()
         } else {
@@ -957,6 +977,13 @@ fn write_sheet(
     // before that row has any cells is dropped — which is exactly how the
     // outline levels silently failed to appear in the file the first time.
     write_sizing(ws, s)?;
+    // Decoration goes on after the cells for the same reason sizing does:
+    // `rust_xlsxwriter` merges a cell format into the cell record it already
+    // has, and a format set before the cell exists is dropped.
+    if let Some(fmt) = s.format {
+        let (rows, cols) = extent(s.sheet, s.formulas);
+        crate::decor_xlsx::write_decor(ws, fmt, rows, cols)?;
+    }
     Ok(())
 }
 
