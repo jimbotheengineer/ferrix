@@ -11,6 +11,7 @@
 //!   rather than RAM and opens instantly on subsequent runs.
 
 pub mod comment_sidecar;
+pub mod compact;
 pub mod convert;
 pub mod csv;
 pub mod edits;
@@ -23,6 +24,7 @@ pub mod table_xlsx;
 pub mod xlsx;
 
 pub use comment_sidecar::{comments_path_for, load_comments, save_comments, CommentSidecarError};
+pub use compact::{compact_cache, CompactError, CompactOutcome, CompactStats};
 pub use convert::{
     cache_is_fresh, cache_path_for, convert_csv, convert_csv_cancellable, ConvertError,
     ConvertStats,

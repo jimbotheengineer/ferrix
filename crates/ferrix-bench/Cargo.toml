@@ -41,6 +41,10 @@ name = "check-export"
 path = "src/check_export.rs"
 
 [[bin]]
+name = "check-compact"
+path = "src/check_compact.rs"
+
+[[bin]]
 name = "check-persist"
 path = "src/check_persist.rs"
 
