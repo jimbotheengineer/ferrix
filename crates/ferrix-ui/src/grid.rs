@@ -477,6 +477,19 @@ pub struct GridResponse {
     pub frozen_row_count: usize,
     /// The zoom actually applied this frame, after clamping.
     pub zoom: f32,
+    /// Cell whose comment marker the pointer is resting on, if any. The caller
+    /// paints the tooltip, because the grid draws onto a raw `Painter` and has
+    /// no widget `Response` to hang egui's hover machinery off.
+    pub hovered_comment: Option<CellRef>,
+    /// Cell the pointer was over when the SECONDARY button was clicked, and
+    /// the screen point it happened at. The caller opens its context menu
+    /// there — on the cell the user aimed at, not on wherever the selection
+    /// happened to be.
+    pub context_click: Option<(CellRef, egui::Pos2)>,
+    /// How many comment markers were painted this frame. Real paint output, so
+    /// a test asserting "the marker is gone" reads the screen rather than the
+    /// model.
+    pub comment_markers: usize,
 }
 
 pub struct Grid<'a> {
@@ -526,6 +539,14 @@ pub struct Grid<'a> {
     /// Merged regions. `None` when the sheet has none, keeping the default
     /// paint path free of lookups.
     pub merges: Option<&'a ferrix_core::merge::MergeMap>,
+    /// Cell comments, for the corner marker and the hover tooltip.
+    ///
+    /// Consulted once per visible ROW, not once per visible cell: the paint
+    /// loop hoists `row_comments()` out of its column loop, and a sheet with
+    /// no comments at all short-circuits on `is_empty()` before touching the
+    /// map. That is what keeps a 200M-row sheet's frame cost unchanged by
+    /// this feature.
+    pub comments: Option<&'a ferrix_core::CommentMap>,
     /// Active sort, when a column header has been clicked. A VIEW TRANSFORM:
     /// it permutes which underlying row each screen row shows and never moves
     /// a byte of data. Composed after the filters through [`RowResolver`].
@@ -719,18 +740,26 @@ impl<'a> Grid<'a> {
         // is delivered. A synthetic click with no preceding move lands nowhere
         // and looks like a broken grid. Send a move first, or test by hand.
         let interact_rect = Rect::from_min_max(body_origin, outer.max);
-        let (pointer_pos, wheel, primary_clicked, primary_pressed, primary_double, dragging) =
-            ui.ctx().input(|i| {
-                (
-                    i.pointer.interact_pos(),
-                    i.raw_scroll_delta,
-                    i.pointer.primary_clicked(),
-                    i.pointer.primary_pressed(),
-                    i.pointer
-                        .button_double_clicked(egui::PointerButton::Primary),
-                    i.pointer.primary_down(),
-                )
-            });
+        let (
+            pointer_pos,
+            wheel,
+            primary_clicked,
+            primary_pressed,
+            primary_double,
+            dragging,
+            secondary_clicked,
+        ) = ui.ctx().input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.raw_scroll_delta,
+                i.pointer.primary_clicked(),
+                i.pointer.primary_pressed(),
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary),
+                i.pointer.primary_down(),
+                i.pointer.button_clicked(egui::PointerButton::Secondary),
+            )
+        });
         let drag_pos = pointer_pos;
 
         let pointer_in_body = pointer_pos.is_some_and(|p| interact_rect.contains(p));
@@ -832,6 +861,9 @@ impl<'a> Grid<'a> {
         let mut fill_to = None;
         let mut fill_released = false;
         let mut painted_cells = 0usize;
+        let mut comment_markers = 0usize;
+        let mut hovered_comment: Option<CellRef> = None;
+        let mut context_click: Option<(CellRef, egui::Pos2)> = None;
         let mut painted_rows: Vec<(usize, u32)> = Vec::with_capacity(row_bands.len());
         let mut frozen_row_count = 0usize;
 
@@ -931,6 +963,16 @@ impl<'a> Grid<'a> {
             } else if r % 2 == 1 {
                 rp.rect_filled(row_rect, 0.0, th.row_alt);
             }
+
+            // ONE probe per visible row, hoisted out of the column loop
+            // below. A per-cell `get()` here would be ~1,500 map probes every
+            // frame; `is_empty()` inside `row_comments` makes an uncommented
+            // sheet cost zero. Padding rows are past the end of the sheet and
+            // can hold no comment.
+            let row_notes = self
+                .comments
+                .filter(|_| !is_pad)
+                .and_then(|m| m.row_comments(row));
 
             for (ci, &(c, x)) in col_bands.iter().enumerate() {
                 let in_lead_cols = ci < band_cols;
@@ -1167,6 +1209,37 @@ impl<'a> Grid<'a> {
                         ));
                     }
                 }
+
+                // The comment marker: a small triangle in the TOP-LEFT corner.
+                //
+                // Deliberately the opposite corner from the validation flag,
+                // and a different colour, so a cell that is both commented and
+                // invalid shows both facts rather than one hiding the other.
+                // Only a binary-search hit on the row's already-fetched
+                // comment list; an uncommented row never reaches here.
+                if let Some(notes) = row_notes {
+                    if notes
+                        .binary_search_by_key(&(c as u32), |(cc, _)| *cc)
+                        .is_ok()
+                    {
+                        let tl = cell_rect.min;
+                        let s = 6.0 * m.zoom;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![tl, egui::pos2(tl.x + s, tl.y), egui::pos2(tl.x, tl.y + s)],
+                            th.comment_flag,
+                            Stroke::NONE,
+                        ));
+                        comment_markers += 1;
+                        // Hover is decided against the whole CELL, not the few
+                        // pixels of the triangle: a tooltip you have to hit a
+                        // 6px target to see is a tooltip nobody finds.
+                        if pointer_pos.is_some_and(|p| {
+                            cell_rect.contains(p) && clip_rect.contains(p) && grid_rect.contains(p)
+                        }) {
+                            hovered_comment = Some(cref);
+                        }
+                    }
+                }
                 painted_cells += 1;
             }
         }
@@ -1258,6 +1331,12 @@ impl<'a> Grid<'a> {
         }
         if primary_double {
             double_clicked = pointer_pos.and_then(hit);
+        }
+        // Right-click, resolved through THE SAME hit test as a left click, so
+        // the menu can never open on a different cell than a click would
+        // select.
+        if secondary_clicked {
+            context_click = pointer_pos.and_then(|p| hit(p).map(|c| (c, p)));
         }
         // Drag-to-extend: the button is held, the pointer is over the body,
         // and this is not the initial press (which `clicked` already covers).
@@ -1586,6 +1665,9 @@ impl<'a> Grid<'a> {
             painted_rows,
             frozen_row_count,
             zoom: m.zoom,
+            hovered_comment,
+            comment_markers,
+            context_click,
         }
     }
 }

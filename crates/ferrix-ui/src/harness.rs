@@ -305,6 +305,34 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    // ---- cell comments (roadmap #12) ----
+    //
+    // These drive the same entry points the context menu and the editor's
+    // buttons call. The alternative -- synthesising a right-click and then a
+    // click on a menu item whose pixel position depends on the theme's text
+    // metrics -- would test menu layout rather than whether a comment attaches
+    // to, follows, and leaves the right cell.
+
+    /// Write (or replace) a comment on a cell, through the real editor path.
+    pub fn set_comment(&mut self, cell: ferrix_core::CellRef, author: &str, text: &str) {
+        self.app.begin_comment(cell);
+        self.app.set_comment_buffers_for_test(author, text);
+        self.app.commit_comment();
+        self.steps(2);
+    }
+
+    /// Delete a cell's comment, as the menu's Delete item does.
+    pub fn delete_comment(&mut self, cell: ferrix_core::CellRef) {
+        self.app.delete_comment(cell);
+        self.steps(2);
+    }
+
+    /// Comment markers actually painted by the most recent frame.
+    pub fn comment_marker_count(&mut self) -> usize {
+        self.step();
+        self.app.painted_comment_markers()
+    }
+
     /// Set the selection directly, so a test can say what it means instead of
     /// spelling a drag in coordinates.
     pub fn select(&mut self, a: ferrix_core::CellRef, b: ferrix_core::CellRef) {
@@ -3019,6 +3047,294 @@ xxx,yyy,zzz
             shown.starts_with("100"),
             "the live preview must resolve the name, not report #NAME?; got {shown:?}"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- cell comments / notes (roadmap #12) ----
+    //
+    // The invariants worth guarding, in order of how badly they fail:
+    //  * a comment must FOLLOW its cell through a column reorder. Leaving it
+    //    keyed to the old display column puts the note beside a different
+    //    number — plausible, wrong, and invisible.
+    //  * an uncommented sheet must cost NOTHING on the paint path, which runs
+    //    per visible cell per frame at 60fps.
+    //  * deleting a comment must remove the MARKER, not merely the map entry.
+
+    #[test]
+    fn a_comment_attaches_to_the_cell_and_paints_a_marker() {
+        let p = write_csv("comment_add.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = h.comment_marker_count();
+        assert_eq!(before, 0, "a fresh sheet has no comment markers");
+
+        h.set_comment(CellRef::new(1, 1), "ana", "check with finance");
+
+        assert_eq!(h.app().comment_count(), 1);
+        assert_eq!(
+            h.app().comment_text(CellRef::new(1, 1)),
+            Some("check with finance")
+        );
+        // The MARKER, read from the grid's real paint output rather than from
+        // the map — the model already agreed with itself above.
+        assert_eq!(
+            h.comment_marker_count(),
+            1,
+            "the commented cell must paint exactly one marker"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn editing_a_comment_replaces_it_rather_than_adding_a_second() {
+        let p = write_csv("comment_edit.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let cell = CellRef::new(2, 0);
+        h.set_comment(cell, "ana", "first draft");
+        h.set_comment(cell, "bo", "revised");
+
+        assert_eq!(
+            h.app().comment_count(),
+            1,
+            "an edit must not leave the old note behind"
+        );
+        assert_eq!(h.app().comment_text(cell), Some("revised"));
+        assert_eq!(
+            h.comment_marker_count(),
+            1,
+            "one comment must paint one marker, not two stacked"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_comment_removes_the_marker() {
+        // The assertion that matters is on the PAINT output: clearing the map
+        // while the grid kept drawing would look identical in the model and
+        // completely broken on screen.
+        let p = write_csv("comment_delete.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let cell = CellRef::new(0, 2);
+        h.set_comment(cell, "ana", "temporary");
+        assert_eq!(h.comment_marker_count(), 1, "setup: the marker is painted");
+
+        h.delete_comment(cell);
+
+        assert_eq!(h.app().comment_count(), 0);
+        assert_eq!(h.app().comment_text(cell), None);
+        assert_eq!(
+            h.comment_marker_count(),
+            0,
+            "deleting a comment must stop the marker being painted"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn clearing_a_comments_text_deletes_it() {
+        // "Select all, delete, save" is how a user removes a note without
+        // hunting for a Delete button. An empty note stored as a note would
+        // leave a marker promising text that is not there.
+        let p = write_csv("comment_clear.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let cell = CellRef::new(1, 0);
+        h.set_comment(cell, "ana", "will be cleared");
+        assert_eq!(h.app().comment_count(), 1);
+
+        h.set_comment(cell, "ana", "   ");
+        assert_eq!(h.app().comment_count(), 0, "blank text removes the note");
+        assert_eq!(h.comment_marker_count(), 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_comment_follows_its_cell_through_a_column_reorder() {
+        // THE pitfall this feature was warned about. The overlay is keyed by
+        // DISPLAY position and relocated on reorder; a comment map keyed the
+        // same way and NOT relocated would leave the note sitting on whatever
+        // column happens to land in that slot — beside a different number,
+        // with nothing on screen to say so.
+        let p = write_csv("comment_reorder.csv", "a,b,c\n1,2,3\n4,5,6\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Note on B1, which holds 2.
+        let b1 = CellRef::new(0, 1);
+        assert_eq!(h.app().display(b1), "2", "setup");
+        h.set_comment(b1, "ana", "this 2 is provisional");
+
+        // Move column A to the end: a,b,c -> b,c,a. The value 2 moves from
+        // display 1 to display 0.
+        h.move_columns(0, 1, 3).expect("move");
+        h.steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "2", "b moved to A");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "1", "a moved to C");
+
+        // The comment must have travelled WITH the 2, to display column 0.
+        assert_eq!(
+            h.app().comment_text(CellRef::new(0, 0)),
+            Some("this 2 is provisional"),
+            "the note must follow the cell it annotates"
+        );
+        assert_eq!(
+            h.app().comment_text(b1),
+            None,
+            "the note must not be left on the column the 2 vacated"
+        );
+        assert_eq!(
+            h.app().comment_count(),
+            1,
+            "a reorder must not duplicate or drop the note"
+        );
+        assert_eq!(h.comment_marker_count(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_cell_with_no_comment_costs_no_lookup_work_on_the_paint_path() {
+        // The paint path asks about every visible cell, every frame. A sheet
+        // with no comments must not probe the map once; a sheet WITH comments
+        // must probe once per visible ROW, not once per visible cell.
+        let p = write_csv("comment_cost.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.app().comment_map().reset_probes();
+        h.step();
+        let painted = h.app().painted_cell_count();
+        assert!(painted > 0, "setup: the grid must have painted something");
+        assert_eq!(
+            h.app().comment_map().probes(),
+            0,
+            "{painted} painted cells on an uncommented sheet must cost zero \
+             comment-map probes"
+        );
+
+        // With a comment present, the cost must scale with rows, not cells.
+        h.set_comment(CellRef::new(0, 0), "ana", "hi");
+        h.app().comment_map().reset_probes();
+        h.step();
+        let probes = h.app().comment_map().probes();
+        let rows = h.app().painted_row_count() as u64;
+        assert!(rows > 0, "setup: rows must have been painted");
+        assert!(
+            probes <= rows,
+            "the paint path made {probes} probes for {rows} painted rows — \
+             the row lookup is not hoisted out of the column loop"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_200m_row_shaped_sheet_with_three_comments_stores_exactly_three_entries() {
+        // Comments are sparse: cost is O(comments), never O(rows). Addresses
+        // are placed across a 200M-row space to prove nothing is materialised
+        // per row.
+        let p = write_csv("comment_scale.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        for (row, col, text) in [
+            (0u32, 0u32, "top"),
+            (99_999_999, 1, "middle"),
+            (199_999_999, 2, "bottom"),
+        ] {
+            h.set_comment(CellRef::new(row, col), "ana", text);
+        }
+
+        assert_eq!(
+            h.app().comment_count(),
+            3,
+            "three comments over a 200M-row address space must cost three entries"
+        );
+        assert!(
+            h.app().comment_map().heap_bytes() < 4_000,
+            "three comments cost {} bytes",
+            h.app().comment_map().heap_bytes()
+        );
+        // Deep row indices must survive intact rather than being clamped to
+        // the loaded sheet's extent.
+        assert_eq!(
+            h.app().comment_text(CellRef::new(199_999_999, 2)),
+            Some("bottom")
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn comments_survive_a_save_and_reopening_the_file() {
+        // A note that vanishes when the file is reopened is a note nobody will
+        // ever write a second one of.
+        let p = write_csv("comment_persist.csv", SAMPLE);
+        let side = ferrix_io::comments_path_for(&p);
+        let _ = std::fs::remove_file(&side);
+
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            h.set_comment(CellRef::new(1, 1), "ana", "survives a restart");
+            h.set_comment(CellRef::new(3, 0), "bo", "so does this one");
+            assert!(h.app_mut().save_comments(), "save must report success");
+        }
+
+        assert!(side.exists(), "saving must write the comment sidecar");
+
+        // Fresh app, same file: the notes must come back on their own cells.
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.comment_count() == 2));
+        assert_eq!(
+            h.app().comment_text(CellRef::new(1, 1)),
+            Some("survives a restart")
+        );
+        assert_eq!(
+            h.app().comment_text(CellRef::new(3, 0)),
+            Some("so does this one")
+        );
+        assert_eq!(
+            h.comment_marker_count(),
+            2,
+            "restored comments must paint their markers"
+        );
+
+        let _ = std::fs::remove_file(&side);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn deleting_a_comment_and_saving_does_not_resurrect_it_on_reload() {
+        // The failure: save writes only non-empty maps, so an emptied map
+        // leaves the old sidecar on disk and the note comes back from the dead.
+        let p = write_csv("comment_unpersist.csv", SAMPLE);
+        let side = ferrix_io::comments_path_for(&p);
+        let _ = std::fs::remove_file(&side);
+
+        let cell = CellRef::new(2, 1);
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            h.set_comment(cell, "ana", "should not come back");
+            assert!(h.app_mut().save_comments());
+            h.delete_comment(cell);
+            assert!(h.app_mut().save_comments());
+        }
+
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(3);
+        assert_eq!(
+            h.app().comment_count(),
+            0,
+            "a deleted comment must not survive the reload"
+        );
+        assert_eq!(h.comment_marker_count(), 0);
+        let _ = std::fs::remove_file(&side);
         let _ = std::fs::remove_file(&p);
     }
 }
