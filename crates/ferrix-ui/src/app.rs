@@ -434,6 +434,14 @@ pub struct FerrixApp {
     /// Comment markers painted by the last frame.
     last_comment_markers: usize,
 
+    /// Border edges, rotated texts and wrapped texts the grid painted last
+    /// frame (issue #28). Real paint output, recorded from the grid's own
+    /// response, so a test asserting "the border is actually drawn" is reading
+    /// the screen rather than the format store.
+    last_border_segments: usize,
+    last_rotated_texts: usize,
+    last_wrapped_texts: usize,
+
     /// Active trace-precedents/dependents session (roadmap #39), if any.
     /// `None` means "Remove Arrows" was pressed or nothing has been traced.
     trace: Option<crate::trace::TraceState>,
@@ -672,6 +680,9 @@ impl FerrixApp {
             allow_close: false,
             comments_path: None,
             last_comment_markers: 0,
+            last_border_segments: 0,
+            last_rotated_texts: 0,
+            last_wrapped_texts: 0,
             trace: None,
             last_trace_arrows: 0,
             last_trace_total: 0,
@@ -3510,6 +3521,29 @@ impl FerrixApp {
         self.last_comment_markers
     }
 
+    // --- painted decoration counters (issue #28) ---
+    //
+    // All three come from the grid's paint output, so they answer "did this
+    // actually get drawn" rather than "is it in the model". A model-only
+    // assertion would pass against a perfectly-stored, never-painted format —
+    // which is precisely how four earlier features in this repo shipped
+    // unreachable.
+
+    /// Border edges painted last frame, counted once per EDGE.
+    pub fn painted_border_segments(&self) -> usize {
+        self.last_border_segments
+    }
+
+    /// Cells whose text was painted rotated last frame.
+    pub fn painted_rotated_texts(&self) -> usize {
+        self.last_rotated_texts
+    }
+
+    /// Cells whose text was laid out wrapped last frame.
+    pub fn painted_wrapped_texts(&self) -> usize {
+        self.last_wrapped_texts
+    }
+
     /// Persist comments beside the base file.
     ///
     /// Independent of `save_edits`: a session that only added a note has
@@ -3722,6 +3756,70 @@ impl FerrixApp {
     }
 
     // ============================ conditional formatting (roadmap #11) =====
+
+    /// Apply cell decoration — borders, alignment, wrap, rotation (#28) — to
+    /// the current selection.
+    ///
+    /// A SINGLE cell goes to the per-cell override, a RANGE goes to range
+    /// scope, and a whole-column selection goes to COLUMN scope. That last
+    /// case is the scale one: bordering column C must cost one entry, not one
+    /// per row, and must keep applying to rows a later paste appends. The
+    /// dispatch is here rather than in the store so the store never has to
+    /// guess what the user meant by a selection.
+    ///
+    /// Layers over what is already there — `CellDecor::apply_to` semantics —
+    /// so "add a bottom border" does not clear an alignment set a moment ago.
+    pub fn apply_decor(&mut self, decor: ferrix_core::CellDecor) {
+        // Formatting is a granular allowance, exactly as it is for typography.
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::FormatCells)
+        {
+            self.status = format!("Formatting refused — {d}");
+            return;
+        }
+        if decor.is_empty() {
+            return;
+        }
+        let (a, b) = self.selection.bounds();
+        let rows = self.wb.view().row_count() as u32;
+        // "The whole column is selected" means the selection spans every row
+        // that exists. Stored on the COLUMN so it also covers rows that do
+        // not exist yet — which is the difference between a border that
+        // survives an append and one that does not.
+        let whole_cols = rows > 0 && a.row == 0 && b.row + 1 >= rows;
+        if whole_cols {
+            for col in a.col..=b.col {
+                self.wb.format.set_column_decor(col, decor);
+            }
+        } else if a == b {
+            self.wb.format.set_cell_decor(a, decor);
+        } else {
+            let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+            self.wb.format.set_range_decor(range, decor);
+        }
+        self.wb.mark_dirty();
+        self.status = "Cell formatting applied".into();
+    }
+
+    /// The decoration a cell resolves to right now, through the same
+    /// `SheetFormat` the grid paints from.
+    pub fn decor_at(&self, cell: CellRef) -> ferrix_core::CellDecor {
+        self.wb.format.decor_at(cell)
+    }
+
+    /// Scopes carrying decoration. The number the scale criterion asserts on:
+    /// a function of how many formats the user applied, never of how many
+    /// rows they cover.
+    pub fn decor_count(&self) -> usize {
+        self.wb.format.decor_count()
+    }
+
+    /// Bytes the format store owns, for the under-1KB scale assertion.
+    pub fn format_heap_bytes(&self) -> usize {
+        self.wb.format.heap_bytes()
+    }
 
     /// Open the New Rule dialog on the current selection.
     pub fn cond_new_rule(&mut self) {
@@ -4577,18 +4675,62 @@ impl FerrixApp {
             &[ferrix_io::SheetExport::new("Sheet1", sheet)
                 .with_formulas(&self.wb.overlay)
                 .with_tables(&self.tables)
+                // Cell decoration (issue #28) must survive the round trip for
+                // the same reason protection does: a sheet the user bordered
+                // and re-exported must still have its borders.
+                .with_format(&self.wb.format)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
         ) {
-            Ok(()) => format!(
-                "Exported {} table(s), {} name(s) → {}",
-                self.tables.len(),
-                self.wb.names.len(),
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            Ok(()) => {
+                // Report what will NOT look the same in Excel, the way
+                // `rule_survives_xlsx` does — the user learns here rather
+                // than after opening the file.
+                let lossy = self.decor_export_warnings();
+                let base = format!(
+                    "Exported {} table(s), {} name(s) → {}",
+                    self.tables.len(),
+                    self.wb.names.len(),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                match lossy.first() {
+                    None => base,
+                    Some(first) if lossy.len() == 1 => format!("{base} — note: {first}"),
+                    Some(first) => format!(
+                        "{base} — note: {first} (and {} more formatting caveat(s))",
+                        lossy.len() - 1
+                    ),
+                }
+            }
             Err(e) => format!("Export failed: {e}"),
         };
+    }
+
+    /// Everything about this sheet's decoration that xlsx cannot carry
+    /// exactly, deduped, in the [`ferrix_io::decor_xlsx_loss`] shape.
+    ///
+    /// Public because the export dialog wants it BEFORE writing, not only in
+    /// the status line afterwards.
+    pub fn decor_export_warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push = |d: &ferrix_core::CellDecor, out: &mut Vec<String>| {
+            for m in ferrix_io::decor_xlsx_loss(d) {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        };
+        for (_, cf) in self.wb.format.columns() {
+            push(&cf.decor, &mut out);
+        }
+        for rf in self.wb.format.ranges() {
+            push(&rf.decor, &mut out);
+        }
+        for (_, ov) in self.wb.format.overrides() {
+            push(&ov.decor, &mut out);
+        }
+        out
     }
 
     /// Install structured tables over the current sheet and refresh everything
@@ -5696,8 +5838,22 @@ impl FerrixApp {
     /// that hard-codes pixels ends up clicking somewhere else and reporting a
     /// working feature as broken.
     pub fn cell_center(&self, cell: CellRef) -> Option<(f32, f32)> {
+        let r = self.cell_rect(cell)?;
+        let c = r.center();
+        Some((c.x, c.y))
+    }
+
+    /// Screen rect of a cell as it would be painted right now.
+    ///
+    /// Goes through `cell_screen_rect_h` with the app's OWN `RowHeights`, so
+    /// a wrapped row's rect is as tall here as it is on screen (issue #28).
+    /// Without that, the in-cell editor and every test reading geometry back
+    /// would use a 22px row where the grid painted a 44px one.
+    pub fn cell_rect(&self, cell: CellRef) -> Option<egui::Rect> {
         let outer = self.last_grid_rect?;
-        let r = Grid::cell_screen_rect(
+        let view = self.wb.view();
+        let heights = crate::grid::RowHeights::new(Some(&self.wb.format), &view, &self.col_widths);
+        Grid::cell_screen_rect_h(
             cell,
             outer,
             &self.scroll,
@@ -5705,9 +5861,8 @@ impl FerrixApp {
             &self.row_resolver(self.pad_space()),
             crate::grid::Metrics::new(self.zoom),
             self.panes,
-        )?;
-        let c = r.center();
-        Some((c.x, c.y))
+            Some(&heights),
+        )
     }
 
     /// Which cell a viewport point is over (issue #38).
@@ -5725,10 +5880,14 @@ impl FerrixApp {
         let resolver = self.row_resolver(self.pad_space());
         let metrics = crate::grid::Metrics::new(self.zoom);
         let cols = self.col_widths.len().max(self.wb.view().col_count());
+        // Through the SAME heights the grid painted with, so a wrapped row is
+        // as tall here as it looks (issue #28).
+        let view = self.wb.view();
+        let heights = crate::grid::RowHeights::new(Some(&self.wb.format), &view, &self.col_widths);
         for (_, row) in &self.last_painted_rows {
             for c in 0..cols {
                 let cell = CellRef::new(*row, c as u32);
-                if let Some(r) = Grid::cell_screen_rect(
+                if let Some(r) = Grid::cell_screen_rect_h(
                     cell,
                     outer,
                     &self.scroll,
@@ -5736,6 +5895,7 @@ impl FerrixApp {
                     &resolver,
                     metrics,
                     self.panes,
+                    Some(&heights),
                 ) {
                     if r.contains(p) {
                         return Some(cell);
@@ -8029,6 +8189,9 @@ impl FerrixApp {
 
                 self.last_painted = resp.painted_cells;
                 self.last_comment_markers = resp.comment_markers;
+                self.last_border_segments = resp.border_segments;
+                self.last_rotated_texts = resp.rotated_texts;
+                self.last_wrapped_texts = resp.wrapped_texts;
 
                 // --- trace precedents / dependents arrows (roadmap #39) ---
                 //

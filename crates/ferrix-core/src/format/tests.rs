@@ -438,6 +438,7 @@ fn a_per_cell_override_beats_every_rule_and_is_the_only_per_cell_storage() {
                 typography: Default::default(),
             },
             format: None,
+            decor: Default::default(),
         },
     );
     let s = style_at(&f, cell(7, 0), &Value::Number(-1.0));
@@ -467,6 +468,7 @@ fn clearing_an_override_removes_its_entry() {
                 typography: Default::default(),
             },
             format: None,
+            decor: Default::default(),
         },
     );
     assert_eq!(f.override_count(), 1);
@@ -548,6 +550,7 @@ fn a_range_format_overrides_the_column_format_and_a_cell_override_beats_both() {
         CellOverride {
             manual: ManualStyle::default(),
             format: Some(NumberFormat::Thousands { places: 2 }),
+            decor: Default::default(),
         },
     );
     assert_eq!(
@@ -619,4 +622,227 @@ fn heap_cost_tracks_rule_count_not_row_count() {
         b.heap_bytes(),
         "a 200M-row range must cost exactly what a 10-row one does"
     );
+}
+
+// ================================================ cell decoration (issue #28) ==
+
+fn decor_plan_of(f: &SheetFormat, col: u32) -> Vec<DecorEntry> {
+    let mut p = Vec::new();
+    f.decor_plan(col, &mut p);
+    p
+}
+
+/// THE scale criterion for issue #28, stated as a stored-size assertion.
+///
+/// The claim is not "it looks right over ten million rows" — that is what an
+/// implementation with a `HashMap<CellRef, CellDecor>` would also satisfy,
+/// right up until it exhausted memory. The claim is that the STORE never
+/// learns how many rows the format covers, so the number asserted here is
+/// `heap_bytes()` and the comparison row count is 10,000,000.
+///
+/// What would this assert if the feature did nothing at all? It would fail:
+/// `decor_count()` would be 0, so the store would not be holding the format.
+#[test]
+fn a_column_scope_decor_over_10m_rows_stays_under_1kb() {
+    let mut f = SheetFormat::new();
+    f.set_column_decor(
+        3,
+        CellDecor::default()
+            .with_box(Border::colored(BorderStyle::Thick, Rgb(0x20, 0x40, 0x80)))
+            .with_h_align(HAlign::Center)
+            .with_v_align(VAlign::Top)
+            .with_indent(4)
+            .with_wrap(true)
+            .with_rotation(45),
+    );
+
+    assert_eq!(
+        f.decor_count(),
+        1,
+        "one column scope, not ten million cells"
+    );
+    assert!(
+        f.heap_bytes() < 1024,
+        "a column-scope decoration must stay under 1KB however many rows it \
+         covers; got {} bytes",
+        f.heap_bytes()
+    );
+
+    // And the format really does reach row 9,999,999 — otherwise the size
+    // above would be small for the wrong reason.
+    let deep = f.decor_at(cell(9_999_999, 3));
+    assert_eq!(deep.h_align, Some(HAlign::Center));
+    assert_eq!(deep.rotation_deg(), 45);
+    assert!(deep.border(Side::Bottom).is_some());
+}
+
+/// The same claim for range scope: the rectangle is stored, not its cells.
+#[test]
+fn a_range_scope_decor_costs_the_same_at_10_rows_and_10m() {
+    let d = CellDecor::default().with_border(Side::Bottom, Border::new(BorderStyle::Double));
+    let mut small = SheetFormat::new();
+    small.set_range_decor(TableRange::new(0, 0, 9, 0), d);
+    let mut huge = SheetFormat::new();
+    huge.set_range_decor(TableRange::new(0, 0, 9_999_999, 0), d);
+
+    assert_eq!(
+        small.heap_bytes(),
+        huge.heap_bytes(),
+        "a 10M-row decorated range must cost exactly what a 10-row one does"
+    );
+    assert!(huge.heap_bytes() < 1024, "{} bytes", huge.heap_bytes());
+}
+
+#[test]
+fn decor_layers_column_then_range_then_cell() {
+    let mut f = SheetFormat::new();
+    f.set_column_decor(
+        0,
+        CellDecor::default()
+            .with_h_align(HAlign::Right)
+            .with_indent(2),
+    );
+    f.set_range_decor(
+        TableRange::new(5, 0, 9, 0),
+        CellDecor::default().with_h_align(HAlign::Center),
+    );
+    f.set_cell_decor(cell(7, 0), CellDecor::default().with_wrap(true));
+
+    // Outside the range: only the column speaks.
+    let a = f.decor_at(cell(1, 0));
+    assert_eq!(a.h_align, Some(HAlign::Right));
+    assert_eq!(a.indent_level(), 2);
+    assert!(!a.wraps());
+
+    // Inside the range: the range's alignment wins, the column's indent
+    // survives because the range said nothing about it.
+    let b = f.decor_at(cell(6, 0));
+    assert_eq!(b.h_align, Some(HAlign::Center));
+    assert_eq!(
+        b.indent_level(),
+        2,
+        "an unset field must inherit, not reset"
+    );
+
+    // The cell override adds wrap without disturbing either.
+    let c = f.decor_at(cell(7, 0));
+    assert_eq!(c.h_align, Some(HAlign::Center));
+    assert_eq!(c.indent_level(), 2);
+    assert!(c.wraps());
+}
+
+#[test]
+fn an_explicit_none_border_erases_an_inherited_one() {
+    let mut f = SheetFormat::new();
+    f.set_column_decor(
+        0,
+        CellDecor::default().with_border(Side::Top, Border::new(BorderStyle::Thick)),
+    );
+    f.set_range_decor(
+        TableRange::new(3, 0, 3, 0),
+        CellDecor::default().with_border(Side::Top, Border::new(BorderStyle::None)),
+    );
+
+    assert!(
+        f.decor_at(cell(2, 0)).border(Side::Top).is_some(),
+        "outside the range the column's border stands"
+    );
+    assert!(
+        f.decor_at(cell(3, 0)).border(Side::Top).is_none(),
+        "an explicit BorderStyle::None must erase, not inherit"
+    );
+}
+
+#[test]
+fn indent_and_rotation_are_clamped_at_the_door() {
+    let d = CellDecor::default().with_indent(200).with_rotation(400);
+    assert_eq!(d.indent_level(), MAX_INDENT);
+    assert_eq!(d.rotation_deg(), MAX_ROTATION);
+    let d = CellDecor::default().with_rotation(-400);
+    assert_eq!(d.rotation_deg(), MIN_ROTATION);
+}
+
+#[test]
+fn wrap_beats_shrink_so_the_two_never_fight() {
+    let d = CellDecor::default().with_wrap(true).with_shrink(true);
+    assert!(d.wraps());
+    assert!(
+        !d.shrinks(),
+        "a wrapped cell grows its row; shrinking the font too would fight it"
+    );
+}
+
+#[test]
+fn a_decor_plan_only_gathers_scopes_that_can_touch_the_column() {
+    let mut f = SheetFormat::new();
+    f.set_column_decor(0, CellDecor::default().with_wrap(true));
+    f.set_range_decor(
+        TableRange::new(0, 0, 9, 0),
+        CellDecor::default().with_indent(1),
+    );
+    f.set_column_decor(1, CellDecor::default().with_rotation(90));
+
+    assert_eq!(decor_plan_of(&f, 0).len(), 2);
+    assert_eq!(decor_plan_of(&f, 1).len(), 1);
+    assert_eq!(decor_plan_of(&f, 5).len(), 0);
+    // A range entry that carries only a RULE contributes nothing here, so the
+    // decor path does not pay for conditional formatting.
+    f.push_rule_for_range(TableRange::new(0, 5, 9, 5), presets::data_bar());
+    assert_eq!(decor_plan_of(&f, 5).len(), 0);
+}
+
+#[test]
+fn clearing_a_columns_decor_returns_the_store_to_empty() {
+    let mut f = SheetFormat::new();
+    f.set_column_decor(2, CellDecor::default().with_wrap(true));
+    assert!(f.has_decor());
+    f.clear_column_decor(2);
+    assert!(!f.has_decor());
+    assert!(
+        f.is_empty(),
+        "an emptied column must not keep a live key and inflate heap_bytes"
+    );
+}
+
+#[test]
+fn wrapped_line_count_grows_with_text_and_never_reports_zero() {
+    // 100px wide minus 12px padding leaves ~12 characters per line.
+    let one = wrapped_line_count("short", 100.0, 0.0);
+    let many = wrapped_line_count(&"x".repeat(60), 100.0, 0.0);
+    assert_eq!(one, 1);
+    assert!(many > one, "more text must need more lines, got {many}");
+    assert_eq!(
+        wrapped_line_count("", 100.0, 0.0),
+        1,
+        "empty still owns a line"
+    );
+    // Indent eats usable width, so the same text needs at least as many lines.
+    assert!(wrapped_line_count(&"x".repeat(60), 100.0, 40.0) >= many);
+    // A newline is a line break even when the text is short.
+    assert_eq!(wrapped_line_count("a\nb\nc", 400.0, 0.0), 3);
+}
+
+#[test]
+fn a_single_line_wrapped_row_is_exactly_the_default_height() {
+    assert_eq!(wrapped_row_height(1, 22.0), 22.0);
+    assert!(wrapped_row_height(2, 22.0) > 22.0);
+    assert_eq!(
+        wrapped_row_height(MAX_WRAP_LINES + 50, 22.0),
+        wrapped_row_height(MAX_WRAP_LINES, 22.0),
+        "row growth is bounded so one cell cannot fill the viewport"
+    );
+}
+
+#[test]
+fn decorating_the_same_range_twice_reuses_one_entry() {
+    let mut f = SheetFormat::new();
+    let r = TableRange::new(0, 0, 100, 4);
+    f.set_range_decor(r, CellDecor::default().with_wrap(true));
+    let before = f.heap_bytes();
+    f.set_range_decor(r, CellDecor::default().with_indent(3));
+    assert_eq!(f.ranges().len(), 1, "one selection, one entry");
+    assert_eq!(f.heap_bytes(), before);
+    let d = f.decor_at(cell(4, 2));
+    assert!(d.wraps(), "the second call must layer, not replace");
+    assert_eq!(d.indent_level(), 3);
 }

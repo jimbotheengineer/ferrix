@@ -452,7 +452,7 @@ fn cmp_rule(op: CmpOp, v: f64) -> DataValidationRule<f64> {
     }
 }
 
-fn to_color(c: Rgb) -> rust_xlsxwriter::Color {
+pub(crate) fn to_color(c: Rgb) -> rust_xlsxwriter::Color {
     rust_xlsxwriter::Color::RGB(c.to_u32())
 }
 

@@ -557,6 +557,24 @@ pub struct GridResponse {
     /// can assert the gutter actually drew a control rather than trusting the
     /// model.
     pub outline_buttons: usize,
+    /// Border EDGES drawn this frame (issue #28).
+    ///
+    /// Real paint output, counted at the point of drawing, and counted once
+    /// per edge rather than once per stroke — so a shared edge between two
+    /// bordered neighbours contributes 1 and a test can prove it is not
+    /// double-drawn. `paint_shape_count` cannot answer that: a double border
+    /// emits two strokes and a dashed one emits many, so a total would move
+    /// for reasons unrelated to the property being asserted.
+    pub border_segments: usize,
+    /// Cells whose text was painted ROTATED this frame.
+    ///
+    /// A rotated cell emits an `egui::Shape::Text` with a non-zero angle
+    /// instead of a plain galley — a different shape, from a different call.
+    /// Counted here so a test can assert rotation actually reached the
+    /// painter rather than inspecting pixels.
+    pub rotated_texts: usize,
+    /// Cells whose text was laid out WRAPPED this frame.
+    pub wrapped_texts: usize,
 }
 
 pub struct Grid<'a> {
@@ -654,6 +672,108 @@ fn sheet_c32(c: ferrix_core::Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.0, c.1, c.2)
 }
 
+/// THE row-height definition for wrapped text (issue #28).
+///
+/// Paint, the grid lines, the row-number gutter, the hit test and
+/// [`Grid::cell_screen_rect`] all get a row's height from this one type. A
+/// second, independently-derived height is exactly the failure the guide
+/// warns about for row mappings: a wrapped row would be PAINTED 44px tall
+/// and CLICKED as 22px tall, so a click near its bottom would select the row
+/// below the one the user is looking at, and no single-feature test would see
+/// it because each feature would be self-consistent.
+///
+/// Construction is O(configured wrap scopes), not O(rows) and not O(cells):
+/// it resolves the set of WRAPPING COLUMNS once, and then measures only the
+/// rows it is actually asked about.
+pub struct RowHeights<'a> {
+    format: Option<&'a ferrix_core::SheetFormat>,
+    view: &'a SheetView<'a>,
+    col_widths: &'a [f32],
+    /// Columns some scope asked to wrap. EMPTY is the overwhelmingly common
+    /// case and short-circuits every query to the uniform height.
+    wrap_cols: Vec<u32>,
+}
+
+impl<'a> RowHeights<'a> {
+    pub fn new(
+        format: Option<&'a ferrix_core::SheetFormat>,
+        view: &'a SheetView<'a>,
+        col_widths: &'a [f32],
+    ) -> Self {
+        let mut wrap_cols = Vec::new();
+        if let Some(f) = format.filter(|f| f.has_decor()) {
+            let max_col = view.col_count().max(col_widths.len()).saturating_sub(1) as u32;
+            f.wrapping_cols(max_col, &mut wrap_cols);
+        }
+        Self {
+            format,
+            view,
+            col_widths,
+            wrap_cols,
+        }
+    }
+
+    /// Does every row have the same height? The fast path, and the state of
+    /// any sheet that has never used wrap.
+    #[inline]
+    pub fn is_uniform(&self) -> bool {
+        self.wrap_cols.is_empty()
+    }
+
+    /// Height of one DATA row, at the given metrics.
+    ///
+    /// Measured against UNZOOMED widths so the line count — and therefore how
+    /// many rows fit on screen — does not change with zoom. Zoom scales the
+    /// result, exactly as it scales the uniform height.
+    pub fn height_of(&self, row: u32, m: Metrics) -> f32 {
+        if self.is_uniform() {
+            return m.row_h;
+        }
+        let Some(fmt) = self.format else {
+            return m.row_h;
+        };
+        let mut lines = 1u32;
+        let mut plan = Vec::new();
+        for &c in &self.wrap_cols {
+            fmt.decor_plan(c, &mut plan);
+            let cref = CellRef::new(row, c);
+            let d = fmt.resolve_decor(cref, &plan);
+            if !d.wraps() {
+                continue;
+            }
+            let text = self.view.display(cref);
+            if text.is_empty() {
+                continue;
+            }
+            let w = self
+                .col_widths
+                .get(c as usize)
+                .copied()
+                .unwrap_or(DEFAULT_COL_WIDTH);
+            lines = lines.max(ferrix_core::format::wrapped_line_count(
+                &text,
+                w,
+                d.indent_px(),
+            ));
+        }
+        ferrix_core::format::wrapped_row_height(lines, ROW_HEIGHT) * m.zoom
+    }
+
+    /// Height of a SCREEN row, resolved through the one row resolver.
+    ///
+    /// A padding row is past the end of the sheet and holds no text, so it is
+    /// always the uniform height.
+    pub fn screen_height(&self, r: usize, resolver: &RowResolver<'_>, m: Metrics) -> f32 {
+        if self.is_uniform() {
+            return m.row_h;
+        }
+        match resolver.resolve(r) {
+            Some(sr) if !sr.is_pad() => self.height_of(sr.row(), m),
+            _ => m.row_h,
+        }
+    }
+}
+
 impl<'a> Grid<'a> {
     /// Screen rect of a cell, or None when it is scrolled out of view. The
     /// editor uses this to place its TextEdit exactly over the cell.
@@ -670,6 +790,26 @@ impl<'a> Grid<'a> {
         m: Metrics,
         panes: Panes,
     ) -> Option<Rect> {
+        Self::cell_screen_rect_h(cell, outer, scroll, col_widths, resolver, m, panes, None)
+    }
+
+    /// [`Grid::cell_screen_rect`] with wrapped-row heights taken into account.
+    ///
+    /// `heights` is `None` for callers that have no `SheetFormat` to hand, in
+    /// which case every row is the uniform height — which is also exactly
+    /// what [`RowHeights::is_uniform`] reports for a sheet that has never
+    /// used wrap, so the two paths agree on every sheet without wrapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cell_screen_rect_h(
+        cell: CellRef,
+        outer: Rect,
+        scroll: &ScrollState,
+        col_widths: &[f32],
+        resolver: &RowResolver<'_>,
+        m: Metrics,
+        panes: Panes,
+        heights: Option<&RowHeights<'_>>,
+    ) -> Option<Rect> {
         let body_origin = outer.min + Vec2::new(m.row_header_w, m.header_h);
         // Through THE resolver, so the editor lands on the same screen row the
         // paint loop drew the cell on — under a filter, a sort, or both.
@@ -677,26 +817,64 @@ impl<'a> Grid<'a> {
         let w_of = |c: usize| -> f32 {
             m.col_width(col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH))
         };
+        // Height of a SCREEN row, from the same source the paint loop uses.
+        // Falls back to the uniform height when the caller has no format.
+        let h_of =
+            |r: usize| -> f32 { heights.map_or(m.row_h, |h| h.screen_height(r, resolver, m)) };
+        let uniform = heights.is_none_or(|h| h.is_uniform());
 
         // Band extents, mirroring `show`. Widths and heights come from the
         // SAME metrics and the SAME col_widths the body uses — a frozen column
         // is the same column, not a copy of it.
         let band_rows = panes.rows;
         let band_cols = panes.cols;
-        let band_h = band_rows as f32 * m.row_h;
+        // A band of wrapped rows is as tall as its rows actually are, summed
+        // through the same function that paints them.
+        let band_h: f32 = if uniform {
+            band_rows as f32 * m.row_h
+        } else {
+            (panes.lead_first_row()..panes.lead_first_row() + band_rows)
+                .map(h_of)
+                .sum()
+        };
         let lead_r = panes.lead_first_row();
         let lead_c = panes.lead_first_col();
         let band_w: f32 = (lead_c..lead_c + band_cols).map(w_of).sum();
 
+        let this_h = h_of(visible);
         // A row inside the leading band is painted from the band's own offset,
         // which under a freeze never moves — so it has a rect no matter how
         // far the body has scrolled.
         let y = if band_rows > 0 && visible >= lead_r && visible < lead_r + band_rows {
-            body_origin.y + (visible - lead_r) as f32 * m.row_h
+            if uniform {
+                body_origin.y + (visible - lead_r) as f32 * m.row_h
+            } else {
+                body_origin.y + (lead_r..visible).map(h_of).sum::<f32>()
+            }
         } else {
-            let rel = visible as f64 - scroll.row_offset;
-            let yy = body_origin.y + band_h + (rel * m.row_h as f64) as f32;
-            if yy + m.row_h < body_origin.y + band_h || yy > outer.max.y {
+            let first = scroll.row_offset.floor().max(0.0) as usize;
+            let frac_px = ((scroll.row_offset - first as f64) * m.row_h as f64) as f32;
+            let yy = if uniform {
+                let rel = visible as f64 - scroll.row_offset;
+                body_origin.y + band_h + (rel * m.row_h as f64) as f32
+            } else if visible >= first {
+                // Running sum from the first body row, exactly the way `show`
+                // lays the body band out. Bounded by the viewport: the loop
+                // below stops as soon as it has left the visible area.
+                let mut acc = body_origin.y + band_h - frac_px;
+                for r in first..visible {
+                    acc += h_of(r);
+                    if acc > outer.max.y {
+                        return None;
+                    }
+                }
+                acc
+            } else {
+                // Above the viewport: not painted, so it has no rect. Summing
+                // backwards would invent one for a row `show` never drew.
+                return None;
+            };
+            if yy + this_h < body_origin.y + band_h || yy > outer.max.y {
                 return None;
             }
             yy
@@ -717,7 +895,7 @@ impl<'a> Grid<'a> {
             }
             xx
         };
-        Some(Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, m.row_h)))
+        Some(Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, this_h)))
     }
 
     pub fn show(self, ui: &mut Ui) -> GridResponse {
@@ -943,26 +1121,9 @@ impl<'a> Grid<'a> {
 
         // --- the two bands, in paint order ---
         //
-        // The frozen/split band is built FIRST and the body second, so the
-        // paint loops below walk the band before the body exactly as the
-        // feature describes. Both lists are viewport-sized: a band is a few
-        // extra painted rows, never a second pass over the sheet.
-        let mut row_bands: Vec<(usize, f32)> = Vec::with_capacity(band_rows + visible_count + 1);
-        for i in 0..band_rows {
-            let r = lead_r + i;
-            if r >= total_rows {
-                break;
-            }
-            row_bands.push((r, grid_rect.min.y + i as f32 * row_h));
-        }
-        let body_row_start = row_bands.len();
-        for r in row_range.clone() {
-            row_bands.push((
-                r,
-                body_rect.min.y + (r - first_row) as f32 * row_h - frac_px,
-            ));
-        }
-
+        // Columns are built FIRST because wrapped-text row heights (issue
+        // #28) need to know which columns are on screen and how wide they
+        // are: a row is only as tall as the visible cell that wraps in it.
         let mut col_bands: Vec<(usize, f32)> = Vec::with_capacity(band_cols + total_cols.min(64));
         for i in 0..band_cols {
             let c = lead_c + i;
@@ -979,6 +1140,73 @@ impl<'a> Grid<'a> {
             col_bands.iter().find(|(cc, _)| *cc == c).map(|&(_, x)| x)
         };
 
+        // --- wrapped-text row heights (issue #28) ---
+        //
+        // Decoration plans, built once per VISIBLE COLUMN per frame exactly
+        // like the conditional-format plans below, and only for columns that
+        // can wrap at all. A sheet with no decoration configured short-
+        // circuits on `has_decor()` and does no work here whatsoever, so this
+        // feature costs an undecorated 200M-row sheet one boolean per frame.
+        let decor_plans: Vec<(usize, Vec<ferrix_core::DecorEntry>)> =
+            match self.format.filter(|f| f.has_decor()) {
+                Some(fmt) => col_bands
+                    .iter()
+                    .map(|&(c, _)| {
+                        let mut p = Vec::new();
+                        fmt.decor_plan(c as u32, &mut p);
+                        (c, p)
+                    })
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+        let decor_plan_of = |c: usize| -> Option<&[ferrix_core::DecorEntry]> {
+            decor_plans
+                .iter()
+                .find(|(cc, _)| *cc == c)
+                .map(|(_, p)| p.as_slice())
+        };
+        // THE row-height source, shared with the hit test and
+        // `cell_screen_rect` (issue #28). Built here rather than measured in
+        // the loop so exactly one definition exists — see [`RowHeights`].
+        let heights = RowHeights::new(self.format, view, self.col_widths);
+        let row_height_of = |r: usize| -> f32 { heights.screen_height(r, &resolver, m) };
+
+        // The frozen/split band is built FIRST and the body second, so the
+        // paint loops below walk the band before the body exactly as the
+        // feature describes. Both lists are viewport-sized: a band is a few
+        // extra painted rows, never a second pass over the sheet.
+        //
+        // Each entry carries its own HEIGHT, because a wrapped row is taller
+        // than its neighbours. Positions are a running sum rather than
+        // `i * row_h`, so one tall row pushes the rows below it down instead
+        // of being drawn over them.
+        let mut row_bands: Vec<(usize, f32, f32)> =
+            Vec::with_capacity(band_rows + visible_count + 1);
+        let mut band_y = grid_rect.min.y;
+        for i in 0..band_rows {
+            let r = lead_r + i;
+            if r >= total_rows {
+                break;
+            }
+            let h = row_height_of(r);
+            row_bands.push((r, band_y, h));
+            band_y += h;
+        }
+        let body_row_start = row_bands.len();
+        let mut body_y = body_rect.min.y - frac_px;
+        for r in row_range.clone() {
+            let h = row_height_of(r);
+            row_bands.push((r, body_y, h));
+            body_y += h;
+            // Stop once the running sum has left the viewport. Without this a
+            // screenful of 12-line rows would still walk `visible_count`
+            // entries sized for single-line rows — bounded, but wasted.
+            if body_y > grid_rect.max.y {
+                break;
+            }
+        }
+
         let mut clicked = None;
         let mut double_clicked = None;
         let mut drag_to = None;
@@ -991,6 +1219,13 @@ impl<'a> Grid<'a> {
         let mut context_click: Option<(CellRef, egui::Pos2)> = None;
         let mut painted_rows: Vec<(usize, u32)> = Vec::with_capacity(row_bands.len());
         let mut frozen_row_count = 0usize;
+        // Border edges already drawn this frame, keyed by quantised geometry
+        // (issue #28). See the border block in the cell loop for why sharing
+        // matters. Empty and untouched on any sheet with no borders.
+        let mut drawn_edges: BTreeSet<(i32, i32, i32, i32)> = BTreeSet::new();
+        let mut border_segments = 0usize;
+        let mut rotated_texts = 0usize;
+        let mut wrapped_texts = 0usize;
 
         // Narrow the match list to just the visible rows once per frame, so
         // per-cell highlight testing is a small linear probe rather than a
@@ -1069,7 +1304,7 @@ impl<'a> Grid<'a> {
                 let mut evals: Vec<ferrix_core::RuleEval> = Vec::new();
                 if ferrix_core::SheetFormat::plan_needs_window(&plan) {
                     if !have_rows {
-                        for &(r, _) in &row_bands {
+                        for &(r, _, _) in &row_bands {
                             if let Some(sr) = resolve_row(r) {
                                 if !sr.is_pad() {
                                     window_rows.push(sr.row());
@@ -1126,7 +1361,7 @@ impl<'a> Grid<'a> {
         // through the SAME `resolve_row`, so a frozen row shows the same
         // record under a sort or filter that it would show unfrozen — there is
         // no second row mapping anywhere in this function.
-        for (bi, &(r, y)) in row_bands.iter().enumerate() {
+        for (bi, &(r, y, row_h)) in row_bands.iter().enumerate() {
             let in_lead_rows = bi < body_row_start;
             // Resolve the screen row to a data row through BOTH filters, in
             // the order they narrow: the table first, then search. Resolving
@@ -1329,6 +1564,24 @@ impl<'a> Grid<'a> {
                 }
 
                 let value = view.get(cref);
+                // Cell decoration (issue #28): borders, alignment, indent,
+                // wrap, rotation. Resolved from the plan built once for this
+                // column above, so a decorated 200M-row column costs exactly
+                // what a decorated 200-row one does. A cell no scope decorates
+                // gets `CellDecor::default()`, whose every field is `None`, and
+                // the paint path below is then byte-for-byte what it was.
+                //
+                // Resolved whenever the sheet has ANY decoration, even when
+                // this column's plan is empty: a per-cell override lives in
+                // neither column nor range scope and so contributes no plan
+                // entry, and gating on a non-empty plan silently dropped
+                // every single-cell border. `resolve_decor` consults the
+                // override map itself, which is why it is handed an empty
+                // slice rather than skipped.
+                let cd = match sheet_fmt.filter(|f| f.has_decor() && !is_pad) {
+                    Some(f) => f.resolve_decor(cref, decor_plan_of(c).unwrap_or(&[])),
+                    None => ferrix_core::CellDecor::default(),
+                };
                 // Issue #38: show formulas. The SOURCE replaces the value for
                 // this cell only, pulled here in the paint loop for a cell
                 // that is already being drawn — so the mode costs a viewport
@@ -1406,13 +1659,48 @@ impl<'a> Grid<'a> {
                         );
                     }
 
-                    let pad = 6.0 * m.zoom;
-                    let anchor = match align {
-                        Align2::RIGHT_CENTER => {
-                            egui::pos2(cell_rect.max.x - pad, cell_rect.center().y)
+                    // --- alignment, indent and vertical placement (#28) ---
+                    //
+                    // An explicit horizontal alignment REPLACES the
+                    // type-driven default; `HAlign::General` asks for that
+                    // default back, which is why it is a variant rather than
+                    // an absence.
+                    let align = match cd.h_align {
+                        None | Some(ferrix_core::HAlign::General) => align,
+                        // Justify has no renderer here and is drawn left, the
+                        // way Excel degrades it in a single-line cell. It is
+                        // reported by `decor_survives_xlsx` rather than
+                        // silently rewritten.
+                        Some(ferrix_core::HAlign::Left) | Some(ferrix_core::HAlign::Justify) => {
+                            Align2::LEFT_CENTER
                         }
-                        Align2::CENTER_CENTER => cell_rect.center(),
-                        _ => egui::pos2(cell_rect.min.x + pad, cell_rect.center().y),
+                        Some(ferrix_core::HAlign::Center) => Align2::CENTER_CENTER,
+                        Some(ferrix_core::HAlign::Right) => Align2::RIGHT_CENTER,
+                    };
+                    let pad = 6.0 * m.zoom;
+                    // Indent pushes the text in from the side it is aligned
+                    // to, which for a right-aligned cell is the RIGHT edge —
+                    // the same thing Excel does, and the reason this is not
+                    // simply added to `min.x`.
+                    let ind = cd.indent_px() * m.zoom;
+                    // Vertical placement only becomes observable once a row is
+                    // taller than one line, which is exactly what wrapping
+                    // makes happen.
+                    let cy = match cd.v_align {
+                        Some(ferrix_core::VAlign::Top) => cell_rect.min.y + pad,
+                        Some(ferrix_core::VAlign::Bottom) => cell_rect.max.y - pad,
+                        _ => cell_rect.center().y,
+                    };
+                    let valign = match cd.v_align {
+                        Some(ferrix_core::VAlign::Top) => egui::Align::TOP,
+                        Some(ferrix_core::VAlign::Bottom) => egui::Align::BOTTOM,
+                        _ => egui::Align::Center,
+                    };
+                    let align = Align2([align.x(), valign]);
+                    let anchor = match align.x() {
+                        egui::Align::Max => egui::pos2(cell_rect.max.x - pad - ind, cy),
+                        egui::Align::Center => egui::pos2(cell_rect.center().x, cy),
+                        _ => egui::pos2(cell_rect.min.x + pad + ind, cy),
                     };
                     // Type styling. `decor` is None for the overwhelming
                     // majority of cells, so the default path allocates and
@@ -1433,7 +1721,24 @@ impl<'a> Grid<'a> {
                     // grows with the zoom and a cell with an explicit point
                     // size grows by the same factor rather than staying put.
                     let ty = ty.resolved(BASE_FONT);
-                    let size = ty.size * m.zoom;
+                    // Shrink to fit (#28): scale the point size down until
+                    // the text fits the cell's usable width, never up. Skipped
+                    // for a wrapped cell — `CellDecor::shrinks` already
+                    // enforces that, so the two cannot both apply.
+                    let mut size = ty.size * m.zoom;
+                    if cd.shrinks() {
+                        let usable = (cell_rect.width() - 2.0 * pad - ind).max(1.0);
+                        let est = text.chars().count() as f32
+                            * ferrix_core::format::WRAP_CHAR_PX
+                            * m.zoom
+                            * (size / (BASE_FONT * m.zoom)).max(0.01);
+                        if est > usable {
+                            // Floored so a very long value stays legible
+                            // rather than shrinking to an unreadable smudge.
+                            size =
+                                (size * usable / est).max(ferrix_core::format::MIN_FONT_PT * 0.5);
+                        }
+                    }
 
                     let font = match ty.family {
                         ferrix_core::format::FontFamily::Monospace => FontId::monospace(size),
@@ -1449,10 +1754,49 @@ impl<'a> Grid<'a> {
                     // bundling a second font file; this reads as bold at the
                     // sizes a grid actually uses and costs one extra draw on
                     // the rare cells that ask for it.
-                    let galley = clip.layout_no_wrap(text.clone(), font.clone(), color);
+                    //
+                    // A WRAPPED cell lays out into the cell's usable width
+                    // instead, which is what makes its galley multiple lines
+                    // tall — and that height is what the row was already sized
+                    // for by `RowHeights`.
+                    let galley = if cd.wraps() {
+                        let wrap_w = cell_rect.width() - 2.0 * pad - ind;
+                        // A degenerate width would ask egui to break every
+                        // glyph onto its own line. Skipped explicitly HERE,
+                        // next to the width that defines it, rather than
+                        // relying on a downstream clip: a zero-width rect
+                        // still `intersects` its clip rect, so nothing further
+                        // down would catch it.
+                        if wrap_w <= 0.0 {
+                            painted_cells += 1;
+                            continue;
+                        }
+                        wrapped_texts += 1;
+                        clip.layout(text.clone(), font.clone(), color, wrap_w)
+                    } else {
+                        clip.layout_no_wrap(text.clone(), font.clone(), color)
+                    };
                     let rect = align.anchor_size(anchor, galley.size());
-                    clip.galley(rect.min, galley.clone(), color);
-                    if ty.bold {
+                    // --- rotation (#28) ---
+                    //
+                    // Rotated text is emitted as a TextShape with an angle,
+                    // which is a different shape kind from the plain galley
+                    // above — so `paint_shape_count` and the shape stream
+                    // both change when rotation is on, and a test can assert
+                    // on that rather than on appearance.
+                    let rot = cd.rotation_deg();
+                    if rot != 0 {
+                        // egui's angle is clockwise radians; the model's
+                        // positive rotation is counter-clockwise, matching
+                        // Excel's dialog. Negated here, once.
+                        let mut ts = egui::epaint::TextShape::new(rect.min, galley.clone(), color);
+                        ts.angle = -(rot as f32).to_radians();
+                        clip.add(egui::Shape::Text(ts));
+                        rotated_texts += 1;
+                    } else {
+                        clip.galley(rect.min, galley.clone(), color);
+                    }
+                    if ty.bold && rot == 0 {
                         clip.galley(rect.min + Vec2::new(0.4, 0.0), galley.clone(), color);
                     }
                     if ty.underline {
@@ -1462,6 +1806,130 @@ impl<'a> Grid<'a> {
                     if ty.strikethrough {
                         let y = rect.center().y;
                         clip.hline(rect.min.x..=rect.max.x, y, Stroke::new(1.0_f32, color));
+                    }
+                }
+
+                // --- cell borders and the diagonal (issue #28) ---
+                //
+                // Drawn AFTER the text so a thick border reads as a frame
+                // around the value rather than a line the glyphs sit on top
+                // of, and before the validation/comment flags, which are
+                // corner markers that must stay on top of everything.
+                //
+                // SHARED EDGES ARE NOT DOUBLE-DRAWN. Two adjacent cells that
+                // both ask for a border between them describe ONE line, and
+                // drawing it twice is visible: the two strokes composite to a
+                // heavier, darker edge than either cell asked for, and at
+                // fractional zoom they land a half pixel apart and the line
+                // looks doubled. So every edge is registered in `drawn_edges`
+                // by its geometry, and the second cell to claim it is
+                // ignored. The FIRST claimant wins, which is the left/top
+                // neighbour, matching Excel's own precedence.
+                if !cd.is_empty() {
+                    let mut edge = |a: egui::Pos2, b: egui::Pos2, bd: ferrix_core::Border| {
+                        // Quantised to 1/16px so two cells computing the same
+                        // edge from opposite sides agree despite float error.
+                        let key = (
+                            (a.x * 16.0).round() as i32,
+                            (a.y * 16.0).round() as i32,
+                            (b.x * 16.0).round() as i32,
+                            (b.y * 16.0).round() as i32,
+                        );
+                        if !drawn_edges.insert(key) {
+                            return;
+                        }
+                        let w = bd.style.width() * m.zoom;
+                        // An edge with no width draws nothing. Skipped
+                        // explicitly on the dimension that defines it, next to
+                        // the computation — a zero-width stroke still reaches
+                        // the painter and a downstream clip check would not
+                        // reject it.
+                        if w <= 0.0 {
+                            return;
+                        }
+                        // Counted once per EDGE, not once per stroke: a
+                        // double border is two strokes but one edge, and a
+                        // dashed one is many. The number a test asserts on has
+                        // to be "how many borders were drawn", or it would
+                        // change with the dash length.
+                        border_segments += 1;
+                        let col = bd.color.map_or(th.text, sheet_c32);
+                        match bd.style {
+                            ferrix_core::BorderStyle::Double => {
+                                // Two thin lines with a gap, which is what
+                                // "double" means — not one thick one.
+                                let off = w * 0.75;
+                                let n = if (a.x - b.x).abs() < f32::EPSILON {
+                                    Vec2::new(off, 0.0)
+                                } else {
+                                    Vec2::new(0.0, off)
+                                };
+                                let s = Stroke::new(w * 0.5, col);
+                                painter.line_segment([a - n, b - n], s);
+                                painter.line_segment([a + n, b + n], s);
+                            }
+                            ferrix_core::BorderStyle::Dotted | ferrix_core::BorderStyle::Dashed => {
+                                // Dashes are real segments rather than a
+                                // stroke pattern, because egui has no dash
+                                // support on a plain line and a solid line
+                                // labelled "dashed" would be a lie the user
+                                // can see.
+                                let dash = if bd.style == ferrix_core::BorderStyle::Dotted {
+                                    2.0 * m.zoom
+                                } else {
+                                    5.0 * m.zoom
+                                };
+                                let gap = dash;
+                                let d = b - a;
+                                let len = d.length();
+                                if len <= 0.0 {
+                                    return;
+                                }
+                                let unit = d / len;
+                                let s = Stroke::new(w, col);
+                                let mut t = 0.0;
+                                while t < len {
+                                    let e = (t + dash).min(len);
+                                    painter.line_segment([a + unit * t, a + unit * e], s);
+                                    t = e + gap;
+                                }
+                                // Explicit unit so this arm's type matches the
+                                // others; the `while` is the last expression
+                                // otherwise and its `()` reads as accidental.
+                            }
+                            _ => {
+                                painter.line_segment([a, b], Stroke::new(w, col));
+                            }
+                        }
+                    };
+                    let (tl, tr2) = (cell_rect.min, egui::pos2(cell_rect.max.x, cell_rect.min.y));
+                    let (bl, br2) = (egui::pos2(cell_rect.min.x, cell_rect.max.y), cell_rect.max);
+                    if let Some(b) = cd.border(ferrix_core::Side::Top) {
+                        edge(tl, tr2, b);
+                    }
+                    if let Some(b) = cd.border(ferrix_core::Side::Bottom) {
+                        edge(bl, br2, b);
+                    }
+                    if let Some(b) = cd.border(ferrix_core::Side::Left) {
+                        edge(tl, bl, b);
+                    }
+                    if let Some(b) = cd.border(ferrix_core::Side::Right) {
+                        edge(tr2, br2, b);
+                    }
+                    // The diagonal is INSIDE the cell, so it can never be a
+                    // shared edge and is not deduped.
+                    if let Some((b, dir)) = cd.diagonal.filter(|(b, _)| b.is_visible()) {
+                        let w = b.style.width() * m.zoom;
+                        if w > 0.0 {
+                            let col = b.color.map_or(th.text, sheet_c32);
+                            let s = Stroke::new(w, col);
+                            if dir.up() {
+                                painter.line_segment([bl, tr2], s);
+                            }
+                            if dir.down() {
+                                painter.line_segment([tl, br2], s);
+                            }
+                        }
                     }
                 }
 
@@ -1521,7 +1989,7 @@ impl<'a> Grid<'a> {
         // Drawn per band from the same lists the cells came from, so a line
         // never lands where its row is not.
         let line = Stroke::new(1.0_f32, th.grid_line);
-        for (bi, &(_, y)) in row_bands.iter().enumerate() {
+        for (bi, &(_, y, _)) in row_bands.iter().enumerate() {
             let lp = painter.with_clip_rect(if bi < body_row_start {
                 band_clip
             } else {
@@ -1570,14 +2038,47 @@ impl<'a> Grid<'a> {
             if !grid_rect.contains(pos) {
                 return None;
             }
-            let r = if band_rows > 0 && pos.y < body_rect.min.y {
-                lead_r + ((pos.y - grid_rect.min.y) / row_h) as usize
-            } else {
-                let dy = pos.y - body_rect.min.y + frac_px;
-                if dy < 0.0 {
-                    return None;
+            // Wrapped rows (issue #28) make rows different heights, so y is
+            // resolved by SEARCHING THE BAND LIST the paint loop just built
+            // rather than by dividing by a uniform height. That list is the
+            // painted geometry itself, so a click lands on the cell that
+            // visually covers the pixel by construction — there is no second
+            // height arithmetic that could drift from it.
+            //
+            // The uniform case keeps its division: with every row the same
+            // height the two agree exactly, and division is O(1) where the
+            // search is O(visible rows).
+            let r = if heights.is_uniform() {
+                if band_rows > 0 && pos.y < body_rect.min.y {
+                    lead_r + ((pos.y - grid_rect.min.y) / row_h) as usize
+                } else {
+                    let dy = pos.y - body_rect.min.y + frac_px;
+                    if dy < 0.0 {
+                        return None;
+                    }
+                    first_row + (dy / row_h) as usize
                 }
-                first_row + (dy / row_h) as usize
+            } else {
+                let in_band = band_rows > 0 && pos.y < body_rect.min.y;
+                let mut found = None;
+                for (bi, &(rr, yy, hh)) in row_bands.iter().enumerate() {
+                    // A row of zero height covers no pixels; skip it
+                    // explicitly here, next to the height that defines it,
+                    // rather than trusting a range check — `yy..yy` contains
+                    // nothing but `pos.y >= yy && pos.y < yy` is not the only
+                    // spelling a future edit might reach for.
+                    if hh <= 0.0 {
+                        continue;
+                    }
+                    if (bi < body_row_start) != in_band {
+                        continue;
+                    }
+                    if pos.y >= yy && pos.y < yy + hh {
+                        found = Some(rr);
+                        break;
+                    }
+                }
+                found?
             };
             let cx = if band_cols > 0 && pos.x < body_rect.min.x {
                 col_x[lead_c] + (pos.x - grid_rect.min.x)
@@ -1937,7 +2438,7 @@ impl<'a> Grid<'a> {
         // Walks the SAME band list as the cells — frozen band first, then the
         // body — so the number beside a frozen row is that row's number no
         // matter where the body has scrolled to.
-        for (bi, &(r, y)) in row_bands.iter().enumerate() {
+        for (bi, &(r, y, row_h)) in row_bands.iter().enumerate() {
             let Some(resolved) = resolve_row(r) else {
                 continue;
             };
@@ -2074,6 +2575,9 @@ impl<'a> Grid<'a> {
             header_context,
             outline_toggle,
             outline_buttons,
+            border_segments,
+            rotated_texts,
+            wrapped_texts,
         }
     }
 }

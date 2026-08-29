@@ -147,6 +147,31 @@ impl PlanEntry<'_> {
     }
 }
 
+/// One entry of a column's resolved *decoration* plan (issue #28).
+///
+/// The decoration twin of [`PlanEntry`], and built the same way and for the
+/// same reason: [`SheetFormat::decor_plan`] assembles the ordered list of
+/// decorations affecting one column ONCE per visible column per frame, and
+/// the per-cell work is then a walk over that slice with two integer
+/// comparisons. `decor` is `Copy` and heap-free, so the entry is carried by
+/// value rather than borrowed.
+#[derive(Clone, Copy, Debug)]
+pub struct DecorEntry {
+    pub decor: CellDecor,
+    /// `None` for column scope, `Some((first, last))` for range scope.
+    pub rows: Option<(u32, u32)>,
+}
+
+impl DecorEntry {
+    #[inline]
+    pub fn covers(&self, row: u32) -> bool {
+        match self.rows {
+            None => true,
+            Some((a, b)) => row >= a && row <= b,
+        }
+    }
+}
+
 // ============================================================ manual styles ==
 
 /// A colour the user picked by hand, with no condition attached.
@@ -282,6 +307,433 @@ pub fn clamp_font_pt(pt: f32) -> f32 {
     pt.clamp(MIN_FONT_PT, MAX_FONT_PT)
 }
 
+// ============================================================ cell decoration ==
+//
+// Issue #28. Everything below follows the [`Typography`] pattern exactly:
+// every field is `Option`, `None` means "inherit", and the whole struct is
+// `Copy` with no heap of its own. That is what lets a column-scope decoration
+// and a range-scope decoration layer without either knowing about the other,
+// and it is why decorating 10,000,000 rows costs one entry rather than ten
+// million.
+
+/// How a border edge is drawn. `None` is the absence of a border and is
+/// spelled by `Option<Border>` being `None`, not by a variant here — so
+/// "inherit" and "explicitly no border" stay distinguishable, which matters
+/// when a range clears a border the column set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BorderStyle {
+    /// Explicitly no line. Distinct from inheriting: this ERASES a lower
+    /// scope's edge rather than deferring to it.
+    #[default]
+    None,
+    Thin,
+    Medium,
+    Thick,
+    Double,
+    Dotted,
+    Dashed,
+}
+
+impl BorderStyle {
+    /// Pixel width the renderer draws this at, before zoom.
+    ///
+    /// `Double` reports the width of ONE of its two lines; the painter draws
+    /// two of them, which is why it is not simply "thick".
+    pub fn width(self) -> f32 {
+        match self {
+            BorderStyle::None => 0.0,
+            BorderStyle::Thin | BorderStyle::Dotted | BorderStyle::Dashed => 1.0,
+            BorderStyle::Medium | BorderStyle::Double => 1.6,
+            BorderStyle::Thick => 2.6,
+        }
+    }
+
+    /// Does this style draw anything at all?
+    pub fn is_visible(self) -> bool {
+        self != BorderStyle::None
+    }
+
+    /// The `<border>` child element's `style` attribute in OOXML.
+    pub fn ooxml(self) -> &'static str {
+        match self {
+            BorderStyle::None => "none",
+            BorderStyle::Thin => "thin",
+            BorderStyle::Medium => "medium",
+            BorderStyle::Thick => "thick",
+            BorderStyle::Double => "double",
+            BorderStyle::Dotted => "dotted",
+            BorderStyle::Dashed => "dashed",
+        }
+    }
+
+    /// Every style, for exhaustive round-trip tests.
+    pub const ALL: [BorderStyle; 7] = [
+        BorderStyle::None,
+        BorderStyle::Thin,
+        BorderStyle::Medium,
+        BorderStyle::Thick,
+        BorderStyle::Double,
+        BorderStyle::Dotted,
+        BorderStyle::Dashed,
+    ];
+}
+
+/// One border edge: a style and its colour.
+///
+/// The colour is `Option` for the same reason everything else here is —
+/// `None` means "the theme's grid ink", so a border set before a theme
+/// switch does not pin itself to a colour that becomes invisible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Border {
+    pub style: BorderStyle,
+    pub color: Option<Rgb>,
+}
+
+impl Border {
+    pub const fn new(style: BorderStyle) -> Self {
+        Self { style, color: None }
+    }
+
+    pub const fn colored(style: BorderStyle, color: Rgb) -> Self {
+        Self {
+            style,
+            color: Some(color),
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.style.is_visible()
+    }
+}
+
+/// Which side of a cell an edge is on.
+///
+/// Ordered so the array index is the discriminant and `Side::ALL` can be
+/// iterated without a match.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left = 0,
+    Right = 1,
+    Top = 2,
+    Bottom = 3,
+}
+
+impl Side {
+    pub const ALL: [Side; 4] = [Side::Left, Side::Right, Side::Top, Side::Bottom];
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Which way a diagonal runs. Excel models these as two independent flags on
+/// one border, and so does this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Diagonal {
+    #[default]
+    /// Bottom-left to top-right.
+    Up,
+    /// Top-left to bottom-right.
+    Down,
+    /// Both, forming an X.
+    Both,
+}
+
+impl Diagonal {
+    pub fn up(self) -> bool {
+        matches!(self, Diagonal::Up | Diagonal::Both)
+    }
+    pub fn down(self) -> bool {
+        matches!(self, Diagonal::Down | Diagonal::Both)
+    }
+}
+
+/// Horizontal text placement inside a cell.
+///
+/// `General` is not "left": it is the type-driven default the grid already
+/// applies — numbers right, text left, booleans centred. Keeping it as a
+/// distinct variant means a user can explicitly ask for that behaviour back
+/// after setting an alignment, which "unset" alone cannot express once the
+/// value has been persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HAlign {
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+    /// Excel's `justify`. Ferrix renders it as left; recorded so the round
+    /// trip does not silently rewrite the user's choice.
+    Justify,
+}
+
+/// Vertical text placement inside a cell. Only observable once the row is
+/// taller than one line — which wrapping and rotation both make happen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VAlign {
+    Top,
+    #[default]
+    Center,
+    Bottom,
+}
+
+/// Largest indent level, matching Excel. One level is [`INDENT_STEP_PX`].
+pub const MAX_INDENT: u8 = 15;
+/// Pixels one indent level adds, before zoom. Excel uses three character
+/// widths; this is the equivalent at the grid's default font.
+pub const INDENT_STEP_PX: f32 = 9.0;
+
+/// Rotation limits, in degrees. Positive is counter-clockwise, matching both
+/// Excel's dialog and the sign convention of the OOXML attribute for the
+/// 0..=90 half.
+pub const MIN_ROTATION: i16 = -90;
+pub const MAX_ROTATION: i16 = 90;
+
+/// Clamp a requested rotation into the representable range.
+pub fn clamp_rotation(deg: i16) -> i16 {
+    deg.clamp(MIN_ROTATION, MAX_ROTATION)
+}
+
+/// Clamp a requested indent level.
+pub fn clamp_indent(level: u8) -> u8 {
+    level.min(MAX_INDENT)
+}
+
+// -------------------------------------------------------- wrapped-row height ==
+
+/// Average glyph advance the wrap estimator assumes, in unzoomed pixels.
+///
+/// The same 7.2 the autofit estimator in the UI already uses, kept here so
+/// paint, hit-testing and the editor all derive a wrapped row's height from
+/// ONE arithmetic definition. That is the whole point of putting it in the
+/// model instead of measuring a galley in the paint loop: a galley is only
+/// available where an egui `Fonts` is, and the hit test and
+/// `cell_screen_rect` run where one is not. Two measurements would agree
+/// until a font changed and then hit-test a different row than was painted.
+pub const WRAP_CHAR_PX: f32 = 7.2;
+
+/// Horizontal padding a cell reserves for its text, both edges together.
+pub const CELL_TEXT_PAD_PX: f32 = 12.0;
+
+/// How many lines `text` needs when wrapped into `width_px`.
+///
+/// Counts explicit newlines too, so a multi-line string reports its real
+/// line count rather than one long run. Always at least 1: an empty cell
+/// still occupies a line.
+///
+/// This is an ESTIMATE, and deliberately so — see [`WRAP_CHAR_PX`]. It is
+/// monotonic in text length, which is the property the feature needs: more
+/// text never produces a shorter row.
+pub fn wrapped_line_count(text: &str, width_px: f32, indent_px: f32) -> u32 {
+    let usable = width_px - CELL_TEXT_PAD_PX - indent_px;
+    // A column narrower than one glyph would divide toward infinity lines.
+    // One character per line is the floor, which is also what a real
+    // renderer does when it cannot break any smaller.
+    let per_line = (usable / WRAP_CHAR_PX).floor().max(1.0) as usize;
+    let mut lines = 0u32;
+    for segment in text.split('\n') {
+        let chars = segment.chars().count().max(1);
+        lines += chars.div_ceil(per_line) as u32;
+    }
+    lines.max(1)
+}
+
+/// Largest number of lines a wrapped row is allowed to grow to.
+///
+/// Bounded because an unbounded row height is a row that fills the viewport
+/// and hides every other row — and because the scroll model measures its
+/// extent in ROWS, so one enormous row degrades scrolling for the whole
+/// sheet.
+pub const MAX_WRAP_LINES: u32 = 12;
+
+/// Largest number of columns the wrapped-row-height scan will consider.
+///
+/// See [`SheetFormat::wrapping_cols`]. This bounds the per-row cost of the
+/// feature so a wrap applied to an enormous range stays a viewport-sized
+/// amount of work rather than a sheet-sized one.
+pub const WRAP_COL_SCAN_CAP: usize = 64;
+
+/// Height a row needs to show `lines` wrapped lines, given the sheet default.
+///
+/// One line is exactly the default height, so an unwrapped sheet is
+/// pixel-identical to one that never heard of this feature.
+pub fn wrapped_row_height(lines: u32, default_h: f32) -> f32 {
+    let lines = lines.clamp(1, MAX_WRAP_LINES);
+    if lines == 1 {
+        return default_h;
+    }
+    // Line spacing, not the full row height per line: the first line already
+    // carries the row's vertical padding, so repeating it per line would make
+    // a two-line cell twice as tall as it needs to be.
+    default_h + (lines - 1) as f32 * (default_h - 6.0).max(8.0)
+}
+
+/// Everything about a cell's *presentation* that is not a colour or a font:
+/// borders, alignment, indent, wrapping, shrink-to-fit and rotation.
+///
+/// Deliberately a sibling of [`Typography`] rather than a member of it: type
+/// styling answers "what does the ink look like", this answers "where does it
+/// go and what is drawn around it". They layer through the same
+/// [`CellDecor::apply_to`] discipline and share the same `None`-inherits rule.
+///
+/// **This is `Copy` and owns no heap.** A `CellDecor` on a column applies to
+/// every row of that column including rows that do not exist yet, which is
+/// the whole scale argument of this module restated for issue #28: a border
+/// over 200M rows is these ~32 bytes, once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CellDecor {
+    /// Indexed by [`Side`]. `None` inherits; `Some(Border { style: None, .. })`
+    /// explicitly erases whatever a lower scope set.
+    pub borders: [Option<Border>; 4],
+    /// The diagonal line through the cell, and which way it runs.
+    pub diagonal: Option<(Border, Diagonal)>,
+    pub h_align: Option<HAlign>,
+    pub v_align: Option<VAlign>,
+    /// Indent levels, 0..=[`MAX_INDENT`].
+    pub indent: Option<u8>,
+    pub wrap: Option<bool>,
+    pub shrink: Option<bool>,
+    /// Degrees, [`MIN_ROTATION`]..=[`MAX_ROTATION`].
+    pub rotation: Option<i16>,
+}
+
+impl CellDecor {
+    pub fn is_empty(&self) -> bool {
+        self.borders.iter().all(|b| b.is_none())
+            && self.diagonal.is_none()
+            && self.h_align.is_none()
+            && self.v_align.is_none()
+            && self.indent.is_none()
+            && self.wrap.is_none()
+            && self.shrink.is_none()
+            && self.rotation.is_none()
+    }
+
+    /// Layer `self` over `out`: set fields win, `None` fields leave `out`
+    /// alone. Applied outermost-scope-first — column, then range, then cell
+    /// override — so the most specific instruction the user gave is the one
+    /// that survives, exactly as [`Typography::apply_to`] does.
+    #[inline]
+    pub fn apply_to(&self, out: &mut CellDecor) {
+        for s in Side::ALL {
+            if let Some(b) = self.borders[s.index()] {
+                out.borders[s.index()] = Some(b);
+            }
+        }
+        if self.diagonal.is_some() {
+            out.diagonal = self.diagonal;
+        }
+        if self.h_align.is_some() {
+            out.h_align = self.h_align;
+        }
+        if self.v_align.is_some() {
+            out.v_align = self.v_align;
+        }
+        if self.indent.is_some() {
+            out.indent = self.indent;
+        }
+        if self.wrap.is_some() {
+            out.wrap = self.wrap;
+        }
+        if self.shrink.is_some() {
+            out.shrink = self.shrink;
+        }
+        if self.rotation.is_some() {
+            out.rotation = self.rotation;
+        }
+    }
+
+    /// The border on one side, if it draws anything.
+    #[inline]
+    pub fn border(&self, side: Side) -> Option<Border> {
+        self.borders[side.index()].filter(|b| b.is_visible())
+    }
+
+    #[inline]
+    pub fn wraps(&self) -> bool {
+        self.wrap == Some(true)
+    }
+
+    #[inline]
+    pub fn shrinks(&self) -> bool {
+        // Wrap wins: a wrapped cell grows its row instead of shrinking its
+        // font, and doing both would fight. Excel resolves it the same way,
+        // which is also why `xlsx_loss` reports the combination.
+        self.shrink == Some(true) && !self.wraps()
+    }
+
+    /// Rotation in degrees, 0 when unset.
+    #[inline]
+    pub fn rotation_deg(&self) -> i16 {
+        self.rotation.unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn indent_level(&self) -> u8 {
+        self.indent.unwrap_or(0)
+    }
+
+    /// Left-edge padding this indent adds, in unzoomed pixels.
+    #[inline]
+    pub fn indent_px(&self) -> f32 {
+        self.indent_level() as f32 * INDENT_STEP_PX
+    }
+
+    // --- builders, for the toolbar and for tests ---
+
+    pub fn with_border(mut self, side: Side, b: Border) -> Self {
+        self.borders[side.index()] = Some(b);
+        self
+    }
+
+    /// All four sides at once — the "box" button.
+    pub fn with_box(mut self, b: Border) -> Self {
+        for s in Side::ALL {
+            self.borders[s.index()] = Some(b);
+        }
+        self
+    }
+
+    pub fn with_diagonal(mut self, b: Border, d: Diagonal) -> Self {
+        self.diagonal = Some((b, d));
+        self
+    }
+
+    pub fn with_h_align(mut self, a: HAlign) -> Self {
+        self.h_align = Some(a);
+        self
+    }
+
+    pub fn with_v_align(mut self, a: VAlign) -> Self {
+        self.v_align = Some(a);
+        self
+    }
+
+    /// Clamped at the door, so no caller can store an indent the renderer
+    /// cannot draw or the exporter cannot write.
+    pub fn with_indent(mut self, level: u8) -> Self {
+        self.indent = Some(clamp_indent(level));
+        self
+    }
+
+    pub fn with_wrap(mut self, on: bool) -> Self {
+        self.wrap = Some(on);
+        self
+    }
+
+    pub fn with_shrink(mut self, on: bool) -> Self {
+        self.shrink = Some(on);
+        self
+    }
+
+    /// Clamped to [`MIN_ROTATION`]..=[`MAX_ROTATION`].
+    pub fn with_rotation(mut self, deg: i16) -> Self {
+        self.rotation = Some(clamp_rotation(deg));
+        self
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ManualStyle {
     pub fill: Option<Rgb>,
@@ -320,11 +772,15 @@ pub struct ColumnFormat {
     pub format: NumberFormat,
     /// Rules, evaluated in order. Later entries override earlier ones.
     pub rules: Vec<ConditionalRule>,
+    /// Borders, alignment, wrap and rotation for every cell of this column
+    /// (issue #28). `Copy` and heap-free, so this is the same handful of
+    /// bytes whether the column has 200 rows or 200,000,000.
+    pub decor: CellDecor,
 }
 
 impl ColumnFormat {
     pub fn is_empty(&self) -> bool {
-        self.format == NumberFormat::General && self.rules.is_empty()
+        self.format == NumberFormat::General && self.rules.is_empty() && self.decor.is_empty()
     }
 
     fn heap_bytes(&self) -> usize {
@@ -342,6 +798,9 @@ pub struct RangeFormat {
     /// Overrides the column format inside this rectangle when set.
     pub format: Option<NumberFormat>,
     pub rules: Vec<ConditionalRule>,
+    /// Decoration for every cell in the rectangle (issue #28). The rectangle
+    /// is stored, never its cells, so `B2:B50000000` costs one of these.
+    pub decor: CellDecor,
 }
 
 impl RangeFormat {
@@ -350,6 +809,7 @@ impl RangeFormat {
             range,
             format: None,
             rules: Vec::new(),
+            decor: CellDecor::default(),
         }
     }
 
@@ -358,8 +818,13 @@ impl RangeFormat {
         self
     }
 
+    pub fn with_decor(mut self, decor: CellDecor) -> Self {
+        self.decor = decor;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.format.is_none() && self.rules.is_empty()
+        self.format.is_none() && self.rules.is_empty() && self.decor.is_empty()
     }
 
     fn heap_bytes(&self) -> usize {
@@ -381,11 +846,13 @@ impl RangeFormat {
 pub struct CellOverride {
     pub manual: ManualStyle,
     pub format: Option<NumberFormat>,
+    /// Decoration for this one cell — the "border this cell only" case.
+    pub decor: CellDecor,
 }
 
 impl CellOverride {
     pub fn is_empty(&self) -> bool {
-        self.manual.is_empty() && self.format.is_none()
+        self.manual.is_empty() && self.format.is_none() && self.decor.is_empty()
     }
 }
 
@@ -454,6 +921,73 @@ impl SheetFormat {
     pub fn rule_count(&self) -> usize {
         self.columns.values().map(|c| c.rules.len()).sum::<usize>()
             + self.ranges.iter().map(|r| r.rules.len()).sum::<usize>()
+    }
+
+    /// How many scopes carry a non-empty [`CellDecor`] (issue #28).
+    ///
+    /// A count of SCOPES, never of cells — the number a scale test can assert
+    /// stays at 1 after decorating ten million rows.
+    pub fn decor_count(&self) -> usize {
+        self.columns
+            .values()
+            .filter(|c| !c.decor.is_empty())
+            .count()
+            + self.ranges.iter().filter(|r| !r.decor.is_empty()).count()
+            + self
+                .overrides
+                .values()
+                .filter(|o| !o.decor.is_empty())
+                .count()
+    }
+
+    /// Is any decoration configured anywhere on this sheet?
+    ///
+    /// The paint loop's short circuit: a sheet with no borders or alignment
+    /// never builds a decoration plan at all, so issue #28 costs an
+    /// undecorated sheet one boolean per frame.
+    pub fn has_decor(&self) -> bool {
+        self.decor_count() > 0
+    }
+
+    /// Every column that any scope has asked to WRAP, ascending and deduped.
+    ///
+    /// The row-height calculation needs this and nothing else, and it must be
+    /// answerable without knowing which columns are on screen — otherwise a
+    /// row's height would change as the user scrolled sideways, and the
+    /// height used by the hit test would differ from the one used to paint.
+    ///
+    /// Bounded by `max_col`, and by `WRAP_COL_SCAN_CAP` overall: a wrap over
+    /// a range spanning the whole sheet must not enumerate 16,384 columns on
+    /// every frame. Past the cap the extra columns simply do not contribute
+    /// to row height, which degrades to "not as tall as it could be" rather
+    /// than to a stall.
+    pub fn wrapping_cols(&self, max_col: u32, out: &mut Vec<u32>) {
+        out.clear();
+        for (&c, cf) in &self.columns {
+            if cf.decor.wraps() && c <= max_col {
+                out.push(c);
+            }
+        }
+        for rf in &self.ranges {
+            if !rf.decor.wraps() {
+                continue;
+            }
+            let last = rf.range.last_col.min(max_col);
+            for c in rf.range.first_col..=last {
+                if out.len() >= WRAP_COL_SCAN_CAP {
+                    break;
+                }
+                out.push(c);
+            }
+        }
+        for ((_, c), ov) in &self.overrides {
+            if ov.decor.wraps() && *c <= max_col {
+                out.push(*c);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.truncate(WRAP_COL_SCAN_CAP);
     }
 
     pub fn override_count(&self) -> usize {
@@ -622,6 +1156,127 @@ impl SheetFormat {
             }
             None => false,
         }
+    }
+
+    // --- decoration: borders, alignment, wrap, rotation (issue #28) ---
+
+    /// Decorate an entire column — borders, alignment, wrap, rotation.
+    ///
+    /// ONE entry, whatever the row count. This is the operation the scale
+    /// criterion is written against: applying it over 10,000,000 rows must
+    /// leave [`SheetFormat::heap_bytes`] under a kilobyte, because the store
+    /// never learns how many rows the column has.
+    ///
+    /// LAYERS onto whatever the column already had rather than replacing it,
+    /// so "add a bottom border" does not silently clear an alignment set a
+    /// moment earlier. Pass a `CellDecor` with an explicit
+    /// [`BorderStyle::None`] to erase one edge.
+    pub fn set_column_decor(&mut self, col: u32, decor: CellDecor) {
+        let entry = self.column_mut(col);
+        decor.apply_to(&mut entry.decor);
+        self.prune();
+    }
+
+    /// Wipe a column's decoration entirely, back to "inherit everything".
+    pub fn clear_column_decor(&mut self, col: u32) {
+        if let Some(c) = self.columns.get_mut(&col) {
+            c.decor = CellDecor::default();
+        }
+        self.prune();
+    }
+
+    pub fn column_decor(&self, col: u32) -> CellDecor {
+        self.columns
+            .get(&col)
+            .map_or(CellDecor::default(), |c| c.decor)
+    }
+
+    /// Decorate a rectangle — the "border this selection" command.
+    ///
+    /// A 200M-cell selection and a 4-cell one produce the same one entry.
+    /// Reuses the existing entry for an exact range match, matching
+    /// [`SheetFormat::push_rule_for_range`], so decorating the same selection
+    /// twice does not grow the store.
+    pub fn set_range_decor(&mut self, range: TableRange, decor: CellDecor) -> usize {
+        let ri = match self.range_index_of(range) {
+            Some(i) => i,
+            None => self.push_range(RangeFormat::new(range)),
+        };
+        let mut merged = self.ranges[ri].decor;
+        decor.apply_to(&mut merged);
+        self.ranges[ri].decor = merged;
+        self.prune();
+        // `prune` can drop entries before `ri`, so the index is re-derived
+        // rather than assumed — returning a stale index would have the caller
+        // edit somebody else's range.
+        self.range_index_of(range).unwrap_or(ri)
+    }
+
+    /// Decorate one specific cell. The only per-cell decoration path, and
+    /// opt-in exactly like [`SheetFormat::set_cell_override`].
+    pub fn set_cell_decor(&mut self, cell: CellRef, decor: CellDecor) {
+        let e = self.overrides.entry((cell.row, cell.col)).or_default();
+        decor.apply_to(&mut e.decor);
+        if e.is_empty() {
+            self.overrides.remove(&(cell.row, cell.col));
+        }
+    }
+
+    /// Collect the ordered decorations affecting `col` into `out`.
+    ///
+    /// Called once per visible column per frame, not per cell — the twin of
+    /// [`SheetFormat::plan`], and `out` is caller-owned and reused so a
+    /// steady-state repaint allocates nothing here either.
+    pub fn decor_plan(&self, col: u32, out: &mut Vec<DecorEntry>) {
+        out.clear();
+        if let Some(c) = self.columns.get(&col) {
+            if !c.decor.is_empty() {
+                out.push(DecorEntry {
+                    decor: c.decor,
+                    rows: None,
+                });
+            }
+        }
+        for rf in &self.ranges {
+            if col < rf.range.first_col || col > rf.range.last_col || rf.decor.is_empty() {
+                continue;
+            }
+            out.push(DecorEntry {
+                decor: rf.decor,
+                rows: Some((rf.range.first_row, rf.range.last_row)),
+            });
+        }
+    }
+
+    /// Resolve one cell's decoration from a prepared plan.
+    ///
+    /// **Allocates nothing.** Column scope first, then ranges in order, then
+    /// the per-cell override — the same precedence [`SheetFormat::resolve`]
+    /// uses for colour, so a user who has learned one has learned both.
+    pub fn resolve_decor(&self, cell: CellRef, plan: &[DecorEntry]) -> CellDecor {
+        let mut out = CellDecor::default();
+        for e in plan {
+            if e.covers(cell.row) {
+                e.decor.apply_to(&mut out);
+            }
+        }
+        if let Some(o) = self.overrides.get(&(cell.row, cell.col)) {
+            o.decor.apply_to(&mut out);
+        }
+        out
+    }
+
+    /// Resolve a cell's decoration without a prepared plan.
+    ///
+    /// For callers outside the paint loop (the exporter, the sidecar, tests)
+    /// that touch a handful of cells rather than a viewport of them. The
+    /// paint loop must use [`SheetFormat::decor_plan`] +
+    /// [`SheetFormat::resolve_decor`]: this one walks every range on the
+    /// sheet per call.
+    pub fn decor_at(&self, cell: CellRef) -> CellDecor {
+        let mut plan = Vec::new();
+        self.decor_plan(cell.col, &mut plan);
+        self.resolve_decor(cell, &plan)
     }
 
     // --- per-cell overrides ---

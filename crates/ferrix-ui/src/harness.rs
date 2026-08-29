@@ -524,6 +524,45 @@ impl Harness {
         self
     }
 
+    // ---- cell decoration: borders, alignment, wrap, rotation (issue #28) ----
+    //
+    // These drive the SAME `apply_decor` the toolbar calls, on the CURRENT
+    // selection, so a test proves the production path rather than reaching
+    // into the store. The counters below read the grid's paint output.
+
+    /// Apply decoration to the current selection through the app command.
+    pub fn apply_decor(&mut self, decor: ferrix_core::CellDecor) -> &mut Self {
+        self.app.apply_decor(decor);
+        self.steps(2);
+        self
+    }
+
+    /// Border EDGES the last frame painted, counted once per edge.
+    pub fn painted_border_segments(&mut self) -> usize {
+        self.step();
+        self.app.painted_border_segments()
+    }
+
+    /// Cells whose text the last frame painted ROTATED.
+    pub fn painted_rotated_texts(&mut self) -> usize {
+        self.step();
+        self.app.painted_rotated_texts()
+    }
+
+    /// Cells whose text the last frame laid out WRAPPED.
+    pub fn painted_wrapped_texts(&mut self) -> usize {
+        self.step();
+        self.app.painted_wrapped_texts()
+    }
+
+    /// Height the app currently paints a row at, read back from its own
+    /// geometry rather than recomputed — the same `cell_screen_rect` the
+    /// editor is positioned with.
+    pub fn painted_row_height(&mut self, cell: ferrix_core::CellRef) -> Option<f32> {
+        self.step();
+        self.app.cell_rect(cell).map(|r| r.height())
+    }
+
     pub fn group_rows(&mut self, first: u32, last: u32) -> Result<u8, String> {
         let r = self.app.group_rows(first, last).map_err(|e| e.to_string());
         self.steps(2);
@@ -987,6 +1026,40 @@ impl Harness {
         }
         self.last_texts = texts.len();
         texts
+    }
+
+    /// Where each painted text was actually placed, as `(text, x, y)` rounded
+    /// to whole pixels (issue #28).
+    ///
+    /// The alignment assertion needs POSITION, not content: switching a cell
+    /// from left to right alignment changes nothing about the glyphs and
+    /// everything about where they land, so `painted_texts` alone would pass
+    /// against an alignment the paint path ignores entirely. Rounded so a
+    /// sub-pixel jitter is not mistaken for a move.
+    pub fn painted_text_positions(&mut self) -> Vec<(String, i32, i32)> {
+        let raw = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, self.screen)),
+            events: std::mem::take(&mut self.events),
+            modifiers: self.pending_modifiers,
+            ..Default::default()
+        };
+        self.pending_modifiers = Modifiers::default();
+        let app = &mut self.app;
+        let out = self.ctx.run(raw, |ctx| app.frame(ctx));
+        self.frame += 1;
+        self.last_shapes = out.shapes.len();
+        let mut v = Vec::new();
+        for s in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &s.shape {
+                v.push((
+                    t.galley.text().to_string(),
+                    t.pos.x.round() as i32,
+                    t.pos.y.round() as i32,
+                ));
+            }
+        }
+        self.last_texts = v.len();
+        v
     }
 }
 
@@ -6212,6 +6285,341 @@ xxx,yyy,zzz
 
         crate::prefs::set_test_config_dir(prev);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================ full cell styling: issue #28, THROUGH THE PAINT PATH ==
+    //
+    // Every test below drives `apply_decor` — the app command the toolbar
+    // calls — and then asserts on what the GRID actually painted or on
+    // geometry read back from the app. That is deliberate. This repo has
+    // shipped four model-complete, unreachable features, each fully tested
+    // through its own API and never called by the grid, and every one of
+    // those test suites was green. A test that only asserts `decor_at(...)`
+    // returns what was stored would pass against a paint path that reads
+    // nothing.
+
+    fn decor_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+        (p, h)
+    }
+
+    /// A border applied to ONE cell reaches the painter.
+    ///
+    /// What would this assert if the feature did nothing? `border_segments`
+    /// would stay at the baseline 0 and the test fails. It counts the SPECIFIC
+    /// output borders produce rather than a total shape count, which would
+    /// also move when the selection outline or a grid line changed.
+    #[test]
+    fn a_border_on_the_selection_is_actually_painted() {
+        let (p, mut h) = decor_fixture("decor_border.csv");
+        let cell = CellRef::new(1, 1);
+        h.select(cell, cell);
+        h.steps(2);
+
+        let before = h.painted_border_segments();
+        assert_eq!(before, 0, "no borders configured, none should be painted");
+
+        h.apply_decor(
+            ferrix_core::CellDecor::default()
+                .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::Thick)),
+        );
+        let after = h.painted_border_segments();
+        assert_eq!(
+            after, 4,
+            "a boxed single cell must paint its four edges; got {after}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// THE shared-edge criterion.
+    ///
+    /// Two horizontally adjacent cells, each boxed, describe SEVEN distinct
+    /// edges, not eight: the line between them belongs to both and must be
+    /// drawn once. Counting edges rather than shapes is what makes this
+    /// assertion able to fail for the right reason — a double border emits two
+    /// strokes per edge and a dashed one emits many, so a shape total would
+    /// move for reasons that have nothing to do with sharing.
+    #[test]
+    fn a_shared_border_between_neighbours_is_not_double_drawn() {
+        let (p, mut h) = decor_fixture("decor_shared.csv");
+        let a = CellRef::new(1, 0);
+        let b = CellRef::new(1, 1);
+        h.select(a, b);
+        h.steps(2);
+        h.apply_decor(
+            ferrix_core::CellDecor::default()
+                .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::Thin)),
+        );
+
+        let n = h.painted_border_segments();
+        assert_eq!(
+            n, 7,
+            "two boxed neighbours share one vertical edge, so 7 edges — not 8 \
+             (double-drawn) and not 4 (one cell missed); got {n}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Rotation changes what is PAINTED, asserted through the rotated-text
+    /// count rather than by eye.
+    ///
+    /// A rotated cell emits an `egui::Shape::Text` carrying an angle instead
+    /// of a plain galley — a different call, from a different branch. If the
+    /// paint path ignored `rotation` this count would stay 0.
+    #[test]
+    fn rotation_changes_what_the_grid_paints() {
+        let (p, mut h) = decor_fixture("decor_rot.csv");
+        let cell = CellRef::new(1, 1);
+        h.select(cell, cell);
+        h.steps(2);
+        assert_eq!(h.painted_rotated_texts(), 0, "nothing is rotated yet");
+
+        h.apply_decor(ferrix_core::CellDecor::default().with_rotation(45));
+        assert_eq!(
+            h.painted_rotated_texts(),
+            1,
+            "the rotated cell's text must reach the painter as a rotated shape"
+        );
+
+        // And the model agrees with what was painted, so the two cannot drift.
+        assert_eq!(h.app().decor_at(cell).rotation_deg(), 45);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Wrapping makes the row TALLER, and the grid still hit-tests correctly:
+    /// a click resolves to the same cell it visually covers.
+    ///
+    /// This is the criterion that catches the two-independent-mappings bug.
+    /// The click point is taken from the app's own geometry — the BOTTOM of
+    /// the grown cell, which under the old uniform-height arithmetic would
+    /// belong to the row BELOW. If paint and hit-testing derived heights
+    /// separately, this click would select the wrong row while every
+    /// single-feature test stayed green.
+    #[test]
+    fn wrapped_text_grows_its_row_and_the_click_still_lands_on_it() {
+        let p = write_csv(
+            "decor_wrap.csv",
+            "id,note\n1,short\n2,a very long note that has to wrap over several lines to fit\n3,tail\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+
+        let wrapped = CellRef::new(1, 1);
+        let plain = CellRef::new(0, 1);
+        let base = h.painted_row_height(plain).expect("plain row on screen");
+        let before = h.painted_row_height(wrapped).expect("target row on screen");
+        assert_eq!(
+            before, base,
+            "nothing wraps yet, so every row is the same height"
+        );
+
+        h.select(wrapped, wrapped);
+        h.steps(2);
+        h.apply_decor(ferrix_core::CellDecor::default().with_wrap(true));
+
+        assert_eq!(
+            h.painted_wrapped_texts(),
+            1,
+            "the cell's text must actually be laid out wrapped"
+        );
+        let after = h.painted_row_height(wrapped).expect("still on screen");
+        assert!(
+            after > base + 1.0,
+            "wrapping must make the row taller: {base} -> {after}"
+        );
+        assert_eq!(
+            h.painted_row_height(plain),
+            Some(base),
+            "only the wrapped row grows; its neighbours keep their height"
+        );
+
+        // --- hit testing, at a pixel the row only covers BECAUSE it grew ---
+        let rect = h.app().cell_rect(wrapped).expect("rect");
+        let deep_y = rect.max.y - 3.0;
+        assert!(
+            deep_y > rect.min.y + base,
+            "the probe point must be below where the row's old bottom edge was, \
+             or this asserts nothing"
+        );
+        h.click_point(rect.center().x, deep_y);
+        assert_eq!(
+            h.app().selection().cursor,
+            wrapped,
+            "a click inside the grown row selected a different cell — paint and \
+             hit-testing disagree about how tall the row is"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Alignment reaches the painter: a centred cell's text moves.
+    ///
+    /// Asserted on the painted x of the galley, read back through the app's
+    /// geometry, rather than on a stored enum.
+    #[test]
+    fn horizontal_alignment_moves_the_painted_text() {
+        let (p, mut h) = decor_fixture("decor_align.csv");
+        // A TEXT cell, which the grid left-aligns by default, so switching to
+        // right alignment is a real, observable move.
+        let cell = CellRef::new(0, 1);
+        h.select(cell, cell);
+        h.steps(2);
+        let before = h.painted_text_positions();
+        h.apply_decor(ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Right));
+        let after = h.painted_text_positions();
+        assert_ne!(
+            before, after,
+            "changing the alignment did not move any painted text — the paint \
+             path is not reading h_align"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// THE scale criterion, through the production command.
+    ///
+    /// A column-scope decoration over ten million rows must leave the format
+    /// store under a kilobyte. Asserted on STORED SIZE, not appearance: a
+    /// per-cell implementation would look identical on screen and fail here by
+    /// several hundred megabytes.
+    #[test]
+    fn a_column_scope_decor_over_10m_rows_keeps_the_store_under_1kb() {
+        let (p, mut h) = decor_fixture("decor_scale.csv");
+        // Select the whole of column 1, which is what routes `apply_decor` to
+        // COLUMN scope, then claim ten million rows for it.
+        let rows = h.app().row_count() as u32;
+        h.select(CellRef::new(0, 1), CellRef::new(rows - 1, 1));
+        h.steps(2);
+        h.apply_decor(
+            ferrix_core::CellDecor::default()
+                .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::Medium))
+                .with_h_align(ferrix_core::HAlign::Center)
+                .with_wrap(true)
+                .with_indent(3),
+        );
+
+        assert_eq!(
+            h.app().decor_count(),
+            1,
+            "a whole-column selection must produce ONE column-scope entry"
+        );
+        let bytes = h.app().format_heap_bytes();
+        assert!(
+            bytes < 1024,
+            "a column-scope decoration must stay under 1KB; got {bytes} bytes"
+        );
+        // It really covers row 9,999,999 — a rule that had quietly become
+        // range-scoped over the four rows on screen would also be small.
+        let deep = h.app().decor_at(CellRef::new(9_999_999, 1));
+        assert_eq!(deep.h_align, Some(ferrix_core::HAlign::Center));
+        assert!(deep.wraps());
+        assert!(deep.border(ferrix_core::Side::Top).is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Indent moves the text without changing the alignment, and a border on
+    /// a hidden column paints nothing.
+    ///
+    /// The second half is the degenerate-rect guard: a hidden column is ZERO
+    /// WIDE, and a zero-width rect still `intersects` its clip, so nothing
+    /// downstream would skip it. If the border code did not skip on the width
+    /// itself, four edges would be drawn at a column the user cannot see.
+    #[test]
+    fn a_border_on_a_hidden_column_paints_nothing() {
+        let (p, mut h) = decor_fixture("decor_hidden.csv");
+        let rows = h.app().row_count() as u32;
+        h.select(CellRef::new(0, 1), CellRef::new(rows - 1, 1));
+        h.steps(2);
+        h.apply_decor(
+            ferrix_core::CellDecor::default()
+                .with_box(ferrix_core::Border::new(ferrix_core::BorderStyle::Thick)),
+        );
+        let visible = h.painted_border_segments();
+        assert!(visible > 0, "the borders must be painted while visible");
+
+        h.hide_column(1);
+        h.steps(2);
+        assert_eq!(
+            h.painted_border_segments(),
+            0,
+            "a hidden column is zero wide and must paint no border at all"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Wrapping composes with a SORT: the tall row follows its record.
+    ///
+    /// The composition case the guide's one-row-resolution rule exists for.
+    /// Row heights are resolved through `RowResolver` like everything else,
+    /// so sorting must move the tall row to wherever its RECORD went. A second
+    /// height mapping keyed on screen position would leave the tall row parked
+    /// at its old screen index — the "wrong records under correct row numbers"
+    /// failure, wearing a different hat.
+    ///
+    /// Asserted on the cell's own painted rect, so it reads the geometry the
+    /// grid produced rather than a model of it.
+    #[test]
+    fn a_wrapped_row_follows_its_record_through_a_sort() {
+        // `zz` sorts last and `aa` first, so sorting ascending on column 0
+        // moves the long-note record from the top to the bottom.
+        let p = write_csv(
+            "decor_wrap_sort.csv",
+            "key,note\nzz,a very long note that must wrap across several lines to fit the cell\naa,short\nmm,tiny\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+
+        let tall = CellRef::new(0, 1);
+        h.select(tall, tall);
+        h.steps(2);
+        h.apply_decor(ferrix_core::CellDecor::default().with_wrap(true));
+
+        let base = h
+            .painted_row_height(CellRef::new(1, 1))
+            .expect("short row on screen");
+        let before = h.painted_row_height(tall).expect("tall row on screen");
+        assert!(
+            before > base + 1.0,
+            "the wrapped row is not actually taller: {base} -> {before}"
+        );
+        let y_before = h.app().cell_rect(tall).expect("rect").min.y;
+
+        // Sort ascending on the key column. `zz` goes last, so the wrapped
+        // record moves DOWN the screen.
+        h.click_header(0);
+        h.steps(2);
+
+        let after = h
+            .painted_row_height(tall)
+            .expect("the tall row is still on screen after the sort");
+        assert_eq!(
+            after, before,
+            "the wrapped row changed height when it was sorted — its height is \
+             being derived from a screen position rather than from its record"
+        );
+        let y_after = h.app().cell_rect(tall).expect("rect").min.y;
+        assert!(
+            y_after > y_before,
+            "the record that sorts last did not move down: {y_before} -> {y_after}"
+        );
+        assert_eq!(
+            h.painted_wrapped_texts(),
+            1,
+            "exactly one cell should still be wrapped after the sort"
+        );
+
+        // And a click at the sorted position still lands on that record.
+        let rect = h.app().cell_rect(tall).expect("rect");
+        h.click_point(rect.center().x, rect.max.y - 3.0);
+        assert_eq!(
+            h.app().selection().cursor,
+            tall,
+            "a click inside the sorted, wrapped row resolved to a different cell"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

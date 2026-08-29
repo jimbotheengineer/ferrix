@@ -42,7 +42,8 @@ pub use column::Column;
 pub use comment::{Comment, CommentMap};
 pub use filter::RowFilter;
 pub use format::{
-    CellOverride, ColumnFormat, ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat,
+    Border, BorderStyle, CellDecor, CellOverride, ColumnFormat, DecorEntry, Diagonal, HAlign,
+    ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat, Side, VAlign,
 };
 pub use order::{AxisOrder, OrderError, SheetOrder};
 pub use overlay::{CellInput, EditOverlay, OverlayChange};
