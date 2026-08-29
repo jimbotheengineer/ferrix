@@ -24,12 +24,54 @@ use std::path::PathBuf;
 use crate::theme::ThemeMode;
 
 /// Everything persisted between runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// `PartialEq` but not `Eq`: `zoom` is an f32. Comparisons here are exact by
+/// design — a zoom is only ever one of a fixed set of stops, or a value that
+/// round-tripped through this file's own formatting.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prefs {
     /// `None` means "never chosen" — the caller then follows the OS.
     pub theme: Option<ThemeMode>,
     /// Issue #20: show empty padding rows past the end of the sheet.
     pub show_empty_rows: bool,
+    /// Zoom level per sheet, keyed by sheet NAME rather than by `SheetId`.
+    ///
+    /// Ids are assigned per run and mean nothing across a restart; the name is
+    /// what the user recognises and what survives reopening the file. Only
+    /// sheets the user actually zoomed appear, so the default costs nothing.
+    pub zoom: Vec<(String, f32)>,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            show_empty_rows: false,
+            zoom: Vec::new(),
+        }
+    }
+}
+
+impl Prefs {
+    /// Zoom remembered for a sheet, or 100% when it was never set.
+    pub fn zoom_of(&self, sheet: &str) -> f32 {
+        self.zoom
+            .iter()
+            .find(|(n, _)| n == sheet)
+            .map(|&(_, z)| crate::grid::clamp_zoom(z))
+            .unwrap_or(1.0)
+    }
+
+    /// Remember a sheet's zoom. 100% is the default, so it is REMOVED rather
+    /// than stored — otherwise the file would accrue an entry for every sheet
+    /// the user ever glanced at.
+    pub fn set_zoom(&mut self, sheet: &str, zoom: f32) {
+        let z = crate::grid::clamp_zoom(zoom);
+        self.zoom.retain(|(n, _)| n != sheet);
+        if (z - 1.0).abs() > 1e-4 {
+            self.zoom.push((sheet.to_string(), z));
+        }
+    }
 }
 
 const FILE: &str = "prefs.toml";
@@ -83,25 +125,43 @@ impl Prefs {
                 // falls back to the OS preference rather than to a guess.
                 "theme" => out.theme = ThemeMode::parse(v),
                 "show_empty_rows" => out.show_empty_rows = v == "true",
+                // `zoom.<sheet name> = 2` — one line per zoomed sheet. A name
+                // containing '=' still parses: `split_once` takes the FIRST
+                // '=', and the key is everything before it.
+                k2 if k2.starts_with("zoom.") => {
+                    let name = k2.trim_start_matches("zoom.").trim().trim_matches('"');
+                    if let Ok(z) = v.parse::<f32>() {
+                        if !name.is_empty() {
+                            out.set_zoom(name, z);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         out
     }
 
-    pub fn to_text(self) -> String {
+    pub fn to_text(&self) -> String {
         let mut s = String::from("# Ferrix preferences\n");
         if let Some(t) = self.theme {
             s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
         }
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
+        for (name, z) in &self.zoom {
+            // Newlines in a sheet name would forge a second key, so they are
+            // dropped rather than written — a preference file must never be
+            // able to inject a setting the user did not choose.
+            let name = name.replace(['\n', '\r'], " ");
+            s.push_str(&format!("zoom.{name} = {z}\n"));
+        }
         s
     }
 
     /// Best-effort write. A failure to persist a preference is not worth
     /// interrupting the user over, so the error is returned for logging and
     /// otherwise dropped by the caller.
-    pub fn save(self) -> std::io::Result<()> {
+    pub fn save(&self) -> std::io::Result<()> {
         let Some(dir) = config_dir() else {
             return Ok(());
         };
@@ -121,6 +181,7 @@ mod tests {
                 let p = Prefs {
                     theme,
                     show_empty_rows,
+                    zoom: vec![("Sheet1".into(), 2.0), ("quarterly report".into(), 0.5)],
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -150,6 +211,7 @@ mod tests {
         let full = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            zoom: vec![("Sheet1".into(), 3.0)],
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -172,6 +234,7 @@ mod tests {
         let want = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            zoom: vec![("Sheet1".into(), 2.0)],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

@@ -339,6 +339,66 @@ impl Harness {
         self
     }
 
+    // ---- freeze / split / zoom (roadmap #6) ----
+
+    /// Freeze at the cursor. Exposed for the same reason as
+    /// `toggle_filter_mode`: the menu item's pixel position moves with the
+    /// theme and window width, and a test about FREEZE SEMANTICS should not be
+    /// a test about where a menu happens to open. The same entry point the
+    /// menu item calls.
+    pub fn freeze_at_cursor(&mut self, rows: bool, cols: bool) -> &mut Self {
+        self.app.freeze_at_cursor(rows, cols);
+        self.steps(2);
+        self
+    }
+
+    pub fn unfreeze(&mut self) -> &mut Self {
+        self.app.unfreeze();
+        self.steps(2);
+        self
+    }
+
+    pub fn split_at_cursor(&mut self) -> &mut Self {
+        self.app.split_at_cursor();
+        self.steps(2);
+        self
+    }
+
+    pub fn set_zoom(&mut self, z: f32) -> &mut Self {
+        self.app.set_zoom(z);
+        self.steps(2);
+        self
+    }
+
+    /// Scroll the body pane to a screen row and let the frame settle.
+    pub fn scroll_body_to(&mut self, screen_row: f64) -> &mut Self {
+        self.app.scroll_body_to(screen_row);
+        self.steps(2);
+        self
+    }
+
+    /// Click a CELL at its ACTUAL painted centre, read back from the app.
+    ///
+    /// Same discipline as `click_header`: geometry comes from the running app
+    /// rather than from constants, so the click still lands when the zoom
+    /// changes or a bar opens above the grid. Returns false when the cell is
+    /// not on screen, which is itself a useful assertion.
+    pub fn click_cell(&mut self, cell: ferrix_core::CellRef) -> bool {
+        self.step();
+        let Some((x, y)) = self.app.cell_center(cell) else {
+            return false;
+        };
+        self.click_at(x, y).steps(2);
+        true
+    }
+
+    /// Click a raw viewport POINT — the whole point of the zoom hit-test
+    /// check, where the test must supply the pixel and the app must resolve it.
+    pub fn click_point(&mut self, x: f32, y: f32) -> &mut Self {
+        self.click_at(x, y).steps(2);
+        self
+    }
+
     /// The app under test, for assertions.
     pub fn app(&self) -> &FerrixApp {
         &self.app
