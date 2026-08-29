@@ -5254,6 +5254,61 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&p);
     }
 
+    /// COMPOSITION of #29 (hiding) and #38 (show formulas) in one paint.
+    ///
+    /// Neither branch could write this. Both extended the SAME cell-paint
+    /// loop independently: #29 gives a hidden column zero width via
+    /// `width_of`, and #38 substitutes `edit_text(cell)` for the value. Each
+    /// branch's own tests pass without the other's field even existing, so
+    /// the failure mode they cannot see is "show formulas resurrects a hidden
+    /// column" — the source is fetched per painted cell, and if that fetch
+    /// ran outside the width/visibility check, hiding would silently stop
+    /// working exactly when the mode is on.
+    ///
+    /// Asserts on PAINTED text rather than on a flag, because a leak here is
+    /// visible only on screen.
+    #[test]
+    fn hiding_a_column_still_hides_it_when_showing_formulas() {
+        let (p, mut h) = fbar_fixture("compose_hide_show.csv");
+        // Off the formula cell: the formula BAR paints the selected cell's
+        // source regardless of the grid mode, which would mask the leak.
+        h.press_key(Key::ArrowDown).steps(2);
+
+        // Column C (index 2) holds the formula in C1 and the values below.
+        h.hide_column(2);
+        let hidden_plain = h.painted_texts();
+        assert!(
+            !hidden_plain.iter().any(|t| t == "90"),
+            "precondition: hiding column C must remove its value: {hidden_plain:?}"
+        );
+
+        h.toggle_show_formulas();
+        assert!(h.app().showing_formulas(), "the toggle did not take");
+
+        let hidden_formulas = h.painted_texts();
+        assert!(
+            !hidden_formulas.iter().any(|t| t.contains("SUM(C2:C4)")),
+            "a HIDDEN column painted its formula source — show-formulas \
+             bypassed the hidden-column width check: {hidden_formulas:?}"
+        );
+        assert!(
+            !hidden_formulas.iter().any(|t| t == "90"),
+            "the hidden column's value came back with formulas on: {hidden_formulas:?}"
+        );
+
+        // ...and unhiding with the mode still on shows the SOURCE, proving
+        // the assertions above failed for the right reason (the column being
+        // hidden) rather than because show-formulas does nothing here.
+        h.unhide_column(2);
+        let shown = h.painted_texts();
+        assert!(
+            shown.iter().any(|t| t.contains("=SUM(C2:C4)")),
+            "unhiding with formulas on must reveal the source: {shown:?}"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// Ctrl+` must change what is PAINTED, not just a flag.
     ///
     /// Asserted on the galley text of the frame's own tessellated output: a

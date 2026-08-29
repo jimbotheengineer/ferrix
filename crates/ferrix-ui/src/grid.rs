@@ -1168,6 +1168,17 @@ impl<'a> Grid<'a> {
             for (ci, &(c, x)) in col_bands.iter().enumerate() {
                 let in_lead_cols = ci < band_cols;
                 let w = width_of(c);
+                // A hidden column is ZERO WIDE (issue #29). Skip it before
+                // anything is drawn: a zero-width `cell_rect` still
+                // `intersects` the band clip — a point inside a rect counts —
+                // so the check below does NOT catch this, and the cell's text
+                // would be painted at the hidden column's x and spill over the
+                // neighbour that took its place. The criterion is that a
+                // hidden column is skipped in paint, so this is where it is
+                // enforced, next to the width that defines it.
+                if w <= 0.0 {
+                    continue;
+                }
                 let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, row_h));
                 // Clip to the intersection of this cell's row band and column
                 // band, so neither band paints over the other.
