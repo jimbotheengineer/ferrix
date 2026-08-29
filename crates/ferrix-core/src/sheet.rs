@@ -264,6 +264,24 @@ impl Sheet {
         query: &crate::search::Query,
         limit: usize,
     ) -> crate::search::SearchResults {
+        self.search_rows(query, 0, usize::MAX, limit)
+    }
+
+    /// Search a half-open row window `[r0, r1)`.
+    ///
+    /// This is what lets Replace All stream. A full-sheet search must
+    /// materialise every hit it reports, so its memory is O(matches) — fine
+    /// for showing "3 of 412", fatal for a replace that matches 80 million
+    /// cells. Walking the sheet a window at a time keeps peak memory at
+    /// O(window), and each window still gets the arena-first columnar scan, so
+    /// the total work is the same integer pass it always was.
+    pub fn search_rows(
+        &self,
+        query: &crate::search::Query,
+        r0: usize,
+        r1: usize,
+        limit: usize,
+    ) -> crate::search::SearchResults {
         let t = std::time::Instant::now();
         let ids = crate::search::IdSet::from_arena(&self.arena, query);
 
@@ -271,7 +289,7 @@ impl Sheet {
         let mut per_col: Vec<(usize, Vec<u32>)> = Vec::new();
         for (ci, col) in self.columns.iter().enumerate() {
             let mut rows = Vec::new();
-            col.scan_matches(0, col.len(), query, &ids, &mut rows);
+            col.scan_matches(r0, r1.min(col.len()), query, &ids, &mut rows);
             if !rows.is_empty() {
                 per_col.push((ci, rows));
             }

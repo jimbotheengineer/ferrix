@@ -442,6 +442,121 @@ impl<'a> SheetView<'a> {
             Value::Error(e) => query.matches_str(e.as_str()),
         }
     }
+
+    /// Search one half-open row window, base only, without overlay
+    /// reconciliation.
+    ///
+    /// Replace All reconciles the overlay itself as it walks (an edited cell's
+    /// current text is read through `replace_text`), so a windowed scan does
+    /// not repeat that work.
+    fn search_rows(
+        &self,
+        query: &ferrix_core::Query,
+        r0: usize,
+        r1: usize,
+        limit: usize,
+    ) -> ferrix_core::SearchResults {
+        match self.base {
+            BaseData::Memory(s) => s.search_rows(query, r0, r1, limit),
+            BaseData::Mapped(m) => m.search_rows(query, r0, r1, limit),
+        }
+    }
+
+    /// The text a replace reads for `cell`, under `look_in`.
+    ///
+    /// `None` means "this cell is not a candidate at all", which is how
+    /// `LookIn::Values` skips formula cells: a formula's displayed value is a
+    /// computed result, and overwriting a result with text would silently
+    /// destroy the formula that produced it.
+    pub fn replace_text(&self, cell: CellRef, look_in: ferrix_core::LookIn) -> Option<String> {
+        match look_in {
+            ferrix_core::LookIn::Values => {
+                if self.overlay.has_formula(cell) {
+                    return None;
+                }
+                Some(self.display(cell))
+            }
+            // `edit_text` is exactly the right reader here: a formula answers
+            // with its SOURCE (`=A1*2`), everything else with its text. That
+            // is what makes "look in: formulas" rewrite the formula rather
+            // than the number it currently shows.
+            ferrix_core::LookIn::Formulas => Some(self.edit_text(cell)),
+        }
+    }
+
+    /// Candidate cells in one half-open row window, in row-major order.
+    ///
+    /// The window is the unit that bounds memory. Callers that must hold a
+    /// `&mut` on the workbook to apply edits (which is every real caller)
+    /// cannot keep a borrowing iterator alive across the write, so they loop
+    /// over windows instead: scan a window, drop the borrow, apply, repeat.
+    /// Peak memory is therefore O(window hits), never O(total matches).
+    pub fn replace_window(
+        &self,
+        query: &ferrix_core::Query,
+        look_in: ferrix_core::LookIn,
+        r0: usize,
+        r1: usize,
+    ) -> Vec<(CellRef, String)> {
+        let mut hits = self.search_rows(query, r0, r1, usize::MAX).matches;
+
+        // Overlay cells in this window the base scan could not know about: an
+        // edit may have created a match, and under LookIn::Formulas a
+        // formula's SOURCE may match while its displayed result does not.
+        if !self.overlay.is_empty() {
+            let mut extra: Vec<CellRef> = Vec::new();
+            for (cell, input) in self.overlay.edited_cells() {
+                let row = cell.row as usize;
+                if row < r0 || row >= r1 {
+                    continue;
+                }
+                let matched = match look_in {
+                    ferrix_core::LookIn::Values => self.value_matches(&input.value(), query),
+                    ferrix_core::LookIn::Formulas => match input.formula_src() {
+                        Some(src) => query.matches_str(src),
+                        None => self.value_matches(&input.value(), query),
+                    },
+                };
+                if matched
+                    && hits
+                        .binary_search_by(|m| (m.row, m.col).cmp(&(cell.row, cell.col)))
+                        .is_err()
+                {
+                    extra.push(*cell);
+                }
+            }
+            if !extra.is_empty() {
+                hits.extend(extra);
+                hits.sort_by_key(|c| (c.row, c.col));
+                hits.dedup();
+            }
+        }
+
+        let mut out = Vec::with_capacity(hits.len());
+        for cell in hits {
+            // An edited cell is a candidate only if its CURRENT text matches;
+            // the base scan may be reporting a match the user has edited away.
+            if look_in == ferrix_core::LookIn::Values {
+                if let Some(v) = self.overlay.value(cell) {
+                    if !self.value_matches(&v, query) {
+                        continue;
+                    }
+                }
+            }
+            let Some(text) = self.replace_text(cell, look_in) else {
+                continue;
+            };
+            // Under LookIn::Formulas the base scan matched the displayed
+            // value, but the text about to be rewritten is the SOURCE — re-test
+            // it so a cell whose source does not contain the needle is never
+            // touched.
+            if look_in == ferrix_core::LookIn::Formulas && !query.matches_str(&text) {
+                continue;
+            }
+            out.push((cell, text));
+        }
+        out
+    }
 }
 
 /// Formulas evaluate against the composite view, so `=SUM(A1:A10)` sees edited

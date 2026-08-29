@@ -37,8 +37,10 @@ pub use format::{
     CellOverride, ColumnFormat, ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat,
 };
 pub use order::{AxisOrder, OrderError, SheetOrder};
-pub use overlay::{CellInput, EditOverlay};
-pub use search::{IdSet, Query, SearchResults};
+pub use overlay::{CellInput, EditOverlay, OverlayChange};
+pub use search::{
+    replace_stream, IdSet, LookIn, Query, ReplaceOutcome, ReplaceReport, ReplaceSpec, SearchResults,
+};
 pub use selection::Selection;
 pub use sheet::{column_name, CellRef, Sheet, SheetCell, SheetId};
 pub use table::{

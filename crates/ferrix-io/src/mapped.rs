@@ -311,6 +311,12 @@ impl MappedSheet {
 /// per-column row lists at the end.
 impl MappedSheet {
     pub fn search(&self, query: &Query, limit: usize) -> SearchResults {
+        self.search_rows(query, 0, usize::MAX, limit)
+    }
+
+    /// Search a half-open row window `[r0, r1)` — the streaming entry point
+    /// Replace All walks the sheet with. See [`ferrix_core::Sheet::search_rows`].
+    pub fn search_rows(&self, query: &Query, r0: usize, r1: usize, limit: usize) -> SearchResults {
         let t = std::time::Instant::now();
 
         // Step 1: match the needle against the arena. This is the whole trick
@@ -345,13 +351,21 @@ impl MappedSheet {
                 }
 
                 let len = d.len as usize;
-                let tags = &self.mmap[d.tags_off as usize..d.tags_off as usize + len];
+                // Clamp the window to this column's extent. The whole-column
+                // skips above still apply; this only narrows the byte range.
+                let lo = r0.min(len);
+                let hi = r1.min(len);
+                if lo >= hi {
+                    return (ci, rows);
+                }
+                let tags = &self.mmap[d.tags_off as usize + lo..d.tags_off as usize + hi];
                 let t_num = ValueTag::Number as u8;
                 let t_bool = ValueTag::Bool as u8;
                 let t_text = ValueTag::Text as u8;
                 let t_err = ValueTag::Error as u8;
 
-                for (i, &tag) in tags.iter().enumerate() {
+                for (off, &tag) in tags.iter().enumerate() {
+                    let i = lo + off;
                     let hit = if tag == t_text {
                         if !scan_text {
                             false

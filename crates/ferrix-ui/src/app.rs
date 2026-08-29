@@ -92,6 +92,33 @@ pub struct FerrixApp {
     search_whole_cell: bool,
     /// Filter mode: when on, the grid renders only rows containing a match.
     search_filter_mode: bool,
+    /// Replace panel state. It sits beside the search box (Ctrl+H) rather than
+    /// in its own window, so find and replace share one query and one set of
+    /// options — toggling "match case" must mean the same thing to both.
+    replace_open: bool,
+    replace_input: String,
+    replace_focus_pending: bool,
+    /// Regex mode applies to the search query itself, so Ctrl+F and Ctrl+H
+    /// agree on what a match is.
+    search_regex: bool,
+    /// Reported when a regex fails to compile. Silently finding nothing would
+    /// be indistinguishable from "no matches", which is the worst answer to a
+    /// typo'd pattern.
+    search_regex_error: Option<String>,
+    /// Whether a replace reads displayed values or formula source text.
+    replace_look_in: ferrix_core::LookIn,
+    /// Cancellation for a running Replace All. Held across frames so the
+    /// Cancel button can flip it while the pass is in flight.
+    replace_cancel: ferrix_core::CancelToken,
+    /// Live `(examined, applied)` from the pass in progress, so a long replace
+    /// reports rather than freezing silently.
+    replace_progress: Option<(usize, usize)>,
+    /// Trip the cancel flag once this many cells have been applied.
+    ///
+    /// Exists so a test can stop a Replace All at a KNOWN point instead of
+    /// racing a timer thread against it. Always `None` in the running app,
+    /// where the Cancel button flips `replace_cancel` directly.
+    replace_cancel_after_applied: Option<usize>,
     /// The visible-row -> underlying-row mapping backing filter mode.
     ///
     /// Rebuilt once per search (and once when the toggle flips), never per
@@ -217,6 +244,15 @@ impl FerrixApp {
             search_whole_cell: false,
             chart: crate::chart_panel::ChartPanel::default(),
             search_filter_mode: false,
+            replace_open: false,
+            replace_input: String::new(),
+            replace_focus_pending: false,
+            search_regex: false,
+            search_regex_error: None,
+            replace_look_in: ferrix_core::LookIn::Values,
+            replace_cancel: ferrix_core::CancelToken::new(),
+            replace_progress: None,
+            replace_cancel_after_applied: None,
             row_filter: None,
             header_drag: None,
             fill_source: None,
@@ -1411,6 +1447,16 @@ impl FerrixApp {
         self.wb.view().display(cell)
     }
 
+    /// What the formula bar would show for a cell: a formula's SOURCE text,
+    /// otherwise its display value.
+    ///
+    /// This is the only way a test can tell "the formula was rewritten" from
+    /// "the formula was replaced by a literal that happens to show the same
+    /// number" — the exact confusion 'look in: formulas' has to avoid.
+    pub fn edit_text(&self, cell: CellRef) -> String {
+        self.wb.view().edit_text(cell)
+    }
+
     /// The cursor cell — where typing lands.
     pub fn cursor(&self) -> CellRef {
         self.selection.cursor
@@ -1752,11 +1798,7 @@ impl FerrixApp {
             // keep the cap sane on a huge machine rather than letting it grow
             // until the search itself becomes the slow part.
             .min(5_000_000);
-        let Some(query) = ferrix_core::Query::new(
-            self.search_input.trim(),
-            self.search_case_sensitive,
-            self.search_whole_cell,
-        ) else {
+        let Some(query) = self.compiled_query() else {
             self.search_results = ferrix_core::SearchResults::default();
             self.search_index = 0;
             self.rebuild_row_filter();
@@ -1877,6 +1919,7 @@ impl FerrixApp {
 
     fn close_search(&mut self) {
         self.search_open = false;
+        self.replace_open = false;
         self.search_results = ferrix_core::SearchResults::default();
         self.search_index = 0;
         // Closing search must restore the full sheet: leaving rows hidden with
@@ -1885,6 +1928,202 @@ impl FerrixApp {
         // Re-anchor the viewport in unfiltered row space.
         self.scroll_to_selection();
         self.focus = Focus::Grid;
+    }
+
+    // ------------------------------------------------------------- replace
+
+    /// Compile the current search box into a [`ferrix_core::Query`].
+    ///
+    /// One place, so Ctrl+F and Ctrl+H can never disagree about what a match
+    /// is. A malformed regex is recorded in `search_regex_error` and returns
+    /// `None` — the caller then finds nothing, and the panel says why.
+    fn compiled_query(&mut self) -> Option<ferrix_core::Query> {
+        let raw = self.search_input.trim().to_string();
+        match ferrix_core::Query::compile(
+            &raw,
+            self.search_case_sensitive,
+            self.search_whole_cell,
+            self.search_regex,
+        ) {
+            Ok(q) => {
+                self.search_regex_error = None;
+                q
+            }
+            Err(e) => {
+                self.search_regex_error = Some(e);
+                None
+            }
+        }
+    }
+
+    fn replace_spec(&mut self) -> Option<ferrix_core::ReplaceSpec> {
+        let query = self.compiled_query()?;
+        Some(ferrix_core::ReplaceSpec::new(
+            query,
+            self.replace_input.clone(),
+            self.replace_look_in,
+        ))
+    }
+
+    /// Replace at the current match, then advance to the next one.
+    fn replace_current(&mut self) {
+        let Some(spec) = self.replace_spec() else {
+            self.status = match &self.search_regex_error {
+                Some(e) => format!("Bad pattern: {e}"),
+                None => "Nothing to replace — type something to find".into(),
+            };
+            return;
+        };
+        let Some(cell) = self.search_results.wrapped(self.search_index) else {
+            self.status = "No match to replace".into();
+            return;
+        };
+        match self.wb.replace_one(cell, &spec) {
+            Some(new_text) => {
+                self.status = format!(
+                    "Replaced in {}{} → {new_text:?}",
+                    ferrix_core::column_name(cell.col),
+                    cell.row + 1
+                );
+                // The sheet changed under the result list, so re-find before
+                // advancing — otherwise "next" could step onto a stale hit.
+                self.run_search();
+                self.next_match();
+            }
+            None => {
+                self.status = "That cell no longer matches".into();
+                self.next_match();
+            }
+        }
+    }
+
+    /// Replace everywhere, as ONE undo step.
+    ///
+    /// Runs on the UI thread deliberately: the pass polls `replace_cancel` and
+    /// reports progress, and moving it off-thread would require snapshotting
+    /// the overlay and merging edits back, which is a much larger change than
+    /// this feature needs. The window loop keeps it responsive to cancel.
+    fn replace_all(&mut self) {
+        let Some(spec) = self.replace_spec() else {
+            self.status = match &self.search_regex_error {
+                Some(e) => format!("Bad pattern: {e}"),
+                None => "Nothing to replace — type something to find".into(),
+            };
+            return;
+        };
+        // Derived from live memory, not a magic number: every replaced cell
+        // costs an overlay entry plus a before/after pair in the single undo
+        // entry, and a term matching 80M cells on a 200M-row sheet would
+        // otherwise build an undo entry larger than RAM.
+        let max_edits = ferrix_core::Budget::sample()
+            .max_units_usize(ferrix_core::budget::cost::REPLACE_CELL)
+            .min(20_000_000);
+
+        self.replace_cancel.reset();
+        let cancel = self.replace_cancel.clone();
+        // Deterministic cancellation for tests: cancel from inside the pass's
+        // own progress callback at a known point, rather than racing a timer
+        // against it from another thread. A flaky cancel test proves nothing
+        // about cancel, and a spinning helper thread slows every other test
+        // sharing the machine.
+        let trip = self.replace_cancel_after_applied;
+        let cancel_for_cb = cancel.clone();
+        let report = self
+            .wb
+            .replace_all(&spec, max_edits, &cancel, |_examined, applied| {
+                if let Some(n) = trip {
+                    if applied >= n {
+                        cancel_for_cb.cancel();
+                    }
+                }
+            });
+        self.replace_progress = None;
+
+        self.status = report.describe();
+        // The result list is stale the moment cells change; re-find so the
+        // count and the highlights describe the sheet as it is now.
+        self.run_search();
+    }
+
+    /// Whether the replace panel is open.
+    pub fn replace_is_open(&self) -> bool {
+        self.replace_open
+    }
+
+    /// The replace panel's replacement text.
+    #[allow(dead_code)] // harness API
+    pub fn replace_text_input(&self) -> &str {
+        &self.replace_input
+    }
+
+    /// Which text a replace reads.
+    #[allow(dead_code)] // harness API
+    pub fn replace_look_in(&self) -> ferrix_core::LookIn {
+        self.replace_look_in
+    }
+
+    /// Set the replacement text. The panel's TextEdit writes the same field;
+    /// this is how a test drives it without pixel-hunting the box.
+    pub fn set_replace_input(&mut self, s: &str) {
+        self.replace_input = s.to_string();
+    }
+
+    pub fn set_search_input(&mut self, s: &str) {
+        self.search_input = s.to_string();
+        self.run_search();
+    }
+
+    pub fn set_replace_look_in(&mut self, look_in: ferrix_core::LookIn) {
+        self.replace_look_in = look_in;
+    }
+
+    pub fn set_search_regex(&mut self, on: bool) {
+        self.search_regex = on;
+        self.run_search();
+    }
+
+    pub fn set_search_case_sensitive(&mut self, on: bool) {
+        self.search_case_sensitive = on;
+        self.run_search();
+    }
+
+    pub fn set_search_whole_cell(&mut self, on: bool) {
+        self.search_whole_cell = on;
+        self.run_search();
+    }
+
+    /// A handle to the running replace's cancel flag, so a test (or the
+    /// Cancel button) can stop a pass in flight.
+    pub fn replace_cancel_token(&self) -> ferrix_core::CancelToken {
+        self.replace_cancel.clone()
+    }
+
+    /// Arrange for the next Replace All to cancel itself once `n` cells have
+    /// been applied. Test seam; see the field's docs.
+    pub fn cancel_replace_after(&mut self, n: usize) {
+        self.replace_cancel_after_applied = Some(n);
+    }
+
+    /// Shrink the Replace All scan window so a small fixture still crosses
+    /// several window boundaries. Test seam.
+    pub fn set_replace_window_rows(&mut self, rows: usize) {
+        self.wb.set_replace_window_rows(rows);
+    }
+
+    /// Run Replace All directly, bypassing the button.
+    ///
+    /// The panel's button calls exactly this. Exposed because the alternative
+    /// — synthesising a click on a button whose pixel position depends on the
+    /// theme's text metrics — would test layout arithmetic rather than
+    /// replace behaviour.
+    pub fn do_replace_all(&mut self) {
+        self.replace_all();
+    }
+
+    /// Run a single Replace at the current match. Same rationale as
+    /// [`FerrixApp::do_replace_all`].
+    pub fn do_replace_one(&mut self) {
+        self.replace_current();
     }
 
     /// Centre the viewport on the selection — used when jumping to a match, so
@@ -1954,9 +2193,10 @@ impl FerrixApp {
             }
         }
 
-        let (ctrl_f, ctrl_s, escape, f3, shift_f3) = ctx.input(|i| {
+        let (ctrl_f, ctrl_h, ctrl_s, escape, f3, shift_f3) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::F),
+                i.modifiers.command && i.key_pressed(Key::H),
                 i.modifiers.command && i.key_pressed(Key::S),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::F3) && !i.modifiers.shift,
@@ -2003,6 +2243,19 @@ impl FerrixApp {
                 return;
             }
         }
+        if ctrl_h {
+            // Ctrl+H opens the replace panel BESIDE the search box, opening
+            // search too if it was closed — replace without a find field to
+            // type into would be a panel that cannot do anything.
+            self.search_open = true;
+            self.replace_open = true;
+            self.focus = Focus::Search;
+            // Focus the replacement box: the user pressing Ctrl+H already
+            // knows what they are finding often enough that landing in "find"
+            // would mean an extra Tab every time.
+            self.replace_focus_pending = true;
+            return;
+        }
         if ctrl_f {
             self.search_open = true;
             self.focus = Focus::Search;
@@ -2012,6 +2265,14 @@ impl FerrixApp {
         if self.search_open {
             if escape {
                 self.close_search();
+                // Hand the keyboard back to the grid for real, not just in our
+                // own bookkeeping. egui keeps focus on the (now hidden) text
+                // box otherwise, and every subsequent grid chord — Ctrl+Z
+                // included — is swallowed by a widget that is no longer
+                // on screen.
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
                 return;
             }
             if f3 {
@@ -2516,6 +2777,16 @@ impl FerrixApp {
                             self.search_whole_cell = !self.search_whole_cell;
                             self.run_search();
                         }
+                        if ui
+                            .selectable_label(self.search_regex, ".*")
+                            .on_hover_text(
+                                "Regular expression. In Replace, $1 refers to a capture group.",
+                            )
+                            .clicked()
+                        {
+                            self.search_regex = !self.search_regex;
+                            self.run_search();
+                        }
                         // Filter mode: hide every row without a match.
                         if ui
                             .selectable_label(self.search_filter_mode, "⬍ Filter")
@@ -2608,8 +2879,114 @@ impl FerrixApp {
                             if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
                                 self.close_search();
                             }
+                            if ui
+                                .selectable_label(self.replace_open, "⇄ Replace")
+                                .on_hover_text("Find and replace (Ctrl+H)")
+                                .clicked()
+                            {
+                                self.replace_open = !self.replace_open;
+                                if self.replace_open {
+                                    self.replace_focus_pending = true;
+                                }
+                            }
                         });
                     });
+
+                    // A malformed pattern must say so. Finding nothing looks
+                    // identical to "no matches", which is the worst possible
+                    // answer to a typo.
+                    if let Some(e) = &self.search_regex_error {
+                        ui.label(
+                            RichText::new(format!("⚠ bad pattern: {e}"))
+                                .color(th.error)
+                                .size(11.5),
+                        );
+                    }
+
+                    // --- replace row (Ctrl+H) ---
+                    if self.replace_open {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⇄").size(13.0));
+                            let resp = ui.add_sized(
+                                [260.0, 22.0],
+                                egui::TextEdit::singleline(&mut self.replace_input)
+                                    .hint_text("Replace with…")
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if self.replace_focus_pending {
+                                resp.request_focus();
+                                self.replace_focus_pending = false;
+                            }
+                            if resp.gained_focus() {
+                                self.focus = Focus::Search;
+                            }
+
+                            // Look in: values or formula source. The default is
+                            // values, because rewriting a formula's SOURCE is a
+                            // much bigger hammer than most replaces want.
+                            let look = self.replace_look_in;
+                            ui.label(RichText::new("in").color(th.text_dim).size(11.5));
+                            if ui
+                                .selectable_label(look == ferrix_core::LookIn::Values, "values")
+                                .on_hover_text(
+                                    "Rewrite displayed values. Formula cells are skipped: \
+                                     their displayed text is a computed result.",
+                                )
+                                .clicked()
+                            {
+                                self.replace_look_in = ferrix_core::LookIn::Values;
+                            }
+                            if ui
+                                .selectable_label(look == ferrix_core::LookIn::Formulas, "formulas")
+                                .on_hover_text(
+                                    "Rewrite the underlying text: a formula's SOURCE \
+                                     (=A1*2), not the number it currently shows.",
+                                )
+                                .clicked()
+                            {
+                                self.replace_look_in = ferrix_core::LookIn::Formulas;
+                            }
+
+                            ui.separator();
+                            if ui
+                                .button("Replace")
+                                .on_hover_text("Replace the current match, then advance")
+                                .clicked()
+                            {
+                                self.replace_current();
+                            }
+                            if ui
+                                .button("Replace All")
+                                .on_hover_text("Replace every match — one undo step")
+                                .clicked()
+                            {
+                                self.replace_all();
+                            }
+
+                            // Progress + cancel for a long pass. Cancelling
+                            // KEEPS what was already applied and says how much.
+                            if let Some((examined, applied)) = self.replace_progress {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} examined · {} replaced",
+                                        fmt_int(examined),
+                                        fmt_int(applied)
+                                    ))
+                                    .color(th.text_dim)
+                                    .size(11.0),
+                                );
+                                if ui
+                                    .button("Cancel")
+                                    .on_hover_text(
+                                        "Stop here. Cells already replaced stay replaced.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.replace_cancel.cancel();
+                                }
+                            }
+                        });
+                    }
                 });
         }
 

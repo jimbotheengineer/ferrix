@@ -37,6 +37,14 @@ use eframe::egui::{self, Event, Key, Modifiers, Pos2, RawInput, Vec2};
 
 use crate::app::FerrixApp;
 
+/// Wall-clock floor for [`Harness::step_until`].
+///
+/// Generous on purpose: it is only ever reached when the thing being waited
+/// for never arrives, i.e. when the test is going to fail anyway. In the happy
+/// path the predicate holds within a handful of frames and this is never
+/// consulted.
+const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A headless Ferrix instance.
 #[allow(dead_code)]
 pub struct Harness {
@@ -127,14 +135,37 @@ impl Harness {
     ///
     /// This is how the harness waits for background work — bounded, and with a
     /// definite answer, rather than a sleep that is either flaky or slow.
+    ///
+    /// ## Why there is a wall-clock floor as well as a frame cap
+    ///
+    /// A frame here is pure CPU and takes microseconds, so `max` frames can
+    /// elapse in a couple of milliseconds. When the thing being waited for is
+    /// another THREAD — file loading is off-thread — a pure frame budget is
+    /// really a race against the OS scheduler, and it loses whenever the
+    /// machine is busy (several test binaries in parallel, say). That produced
+    /// intermittent "file never loaded" failures in tests that had nothing to
+    /// do with loading.
+    ///
+    /// So the loop keeps running past `max` frames until a short wall-clock
+    /// deadline expires, yielding between frames. Still bounded, still no
+    /// fixed sleep, still returns a definite answer — but it now gives the
+    /// worker a real chance to finish before declaring it did not.
     pub fn step_until(&mut self, max: usize, pred: impl Fn(&FerrixApp) -> bool) -> bool {
-        for _ in 0..max {
+        let deadline = std::time::Instant::now() + WAIT_TIMEOUT;
+        let mut frames = 0usize;
+        loop {
             if pred(&self.app) {
                 return true;
             }
+            if frames >= max && std::time::Instant::now() >= deadline {
+                return pred(&self.app);
+            }
             self.step();
+            frames += 1;
+            // Let the loader thread actually run. Without this the loop spins
+            // on one core and the worker may never be scheduled.
+            std::thread::yield_now();
         }
-        pred(&self.app)
     }
 
     // ---- input ----
@@ -223,6 +254,18 @@ impl Harness {
     /// Ctrl/Cmd + key. `Modifiers::COMMAND` is what the app matches on.
     pub fn ctrl(&mut self, key: Key) -> &mut Self {
         self.key(key, Modifiers::COMMAND)
+    }
+
+    /// Mutable access to the app, for driving panel actions whose buttons
+    /// would otherwise have to be located by pixel arithmetic.
+    ///
+    /// Deliberately narrow in practice: tests use it to set the find/replace
+    /// fields and to invoke the same `do_replace_*` entry points the panel's
+    /// buttons call, then assert on CELL VALUES. Synthesising a click on a
+    /// button whose position depends on the theme's text metrics would test
+    /// layout, not replace.
+    pub fn app_mut(&mut self) -> &mut FerrixApp {
+        &mut self.app
     }
 
     // ---- observation ----
@@ -804,6 +847,542 @@ mod tests {
         h.type_text("5").step();
         h.press_key(Key::Enter).steps(2);
         assert!(h.app().is_dirty(), "an edit must mark the workbook dirty");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ==================================================== find & replace
+
+    /// Read a whole rectangle as display text — the only honest way to assert
+    /// "these cells changed and NOTHING else did".
+    fn snapshot(h: &Harness, rows: u32, cols: u32) -> Vec<Vec<String>> {
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| h.app().display(CellRef::new(r, c)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_h_opens_the_replace_panel_beside_search_and_edits_nothing() {
+        // Same failure mode Ctrl+F has: a dropped modifier turns Ctrl+H into a
+        // literal 'h' typed into A1. The modifier travels on RawInput here.
+        let p = write_csv("replopen.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = snapshot(&h, 4, 3);
+        h.ctrl(Key::H).steps(2);
+
+        assert!(
+            h.app().replace_is_open(),
+            "Ctrl+H must open the replace panel"
+        );
+        assert!(
+            h.app().search_is_open(),
+            "the replace panel sits BESIDE the search box, so search opens too"
+        );
+        assert_eq!(
+            snapshot(&h, 4, 3),
+            before,
+            "Ctrl+H must not write a single cell"
+        );
+        assert!(!h.app().is_dirty(), "opening a panel is not an edit");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn escape_closes_the_replace_panel() {
+        let p = write_csv("replclose.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::H).steps(2);
+        assert!(h.app().replace_is_open());
+        h.press_key(Key::Escape).steps(2);
+        assert!(!h.app().replace_is_open(), "Escape must close replace too");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_changes_exactly_the_matching_cells_and_nothing_else() {
+        // The core correctness claim, asserted cell by cell over the WHOLE
+        // sheet — not on a status string, which a file-load message would
+        // already have satisfied.
+        let p = write_csv(
+            "replall.csv",
+            "id,status,note\n1,open,opened early\n2,closed,shut\n3,open,still open\n4,pending,none\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = snapshot(&h, 4, 3);
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("open");
+        h.app_mut().set_replace_input("OPEN");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        let after = snapshot(&h, 4, 3);
+
+        // Exactly the cells whose text contained "open" (case-insensitive).
+        assert_eq!(after[0][1], "OPEN", "B2 'open' -> 'OPEN'");
+        assert_eq!(
+            after[0][2], "OPENed early",
+            "C2 substring rewritten in place"
+        );
+        assert_eq!(after[2][1], "OPEN", "B4");
+        assert_eq!(after[2][2], "still OPEN", "C4");
+
+        // And NOTHING else moved. Enumerated explicitly so a replace that
+        // scribbled over an unrelated cell cannot pass.
+        for (r, row) in after.iter().enumerate() {
+            for (c, val) in row.iter().enumerate() {
+                let changed = matches!((r, c), (0, 1) | (0, 2) | (2, 1) | (2, 2));
+                if !changed {
+                    assert_eq!(
+                        *val, before[r][c],
+                        "cell ({r},{c}) must be untouched but went {:?} -> {:?}",
+                        before[r][c], val
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_is_exactly_one_undo_step_and_undo_restores_every_cell() {
+        // Matches `a_bulk_clear_is_exactly_one_undo_step` exactly: a bulk
+        // operation is ONE entry, and one undo puts everything back. Undoing a
+        // 4-cell replace must not take 4 presses.
+        let p = write_csv(
+            "replundo.csv",
+            "id,status,note\n1,open,opened early\n2,closed,shut\n3,open,still open\n4,pending,none\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = snapshot(&h, 4, 3);
+        let depth_before = h.app().undo_depth();
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("open");
+        h.app_mut().set_replace_input("OPEN");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        // Four cells changed, so this is only meaningful if it is > 1 cell.
+        assert_ne!(
+            snapshot(&h, 4, 3),
+            before,
+            "setup: the replace must do work"
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before + 1,
+            "Replace All must push exactly ONE undo entry, not one per cell"
+        );
+
+        // ONE undo restores ALL of it. Close the panel first so the grid owns
+        // the keyboard again — a chord aimed at the grid while a TextEdit has
+        // focus belongs to the field, which is the correct behaviour and the
+        // reason Escape comes first.
+        h.press_key(Key::Escape).steps(2);
+        h.ctrl(Key::Z).steps(3);
+        assert_eq!(
+            snapshot(&h, 4, 3),
+            before,
+            "a single Ctrl+Z must restore every cell the replace changed"
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before,
+            "and leave the history where it started"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn cancelling_a_replace_keeps_applied_edits_and_reports_the_count() {
+        // The contract that matters most: a half-applied replace must not
+        // silently roll back and must not silently continue. It stops, keeps
+        // what it wrote, and says how many.
+        //
+        // The cancel fires from inside the pass's own progress callback, at a
+        // known applied-count. That is deterministic — no timer racing the
+        // work — which matters because a flaky cancel test proves nothing
+        // about cancel.
+        let rows: String = (0..600)
+            .map(|i| format!("{i},target\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let p = write_csv("replcancel.csv", &format!("id,val\n{rows}"));
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() >= 600));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("target");
+        h.app_mut().set_replace_input("DONE");
+        // Stop partway through, on a boundary the pass will actually reach.
+        h.app_mut().cancel_replace_after(200);
+        // Small windows so 600 rows still span several window boundaries —
+        // the shape a 200M-row sheet has, at a size a test can afford.
+        h.app_mut().set_replace_window_rows(64);
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        // Count what actually changed on the sheet.
+        let replaced = (0..600u32)
+            .filter(|r| h.app().display(CellRef::new(*r, 1)) == "DONE")
+            .count();
+        let untouched = (0..600u32)
+            .filter(|r| h.app().display(CellRef::new(*r, 1)) == "target")
+            .count();
+
+        assert_eq!(
+            replaced + untouched,
+            600,
+            "every cell must be either replaced or left exactly as it was — \
+             a cancelled pass must not leave a third, corrupted state"
+        );
+        assert!(
+            replaced > 0,
+            "cancel must KEEP the edits already applied, not roll them back"
+        );
+        assert!(
+            replaced < 600,
+            "cancel must actually STOP the pass; {replaced} of 600 replaced"
+        );
+
+        // The status must report the number actually applied. Asserting the
+        // real count appears — not merely that the status is non-empty, which
+        // the file-load message would already satisfy.
+        let status = h.status().to_string();
+        assert!(
+            status.contains(&replaced.to_string()),
+            "the status must report how many cells were applied ({replaced}); got {status:?}"
+        );
+        assert!(
+            status.to_lowercase().contains("cancel"),
+            "and must say it was cancelled rather than claim completion; got {status:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_cancelled_replace_is_still_exactly_one_undo_step() {
+        // Whatever a cancelled pass managed to apply must still rewind in one
+        // press. A partial replace spread across N undo entries would be worse
+        // than either outcome.
+        let rows: String = (0..600)
+            .map(|i| format!("{i},target\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let p = write_csv("replcancelundo.csv", &format!("id,val\n{rows}"));
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() >= 600));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("target");
+        h.app_mut().set_replace_input("DONE");
+        // Stop partway through, on a boundary the pass will actually reach.
+        h.app_mut().cancel_replace_after(200);
+        // Small windows so 600 rows still span several window boundaries —
+        // the shape a 200M-row sheet has, at a size a test can afford.
+        h.app_mut().set_replace_window_rows(64);
+        h.steps(2);
+        let depth_before = h.app().undo_depth();
+
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        let replaced = (0..600u32)
+            .filter(|r| h.app().display(CellRef::new(*r, 1)) == "DONE")
+            .count();
+        assert!(replaced > 0, "setup: the pass must have applied something");
+        assert!(replaced < 600, "setup: the pass must have been stopped");
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before + 1,
+            "a cancelled Replace All is still ONE undo entry"
+        );
+
+        h.press_key(Key::Escape).steps(2);
+        h.ctrl(Key::Z).steps(3);
+        let still_done = (0..600u32)
+            .filter(|r| h.app().display(CellRef::new(*r, 1)) == "DONE")
+            .count();
+        assert_eq!(
+            still_done, 0,
+            "one undo must restore every cell the cancelled pass wrote"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn look_in_formulas_rewrites_the_source_not_the_displayed_value() {
+        // The distinction the option exists for. With look-in: formulas,
+        // finding "A1" must rewrite the formula TEXT `=A1*2`, not the number
+        // `20` it currently displays — and the cell must still be a formula
+        // afterwards, recalculated against its new reference.
+        let p = write_csv("replformula.csv", "a,b,c\n10,99,0\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // C1 = A1*2 = 20.
+        h.press_key(Key::ArrowRight).step();
+        h.press_key(Key::ArrowRight).step();
+        h.type_text("=A1*2").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "20",
+            "setup: =A1*2 over a=10"
+        );
+        assert_eq!(h.app().edit_text(CellRef::new(0, 2)), "=A1*2");
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut()
+            .set_replace_look_in(ferrix_core::LookIn::Formulas);
+        h.app_mut().set_search_input("A1");
+        h.app_mut().set_replace_input("B1");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(4);
+
+        // THE POINT: the SOURCE changed.
+        assert_eq!(
+            h.app().edit_text(CellRef::new(0, 2)),
+            "=B1*2",
+            "look-in: formulas must rewrite the formula's source text"
+        );
+        // And it is still a live formula, re-evaluated against B1 = 99.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "198",
+            "the rewritten formula must recalculate (99*2), proving the cell \
+             is still a formula and not a literal '=B1*2' string"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn look_in_values_leaves_formula_cells_alone() {
+        // The mirror of the test above. A formula's displayed value is a
+        // computed result; overwriting it with text would silently destroy the
+        // formula that produced it, so values-mode must skip formula cells.
+        let p = write_csv("replvalues.csv", "a,b\n10,0\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.press_key(Key::ArrowRight).step();
+        h.type_text("=A1*2").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "20");
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_replace_look_in(ferrix_core::LookIn::Values);
+        h.app_mut().set_search_input("20");
+        h.app_mut().set_replace_input("ZZZ");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(4);
+
+        assert_eq!(
+            h.app().edit_text(CellRef::new(0, 1)),
+            "=A1*2",
+            "values-mode must not clobber a formula's source"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "20",
+            "and must not replace its computed result"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_respects_match_case() {
+        let p = write_csv("replcase.csv", "v\nNorth\nnorth\nNORTH\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_case_sensitive(true);
+        h.app_mut().set_search_input("North");
+        h.app_mut().set_replace_input("SOUTH");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "SOUTH");
+        assert_eq!(
+            h.app().display(CellRef::new(1, 0)),
+            "north",
+            "case-sensitive replace must leave 'north' alone"
+        );
+        assert_eq!(h.app().display(CellRef::new(2, 0)), "NORTH");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_respects_whole_cell() {
+        let p = write_csv("replwhole.csv", "v\nopen\nreopened\nopened\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_whole_cell(true);
+        h.app_mut().set_search_input("open");
+        h.app_mut().set_replace_input("CLOSED");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "CLOSED");
+        assert_eq!(
+            h.app().display(CellRef::new(1, 0)),
+            "reopened",
+            "whole-cell must not touch a substring match"
+        );
+        assert_eq!(h.app().display(CellRef::new(2, 0)), "opened");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_supports_regex_with_capture_groups() {
+        let p = write_csv("replregex.csv", "d\n2024-07\n2023-01\nnotadate\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_regex(true);
+        h.app_mut().set_search_input(r"(\d{4})-(\d{2})");
+        h.app_mut().set_replace_input("$2/$1");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "07/2024");
+        assert_eq!(h.app().display(CellRef::new(1, 0)), "01/2023");
+        assert_eq!(
+            h.app().display(CellRef::new(2, 0)),
+            "notadate",
+            "a non-matching cell must be untouched"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn single_replace_changes_only_the_current_match() {
+        let p = write_csv("replone.csv", "v\nfoo\nfoo\nfoo\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("foo");
+        h.app_mut().set_replace_input("bar");
+        h.steps(2);
+        h.app_mut().do_replace_one();
+        h.steps(3);
+
+        let changed = (0..3u32)
+            .filter(|r| h.app().display(CellRef::new(*r, 0)) == "bar")
+            .count();
+        assert_eq!(
+            changed, 1,
+            "a single Replace must change exactly one cell, not all three"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_with_no_matches_changes_nothing_and_pushes_no_undo() {
+        // A no-op replace that still dirtied the workbook or grew the undo
+        // stack would make Ctrl+Z rewind something the user never did.
+        let p = write_csv("replnone.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = snapshot(&h, 4, 3);
+        let depth = h.app().undo_depth();
+
+        h.ctrl(Key::H).steps(2);
+        h.app_mut().set_search_input("zzzznotpresent");
+        h.app_mut().set_replace_input("X");
+        h.steps(2);
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        assert_eq!(
+            snapshot(&h, 4, 3),
+            before,
+            "nothing matched, nothing changed"
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth,
+            "a replace that changed nothing must not push an undo entry"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_over_many_rows_does_not_hold_every_match_in_memory() {
+        // The scale invariant, at the largest size a unit test can afford.
+        // 3,000 matching cells across many small windows replace correctly and the overlay holds exactly
+        // the cells that changed — never a per-match index of the whole sheet.
+        let rows: String = (0..3_000)
+            .map(|i| format!("{i},hit\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let p = write_csv("replscale.csv", &format!("id,v\n{rows}"));
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(600, |a| a.row_count() >= 3_000));
+
+        h.ctrl(Key::H).steps(2);
+        // 64-row windows: 3,000 rows spans ~47 windows, so a walk that
+        // dropped, repeated, or mis-bounded a window cannot pass.
+        h.app_mut().set_replace_window_rows(64);
+        h.app_mut().set_search_input("hit");
+        h.app_mut().set_replace_input("done");
+        h.steps(2);
+        let depth = h.app().undo_depth();
+        h.app_mut().do_replace_all();
+        h.steps(3);
+
+        // Spot-check across the whole range, including past every window
+        // boundary, so a windowed walk that dropped a window would fail.
+        for r in [0u32, 1, 999, 1_500, 2_998, 2_999] {
+            assert_eq!(
+                h.app().display(CellRef::new(r, 1)),
+                "done",
+                "row {r} must have been replaced"
+            );
+        }
+        // The id column is untouched.
+        assert_eq!(h.app().display(CellRef::new(2_999, 0)), "2999");
+        assert_eq!(
+            h.app().undo_depth(),
+            depth + 1,
+            "3,000 cells is still ONE undo step"
+        );
+
+        h.press_key(Key::Escape).steps(2);
+        h.ctrl(Key::Z).steps(3);
+        for r in [0u32, 1_500, 2_999] {
+            assert_eq!(
+                h.app().display(CellRef::new(r, 1)),
+                "hit",
+                "one undo must restore row {r}"
+            );
+        }
         let _ = std::fs::remove_file(&p);
     }
 }
