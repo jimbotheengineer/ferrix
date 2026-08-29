@@ -207,7 +207,7 @@ impl DepGraph {
         let mut v: Vec<SheetCell> = self
             .name_uses
             .iter()
-            .filter(|(_, names)| names.iter().any(|n| *n == want))
+            .filter(|(_, names)| names.contains(&want))
             .map(|(at, _)| *at)
             .collect();
         v.sort();

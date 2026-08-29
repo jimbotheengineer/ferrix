@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn exported_names_appear_as_real_definedName_elements() {
+    fn exported_names_appear_as_real_defined_name_elements() {
         // Proves the OOXML Excel reads is actually there, not just that
         // Ferrix agrees with itself.
         use std::io::Read as _;
@@ -1256,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workbook_without_names_writes_no_definedNames_block() {
+    fn a_workbook_without_names_writes_no_defined_names_block() {
         // A file that gained an empty element would churn every save and
         // could confuse stricter readers.
         use std::io::Read as _;

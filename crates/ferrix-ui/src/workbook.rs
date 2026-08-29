@@ -508,6 +508,15 @@ impl Workbook {
         ferrix_formula::parse_with_names(src, &move |ident| names.resolve(ident, sheet.as_deref()))
     }
 
+    /// Parse a formula as the ACTIVE sheet would see it, defined names and all.
+    ///
+    /// The formula bar's live preview goes through here rather than the bare
+    /// parser, so typing `=SUM(Sales)` previews the real value instead of
+    /// reporting an error for a name that is perfectly well defined.
+    pub fn parse_active(&self, src: &str) -> Result<ferrix_formula::Expr, ParseError> {
+        self.parse_on(self.active_sheet(), src)
+    }
+
     /// Every name visible from the active sheet, sheet-scoped first.
     pub fn visible_names(&self) -> Vec<&ferrix_formula::DefinedName> {
         self.names.visible_from(Some(self.active_name()))
@@ -565,8 +574,12 @@ impl Workbook {
         Ok(())
     }
 
-    /// Define a name pointing at an explicit `refers_to` string. Used by
-    /// import and by the Name Manager's edit field.
+    /// Define a name pointing at an explicit `refers_to` string.
+    ///
+    /// Used by xlsx import (which carries its own `refers_to` text verbatim)
+    /// and by tests; the UI defines from a selection instead, so a release
+    /// build of the binary sees this as unused.
+    #[allow(dead_code)]
     pub fn define_name_raw(
         &mut self,
         ident: &str,

@@ -1908,4 +1908,285 @@ xxx,yyy,zzz
         }
         let _ = std::fs::remove_file(&p);
     }
+
+    // --- Name Box and Name Manager (issue #4) ---
+
+    /// A loaded app with `Sales` defined over B1:B3 of the sample, plus a
+    /// formula in D1 that uses it.
+    fn app_with_a_name(tag: &str) -> (Harness, std::path::PathBuf) {
+        // A per-test filename: these tests run in parallel and a shared name
+        // would have one test delete another's fixture mid-load.
+        let p = // Underscores, not hyphens: the stem becomes the SHEET name, and a
+        // hyphen would force it to be quoted in every `refers_to`.
+        write_csv(&format!("names_{tag}.csv"), SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.select(CellRef::new(0, 2), CellRef::new(3, 2));
+        h.app_mut().type_in_name_box("Sales");
+        h.app_mut().commit_name_box();
+        (h, p)
+    }
+
+    #[test]
+    fn the_name_box_shows_the_a1_label_until_the_selection_is_named() {
+        let p = write_csv("namebox-label.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.select(CellRef::new(0, 2), CellRef::new(3, 2));
+        assert_eq!(
+            h.app().name_box_text(),
+            "C1:C4",
+            "an unnamed selection shows its A1 label"
+        );
+
+        h.app_mut().type_in_name_box("Sales");
+        h.app_mut().commit_name_box();
+        assert_eq!(
+            h.app().name_box_text(),
+            "Sales",
+            "once named, the box shows the NAME instead of the label"
+        );
+
+        // A different selection reverts to a label — the box tracks the live
+        // selection rather than remembering the last thing typed.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        assert_eq!(h.app().name_box_text(), "A1");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn typing_a_new_name_into_the_name_box_defines_it_for_the_selection() {
+        let (h, p) = app_with_a_name("define");
+        let d = h
+            .app()
+            .workbook()
+            .names
+            .get("Sales", None)
+            .expect("the Name Box must have defined it");
+        // The sheet is named after the CSV's file stem.
+        let sheet = h.app().workbook().active_name().to_string();
+        assert_eq!(d.refers_to, format!("{sheet}!$C$1:$C$4"));
+        assert_eq!(d.scope, ferrix_formula::NameScope::Workbook);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_name_defined_through_the_name_box_is_usable_in_a_formula() {
+        // The whole point: what the box defines must actually evaluate.
+        let (mut h, p) = app_with_a_name("usable");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(Sales)").step();
+        h.press_key(Key::Enter).steps(2);
+        // qty column is 10+20+30+40.
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "100");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn typing_an_existing_name_navigates_to_it() {
+        let (mut h, p) = app_with_a_name("navigate");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        assert_eq!(h.app().cursor(), CellRef::new(0, 0));
+
+        h.app_mut().type_in_name_box("sales");
+        h.app_mut().commit_name_box();
+
+        let sel = h.app().selection();
+        assert_eq!(
+            sel.bounds(),
+            (CellRef::new(0, 2), CellRef::new(3, 2)),
+            "an existing name must navigate, not define a second name"
+        );
+        assert_eq!(
+            h.app().workbook().names.len(),
+            1,
+            "navigating must not create a duplicate"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn typing_an_address_into_the_name_box_goes_there() {
+        let p = write_csv("namebox-goto.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.app_mut().type_in_name_box("B3");
+        h.app_mut().commit_name_box();
+        assert_eq!(h.app().cursor(), CellRef::new(2, 1));
+        assert!(
+            h.app().workbook().names.is_empty(),
+            "an address must navigate, never become a name"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_name_box_refuses_a_name_that_looks_like_a_reference() {
+        let p = write_csv("namebox-bad.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // ZZ9 is a valid cell address, so it navigates rather than defining.
+        h.app_mut().type_in_name_box("ZZ9");
+        h.app_mut().commit_name_box();
+        assert!(h.app().workbook().names.is_empty());
+
+        // "My Name" has a space: not an address, not a legal name either.
+        h.app_mut().type_in_name_box("My Name");
+        h.app_mut().commit_name_box();
+        assert!(
+            h.app().workbook().names.is_empty(),
+            "an illegal identifier must not land in the table"
+        );
+        assert!(
+            h.status().contains("Cannot define"),
+            "the refusal must be reported, got: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_name_box_can_define_a_sheet_scoped_name() {
+        let p = write_csv("namebox-scope.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        let sheet = h.app().workbook().active_name().to_string();
+
+        h.select(CellRef::new(0, 2), CellRef::new(3, 2));
+        h.app_mut().set_name_box_sheet_scope(true);
+        h.app_mut().type_in_name_box("Local");
+        h.app_mut().commit_name_box();
+
+        let d = h.app().workbook().names.get("Local", Some(&sheet)).unwrap();
+        assert_eq!(d.scope, ferrix_formula::NameScope::Sheet(sheet));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_manager_renames_a_name_and_rewrites_dependent_formula_text() {
+        let (mut h, p) = app_with_a_name("rename");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(Sales)*2").step();
+        h.press_key(Key::Enter).steps(2);
+        let before = h.app().display(CellRef::new(0, 4));
+
+        h.app_mut().open_name_manager();
+        assert!(h.app().names_manager_open());
+        h.app_mut()
+            .begin_name_edit("Sales", ferrix_formula::NameScope::Workbook);
+        h.app_mut().set_name_edit_ident("Revenue");
+        h.app_mut().apply_name_edit_now();
+        h.steps(2);
+
+        assert!(h.app().name_error_text().is_none(), "rename should succeed");
+        // The formula's TEXT changed, and its value did not.
+        assert_eq!(
+            h.app().workbook().view().edit_text(CellRef::new(0, 4)),
+            "=SUM(Revenue)*2"
+        );
+        assert_eq!(h.app().display(CellRef::new(0, 4)), before);
+        assert!(h.app().workbook().names.get("Sales", None).is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_manager_reports_a_rename_that_would_collide() {
+        let (mut h, p) = app_with_a_name("collide");
+        h.select(CellRef::new(0, 0), CellRef::new(3, 0));
+        h.app_mut().type_in_name_box("Ids");
+        h.app_mut().commit_name_box();
+        assert_eq!(h.app().workbook().names.len(), 2);
+
+        h.app_mut()
+            .begin_name_edit("Sales", ferrix_formula::NameScope::Workbook);
+        h.app_mut().set_name_edit_ident("Ids");
+        h.app_mut().apply_name_edit_now();
+
+        assert!(
+            h.app()
+                .name_error_text()
+                .is_some_and(|e| e.contains("already defined")),
+            "a colliding rename must be refused and explained, got: {:?}",
+            h.app().name_error_text()
+        );
+        // And nothing moved.
+        assert!(h.app().workbook().names.get("Sales", None).is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_manager_retargets_a_name_and_recalculates() {
+        let (mut h, p) = app_with_a_name("retarget");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(Sales)").step();
+        h.press_key(Key::Enter).steps(2);
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "100");
+
+        // Repoint Sales at the id column (1+2+3+4).
+        h.app_mut()
+            .begin_name_edit("Sales", ferrix_formula::NameScope::Workbook);
+        let sheet = h.app().workbook().active_name().to_string();
+        h.app_mut()
+            .set_name_edit_target(&format!("{sheet}!$A$1:$A$4"));
+        h.app_mut().apply_name_edit_now();
+        h.steps(2);
+
+        assert!(
+            h.app().name_error_text().is_none(),
+            "retarget rejected: {:?}",
+            h.app().name_error_text()
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "10",
+            "retargeting a name must recalculate its dependents"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_manager_deletes_a_name_and_its_dependents_become_name_errors() {
+        let (mut h, p) = app_with_a_name("delete");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.type_text("=SUM(Sales)").step();
+        h.press_key(Key::Enter).steps(2);
+        assert_eq!(h.app().display(CellRef::new(0, 4)), "100");
+
+        h.app_mut()
+            .delete_name_now("Sales", &ferrix_formula::NameScope::Workbook);
+        h.steps(2);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 4)),
+            "#NAME?",
+            "deleting a referenced name must break its dependents visibly"
+        );
+        assert!(h.app().workbook().names.is_empty());
+        // The user's formula TEXT is kept, so redefining repairs it.
+        assert_eq!(
+            h.app().workbook().view().edit_text(CellRef::new(0, 4)),
+            "=SUM(Sales)"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_formula_bar_preview_resolves_defined_names() {
+        // Before names, `=SUM(Sales)` in the bar previewed a parse error. The
+        // preview must go through the same name-aware parse a commit does.
+        let (mut h, p) = app_with_a_name("preview");
+        h.select(CellRef::new(0, 4), CellRef::new(0, 4));
+        h.app_mut().set_formula_input("=SUM(Sales)");
+        h.steps(2);
+        // The preview carries a timing suffix; the VALUE is what matters.
+        let shown = h.app().formula_preview().unwrap_or("").to_string();
+        assert!(
+            shown.starts_with("100"),
+            "the live preview must resolve the name, not report #NAME?; got {shown:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }
