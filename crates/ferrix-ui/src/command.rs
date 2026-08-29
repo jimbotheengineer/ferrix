@@ -38,7 +38,7 @@
 //! `recent_commands = a,b,c` line. It only breaks ties on score, so typing a
 //! precise query still finds the precise command.
 
-use egui::{Key, RichText};
+use egui::{Key, Modifiers, RichText};
 use ferrix_core::Selection;
 
 use crate::theme::Theme;
@@ -238,13 +238,25 @@ impl Command {
     /// indistinguishable from a bug, so every reason here is a sentence, not
     /// a flag.
     pub fn disabled_reason(&self, st: &CommandState) -> Option<String> {
+        // A reason supplied by the app but left empty would render as a grey
+        // row with no explanation, which is the exact failure this criterion
+        // exists to prevent. Fall back to a sentence rather than to nothing.
+        fn say(reason: &str, fallback: &str) -> Option<String> {
+            Some(if reason.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                reason.to_string()
+            })
+        }
         use CommandId::*;
         match self.id {
             FileOpen | FileOpenXlsx | FileExportCsv | FileExportXlsx if st.busy => {
-                Some(st.busy_hint.clone())
+                say(&st.busy_hint, "Wait for the current operation to finish")
             }
-            FileCompact if !st.can_compact => Some(st.compact_hint.clone()),
-            FileSave if !st.can_save => Some(st.save_hint.clone()),
+            FileCompact if !st.can_compact => {
+                say(&st.compact_hint, "This sheet cannot be compacted right now")
+            }
+            FileSave if !st.can_save => say(&st.save_hint, "There is nothing to save right now"),
             FileExportXlsx if !st.has_tables => Some(
                 "No Excel Table on this sheet — export CSV, or import a workbook that has one"
                     .to_string(),
@@ -560,14 +572,29 @@ impl CommandPalette {
 
     /// One frame of keyboard handling, called from the app's single key path.
     ///
-    /// Reads `ctx.input` without consuming, exactly as the other modals here
-    /// do, so the search field still sees its own typing.
+    /// Keys are CONSUMED (`input_mut`), not merely read. Everything else in
+    /// this app reads without consuming, but the palette must: the in-cell
+    /// editor checks for Escape in the PAINT path later in the same frame, so
+    /// a merely-observed Escape would close the palette *and* cancel the
+    /// user's edit. Consuming is what makes "opening the palette does not
+    /// disturb the current edit" true for closing it too.
     pub fn keys(&mut self, ctx: &egui::Context, st: &CommandState) -> PaletteKey {
         // Ctrl+Shift+P and Ctrl+/ both toggle. Two bindings because muscle
         // memory splits between editors, and neither collides with a grid key.
-        let toggle = ctx.input(|i| {
-            let c = i.modifiers.command;
-            (c && i.modifiers.shift && i.key_pressed(Key::P)) || (c && i.key_pressed(Key::Slash))
+        //
+        // Shift-first, per egui's own guidance: `matches_logically` ignores an
+        // extra Shift, so a bare Ctrl+P check would swallow Ctrl+Shift+P.
+        let toggle = ctx.input_mut(|i| {
+            let shift_p = i.consume_key(
+                Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                Key::P,
+            );
+            let slash = i.consume_key(Modifiers::COMMAND, Key::Slash);
+            shift_p || slash
         });
         if toggle {
             return if self.open {
@@ -579,14 +606,14 @@ impl CommandPalette {
         if !self.open {
             return PaletteKey::None;
         }
-        let (esc, enter, up, down, page_up, page_down) = ctx.input(|i| {
+        let (esc, enter, up, down, page_up, page_down) = ctx.input_mut(|i| {
             (
-                i.key_pressed(Key::Escape),
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::ArrowDown),
-                i.key_pressed(Key::PageUp),
-                i.key_pressed(Key::PageDown),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::PageUp),
+                i.consume_key(Modifiers::NONE, Key::PageDown),
             )
         });
         if esc {

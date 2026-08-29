@@ -4853,6 +4853,9 @@ xxx,yyy,zzz
 
         // Freeze, and the same command must become runnable — otherwise the
         // 'disabled' state is a constant, not a reflection of the app.
+        // The cursor has to be off row 1 first: "freeze at A1" freezes nothing.
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(2, 0), CellRef::new(2, 0));
         h.freeze_at_cursor(true, false);
         h.steps(2);
         let rows = h.command_palette_rows();
