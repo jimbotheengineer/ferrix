@@ -170,6 +170,13 @@ pub struct Workbook {
     /// Sparse rectangles beside the data, so merged headers cost nothing per
     /// row on a 200M-row sheet.
     pub merges: ferrix_core::merge::MergeMap,
+    /// Cell comments for the ACTIVE sheet.
+    ///
+    /// Sparse, and keyed by DISPLAY position — the same space `overlay` is
+    /// keyed in, and relocated by the same code. See `ferrix_core::comment`
+    /// for why the two must agree: a note that stayed put while its cell moved
+    /// would end up beside a different number, plausibly and invisibly wrong.
+    pub comments: ferrix_core::CommentMap,
     /// Sheet-wide formatting for the ACTIVE sheet: manual colours and type
     /// styling.
     ///
@@ -232,6 +239,7 @@ impl Workbook {
             order: ferrix_core::SheetOrder::new(),
             format: ferrix_core::SheetFormat::new(),
             merges: ferrix_core::merge::MergeMap::new(),
+            comments: ferrix_core::CommentMap::new(),
             parked: std::collections::HashMap::new(),
             next_id: 1,
             undo: Vec::new(),
@@ -926,6 +934,22 @@ impl Workbook {
         if map.is_empty() {
             return Vec::new();
         }
+
+        // Comments ride along with the overlay, for the same reason and by
+        // the same map. THE PITFALL: routing base reads through a new display
+        // indirection while leaving a sparse side-table keyed by the
+        // pre-indirection coordinate slides data out from under the user
+        // silently — the note would stay on screen column B while the number
+        // it describes moved to D. `remap_columns` is a single two-phase pass
+        // so a rotation cannot clobber itself, and costs O(comments).
+        //
+        // Deliberately NOT recorded in the undo entry. Undoing a reorder does
+        // not currently restore `order` either — only the overlay cells — so
+        // relocating comments back would leave them keyed against a
+        // permutation still in effect, i.e. desynced from the very cells they
+        // annotate. Comments track whatever order is live, which keeps the two
+        // stores consistent with each other in every state the app can reach.
+        self.comments.remap_columns(&map);
 
         let mover = ColumnMove { map: map.clone() };
         let mut changes = Vec::new();

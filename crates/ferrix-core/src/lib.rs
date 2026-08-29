@@ -15,6 +15,7 @@ pub mod budget;
 pub mod cancel;
 pub mod chart;
 pub mod column;
+pub mod comment;
 pub mod filter;
 pub mod format;
 pub mod merge;
@@ -35,6 +36,7 @@ pub use bitmap::Bitmap;
 pub use budget::Budget;
 pub use cancel::CancelToken;
 pub use column::Column;
+pub use comment::{Comment, CommentMap};
 pub use filter::RowFilter;
 pub use format::{
     CellOverride, ColumnFormat, ManualStyle, PlanEntry, RangeFormat, RuleEval, SheetFormat,

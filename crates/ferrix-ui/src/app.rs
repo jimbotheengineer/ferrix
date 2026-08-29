@@ -52,6 +52,15 @@ struct Loaded {
     /// they belong to. `None` when the source could not be fingerprinted.
     edits_path: Option<PathBuf>,
     fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+    /// Where cell comments for this dataset are saved.
+    ///
+    /// A SEPARATE file from the edits sidecar, and deliberately not guarded by
+    /// the base fingerprint: "check this with finance" on B7 stays true when
+    /// the CSV is regenerated with a million more rows, so refusing it on a
+    /// stale base would throw away annotations every time the data refreshed.
+    comments_path: Option<PathBuf>,
+    /// Comments restored from that sidecar.
+    comments: ferrix_core::CommentMap,
     /// Edits restored from a sidecar, if one was present and current.
     restored: Option<ferrix_core::EditOverlay>,
     /// Set when a sidecar existed but was rejected, so the UI can warn instead
@@ -267,6 +276,27 @@ pub struct FerrixApp {
     /// request is allowed straight through rather than re-prompting forever.
     allow_close: bool,
 
+    /// Where cell comments are persisted, when the source has a sidecar.
+    comments_path: Option<PathBuf>,
+    /// Cell whose comment is being written or edited, plus the buffer.
+    ///
+    /// `None` means no editor is open. Held here rather than in the grid so
+    /// the dialog survives the frame the grid is repainted on.
+    comment_editing: Option<CellRef>,
+    comment_buffer: String,
+    comment_author_buffer: String,
+    /// True on the frame the comment editor opens, so it takes focus once.
+    comment_focus_pending: bool,
+    /// Cell whose context menu is open, if any. Captured on right-press so the
+    /// menu acts on the cell the user aimed at, not on wherever the selection
+    /// happens to be.
+    context_cell: Option<CellRef>,
+    /// Screen point the context menu is anchored at.
+    context_pos: egui::Pos2,
+
+    /// Comment markers painted by the last frame.
+    last_comment_markers: usize,
+
     /// Sheet currently being renamed inline, and the buffer being typed into.
     renaming: Option<ferrix_core::SheetId>,
     rename_buffer: String,
@@ -391,6 +421,14 @@ impl FerrixApp {
             last_viewport_h: 600.0,
             close_prompt: false,
             allow_close: false,
+            comments_path: None,
+            last_comment_markers: 0,
+            comment_editing: None,
+            comment_buffer: String::new(),
+            comment_author_buffer: String::new(),
+            comment_focus_pending: false,
+            context_cell: None,
+            context_pos: egui::Pos2::ZERO,
             renaming: None,
             rename_buffer: String::new(),
             rename_focus_pending: false,
@@ -476,6 +514,8 @@ impl FerrixApp {
                 self.stats_cols = loaded.cols;
                 self.edits_path = loaded.edits_path;
                 self.fingerprint = loaded.fingerprint;
+                self.comments_path = loaded.comments_path;
+                let loaded_comments = loaded.comments;
                 // Offer recovery before anything else touches the overlay.
                 self.recovery = loaded.recovery;
                 self.recovery_resolved = false;
@@ -492,10 +532,22 @@ impl FerrixApp {
                     loaded.extra_sheets,
                     loaded.names,
                 );
+                // Adopted AFTER build_workbook, which constructs a fresh
+                // Workbook and would otherwise discard them.
+                let restored_comments = loaded_comments.len();
+                self.wb.comments = loaded_comments;
                 if let Some(w) = loaded.edit_warning {
                     self.status = format!("Saved edits not applied — {w}");
                 } else if let Some(n) = restored_count {
                     self.status = format!("{} · restored {} saved edits", self.status, fmt_int(n));
+                }
+                if restored_comments > 0 {
+                    self.status = format!(
+                        "{} · {} comment{}",
+                        self.status,
+                        fmt_int(restored_comments),
+                        if restored_comments == 1 { "" } else { "s" }
+                    );
                 }
                 self.selection.move_to(CellRef::new(0, 0));
                 self.scroll = ScrollState::default();
@@ -984,13 +1036,26 @@ impl FerrixApp {
     /// never touches the base.
     /// Returns true if edits were actually written to disk.
     fn save_edits(&mut self) -> bool {
+        // Written first and unconditionally: the edits path below returns
+        // early when there is nothing in the overlay, and a session that only
+        // added a comment must not lose it to that early return.
+        let comments_written = self.save_comments();
+        let comment_count = self.wb.comments.len();
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
             return false;
         };
         if self.wb.overlay.is_empty() && !self.wb.is_dirty() {
-            self.status = "No edits to save".into();
-            return false;
+            self.status = if comments_written && comment_count > 0 {
+                format!(
+                    "Saved {} comment{}",
+                    fmt_int(comment_count),
+                    if comment_count == 1 { "" } else { "s" }
+                )
+            } else {
+                "No edits to save".into()
+            };
+            return comments_written && comment_count > 0;
         }
         let t = std::time::Instant::now();
         match ferrix_io::edits::save_edits(&path, &self.wb.overlay, fp) {
@@ -1333,6 +1398,139 @@ impl FerrixApp {
     ///
     /// Three honest options: Save (write the sidecar, then close), Discard
     /// (close and lose the edits — stated plainly), and Cancel (stay put).
+    /// The cell context menu: right-click on a cell.
+    ///
+    /// A free-floating window rather than egui's `Response::context_menu`,
+    /// because the grid paints onto a raw `Painter` and allocates no per-cell
+    /// widget to hang a menu off — the whole reason a 200M-row sheet paints in
+    /// constant time.
+    fn show_cell_menu(&mut self, ctx: &egui::Context) {
+        let Some(cell) = self.context_cell else {
+            return;
+        };
+        let has_comment = self.wb.comments.contains(cell);
+        let mut insert = false;
+        let mut delete = false;
+        let mut close = false;
+
+        let resp = egui::Area::new(egui::Id::new("ferrix_cell_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(self.context_pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    ui.label(RichText::new(cell_label(cell)).weak().size(11.0));
+                    ui.separator();
+                    let label = if has_comment {
+                        "Edit Comment…"
+                    } else {
+                        "Insert Comment…"
+                    };
+                    if ui.button(label).clicked() {
+                        insert = true;
+                    }
+                    if ui
+                        .add_enabled(has_comment, egui::Button::new("Delete Comment"))
+                        .clicked()
+                    {
+                        delete = true;
+                    }
+                });
+            });
+
+        // Dismiss on Escape, or on a click anywhere outside the menu. Without
+        // the second the menu would be modal in practice.
+        let clicked_outside = ctx.input(|i| i.pointer.any_click())
+            && !resp.response.rect.contains(
+                ctx.input(|i| i.pointer.interact_pos())
+                    .unwrap_or(egui::Pos2::ZERO),
+            );
+        if ctx.input(|i| i.key_pressed(Key::Escape)) || clicked_outside {
+            close = true;
+        }
+
+        if insert {
+            self.begin_comment(cell);
+            close = true;
+        }
+        if delete {
+            self.delete_comment(cell);
+            close = true;
+        }
+        if close {
+            self.context_cell = None;
+        }
+    }
+
+    /// The comment editor: a small modal over the grid.
+    fn show_comment_editor(&mut self, ctx: &egui::Context) {
+        let Some(cell) = self.comment_editing else {
+            return;
+        };
+        let mut commit = false;
+        let mut cancel = false;
+        let mut delete = false;
+        let had_one = self.wb.comments.contains(cell);
+
+        egui::Window::new(format!("Comment on {}", cell_label(cell)))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Author");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.comment_author_buffer)
+                            .desired_width(180.0),
+                    );
+                });
+                ui.add_space(4.0);
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut self.comment_buffer)
+                        .desired_width(320.0)
+                        .desired_rows(4),
+                );
+                if self.comment_focus_pending {
+                    resp.request_focus();
+                    self.comment_focus_pending = false;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add_enabled(had_one, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        delete = true;
+                    }
+                });
+                // Ctrl+Enter commits; a bare Enter has to insert a newline,
+                // because a note is prose and multi-line notes are the point.
+                if ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command) {
+                    commit = true;
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if delete {
+            self.comment_editing = None;
+            self.comment_focus_pending = false;
+            self.comment_buffer.clear();
+            self.delete_comment(cell);
+        } else if commit {
+            self.commit_comment();
+        } else if cancel {
+            self.cancel_comment();
+        }
+    }
+
     fn show_close_prompt(&mut self, ctx: &egui::Context) {
         let th = self.theme;
         let mut save_and_close = false;
@@ -1783,6 +1981,140 @@ impl FerrixApp {
     pub fn set_selection_for_test(&mut self, a: CellRef, b: CellRef) {
         // Selection::new carries the cursor, so there is nothing else to set.
         self.selection = Selection::new(a, b);
+    }
+
+    // ------------------------------------------------ cell comments (#12)
+
+    /// Open the comment editor on `cell`, seeded with any existing note.
+    ///
+    /// One entry point for both "insert" and "edit": the two differ only in
+    /// whether the buffer starts empty, and keeping them one function means a
+    /// change to how comments are written cannot apply to only one of them.
+    pub fn begin_comment(&mut self, cell: CellRef) {
+        // A merge-covered cell is not a cell the user can point at
+        // independently — its value lives on the anchor. Route the note there
+        // too, or a comment would attach to something invisible.
+        let cell = self.wb.merges.resolve(cell);
+        let existing = self.wb.comments.get(cell);
+        self.comment_buffer = existing.map(|c| c.text.clone()).unwrap_or_default();
+        self.comment_author_buffer = existing
+            .map(|c| c.author.clone())
+            .unwrap_or_else(default_comment_author);
+        self.comment_editing = Some(cell);
+        self.comment_focus_pending = true;
+    }
+
+    /// Commit the open comment editor.
+    ///
+    /// Empty text DELETES the comment rather than storing a blank one: a
+    /// marker triangle promising a note that turns out to be empty is worse
+    /// than no marker, and "clear the box" is how a user expects to remove one.
+    pub fn commit_comment(&mut self) {
+        let Some(cell) = self.comment_editing.take() else {
+            return;
+        };
+        self.comment_focus_pending = false;
+        let text = std::mem::take(&mut self.comment_buffer);
+        let author = std::mem::take(&mut self.comment_author_buffer);
+        if text.trim().is_empty() {
+            if self.wb.comments.remove(cell).is_some() {
+                self.wb.mark_dirty();
+                self.status = format!("Removed comment on {}", cell_label(cell));
+            }
+            return;
+        }
+        let existed = self
+            .wb
+            .comments
+            .set(cell, ferrix_core::Comment::new(author, text))
+            .is_some();
+        self.wb.mark_dirty();
+        self.status = format!(
+            "{} comment on {}",
+            if existed { "Updated" } else { "Added" },
+            cell_label(cell)
+        );
+    }
+
+    /// Fill the open comment editor's buffers, as typing into them would.
+    ///
+    /// Exists so a test can exercise begin/commit without synthesising
+    /// keystrokes into a text box whose position depends on the theme.
+    pub fn set_comment_buffers_for_test(&mut self, author: &str, text: &str) {
+        self.comment_author_buffer = author.to_string();
+        self.comment_buffer = text.to_string();
+    }
+
+    /// Abandon the open comment editor, changing nothing.
+    pub fn cancel_comment(&mut self) {
+        self.comment_editing = None;
+        self.comment_focus_pending = false;
+        self.comment_buffer.clear();
+        self.comment_author_buffer.clear();
+    }
+
+    /// Delete a cell's comment. Reports when there was nothing to delete
+    /// rather than silently doing nothing.
+    pub fn delete_comment(&mut self, cell: CellRef) {
+        let cell = self.wb.merges.resolve(cell);
+        match self.wb.comments.remove(cell) {
+            Some(_) => {
+                self.wb.mark_dirty();
+                self.status = format!("Removed comment on {}", cell_label(cell));
+            }
+            None => self.status = format!("{} has no comment", cell_label(cell)),
+        }
+    }
+
+    /// Whether a comment editor is currently open — used by the key handler to
+    /// keep grid navigation out of the text box.
+    pub fn comment_editor_open(&self) -> bool {
+        self.comment_editing.is_some()
+    }
+
+    /// Comment count on the active sheet, for tests and the status bar.
+    pub fn comment_count(&self) -> usize {
+        self.wb.comments.len()
+    }
+
+    /// A cell's comment text, for tests.
+    pub fn comment_text(&self, cell: CellRef) -> Option<&str> {
+        self.wb.comments.get(cell).map(|c| c.text.as_str())
+    }
+
+    /// The live comment map, for the paint-cost assertions.
+    pub fn comment_map(&self) -> &ferrix_core::CommentMap {
+        &self.wb.comments
+    }
+
+    /// Cells painted by the last frame.
+    pub fn painted_cell_count(&self) -> usize {
+        self.last_painted
+    }
+
+    /// Screen rows painted by the last frame.
+    pub fn painted_row_count(&self) -> usize {
+        self.last_painted_rows.len()
+    }
+
+    /// Comment markers actually PAINTED by the last frame.
+    ///
+    /// Read from the grid's paint output rather than from the map, so a test
+    /// asserting a deleted comment's marker is gone is reading the screen.
+    pub fn painted_comment_markers(&self) -> usize {
+        self.last_comment_markers
+    }
+
+    /// Persist comments beside the base file.
+    ///
+    /// Independent of `save_edits`: a session that only added a note has
+    /// nothing for the edits sidecar to write, and must still not lose the
+    /// note.
+    pub fn save_comments(&mut self) -> bool {
+        let Some(path) = self.comments_path.clone() else {
+            return false;
+        };
+        ferrix_io::save_comments(&path, &self.wb.comments).is_ok()
     }
 
     /// Merge the current selection, or unmerge if it already covers merges.
@@ -3450,7 +3782,9 @@ impl FerrixApp {
         // typing "consulting" into the search box simultaneously drove the
         // grid's type-to-edit path and cleared a cell — silent data loss.
         let widget_has_keyboard = ctx.memory(|m| m.focused()).is_some();
-        if widget_has_keyboard || self.focus != Focus::Grid {
+        // The comment editor owns the keyboard while it is open: arrow keys
+        // must move the caret in the note, not the cursor around the grid.
+        if widget_has_keyboard || self.focus != Focus::Grid || self.comment_editing.is_some() {
             return;
         }
         let (
@@ -3646,6 +3980,8 @@ impl FerrixApp {
         // immediately without touching the disk.
         self.tick_autosave();
         self.show_chart_window(ctx);
+        self.show_cell_menu(ctx);
+        self.show_comment_editor(ctx);
         {}
 
         self.handle_keys(ctx);
@@ -4416,6 +4752,7 @@ impl FerrixApp {
                         theme: th,
                         format: Some(&self.wb.format),
                         merges: Some(&self.wb.merges),
+                        comments: Some(&self.wb.comments),
                         pad_rows: if self.show_empty_rows {
                             crate::grid::EMPTY_ROW_PADDING
                         } else {
@@ -4428,6 +4765,35 @@ impl FerrixApp {
                 };
 
                 self.last_painted = resp.painted_cells;
+                self.last_comment_markers = resp.comment_markers;
+
+                // Right-click opens the cell menu. Anchored at the click
+                // point and remembered across frames, because the click event
+                // is gone by the frame the menu is first drawn.
+                if let Some((cell, pos)) = resp.context_click {
+                    self.context_cell = Some(cell);
+                    self.context_pos = pos;
+                }
+
+                // The hover tooltip. The grid paints onto a raw Painter and
+                // has no widget Response, so the popup is built here from the
+                // cell it reported. Drawn as a real egui tooltip so it floats
+                // above the grid and follows the platform's own styling.
+                if let Some(cell) = resp.hovered_comment {
+                    if let Some(c) = self.wb.comments.get(cell) {
+                        let text = if c.author.is_empty() {
+                            c.text.clone()
+                        } else {
+                            format!("{}:\n{}", c.author, c.text)
+                        };
+                        egui::show_tooltip_text(
+                            ui.ctx(),
+                            ui.layer_id(),
+                            egui::Id::new("ferrix_comment_tip"),
+                            text,
+                        );
+                    }
+                }
                 // Where the headers really landed this frame, so a caller can
                 // click one without guessing at pixels that move whenever a
                 // bar above the grid opens.
@@ -4831,6 +5197,8 @@ where
             first_formulas: None,
             edits_path: restored_edits.path,
             fingerprint: restored_edits.fingerprint,
+            comments_path: restored_edits.comments_path,
+            comments: restored_edits.comments,
             restored: restored_edits.overlay,
             edit_warning: restored_edits.warning,
             recovery: restored_edits.recovery,
@@ -4891,6 +5259,8 @@ where
         first_formulas: None,
         edits_path: restored_edits.path,
         fingerprint: restored_edits.fingerprint,
+        comments_path: restored_edits.comments_path,
+        comments: restored_edits.comments,
         restored: restored_edits.overlay,
         edit_warning: restored_edits.warning,
         recovery: restored_edits.recovery,
@@ -4911,6 +5281,19 @@ fn load_xlsx(path: &Path) -> LoadResult {
     // the per-sheet import never opens. A file with no names yields an empty
     // table rather than an error.
     let names = ferrix_io::import_defined_names(path).unwrap_or_default();
+    // Comments live in xl/comments*.xml, which neither calamine nor the
+    // per-sheet import opens. Only the FIRST sheet's are adopted, because the
+    // workbook holds one comment map for the ACTIVE sheet — the same
+    // limitation `merges` has today.
+    let xlsx_comments: ferrix_core::CommentMap = ferrix_io::import_comments(path)
+        .map(|cs| {
+            ferrix_core::CommentMap::from_iter_cells(
+                cs.into_iter()
+                    .filter(|c| c.sheet_index == 0)
+                    .map(|c| (c.cell, c.comment)),
+            )
+        })
+        .unwrap_or_default();
     let sheet_count = imported.len();
     let total_cells: usize = imported.iter().map(|s| s.stats.cells).sum();
     let kept: usize = imported.iter().map(|s| s.stats.formulas_kept).sum();
@@ -4960,6 +5343,11 @@ fn load_xlsx(path: &Path) -> LoadResult {
         // silent mismatch waiting to happen.
         edits_path: None,
         fingerprint: None,
+        // No sidecar for xlsx: comments live in the package's own
+        // xl/comments*.xml and are written back there on export, so a sidecar
+        // beside the file would be a second, competing source of truth.
+        comments_path: None,
+        comments: xlsx_comments,
         restored: None,
         edit_warning: None,
         recovery: None,
@@ -4982,6 +5370,10 @@ struct RestoredEdits {
     overlay: Option<ferrix_core::EditOverlay>,
     warning: Option<String>,
     recovery: Option<ferrix_io::edits::RecoveryCandidate>,
+    /// Comment sidecar path, always reported so a later save knows where to
+    /// write even when there was nothing to read.
+    comments_path: Option<PathBuf>,
+    comments: ferrix_core::CommentMap,
 }
 
 fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
@@ -5005,13 +5397,42 @@ fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
         // like the user's saved edits simply vanished.
         Err(e) => (None, Some(e.to_string())),
     };
+    // Comments load independently of the edits sidecar and of its
+    // fingerprint check: they are statements about cells that survive the base
+    // being regenerated. A corrupt file is dropped rather than failing the
+    // whole open — the data is what the user came for.
+    let comments_path = ferrix_io::comments_path_for(base);
+    let comments = ferrix_io::load_comments(&comments_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
     RestoredEdits {
         path: Some(path),
         fingerprint: Some(fp),
         overlay,
         warning,
         recovery,
+        comments_path: Some(comments_path),
+        comments,
     }
+}
+
+/// A1-style label for a cell, for status messages.
+fn cell_label(cell: CellRef) -> String {
+    format!("{}{}", ferrix_core::column_name(cell.col), cell.row + 1)
+}
+
+/// Who a new comment is attributed to.
+///
+/// The OS user name, because that is the only identity Ferrix has and an
+/// unattributed note is less useful than a wrong-but-editable one — the author
+/// field is right there in the editor. Falls back to empty, which the xlsx
+/// writer renders under a placeholder rather than a blank author.
+fn default_comment_author() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
 }
 
 /// Read just the first line of a CSV for column headers.

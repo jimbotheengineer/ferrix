@@ -104,6 +104,10 @@ pub struct Theme {
     /// Deliberately loud in both themes: the whole point is that bad data is
     /// impossible to miss rather than silently dropped.
     pub invalid_flag: Color32,
+    /// Corner marker for a cell carrying a comment. Distinct from
+    /// `invalid_flag` on purpose: a cell can be both commented and invalid,
+    /// and two facts must not be painted as one.
+    pub comment_flag: Color32,
     /// Fill for the empty padding rows past the end of the sheet (issue #20).
     /// Must differ from both `bg` and `row_alt`, so "there is no row here" is
     /// visibly different from "this row holds empty strings".
@@ -165,6 +169,7 @@ impl Theme {
             range_fill: Color32::from_rgba_premultiplied(0x1c, 0x2a, 0x3f, 0x60),
             table_band: Color32::from_rgb(0x1a, 0x20, 0x2a),
             invalid_flag: Color32::from_rgb(0xe5, 0x48, 0x4f),
+            comment_flag: Color32::from_rgb(0xf2, 0xb1, 0x3c),
             // Darker than `bg`: past the end of the sheet reads as a recess.
             pad_row: Color32::from_rgb(0x0c, 0x0d, 0x10),
         }
@@ -202,6 +207,7 @@ impl Theme {
             range_fill: Color32::from_rgba_premultiplied(0x18, 0x31, 0x50, 0x50),
             table_band: Color32::from_rgb(0xe6, 0xeb, 0xf3),
             invalid_flag: Color32::from_rgb(0xcc, 0x28, 0x24),
+            comment_flag: Color32::from_rgb(0xb8, 0x7a, 0x00),
             // Slightly grey against the near-white sheet.
             pad_row: Color32::from_rgb(0xe8, 0xea, 0xef),
         }

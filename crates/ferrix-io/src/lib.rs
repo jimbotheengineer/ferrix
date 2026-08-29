@@ -10,6 +10,7 @@
 //!   memory-mapped via [`MappedSheet`], so a 10GB dataset is bounded by disk
 //!   rather than RAM and opens instantly on subsequent runs.
 
+pub mod comment_sidecar;
 pub mod convert;
 pub mod csv;
 pub mod edits;
@@ -21,6 +22,7 @@ pub mod pool;
 pub mod table_xlsx;
 pub mod xlsx;
 
+pub use comment_sidecar::{comments_path_for, load_comments, save_comments, CommentSidecarError};
 pub use convert::{
     cache_is_fresh, cache_path_for, convert_csv, convert_csv_cancellable, ConvertError,
     ConvertStats,
@@ -29,7 +31,9 @@ pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
-pub use table_xlsx::{import_tables, write_table, FerrixTag, ImportedTable};
+pub use table_xlsx::{
+    import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
+};
 pub use xlsx::{
     export_workbook, export_workbook_with_names, export_xlsx, export_xlsx_with_formulas,
     export_xlsx_with_tables, import_defined_names, import_xlsx, import_xlsx_full, ImportStats,

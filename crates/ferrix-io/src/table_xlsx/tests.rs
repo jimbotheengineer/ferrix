@@ -802,3 +802,133 @@ fn temp_files_are_cleaned_up() {
     };
     assert!(!path.exists(), "the fixture must not outlive the test");
 }
+
+// ---- cell comments (roadmap #12) ----
+
+#[test]
+fn comments_reach_the_package_as_real_excel_notes_and_come_back() {
+    // The full loop, and the part that matters most: a comments part WITHOUT
+    // the legacy VML drawing is silently ignored by Excel, so both must be in
+    // the package or the export is a lie.
+    use ferrix_core::{CellRef, Comment, CommentMap};
+
+    let mut m = CommentMap::new();
+    m.set(
+        CellRef::new(0, 0),
+        Comment::new("ana", "check with finance"),
+    );
+    m.set(
+        CellRef::new(3, 2),
+        Comment::new("bo", "revised after audit"),
+    );
+
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("comments");
+    crate::xlsx::export_workbook(
+        t.path(),
+        &[crate::xlsx::SheetExport::new("Data", &sheet).with_comments(&m)],
+    )
+    .expect("export");
+
+    let names = part_names(t.path());
+    assert!(
+        names.iter().any(|n| n == "xl/comments1.xml"),
+        "the comments part must exist, got parts: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("xl/drawings/vmlDrawing")),
+        "without the legacy VML drawing Excel ignores the notes entirely; \
+         parts: {names:?}"
+    );
+
+    let xml = part(t.path(), "xl/comments1.xml").expect("comments part");
+    assert!(
+        xml.contains("check with finance"),
+        "note text must be written"
+    );
+    assert!(xml.contains("ana"), "the author must be written");
+    // The worksheet must point AT the drawing, or the notes are orphaned.
+    let ws = part(t.path(), "xl/worksheets/sheet1.xml").expect("sheet part");
+    assert!(
+        ws.contains("legacyDrawing"),
+        "the worksheet must reference its legacy drawing"
+    );
+
+    // And back in.
+    let mut got = super::import_comments(t.path()).expect("import");
+    got.sort_by_key(|g| (g.cell.row, g.cell.col));
+    assert_eq!(got.len(), 2, "both comments must survive the round trip");
+    assert_eq!(got[0].cell, CellRef::new(0, 0));
+    assert_eq!(got[0].comment, Comment::new("ana", "check with finance"));
+    assert_eq!(got[1].cell, CellRef::new(3, 2));
+    assert_eq!(got[1].comment, Comment::new("bo", "revised after audit"));
+    assert!(got.iter().all(|g| g.sheet_index == 0));
+}
+
+#[test]
+fn an_unattributed_comment_stays_unattributed_across_a_round_trip() {
+    // xl/comments1.xml has no spelling for "no author", so an empty author is
+    // written under a placeholder. The placeholder must not leak back in as a
+    // real author the user never typed.
+    use ferrix_core::{CellRef, Comment, CommentMap};
+
+    let mut m = CommentMap::new();
+    m.set(CellRef::new(1, 1), Comment::new("", "nobody signed this"));
+
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("anon-comment");
+    crate::xlsx::export_workbook(
+        t.path(),
+        &[crate::xlsx::SheetExport::new("Data", &sheet).with_comments(&m)],
+    )
+    .expect("export");
+
+    let got = super::import_comments(t.path()).expect("import");
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].comment.author, "",
+        "a note the user never signed must not acquire an author"
+    );
+    assert_eq!(got[0].comment.text, "nobody signed this");
+}
+
+#[test]
+fn comment_text_with_markup_and_newlines_survives_verbatim() {
+    // XML-significant characters must be escaped and unescaped, not dropped.
+    use ferrix_core::{CellRef, Comment, CommentMap};
+
+    let tricky = "a < b & c > d\nsecond \"line\" — naïve";
+    let mut m = CommentMap::new();
+    m.set(CellRef::new(2, 0), Comment::new("ana", tricky));
+
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("tricky-comment");
+    crate::xlsx::export_workbook(
+        t.path(),
+        &[crate::xlsx::SheetExport::new("Data", &sheet).with_comments(&m)],
+    )
+    .expect("export");
+
+    let got = super::import_comments(t.path()).expect("import");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].comment.text, tricky);
+}
+
+#[test]
+fn a_workbook_with_no_comments_imports_as_none() {
+    // The common case: no comments part at all must be an empty result, not
+    // an error and not an invented note.
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("nocomments");
+    crate::xlsx::export_xlsx(t.path(), &sheet, "Data").expect("export");
+    let got = super::import_comments(t.path()).expect("import");
+    assert!(got.is_empty());
+    assert!(
+        !part_names(t.path())
+            .iter()
+            .any(|n| n.starts_with("xl/comments")),
+        "a sheet with no comments must not carry an empty comments part"
+    );
+}
