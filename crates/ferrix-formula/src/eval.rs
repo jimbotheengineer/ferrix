@@ -466,6 +466,9 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                 None => Value::Error(ErrorKind::NotAvailable),
             }
         }
+        // Date and time functions live in their own module — see
+        // `crate::datetime` for the calendar rules and the injectable clock.
+        name if crate::datetime::is_date_fn(name) => crate::datetime::call(name, args, src),
         _ => Value::Error(ErrorKind::Name),
     }
 }

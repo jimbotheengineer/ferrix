@@ -105,7 +105,12 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
 fn calls_are_supported(e: &Expr) -> bool {
     match e {
         Expr::Call(name, args) => {
-            SUPPORTED_FUNCTIONS.contains(&name.to_ascii_uppercase().as_str())
+            let upper = name.to_ascii_uppercase();
+            // Date/time functions are dispatched by name out of
+            // `ferrix_formula::datetime`, so they are asked directly rather
+            // than duplicated into the list above — one source of truth.
+            (SUPPORTED_FUNCTIONS.contains(&upper.as_str())
+                || ferrix_formula::datetime::is_date_fn(&upper))
                 && args.iter().all(calls_are_supported)
         }
         Expr::Unary(_, a) => calls_are_supported(a),

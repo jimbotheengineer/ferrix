@@ -816,6 +816,72 @@ fn civil_from_serial(serial: i64) -> (i64, u32, u32) {
     civil_from_days(unix_days)
 }
 
+/// (year, month, day) -> Excel serial day number: the exact inverse of
+/// [`civil_from_serial`], phantom 1900-02-29 included.
+///
+/// This lives next to `civil_from_serial` on purpose. There is exactly ONE
+/// calendar in this project, and an inverse that drifted from the forward
+/// direction would be worse than no inverse at all — every serial in
+/// `0..=2_958_465` is pinned to round-trip through both by a test.
+///
+/// Returns `None` outside the 1900 date system's range, or for a month outside
+/// `1..=12`. `d` is not range-checked: callers that want Excel's day rollover
+/// pass `d = 1` and add the offset in *serial* space, which is what Excel
+/// itself does and the only way to cross the phantom day consistently.
+pub fn serial_from_civil(y: i32, m: u32, d: u32) -> Option<f64> {
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    // January and February 1900 sit on the phantom day's side of the
+    // discontinuity, where the serial is simply "days since 1899-12-31" and
+    // the proleptic Gregorian calendar disagrees by one. Answer them directly:
+    // 1900-01-01 is 1, 1900-02-01 is 32, and 1900-02-29 is the phantom 60.
+    let s = if y == 1900 && m <= 2 {
+        i64::from(d) + if m == 2 { 31 } else { 0 }
+    } else {
+        // Invert `civil_from_serial`'s `serial - 25_569 + (serial < 60)`:
+        // above the discontinuity the offset is 25_569, below it 25_568.
+        let u = days_from_civil(i64::from(y), m, i64::from(d)) + 25_569;
+        if u >= 61 {
+            u
+        } else {
+            u - 1
+        }
+    };
+    if !(0..=2_958_465).contains(&s) {
+        return None;
+    }
+    Some(s as f64)
+}
+
+/// Days in a month. February 1900 reports 29 so it agrees with
+/// [`civil_from_serial`]'s phantom day — this is the number `EOMONTH` clamps
+/// to, and it must match what the renderer will print. Every other year uses
+/// the real Gregorian leap rule.
+pub const fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if y == 1900 => 29,
+        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Howard Hinnant's `days_from_civil`, with 1970-01-01 as day 0. Inverse of
+/// [`civil_from_days`]. Signed throughout so an out-of-month `d` (including
+/// zero or negative) extrapolates linearly instead of underflowing.
+fn days_from_civil(y: i64, m: u32, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 }); // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 /// Howard Hinnant's `civil_from_days`, with 1970-01-01 as day 0.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
