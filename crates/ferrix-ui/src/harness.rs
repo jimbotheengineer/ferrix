@@ -7364,4 +7364,500 @@ xxx,yyy,zzz
         );
         let _ = std::fs::remove_file(&p);
     }
+    // ========================================================================
+    // Issue #34: Remove Duplicates, Subtotals, Consolidate
+    // ========================================================================
+    //
+    // Every assertion below is on PER-ROW IDENTITY or an exact count, never on
+    // a total. A SUM over these fixtures is order-independent and would pass
+    // while rows were reordered or dropped — which is precisely the bug dedupe
+    // and subtotals introduce. So the tests ask "which records survived, in
+    // what order", and they ask it through THE resolver.
+
+    /// Four regions, deliberately unsorted, with a repeated key and a unique
+    /// per-row marker so a survivor can be named exactly.
+    ///
+    /// | row | A region | B qty | C marker |
+    /// |-----|----------|-------|----------|
+    /// |  0  | East     | 10    | m0       |
+    /// |  1  | West     | 20    | m1       |
+    /// |  2  | East     | 30    | m2       |  <- duplicate of row 0 on A
+    /// |  3  | North    | 40    | m3       |
+    /// |  4  | West     | 50    | m4       |  <- duplicate of row 1 on A
+    /// |  5  | East     | 60    | m5       |  <- duplicate of row 0 on A
+    const DUPES: &str =
+        "region,qty,marker\nEast,10,m0\nWest,20,m1\nEast,30,m2\nNorth,40,m3\nWest,50,m4\nEast,60,m5\n";
+
+    fn dupe_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(&unique(name, "csv"), DUPES);
+        let mut h = Harness::new(Some(&p));
+        h.step_until(60, |a| a.workbook().view().row_count() > 1);
+        (p, h)
+    }
+
+    /// The marker in column C of every row on the sheet, top to bottom. The
+    /// identity assertion this whole feature turns on.
+    fn markers(h: &Harness) -> Vec<String> {
+        let view = h.app().workbook().view();
+        (0..view.row_count())
+            .map(|r| view.display(CellRef::new(r as u32, 2)))
+            .collect()
+    }
+
+    // ---- Remove Duplicates ----
+
+    #[test]
+    fn remove_duplicates_keeps_the_first_occurrence_of_each_key() {
+        let (p, mut h) = dupe_fixture("dedupe_first");
+        assert_eq!(
+            markers(&h),
+            vec!["m0", "m1", "m2", "m3", "m4", "m5"],
+            "baseline: every row is present"
+        );
+        // Key on column A only. The CSV's first line is consumed as the header
+        // row, so the six DATA rows are m0..m5 at indices 0..5 — the header is
+        // not a record and can never be deduplicated away.
+        h.select(CellRef::new(0, 0), CellRef::new(5, 0));
+        h.remove_duplicates();
+        assert_eq!(
+            markers(&h),
+            vec!["m0", "m1", "m3"],
+            "EXCEL'S RULE: the FIRST row carrying each region survives. A \
+             last-wins implementation would leave m5/m4/m3, and a SUM of \
+             column B would be identical either way"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_duplicates_reports_how_many_it_removed() {
+        let (p, mut h) = dupe_fixture("dedupe_report");
+        h.select(CellRef::new(0, 0), CellRef::new(5, 0));
+        h.remove_duplicates();
+        let s = h.status().to_string();
+        assert!(
+            s.contains("Removed 3 duplicate rows"),
+            "the count must be stated, not implied; got {s:?}"
+        );
+        assert!(
+            s.contains("3 unique rows kept"),
+            "and so must the survivors (one row per distinct region: East, \
+             West, North); got {s:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_duplicates_is_exactly_one_undo_step_and_restores_every_row() {
+        let (p, mut h) = dupe_fixture("dedupe_undo");
+        let before = markers(&h);
+        let depth = h.app().workbook().undo_depth();
+        h.select(CellRef::new(0, 0), CellRef::new(5, 0));
+        h.remove_duplicates();
+        assert_eq!(
+            h.app().workbook().undo_depth(),
+            depth + 1,
+            "THREE rows went, and it must be ONE undo step — a per-row entry \
+             would make the user press Ctrl+Z three times"
+        );
+        assert_eq!(markers(&h).len(), 3);
+
+        h.ctrl(Key::Z).steps(2);
+        assert_eq!(
+            markers(&h),
+            before,
+            "ONE undo must restore EVERY removed row, in the original order, \
+             with its original marker — a count-only check would pass even if \
+             the rows came back scrambled"
+        );
+        assert_eq!(
+            h.app().workbook().undo_depth(),
+            depth,
+            "and the single step is consumed"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn redo_re_removes_the_same_rows() {
+        let (p, mut h) = dupe_fixture("dedupe_redo");
+        h.select(CellRef::new(0, 0), CellRef::new(5, 0));
+        h.remove_duplicates();
+        let after = markers(&h);
+        h.ctrl(Key::Z).steps(2);
+        h.ctrl(Key::Y).steps(2);
+        assert_eq!(
+            markers(&h),
+            after,
+            "redo must land on exactly the state the removal produced"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_key_columns_are_the_ones_the_user_selected() {
+        let (p, mut h) = dupe_fixture("dedupe_key_cols");
+        // Key on A AND B. Column B is unique per row, so nothing repeats.
+        h.select(CellRef::new(0, 0), CellRef::new(5, 1));
+        h.remove_duplicates();
+        assert_eq!(
+            markers(&h),
+            vec!["m0", "m1", "m2", "m3", "m4", "m5"],
+            "adding the unique qty column to the key makes every row distinct; \
+             nothing may be removed"
+        );
+        assert!(
+            h.status().contains("No duplicate rows"),
+            "and it must SAY so rather than silently doing nothing; got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_edited_cell_moves_with_its_row_through_a_dedupe() {
+        // The side-table trap the guide names: the overlay is keyed by DISPLAY
+        // position, so rows sliding up underneath a typed value would leave
+        // the value on a different record — plausibly and invisibly.
+        let (p, mut h) = dupe_fixture("dedupe_overlay");
+        // Data row 3 is m3 (North) — the only North row, so it SURVIVES the
+        // dedupe and can carry the typed value across it.
+        h.click_cell(CellRef::new(3, 2));
+        // The text event must be pumped before Enter, or the app is not yet in
+        // edit mode when the commit arrives and the keystroke is dropped.
+        h.type_text("EDITED").step();
+        h.press_key(Key::Enter).steps(2);
+        assert_eq!(
+            h.app().workbook().view().display(CellRef::new(3, 2)),
+            "EDITED",
+            "baseline: the edit landed on row 3"
+        );
+
+        h.select(CellRef::new(0, 0), CellRef::new(5, 0));
+        h.remove_duplicates();
+        // m3 was at row 3 and is now at row 2 (m0, m1, m3) — the row slid UP
+        // underneath the overlay, which is exactly the trap. Assert CONTENT.
+        // Committing an edit grows the sheet by a trailing blank row, so
+        // compare the populated prefix — but assert its LENGTH too, or a
+        // dedupe that removed nothing would still satisfy the prefix.
+        let m = markers(&h);
+        let populated: Vec<String> = m.iter().take_while(|s| !s.is_empty()).cloned().collect();
+        assert_eq!(
+            populated,
+            vec!["m0", "m1", "EDITED"],
+            "the typed value must still sit on the record it was typed onto — \
+             it belonged to the m3 row and must have travelled with it"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_duplicates_is_reachable_from_the_command_registry() {
+        let (p, mut h) = dupe_fixture("dedupe_wiring");
+        h.open_command_palette();
+        h.command_palette_query("remove dup");
+        let titles = h.command_palette_titles();
+        assert!(
+            titles.iter().any(|t| t.contains("Remove Duplicates")),
+            "a user who searches 'remove dup' must find it; got {titles:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- Subtotals ----
+
+    /// A sheet already grouped by region, so runs are contiguous.
+    const GROUPED: &str = "region,qty\nEast,10\nEast,30\nWest,20\nWest,50\nNorth,40\n";
+
+    fn grouped_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(&unique(name, "csv"), GROUPED);
+        let mut h = Harness::new(Some(&p));
+        h.step_until(60, |a| a.workbook().view().row_count() > 1);
+        // Group on A, aggregate B. `Selection::new(anchor, cursor)` takes the
+        // CURSOR second and `toggle_subtotals` reads the group column off the
+        // cursor — so the cursor must land on A. Anchoring at B and dragging
+        // to A covers the same rectangle with the cursor on the group column.
+        h.select(CellRef::new(0, 1), CellRef::new(4, 0));
+        (p, h)
+    }
+
+    #[test]
+    fn subtotals_insert_a_row_at_each_change_of_value() {
+        use crate::grid::ScreenRow;
+        let (p, mut h) = grouped_fixture("sub_rows");
+        h.toggle_subtotals();
+        // The CSV's first line is the header, so the five DATA rows are
+        // East, East, West, West, North — three runs, three subtotals.
+        let rows = h.screen_rows(12);
+        assert_eq!(
+            rows,
+            vec![
+                ScreenRow::Data(0),
+                ScreenRow::Data(1),
+                ScreenRow::Subtotal {
+                    group: 0,
+                    last_row: 1
+                },
+                ScreenRow::Data(2),
+                ScreenRow::Data(3),
+                ScreenRow::Subtotal {
+                    group: 1,
+                    last_row: 3
+                },
+                ScreenRow::Data(4),
+                ScreenRow::Subtotal {
+                    group: 2,
+                    last_row: 4
+                },
+            ],
+            "PER-ROW IDENTITY: every original row must still be on screen, in \
+             its original order, with exactly one subtotal after each run"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_subtotal_row_is_actually_painted() {
+        let (p, mut h) = grouped_fixture("sub_paint");
+        assert_eq!(
+            h.painted_subtotal_rows(),
+            0,
+            "baseline: nothing is subtotalled"
+        );
+        h.toggle_subtotals();
+        assert!(
+            h.painted_subtotal_rows() >= 3,
+            "three groups must reach the SCREEN, not just the model; got {}",
+            h.painted_subtotal_rows()
+        );
+        assert!(
+            h.painted_subtotal_texts() > 0,
+            "and they must draw their aggregates"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_underlying_rows_are_untouched_by_subtotalling() {
+        let (p, mut h) = grouped_fixture("sub_untouched");
+        let before: Vec<String> = (0..h.app().workbook().view().row_count())
+            .map(|r| h.app().workbook().view().display(CellRef::new(r as u32, 1)))
+            .collect();
+        let rows_before = h.app().workbook().view().row_count();
+        let dirty_before = h.app().workbook().is_dirty();
+        let depth = h.app().workbook().undo_depth();
+
+        h.toggle_subtotals();
+
+        let after: Vec<String> = (0..h.app().workbook().view().row_count())
+            .map(|r| h.app().workbook().view().display(CellRef::new(r as u32, 1)))
+            .collect();
+        assert_eq!(
+            after, before,
+            "a VIEW TRANSFORM writes nothing: every cell must be byte-identical"
+        );
+        assert_eq!(
+            h.app().workbook().view().row_count(),
+            rows_before,
+            "and the sheet must not have grown — a subtotal is not a row"
+        );
+        assert_eq!(
+            h.app().workbook().is_dirty(),
+            dirty_before,
+            "subtotalling must not dirty the workbook"
+        );
+        assert_eq!(
+            h.app().workbook().undo_depth(),
+            depth,
+            "and must push no undo entry — the user removes them by running \
+             the command again"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn removing_subtotals_restores_the_exact_original_view() {
+        let (p, mut h) = grouped_fixture("sub_remove");
+        let before = h.screen_rows(12);
+        h.toggle_subtotals();
+        assert_ne!(h.screen_rows(12), before, "baseline: the view changed");
+        h.toggle_subtotals();
+        assert_eq!(
+            h.screen_rows(12),
+            before,
+            "removing subtotals must restore the EXACT original view, row for \
+             row — not merely the same number of rows"
+        );
+        assert_eq!(h.painted_subtotal_rows(), 0, "and nothing is drawn");
+        assert!(
+            h.status().contains("Subtotals removed"),
+            "and it must say so; got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn subtotals_compose_with_sort_through_the_one_resolver() {
+        use crate::grid::ScreenRow;
+        // Sorting must keep working under subtotals, and the subtotals must
+        // regroup over the SORTED order rather than the file order. That is
+        // only true if both go through RowResolver; a second mapping would
+        // group by the file order and paint the sorted rows, silently pairing
+        // the wrong totals with the wrong records.
+        let p = write_csv(
+            &unique("sub_sort", "csv"),
+            "region,qty\nWest,20\nEast,10\nWest,50\nEast,30\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        h.step_until(60, |a| a.workbook().view().row_count() > 1);
+        // Cursor on A (the group column) — see `grouped_fixture`.
+        h.select(CellRef::new(0, 1), CellRef::new(3, 0));
+        h.click_header(0); // ascending by region
+        h.toggle_subtotals();
+
+        let rows = h.screen_rows(12);
+        // Data rows are West(0), East(1), West(2), East(3) — the header is not
+        // a record. Ascending on A: East(1), East(3), then West(0), West(2).
+        let data: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ScreenRow::Data(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            data,
+            vec![1, 3, 0, 2],
+            "the SORT must still hold under subtotals: East rows (1,3) first, \
+             then West (0,2)"
+        );
+        let subs = rows.iter().filter(|r| r.is_subtotal()).count();
+        assert_eq!(
+            subs, 2,
+            "grouping happens over the SORTED order — East then West — so TWO \
+             runs. The unsorted file order (West, East, West, East) would give \
+             FOUR, so this count is what proves both go through one resolver"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn clicking_a_subtotal_row_selects_nothing() {
+        let (p, mut h) = grouped_fixture("sub_click");
+        h.click_cell(CellRef::new(1, 1));
+        let before = h.app().selection();
+        h.toggle_subtotals();
+        // Screen row 2 is group 0's subtotal (see the identity test above):
+        // two East data rows, then their total.
+        let Some((x, y)) = h.app().cell_center(CellRef::new(0, 1)) else {
+            let _ = std::fs::remove_file(&p);
+            return;
+        };
+        h.click_point(x, y + 2.0 * crate::grid::ROW_HEIGHT).steps(2);
+        assert_eq!(
+            h.app().selection(),
+            before,
+            "a subtotal row is not a cell: clicking it must leave the \
+             selection alone rather than cursoring onto the group's last \
+             record, where the next keystroke would edit data the user never \
+             aimed at"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn subtotals_are_reachable_from_the_command_registry() {
+        let (p, mut h) = grouped_fixture("sub_wiring");
+        h.open_command_palette();
+        h.command_palette_query("subtot");
+        let titles = h.command_palette_titles();
+        assert!(
+            titles.iter().any(|t| t.contains("Subtotals")),
+            "a user who searches 'subtot' must find it; got {titles:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- Consolidate ----
+
+    #[test]
+    fn consolidate_is_reachable_and_says_why_it_cannot_run() {
+        let (p, mut h) = grouped_fixture("cons_wiring");
+        h.open_command_palette();
+        h.command_palette_query("consolid");
+        let rows = h.command_palette_rows();
+        let row = rows
+            .iter()
+            .find(|(t, _)| t.contains("Consolidate"))
+            .expect("Consolidate must be in the palette");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("Consolidate needs at least two sheets — this workbook has one"),
+            "a one-sheet workbook must show the command DISABLED WITH THE \
+             REASON, not hide it: a user who searches and finds nothing \
+             concludes the feature does not exist"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn consolidate_reports_missing_keys_rather_than_zeroing_them() {
+        // `consolidate` reads the LABEL row from the first row of the selected
+        // range, so the label row must be a DATA row. The CSV loader consumes
+        // line 1 as the file header, hence the throwaway first line: it keeps
+        // ",Widgets" addressable as data row 0.
+        let p = write_csv(
+            &unique("cons_q1", "csv"),
+            "h,h2\n,Widgets\nEast,10\nWest,20\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        h.step_until(60, |a| a.workbook().view().row_count() > 1);
+        // A second sheet with an East row and NO West row — the case the whole
+        // feature exists for. Built by TYPING, through the same commit path a
+        // user would use, so the fixture cannot diverge from real data.
+        h.app_mut().add_sheet_for_test();
+        h.steps(2);
+        // Written through the workbook's commit API rather than by typing.
+        // A freshly added sheet reports 0 rows x 0 columns, and typing into it
+        // is silently swallowed — the click lands and the edit never commits.
+        // That is a real product bug (filed separately); driving the fixture
+        // by keystroke here would test THAT bug instead of consolidation.
+        for (cell, text) in [
+            (CellRef::new(0, 1), "Widgets"),
+            (CellRef::new(1, 0), "East"),
+            (CellRef::new(1, 1), "100"),
+        ] {
+            h.app_mut().commit_edit_for_test(cell, text);
+        }
+        h.steps(2);
+        assert!(
+            h.app_mut().switch_to_sheet_for_test(0),
+            "back to the first sheet"
+        );
+        h.steps(2);
+        // Rows 0..2 = labels, East, West; column 0 is the key column.
+        h.select(CellRef::new(0, 0), CellRef::new(2, 1));
+        h.consolidate();
+
+        let s = h.status().to_string();
+        assert!(
+            s.contains("came from") && s.contains("not zeroed"),
+            "the status must SAY a key was missing rather than quietly \
+             producing a total that is short by one sheet; got {s:?}"
+        );
+        // East is on both sheets: 10 + 100. Written below the source block.
+        let view = h.app().workbook().view();
+        assert_eq!(
+            view.display(CellRef::new(5, 1)),
+            "110",
+            "East totals across both sheets"
+        );
+        assert_eq!(
+            view.display(CellRef::new(6, 1)),
+            "20",
+            "West is 20 — the ONE sheet that has it — not 20 plus a phantom 0"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }

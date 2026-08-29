@@ -5097,6 +5097,26 @@ impl FerrixApp {
         self.add_sheet();
     }
 
+    /// Switch to a sheet by tab position, as clicking its tab does.
+    ///
+    /// Goes through `switch_sheet` rather than straight to the workbook, so a
+    /// test lands in the same state a real tab click leaves the app in — with
+    /// the view transforms rebuilt for the sheet that is now showing.
+    pub fn switch_to_sheet_for_test(&mut self, index: usize) -> bool {
+        let Some(&(id, _)) = self
+            .wb
+            .sheet_names()
+            .iter()
+            .collect::<Vec<_>>()
+            .get(index)
+            .copied()
+        else {
+            return false;
+        };
+        self.switch_sheet(id);
+        true
+    }
+
     /// Caret position in the live editor, in bytes.
     pub fn edit_caret(&self) -> usize {
         self.edit_caret
