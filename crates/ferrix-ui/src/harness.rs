@@ -376,6 +376,23 @@ impl Harness {
         self
     }
 
+    /// Drive the REAL print export the menu runs, minus the file picker.
+    ///
+    /// `print_pdf_dialog`/`print_html_dialog` only add an `rfd` save dialog on
+    /// top of this, which cannot open headless — so a test drives the shared
+    /// body directly. This still exercises the snapshot, the sheet name, the
+    /// sizing, and the render call exactly as the menu item does.
+    pub fn print_to_path(
+        &mut self,
+        path: &std::path::Path,
+        html: bool,
+        confirm_large: bool,
+    ) -> &mut Self {
+        self.app.print_to_path(path, html, confirm_large);
+        self.steps(2);
+        self
+    }
+
     // ---- clipboard interop and Paste Special (issue #30) ----
     //
     // Copy goes through the REAL Ctrl+C path, so what these tests read back is
@@ -9987,5 +10004,106 @@ xxx,yyy,zzz
              row is invisible to export and SUM"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn printing_to_pdf_writes_a_file_the_cell_values_can_be_read_out_of() {
+        let (mut h, csv) = numeric_app("print_pdf.csv");
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-print-ui-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+
+        h.print_to_path(&out, false, false);
+        assert!(
+            h.status().contains("Printed") && h.status().contains("page"),
+            "the status should report a printed-page count, got {:?}",
+            h.status()
+        );
+        assert!(out.exists(), "no PDF was written: {}", h.status());
+
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"%PDF"), "not a PDF");
+        // Extract the PDF's text literals directly from the bytes: `(...) Tj`,
+        // honouring the \( \) \\ escapes. ferrix-io's richer reader is
+        // test-gated to that crate, and a self-contained extractor keeps this
+        // assertion reading the serialized file rather than any in-memory data.
+        let text = pdf_text_literals(&bytes).join(" ");
+        for needle in ["150", "200", "180", "120"] {
+            assert!(
+                text.contains(needle),
+                "cell value {needle} is missing from the printed PDF text: {text:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn printing_to_html_writes_a_self_contained_page_with_the_values() {
+        let (mut h, csv) = numeric_app("print_html.csv");
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-print-ui-{}-{}.html",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+
+        h.print_to_path(&out, true, false);
+        assert!(out.exists(), "no HTML was written: {}", h.status());
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("<table"));
+        assert!(html.contains("150") && html.contains("200"));
+        for external in ["<link", "<script", "src=\"http"] {
+            assert!(!html.contains(external), "HTML references {external}");
+        }
+
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Pull the `(...)` string literals a PDF content stream draws with `Tj`,
+    /// decoding the `\(`, `\)`, `\\` escapes. A self-contained extractor so the
+    /// print test reads the serialized bytes, not any in-memory state.
+    fn pdf_text_literals(bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'(' {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' if j + 1 < bytes.len() => {
+                            lit.push(bytes[j + 1] as char);
+                            j += 2;
+                        }
+                        b')' => {
+                            j += 1;
+                            break;
+                        }
+                        c => {
+                            lit.push(c as char);
+                            j += 1;
+                        }
+                    }
+                }
+                out.push(lit);
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 }

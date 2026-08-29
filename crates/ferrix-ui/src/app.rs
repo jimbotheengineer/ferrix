@@ -5307,8 +5307,110 @@ impl FerrixApp {
         };
     }
 
-    /// Everything about this sheet's decoration that xlsx cannot carry
-    /// exactly, deduped, in the [`ferrix_io::decor_xlsx_loss`] shape.
+    /// Write this sheet to `path` as a PDF or a single-file HTML page.
+    ///
+    /// Dialog-free so a test can drive the REAL export the menu runs (the
+    /// `export_xlsx_to` convention): testing `render_pdf` directly would pass
+    /// even if this method wired the wrong sheet, name, or sizing. Runs on the
+    /// calling thread like the Parquet export — the write itself streams one
+    /// page at a time, so the memory bound holds; only UI responsiveness during
+    /// a very large forced job does not, which the large-job refusal makes a
+    /// deliberate choice rather than a silent freeze.
+    ///
+    /// `confirm_large` is threaded through: the first call refuses a job over
+    /// [`ferrix_core::page::LARGE_JOB_PAGES`] pages and reports the count, so a
+    /// user asking to print a 200M-row sheet is warned instead of handed a
+    /// 200,000-page file. A caller that meant it passes `confirm_large = true`.
+    pub fn print_to_path(&mut self, path: &std::path::Path, html: bool, confirm_large: bool) {
+        if self.exporting {
+            self.status = "An export is already running — cancel it first".into();
+            return;
+        }
+        let cost = crate::sheet_view::OwnedSheet::snapshot_cost_bytes(&self.wb.overlay);
+        if let Err(msg) = ferrix_core::Budget::sample().admit(cost, "Printing this sheet's edits") {
+            self.status = msg;
+            return;
+        }
+
+        let name = self.active_sheet_name().to_string();
+        let snapshot = crate::sheet_view::OwnedSheet::new(
+            std::sync::Arc::clone(&self.wb.base),
+            &self.wb.overlay,
+        )
+        .with_name(&name);
+
+        let setup = ferrix_core::page::PageSetup::default();
+        let opts = ferrix_io::render::RenderOptions::default();
+        let rows = self.sizing.rows.clone();
+        let cols = self.sizing.cols.clone();
+
+        let result = if html {
+            ferrix_io::render::render_html(
+                path,
+                &snapshot,
+                &setup,
+                &opts,
+                &rows,
+                &cols,
+                confirm_large,
+                |_, _| {},
+                || false,
+            )
+        } else {
+            ferrix_io::render::render_pdf(
+                path,
+                &snapshot,
+                &setup,
+                &opts,
+                &rows,
+                &cols,
+                confirm_large,
+                |_, _| {},
+                || false,
+            )
+        };
+
+        self.status = match result {
+            Ok(stats) => format!(
+                "Printed {} page(s), {} row(s) ({:.1} MB) → {}",
+                fmt_int(stats.pages as usize),
+                fmt_int(stats.rows as usize),
+                stats.bytes as f64 / 1e6,
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(ferrix_io::render::RenderError::TooManyPages(n)) => format!(
+                "This would print {} pages — nothing was written. Choose a print area or \
+                 confirm to proceed.",
+                fmt_int(n as usize)
+            ),
+            Err(e) => format!("Print failed: {e}"),
+        };
+    }
+
+    /// Menu entry: pick a PDF path, then print to it.
+    fn print_pdf_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name("print.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        // First attempt refuses a large job; the user re-invokes to confirm.
+        self.print_to_path(&path, false, false);
+    }
+
+    /// Menu entry: pick an HTML path, then print to it.
+    fn print_html_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("HTML", &["html"])
+            .set_file_name("print.html")
+            .save_file()
+        else {
+            return;
+        };
+        self.print_to_path(&path, true, false);
+    }
     ///
     /// Public because the export dialog wants it BEFORE writing, not only in
     /// the status line afterwards.
@@ -8251,6 +8353,8 @@ impl FerrixApp {
             C::FileExportCsv => self.export_dialog(),
             C::FileExportXlsx => self.export_xlsx_dialog(),
             C::FileExportParquet => self.export_parquet_dialog(),
+            C::FilePrintPdf => self.print_pdf_dialog(),
+            C::FilePrintHtml => self.print_html_dialog(),
             C::DataValidationNew => self.validation_new_rule(),
             C::DataValidationManage => self.validation_manage(),
             C::DataValidationClear => self.validation_clear_selection(),
