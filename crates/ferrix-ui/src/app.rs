@@ -121,6 +121,16 @@ enum Focus {
 const CELL_EDITOR_ID: &str = "cell_editor";
 const FORMULA_BAR_ID: &str = "formula_bar_edit";
 
+/// How many DISJOINT selection ranges are kept (issue #17).
+///
+/// Ctrl+clicking headers accumulates ranges, and without a cap a user leaning
+/// on Ctrl would grow the list without bound. 64 is far more scattered ranges
+/// than anyone assembles by hand, each is 16 bytes, and the paint loop tests
+/// membership against all of them per visible cell — so the bound is what keeps
+/// that per-cell cost a small constant rather than something that grows with
+/// the session. The cap is REPORTED when it bites, never silently enforced.
+pub const MAX_DISJOINT_SELECTIONS: usize = 64;
+
 /// A highlighted reference outline being dragged onto another cell.
 #[derive(Clone, Copy, Debug)]
 struct RefDrag {
@@ -141,6 +151,15 @@ pub struct FerrixApp {
     col_widths: Vec<f32>,
     /// Active selection. `cursor` is the cell that typing lands in.
     selection: Selection,
+    /// Additional DISJOINT ranges, from Ctrl+clicking row or column headers
+    /// (issue #17).
+    ///
+    /// Bounded on purpose. Each entry is two corners, so a hundred disjoint
+    /// full-column selections over a 200M-row sheet is a few kilobytes rather
+    /// than a row list — but the list itself still has to stop somewhere, or a
+    /// held-down Ctrl+click would grow it without limit. See
+    /// [`MAX_DISJOINT_SELECTIONS`].
+    extra_selections: Vec<Selection>,
     scroll: ScrollState,
 
     focus: Focus,
@@ -297,6 +316,9 @@ pub struct FerrixApp {
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
     header_hitboxes: Vec<(usize, egui::Pos2)>,
+    /// Where each visible ROW header was painted last frame (issue #17).
+    /// Same purpose as `header_hitboxes`, for the other axis.
+    row_header_hitboxes: Vec<(u32, egui::Pos2)>,
     /// (screen row, underlying row) for every row the LAST FRAME painted,
     /// frozen band first. Read back by tests as the app's own account of what
     /// is on screen.
@@ -589,6 +611,7 @@ impl FerrixApp {
             stats_cols: 0,
             col_widths: Vec::new(),
             selection: Selection::default(),
+            extra_selections: Vec::new(),
             scroll: ScrollState::default(),
             focus: Focus::Grid,
             editing: None,
@@ -639,6 +662,7 @@ impl FerrixApp {
             last_outline_buttons: 0,
             sizing_path: None,
             header_hitboxes: Vec::new(),
+            row_header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
             last_frozen_rows: 0,
             last_grid_rect: None,
@@ -5048,6 +5072,261 @@ impl FerrixApp {
         r
     }
 
+    /// Move rows as a display-order permutation (issue #17, scope item 4).
+    ///
+    /// A row MOVE, not an arbitrary permutation: see `Workbook::move_rows` for
+    /// why that is affordable at 200M rows and what the visible limit is. A
+    /// refusal lands in the status line rather than being swallowed.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        let r = self.wb.move_rows(from, count, to);
+        match &r {
+            Ok(()) => {
+                let (runs, cap) = self.wb.row_order_runs();
+                // The run count is surfaced as it approaches the cap, so the
+                // user meets the limit as a warning rather than as a refusal
+                // out of nowhere.
+                self.status = if runs * 4 > cap {
+                    format!(
+                        "Moved {count} row(s) — {runs} of {cap} reorder steps tracked; \
+                         save and reopen to start from a clean order"
+                    )
+                } else {
+                    format!("Moved {count} row(s) to row {}", to + 1)
+                };
+            }
+            Err(e) => self.status = format!("Cannot move those rows: {e}"),
+        }
+        r
+    }
+
+    // ---- structural edits: insert / delete row and column (issue #17) ----
+    //
+    // Each takes the span from the CURRENT SELECTION, so "Insert Row" with
+    // three rows selected inserts three — the behaviour every spreadsheet has.
+    // Each is one undo step, and each reports what it did in the status line
+    // so a refusal (see `AxisOrder::MAX_RUNS`) is visible rather than silent.
+
+    /// Rows the selection spans, as `(first, count)` in display space.
+    fn selected_row_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.row_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    /// Columns the selection spans, as `(first, count)` in display space.
+    fn selected_col_span(&self) -> (u64, u64) {
+        let (a, b) = self.selection.col_range();
+        (u64::from(a), u64::from(b - a + 1))
+    }
+
+    pub fn insert_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .insert_rows(at, count)
+            .map(|()| format!("Inserted {count} row(s) at row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_rows_at_selection(&mut self) {
+        let (at, count) = self.selected_row_span();
+        let outcome = self
+            .wb
+            .delete_rows(at, count)
+            .map(|()| format!("Deleted {count} row(s) from row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
+    pub fn insert_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.insert_columns(at, count).map(|()| {
+            format!(
+                "Inserted {count} column(s) at {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    pub fn delete_columns_at_selection(&mut self) {
+        let (at, count) = self.selected_col_span();
+        let outcome = self.wb.delete_columns(at, count).map(|()| {
+            format!(
+                "Deleted {count} column(s) from {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    /// Report a structural edit and refresh the derived view state.
+    ///
+    /// A REFUSAL IS SHOWN, not swallowed. `AxisOrder` refuses an edit that
+    /// would fragment the display order past its cap, and the whole point of
+    /// that cap is that the user sees the limit rather than feeling it as
+    /// unexplained slowness.
+    fn apply_structural(&mut self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(msg) => {
+                self.status = msg;
+                // The sheet's extent changed, so anything derived from it —
+                // the row count in the status bar, the table filter mask —
+                // has to be recomputed rather than left describing the old
+                // shape.
+                let rows = self.wb.view().row_count();
+                self.stats_rows = rows;
+                self.refresh_tables();
+                self.clamp_selection_to_sheet();
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = format!("Cannot do that: {e}"),
+        }
+    }
+
+    /// Pull the selection back inside the sheet after a delete shrinks it.
+    ///
+    /// Without this, deleting the last row leaves the cursor addressing a row
+    /// that no longer exists, and the next keystroke would extend the sheet to
+    /// recreate it.
+    fn clamp_selection_to_sheet(&mut self) {
+        let view = self.wb.view();
+        let last_row = view.row_count().saturating_sub(1) as u32;
+        let last_col = view.col_count().saturating_sub(1) as u32;
+        let clamp = |c: CellRef| CellRef::new(c.row.min(last_row), c.col.min(last_col));
+        self.selection = Selection::new(clamp(self.selection.anchor), clamp(self.selection.cursor));
+    }
+
+    // ---- row / column header selection (issue #17) ----
+    //
+    // The COLUMN case existed (press selects the whole column); the ROW case
+    // did not, and neither had Ctrl for disjoint or Shift for a span. All
+    // three go through one pair of methods so a row and a column cannot end up
+    // behaving differently by accident.
+
+    /// Select the whole of display row `row`.
+    ///
+    /// `mods` decides how it composes with what is already selected:
+    /// * plain — replace the selection with this row;
+    /// * Shift — extend from the anchor to cover every row between;
+    /// * Ctrl  — ADD this row as a disjoint range, leaving the others alone.
+    ///
+    /// The selection stays two corners in every case. Selecting row 1 and row
+    /// 50,000,000 of a 200M-row sheet must not materialise the 50M rows
+    /// between them, which is exactly what a bounding-box-only model would do
+    /// and why Ctrl needs its own list.
+    pub fn select_row(&mut self, row: u32, mods: egui::Modifiers) {
+        let last_col = self.stats_cols.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(row, 0), CellRef::new(row, last_col));
+        let note = self.apply_header_selection(band, mods, true);
+        // A warning outranks the routine confirmation: "row 4 selected" is
+        // what the user can already see, whereas "the oldest was dropped" is
+        // the only signal that the cap just bit.
+        self.status = note.unwrap_or_else(|| format!("Row {} selected", row as u64 + 1));
+    }
+
+    /// Select the whole of display column `col`. Same modifier rules as
+    /// [`Self::select_row`].
+    pub fn select_column(&mut self, col: u32, mods: egui::Modifiers) {
+        let last_row = self.stats_rows.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(0, col), CellRef::new(last_row, col));
+        let note = self.apply_header_selection(band, mods, false);
+        self.status =
+            note.unwrap_or_else(|| format!("Column {} selected", ferrix_core::column_name(col)));
+    }
+
+    /// Compose a header band with the existing selection per the modifiers.
+    ///
+    /// Returns a status message the caller must PREFER over its own, when the
+    /// composition did something the user needs told about.
+    fn apply_header_selection(
+        &mut self,
+        band: Selection,
+        mods: egui::Modifiers,
+        is_row: bool,
+    ) -> Option<String> {
+        let mut note = None;
+        if mods.command {
+            // Ctrl: a DISJOINT addition. The current selection is pushed into
+            // the extra list and the new band becomes the active one, so the
+            // cursor — and therefore where typing lands — is always the band
+            // the user just clicked.
+            if self.extra_selections.len() < MAX_DISJOINT_SELECTIONS {
+                self.extra_selections.push(self.selection);
+            } else {
+                // Visible, not silent. A cap the user cannot see is a cap they
+                // experience as the feature randomly not working.
+                note = Some(format!(
+                    "Only {MAX_DISJOINT_SELECTIONS} separate selections are kept — \
+                     the oldest was dropped"
+                ));
+                self.extra_selections.remove(0);
+                self.extra_selections.push(self.selection);
+            }
+            self.selection = band;
+        } else if mods.shift {
+            // Shift: one contiguous span from the existing ANCHOR to this
+            // band. Disjoint ranges are cleared, matching what every
+            // spreadsheet does — a span replaces a scattering.
+            self.extra_selections.clear();
+            let anchor = self.selection.anchor;
+            self.selection = if is_row {
+                Selection::new(
+                    CellRef::new(anchor.row, band.anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            } else {
+                Selection::new(
+                    CellRef::new(band.anchor.row, anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            };
+        } else {
+            self.extra_selections.clear();
+            self.selection = band;
+        }
+        self.focus = Focus::Grid;
+        self.sync_formula_bar();
+        note
+    }
+
+    /// The disjoint ranges currently held, for tests and for the paint call.
+    pub fn extra_selections(&self) -> &[Selection] {
+        &self.extra_selections
+    }
+
+    /// Whether a cell is inside ANY selected range, active or disjoint.
+    pub fn cell_is_selected(&self, cell: CellRef) -> bool {
+        self.selection.contains(cell) || self.extra_selections.iter().any(|s| s.contains(cell))
+    }
+
+    /// Whether a display row is fully or partly selected, counting disjoint
+    /// ranges. This is what the row header highlight reads.
+    pub fn row_is_selected(&self, row: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.row_range();
+            row >= a && row <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Whether a display column is fully or partly selected, counting disjoint
+    /// ranges.
+    pub fn column_is_selected(&self, col: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.col_range();
+            col >= a && col <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Where each visible ROW header was painted last frame, for tests that
+    /// need to click one without guessing pixels.
+    pub fn row_header_center(&self, row: u32) -> Option<(f32, f32)> {
+        self.row_header_hitboxes
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, p)| (p.x, p.y))
+    }
+
     /// Whether a load is still in flight.
     pub fn is_loading(&self) -> bool {
         self.loading
@@ -7216,6 +7495,13 @@ impl FerrixApp {
             C::FormulaTraceClear => self.clear_trace(),
             C::FormulaNames => self.names_open = true,
             C::DataGoalSeek => self.goal_seek_open(),
+            // Issue #17. These go through the same selection-span methods the
+            // harness tests drive, so the menu item and the test exercise one
+            // path rather than two.
+            C::DataInsertRow => self.insert_rows_at_selection(),
+            C::DataDeleteRow => self.delete_rows_at_selection(),
+            C::DataInsertColumn => self.insert_columns_at_selection(),
+            C::DataDeleteColumn => self.delete_columns_at_selection(),
             C::DataChart => self.open_chart(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),
@@ -8329,6 +8615,7 @@ impl FerrixApp {
                     Grid {
                         view: &view,
                         selection: Some(self.selection),
+                        extra_selections: &self.extra_selections,
                         col_widths: &self.col_widths,
                         scroll: &mut self.scroll,
                         editing: self.editing,
@@ -8575,6 +8862,7 @@ impl FerrixApp {
                 // click one without guessing at pixels that move whenever a
                 // bar above the grid opens.
                 self.header_hitboxes = resp.header_hitboxes.clone();
+                self.row_header_hitboxes = resp.row_header_hitboxes.clone();
                 self.last_painted_rows = resp.painted_rows.clone();
                 self.last_frozen_rows = resp.frozen_row_count;
                 // The grid clamps the zoom (a band taller than the window is
@@ -8656,10 +8944,22 @@ impl FerrixApp {
                 // user sees what they grabbed. Release commits the move.
                 if let Some(c) = resp.header_press {
                     self.header_drag = Some(c);
-                    let last = self.stats_rows.saturating_sub(1) as u32;
-                    self.selection =
-                        Selection::new(CellRef::new(0, c as u32), CellRef::new(last, c as u32));
-                    self.status = format!("Column {} selected", ferrix_core::column_name(c as u32));
+                    // Plain / Ctrl / Shift all go through the SAME method the
+                    // row case uses, so the two axes cannot drift apart.
+                    let mods = ui.input(|i| i.modifiers);
+                    self.select_column(c as u32, mods);
+                }
+                // --- row header selection (issue #17) ---
+                //
+                // The mirror of the column press above. Reported on PRESS with
+                // the modifiers captured on that frame, because egui's
+                // aggregate `i.modifiers` is only correct while the frame that
+                // produced the press is still being handled.
+                if let Some((row, mods)) = resp.row_header_press {
+                    if self.editing.is_some() {
+                        self.commit_edit();
+                    }
+                    self.select_row(row, mods);
                 }
                 if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
                     if src != dst {

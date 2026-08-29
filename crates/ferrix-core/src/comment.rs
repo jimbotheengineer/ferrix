@@ -283,6 +283,37 @@ impl CommentMap {
         }
     }
 
+    /// Relocate every comment for a row/column INSERT or DELETE on one axis.
+    ///
+    /// Same contract and same reason as [`Self::remap_columns`]: a sparse side
+    /// table keyed by the pre-change coordinate is exactly what slides a note
+    /// off the number it describes. `axis_is_row` picks which coordinate the
+    /// shift applies to.
+    ///
+    /// A comment on a DELETED row or column is dropped — there is nothing left
+    /// for it to annotate. Cost is O(comments), never O(rows).
+    pub fn shift_axis(&mut self, shift: crate::order::AxisShift, axis_is_row: bool) {
+        if self.len == 0 {
+            return;
+        }
+        let all: Vec<(CellRef, Comment)> = self.iter().map(|(c, cm)| (c, cm.clone())).collect();
+        // Rebuild wholesale rather than mutating in place: a shift is a
+        // monotone relabelling of every key, so a two-phase move would visit
+        // the entire map anyway, and rebuilding cannot half-apply.
+        self.by_row.clear();
+        self.len = 0;
+        for (cell, comment) in all {
+            let moved = if axis_is_row {
+                shift.map(cell.row).map(|r| CellRef::new(r, cell.col))
+            } else {
+                shift.map(cell.col).map(|c| CellRef::new(cell.row, c))
+            };
+            if let Some(dest) = moved {
+                self.set(dest, comment);
+            }
+        }
+    }
+
     /// Rebuild from saved parts. Used by the sidecar loader.
     pub fn from_iter_cells<I: IntoIterator<Item = (CellRef, Comment)>>(items: I) -> Self {
         let mut m = Self::new();

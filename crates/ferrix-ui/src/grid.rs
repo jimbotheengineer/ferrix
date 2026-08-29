@@ -550,6 +550,26 @@ pub struct GridResponse {
     pub col_autofit: Option<usize>,
     /// Header that was right-clicked, and where, for the hide/unhide menu.
     pub header_context: Option<(usize, egui::Pos2)>,
+    /// Display ROW whose header was pressed (issue #17).
+    ///
+    /// Reported on PRESS for the same reason [`GridResponse::header_press`] is:
+    /// `primary_clicked` fires on RELEASE, so a gesture keyed off it can never
+    /// start a drag and — more importantly here — a press-and-hold would leave
+    /// the row unselected until the button came back up.
+    ///
+    /// Carries the modifiers as seen on THIS frame, because the caller needs
+    /// to know whether the press was plain, Ctrl (add a disjoint row) or Shift
+    /// (extend a span), and egui's aggregate `i.modifiers` is only correct
+    /// while the frame that produced the press is still being handled.
+    pub row_header_press: Option<(u32, egui::Modifiers)>,
+    /// Where each visible row's header was actually painted this frame:
+    /// (display row, centre point).
+    ///
+    /// Same contract as [`GridResponse::header_hitboxes`], and it exists for
+    /// the same reason: the row band's y depends on the scroll offset, the
+    /// zoom, per-row heights and the frozen band, so a test that hard-codes
+    /// pixels tests arithmetic rather than the gesture.
+    pub row_header_hitboxes: Vec<(u32, egui::Pos2)>,
     /// Outline group whose expand/collapse button was clicked, named by the
     /// group's first row.
     pub outline_toggle: Option<u32>,
@@ -599,6 +619,16 @@ pub struct Grid<'a> {
     /// The active selection. Its cursor is drawn with a strong border, the
     /// rest of the range with a translucent fill.
     pub selection: Option<Selection>,
+    /// Additional, DISJOINT selected ranges (issue #17).
+    ///
+    /// Ctrl+clicking a second row or column adds a range here rather than
+    /// growing `selection` into a bounding box that would cover everything
+    /// between them. Each is still a pair of corners, so selecting rows 1 and
+    /// 50,000,000 of a 200M-row sheet costs 32 bytes, not a row list.
+    ///
+    /// Kept as a slice the caller owns: the grid paints them and has no
+    /// opinion about how they were accumulated.
+    pub extra_selections: &'a [Selection],
     pub col_widths: &'a [f32],
     pub scroll: &'a mut ScrollState,
     /// Cell currently being edited, if any — painted by the caller as a
@@ -1636,6 +1666,14 @@ impl<'a> Grid<'a> {
                         painter.rect_filled(cell_rect, 0.0, th.range_fill);
                     }
                 }
+                // Disjoint ranges paint with the same range fill, so a
+                // Ctrl+click selection LOOKS selected rather than being a
+                // model-only state the user cannot see (issue #17).
+                if !self.extra_selections.is_empty()
+                    && self.extra_selections.iter().any(|s| s.contains(cref))
+                {
+                    painter.rect_filled(cell_rect, 0.0, th.range_fill);
+                }
 
                 // The cell under edit is drawn by the caller's TextEdit.
                 if self.editing == Some(cref) {
@@ -2591,6 +2629,15 @@ impl<'a> Grid<'a> {
         };
         let mut outline_toggle: Option<u32> = None;
         let mut outline_buttons = 0usize;
+        // --- row header selection (issue #17) ---
+        //
+        // The column case already existed; this is its mirror. Both are
+        // resolved from the SAME band walk that paints the header, so the row
+        // a press selects cannot disagree with the number drawn beside it.
+        let mut row_header_press: Option<(u32, egui::Modifiers)> = None;
+        let mut row_header_hitboxes: Vec<(u32, egui::Pos2)> = Vec::new();
+        let pointer_in_row_header = pointer_pos.is_some_and(|p| row_header.contains(p));
+        let modifiers = ui.input(|i| i.modifiers);
         // Row headers carry the ORIGINAL row number even under a filter. A
         // filtered view that renumbered its rows 1..N would be actively
         // misleading: the whole point of finding row 4,912,733 is knowing it
@@ -2622,6 +2669,9 @@ impl<'a> Grid<'a> {
             let selected = self.selection.is_some_and(|s| {
                 let (a, b) = s.row_range();
                 row >= a && row <= b
+            }) || self.extra_selections.iter().any(|s| {
+                let (a, b) = s.row_range();
+                row >= a && row <= b
             });
             if resolved.is_pad() {
                 rhp.rect_filled(rect, 0.0, th.pad_row);
@@ -2632,6 +2682,7 @@ impl<'a> Grid<'a> {
             // Outline gutter for this row: the nesting spine, plus the
             // collapse/expand button on a group's first row. Only real rows
             // carry groups — padding is past the end of every range.
+            let mut on_outline_button = false;
             if let (Some(outline), false) = (self.row_outline, resolved.is_pad()) {
                 let level = outline.level_at(row);
                 if level > 0 {
@@ -2669,7 +2720,25 @@ impl<'a> Grid<'a> {
                     // the button cannot drift from where it is drawn.
                     if primary_clicked && pointer_pos.is_some_and(|p| btn.expand(2.0).contains(p)) {
                         outline_toggle = Some(row);
+                        // An outline toggle is NOT also a row selection: the
+                        // two controls overlap, and letting both fire would
+                        // reselect the sheet every time a group was collapsed.
+                        on_outline_button = true;
                     }
+                }
+            }
+            // Recorded from the SAME rect the number was painted into, so a
+            // caller aiming at the reported centre hits the row it names.
+            // Padding rows are excluded: they are not rows of the file yet, and
+            // selecting one would extend the sheet to create it.
+            if !resolved.is_pad() {
+                row_header_hitboxes.push((row, rect.center()));
+                if pointer_in_row_header
+                    && primary_pressed
+                    && !on_outline_button
+                    && pointer_pos.is_some_and(|p| rect.contains(p))
+                {
+                    row_header_press = Some((row, modifiers));
                 }
             }
             // A padding row still shows its would-be number, so the user can
@@ -2734,6 +2803,8 @@ impl<'a> Grid<'a> {
             resize_released,
             col_autofit,
             header_context,
+            row_header_press,
+            row_header_hitboxes,
             outline_toggle,
             outline_buttons,
             border_segments,

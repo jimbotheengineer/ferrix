@@ -241,6 +241,94 @@ impl ferrix_formula::remap::AxisMap for ColumnMove {
     }
 }
 
+/// Which axis a structural edit acts on.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Axis {
+    Row,
+    Col,
+}
+
+/// Insert or delete. Named rather than a bool so a call site reads as what it
+/// does.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum StructuralOp {
+    Insert,
+    Delete,
+}
+
+/// Adapts an [`ferrix_core::AxisShift`] to the [`AxisMap`] the formula
+/// rewriter wants.
+///
+/// The `None` arm matters: it is what turns a reference into a deleted row or
+/// column into `#REF!` rather than into a silently-wrong neighbour.
+///
+/// [`AxisMap`]: ferrix_formula::remap::AxisMap
+struct AxisShiftMap {
+    shift: ferrix_core::AxisShift,
+}
+
+impl ferrix_formula::remap::AxisMap for AxisShiftMap {
+    fn map(&self, old: u32) -> Option<u32> {
+        self.shift.map(old)
+    }
+}
+
+/// Old display position -> new, for a MOVE of a contiguous span (issue #17).
+///
+/// ## Why this is arithmetic and not a `HashMap`
+///
+/// `remap_formulas_for_order` builds an explicit old->new map by walking every
+/// display position. For columns that is fine — a sheet has tens of them. For
+/// ROWS it is the whole problem restated: moving row 5 to row 100,000,000
+/// would build a hundred million map entries, which is exactly the per-row
+/// work `AxisOrder`'s run encoding exists to avoid. Worse, it would be O(rows)
+/// even when the sheet has three edits on it.
+///
+/// A move is a closed-form permutation, so this computes it instead of storing
+/// it: **zero allocation, O(1) per lookup, independent of how far the row
+/// travelled**. Combined with the fact that the callers iterate the SPARSE
+/// stores (the overlay's edits, the comment map) rather than the axis, a row
+/// move over a 200M-row sheet costs O(edits + runs) and nothing else.
+///
+/// That is why row reorder is implemented as a real move rather than being
+/// refused or declared out of scope: with this representation there is no
+/// 800 MB permutation to avoid. The only bound left is
+/// [`ferrix_core::AxisOrder::MAX_RUNS`], which refuses with a message the UI
+/// shows — a limit the user can see rather than one they can only feel.
+struct SpanMove {
+    from: u64,
+    count: u64,
+    to: u64,
+}
+
+impl ferrix_formula::remap::AxisMap for SpanMove {
+    fn map(&self, old: u32) -> Option<u32> {
+        let r = u64::from(old);
+        let (from, count, to) = (self.from, self.count, self.to);
+        let moved = if to > from {
+            // Forward: the span lands ending at `to`, and everything it
+            // jumped over shifts back by `count`.
+            if r >= from && r < from + count {
+                to - count + (r - from)
+            } else if r >= from + count && r < to {
+                r - count
+            } else {
+                r
+            }
+        } else {
+            // Backward: the span lands at `to`, pushing what was there down.
+            if r >= from && r < from + count {
+                to + (r - from)
+            } else if r >= to && r < from {
+                r + count
+            } else {
+                r
+            }
+        };
+        u32::try_from(moved).ok()
+    }
+}
+
 pub struct Workbook {
     /// The ACTIVE sheet's immutable base. Never present in `parked`.
     ///
@@ -888,8 +976,20 @@ impl Workbook {
     /// Read any sheet, active or parked, through the same composite view.
     pub fn sheet_view(&self, id: SheetId) -> Option<SheetView<'_>> {
         if id == self.sheets[self.active].id {
-            return Some(SheetView::new(&self.base, &self.overlay));
+            // THROUGH the display order, not around it. Formula evaluation
+            // resolves cells with this view, so building it with
+            // `SheetView::new` would make `=C4` read the base's row 4 while
+            // the screen shows the permuted row 4 — the formula bar and the
+            // grid would disagree about what the same reference means.
+            return Some(SheetView::with_order(
+                &self.base,
+                &self.overlay,
+                &self.order,
+            ));
         }
+        // Parked sheets carry no order of their own: `order` belongs to the
+        // ACTIVE sheet (see the field's docs), so a parked view is identity by
+        // construction rather than by omission.
         self.parked.get(&id).map(|(b, o)| SheetView::new(b, o))
     }
 
@@ -1423,7 +1523,466 @@ impl Workbook {
             });
         }
 
+        // Formulas in columns the reorder did NOT move still REFERENCE columns
+        // that did, so their text has to be rewritten too.
+        //
+        // This was the subtle half. A formula sitting in a stationary column
+        // and reading a moved one was left alone, and the error was invisible
+        // for as long as evaluation resolved cells around the display order
+        // instead of through it: `=B1*2` read the base's column B, which had
+        // not moved, so the answer looked right. The moment `sheet_view`
+        // started resolving through the order — which it must, or the grid and
+        // the formula bar disagree about what `B1` means — the same formula
+        // began reading whatever column had slid into display position B.
+        // Both halves are needed; either alone reads the wrong data.
+        let untouched: Vec<(CellRef, String)> = self
+            .overlay
+            .edited_cells()
+            .filter_map(|(c, i)| match i {
+                CellInput::Formula { src, .. } => Some((*c, src.clone())),
+                _ => None,
+            })
+            .collect();
+        for (cell, src) in untouched {
+            // Skip anything the relocation loop already rewrote; remapping a
+            // second time would shift its references twice.
+            if map.contains_key(&cell.col) || changes.iter().any(|ch| ch.cell == cell) {
+                continue;
+            }
+            let rewritten = remap_columns(&src, &mover);
+            if rewritten == src {
+                continue;
+            }
+            let moved = CellInput::Formula {
+                src: rewritten,
+                cached: Value::Empty,
+            };
+            let prev = self.overlay.set(cell, moved.clone());
+            changes.push(CellChange {
+                cell,
+                before: prev,
+                after: Some(moved),
+            });
+        }
+
+        // The graph is keyed by cell, so a rewritten formula has to be
+        // resynced or a stale edge recalculates the wrong dependents.
+        let sheet = self.active_sheet();
+        let touched: Vec<CellRef> = changes.iter().map(|c| c.cell).collect();
+        for cell in touched {
+            self.resync_graph_at(SheetCell::new(sheet, cell));
+        }
+
         changes
+    }
+
+    // ---------------------------------------------------------- issue #17:
+    // insert / delete row and column
+    //
+    // Every one of these is ONE undo step, and every one relocates EVERY side
+    // table keyed by the pre-change coordinate in the same operation. The
+    // stores are enumerated once, in `apply_axis_shift`, precisely so a future
+    // store cannot be added to the workbook and silently missed here — the
+    // failure mode is not a crash, it is the user's edits quietly describing
+    // the wrong records.
+
+    /// Insert `count` blank columns at display position `at`.
+    ///
+    /// Costs `O(runs + edits)`. The `.ferrix` base is never rewritten: the new
+    /// columns get FRESH data indices from past the base's extent, so no
+    /// existing column's data index moves and the mmap is untouched.
+    pub fn insert_columns(&mut self, at: u64, count: u64) -> Result<(), String> {
+        self.structural_edit(Axis::Col, StructuralOp::Insert, at, count)
+    }
+
+    /// Delete `count` columns at display position `at`.
+    pub fn delete_columns(&mut self, at: u64, count: u64) -> Result<(), String> {
+        self.structural_edit(Axis::Col, StructuralOp::Delete, at, count)
+    }
+
+    /// Insert `count` blank rows at display position `at`.
+    pub fn insert_rows(&mut self, at: u64, count: u64) -> Result<(), String> {
+        self.structural_edit(Axis::Row, StructuralOp::Insert, at, count)
+    }
+
+    /// Delete `count` rows at display position `at`.
+    pub fn delete_rows(&mut self, at: u64, count: u64) -> Result<(), String> {
+        self.structural_edit(Axis::Row, StructuralOp::Delete, at, count)
+    }
+
+    /// The one implementation behind all four structural edits.
+    ///
+    /// Rows and columns share it rather than each having their own copy,
+    /// because the four operations differ only in which axis they permute and
+    /// which of `insert_fresh` / `remove` they call. Two copies of this would
+    /// be two chances to forget a side table.
+    fn structural_edit(
+        &mut self,
+        axis: Axis,
+        op: StructuralOp,
+        at: u64,
+        count: u64,
+    ) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        let view = self.view();
+        let (rows, cols) = (view.row_count() as u64, view.col_count() as u64);
+        let extent = match axis {
+            Axis::Row => rows.max(1),
+            Axis::Col => cols.max(1),
+        };
+        if at > extent {
+            return Err(format!(
+                "position {} is past the end of the sheet ({extent})",
+                at + 1
+            ));
+        }
+        if op == StructuralOp::Delete && at + count > extent {
+            return Err(format!(
+                "cannot delete {count} past the end of the sheet ({extent})"
+            ));
+        }
+
+        // The axis is materialised at the sheet's CURRENT extent first, so an
+        // insert at the end still has a display position to land on.
+        {
+            let order = match axis {
+                Axis::Row => self.order.rows_mut(extent),
+                Axis::Col => self.order.cols_mut(extent),
+            };
+            order.ensure_len(extent);
+            match op {
+                StructuralOp::Insert => {
+                    order.insert_fresh(at, count).map_err(|e| e.to_string())?;
+                }
+                StructuralOp::Delete => {
+                    order.remove(at, count).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        let at32 = u32::try_from(at).map_err(|_| "position out of range".to_string())?;
+        let count32 = u32::try_from(count).map_err(|_| "count out of range".to_string())?;
+        let shift = match op {
+            StructuralOp::Insert => ferrix_core::AxisShift::Insert {
+                at: at32,
+                count: count32,
+            },
+            StructuralOp::Delete => ferrix_core::AxisShift::Delete {
+                at: at32,
+                count: count32,
+            },
+        };
+
+        let changes = self.apply_axis_shift(shift, axis);
+
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: match axis {
+                Axis::Row => CellRef::new(at32, 0),
+                Axis::Col => CellRef::new(0, at32),
+            },
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+        });
+        self.dirty = true;
+        self.recalc_all();
+        Ok(())
+    }
+
+    /// Relocate every display-keyed store for one structural shift, and
+    /// rewrite every formula so its references follow.
+    ///
+    /// THE checklist. Everything keyed by a display coordinate has to move in
+    /// the SAME operation as the order does, or it ends up describing whatever
+    /// record slid into its old position:
+    ///
+    /// * the sparse edit overlay (the user's typed values and formulas),
+    /// * formula TEXT inside those cells — rewritten textually, never through
+    ///   the AST, because the parser discards the `$` markers,
+    /// * comments,
+    /// * formatting: column formats, range formats and per-cell overrides,
+    /// * merged regions.
+    ///
+    /// Returns the overlay changes, so the whole edit is ONE undo entry.
+    fn apply_axis_shift(&mut self, shift: ferrix_core::AxisShift, axis: Axis) -> Vec<CellChange> {
+        let is_row = axis == Axis::Row;
+
+        // Side tables that are not part of undo, for the same reason the
+        // reorder path gives: undo restores the overlay but not `order`, so
+        // moving these back would desync them from a permutation still in
+        // effect. They track whatever order is live.
+        self.comments.shift_axis(shift, is_row);
+        self.format.shift_axis(shift, is_row);
+        self.merges.shift_axis(shift, is_row);
+
+        // The overlay is keyed by DISPLAY position while the base is reached
+        // through the order, so an unrelocated overlay would strand every edit
+        // on the wrong row. O(edits), never O(rows).
+        let existing: Vec<(CellRef, CellInput)> = self
+            .overlay
+            .edited_cells()
+            .map(|(c, i)| (*c, i.clone()))
+            .collect();
+
+        let mover = AxisShiftMap { shift };
+        let mut changes = Vec::new();
+
+        // Two phases, so a shift cannot clobber a cell it has not read yet:
+        // vacate every source before writing any destination.
+        for (cell, _) in &existing {
+            if let Some(prev) = self.overlay.clear(*cell) {
+                changes.push(CellChange {
+                    cell: *cell,
+                    before: Some(prev),
+                    after: None,
+                });
+            }
+        }
+
+        for (cell, input) in existing {
+            let dest = if is_row {
+                shift.map(cell.row).map(|r| CellRef::new(r, cell.col))
+            } else {
+                shift.map(cell.col).map(|c| CellRef::new(cell.row, c))
+            };
+            // An edit on a DELETED row or column goes with it. The cell no
+            // longer exists; keeping the value would resurrect it one row up.
+            let Some(dest) = dest else { continue };
+            let moved = match &input {
+                CellInput::Formula { src, .. } => CellInput::Formula {
+                    // Rewriting formula TEXT: a reference into the deleted span
+                    // becomes #REF! rather than silently sliding onto whatever
+                    // record took that position.
+                    src: if is_row {
+                        ferrix_formula::remap::remap_rows(src, &mover)
+                    } else {
+                        ferrix_formula::remap::remap_columns(src, &mover)
+                    },
+                    cached: Value::Empty,
+                },
+                other => other.clone(),
+            };
+            let prev = self.overlay.set(dest, moved.clone());
+            changes.push(CellChange {
+                cell: dest,
+                before: prev,
+                after: Some(moved),
+            });
+        }
+
+        // Formulas that did NOT move still reference cells that did, so their
+        // text has to be rewritten too — `=SUM(B1:B10)` sitting in a column the
+        // insert never touched must still sum the same data.
+        let untouched: Vec<(CellRef, String)> = self
+            .overlay
+            .edited_cells()
+            .filter_map(|(c, i)| match i {
+                CellInput::Formula { src, .. } => Some((*c, src.clone())),
+                _ => None,
+            })
+            .collect();
+        for (cell, src) in untouched {
+            let rewritten = if is_row {
+                ferrix_formula::remap::remap_rows(&src, &mover)
+            } else {
+                ferrix_formula::remap::remap_columns(&src, &mover)
+            };
+            if rewritten == src {
+                continue;
+            }
+            // Only cells this pass has NOT already rewritten: the relocation
+            // loop above already remapped everything it moved, and remapping a
+            // second time would shift those references twice.
+            if changes
+                .iter()
+                .any(|ch| ch.cell == cell && ch.after.is_some())
+            {
+                continue;
+            }
+            let moved = CellInput::Formula {
+                src: rewritten,
+                cached: Value::Empty,
+            };
+            let prev = self.overlay.set(cell, moved.clone());
+            changes.push(CellChange {
+                cell,
+                before: prev,
+                after: Some(moved),
+            });
+        }
+
+        // The graph is keyed by cell, so every touched cell has to be resynced
+        // or a stale edge would recalculate the wrong dependents.
+        let sheet = self.active_sheet();
+        let touched: Vec<CellRef> = changes.iter().map(|c| c.cell).collect();
+        for cell in touched {
+            self.resync_graph_at(SheetCell::new(sheet, cell));
+        }
+
+        changes
+    }
+
+    /// Move `count` rows starting at display position `from` to display
+    /// position `to` (issue #17, scope item 4).
+    ///
+    /// ## Why a MOVE, and not a refusal or an out-of-scope note
+    ///
+    /// The issue offered three options because an arbitrary permutation over
+    /// 200M rows is 800 MB. Neither of the pessimistic options is needed here,
+    /// because nothing in this path is proportional to the row count:
+    ///
+    /// * the permutation itself is [`ferrix_core::AxisOrder`]'s run encoding —
+    ///   a move splits at most three boundaries, so it is O(runs) and the runs
+    ///   count the user's edits, never the sheet's rows;
+    /// * the old->new position map is [`SpanMove`], closed-form arithmetic
+    ///   with no allocation at all — the trap here was building a `HashMap`
+    ///   the way the column path does, which for rows IS the 800 MB;
+    /// * every store that has to follow is sparse and is iterated over ITS OWN
+    ///   entries: the overlay's edits and the comment map. O(edits).
+    ///
+    /// So the cost of dragging one row over a 200M-row sheet is the same as
+    /// over a four-row one.
+    ///
+    /// ## The limit that does exist, and is visible
+    ///
+    /// Runs accumulate: each non-adjacent move can add up to two.
+    /// [`ferrix_core::AxisOrder::MAX_RUNS`] caps that and REFUSES beyond it,
+    /// returning an error this method passes to the caller and the UI puts in
+    /// the status line — rather than accepting the move and making every
+    /// subsequent lookup quietly slower. `coalesce` gives the runs back when a
+    /// move is undone or a row is dragged home, so the cap tracks how scrambled
+    /// the sheet actually is rather than how much the user has ever done.
+    ///
+    /// ## What does NOT follow a row move
+    ///
+    /// Merged regions and range formats are RECTANGLES, and a move cannot keep
+    /// a rectangle a rectangle: display rows 2:4 can become data rows 2, 7, 3.
+    /// They are deliberately left where they are, matching the existing
+    /// `move_columns` behaviour, rather than being silently redrawn over rows
+    /// they were never applied to.
+    pub fn move_rows(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
+        if count == 0 || from == to {
+            return Ok(());
+        }
+        let rows = self.view().row_count().max(1) as u64;
+
+        {
+            let order = self.order.rows_mut(rows);
+            order.ensure_len(rows);
+            order
+                .move_span(from, count, to)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mover = SpanMove { from, count, to };
+        let changes = self.relocate_rows_for_move(&mover);
+
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: CellRef::new(u32::try_from(to).unwrap_or(u32::MAX), 0),
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+        });
+        self.dirty = true;
+        self.recalc_all();
+        Ok(())
+    }
+
+    /// Relocate the row-keyed sparse stores for a row move, and rewrite every
+    /// formula's row references so they follow.
+    ///
+    /// Iterates the STORES, never the axis — that is what keeps a row move on
+    /// a 200M-row sheet O(edits).
+    fn relocate_rows_for_move(&mut self, mover: &SpanMove) -> Vec<CellChange> {
+        use ferrix_formula::remap::{remap_rows, AxisMap};
+
+        // Comments ride along, by the same map and for the same reason the
+        // column path gives: a note left on the pre-move coordinate would
+        // describe whatever record slid into that row.
+        if !self.comments.is_empty() {
+            let moved: Vec<(CellRef, ferrix_core::Comment)> = self
+                .comments
+                .iter()
+                .map(|(c, cm)| (c, cm.clone()))
+                .collect();
+            let relocated: Vec<(CellRef, ferrix_core::Comment)> = moved
+                .iter()
+                .filter_map(|(cell, cm)| {
+                    mover
+                        .map(cell.row)
+                        .map(|r| (CellRef::new(r, cell.col), cm.clone()))
+                })
+                .collect();
+            // Two phases: vacate every source before writing any destination,
+            // or a rotation clobbers a cell it has not read yet.
+            for (cell, _) in &moved {
+                self.comments.remove(*cell);
+            }
+            for (cell, cm) in relocated {
+                self.comments.set(cell, cm);
+            }
+        }
+
+        let existing: Vec<(CellRef, CellInput)> = self
+            .overlay
+            .edited_cells()
+            .map(|(c, i)| (*c, i.clone()))
+            .collect();
+        let mut changes = Vec::new();
+
+        for (cell, _) in &existing {
+            if let Some(prev) = self.overlay.clear(*cell) {
+                changes.push(CellChange {
+                    cell: *cell,
+                    before: Some(prev),
+                    after: None,
+                });
+            }
+        }
+
+        for (cell, input) in existing {
+            let Some(new_row) = mover.map(cell.row) else {
+                continue;
+            };
+            let dest = CellRef::new(new_row, cell.col);
+            let moved_input = match &input {
+                CellInput::Formula { src, .. } => CellInput::Formula {
+                    src: remap_rows(src, mover),
+                    cached: Value::Empty,
+                },
+                other => other.clone(),
+            };
+            let prev = self.overlay.set(dest, moved_input.clone());
+            changes.push(CellChange {
+                cell: dest,
+                before: prev,
+                after: Some(moved_input),
+            });
+        }
+
+        let sheet = self.active_sheet();
+        let touched: Vec<CellRef> = changes.iter().map(|c| c.cell).collect();
+        for cell in touched {
+            self.resync_graph_at(SheetCell::new(sheet, cell));
+        }
+
+        changes
+    }
+
+    /// How many runs the ROW order currently needs, and the cap.
+    ///
+    /// Exposed so the UI can show how close a session is to
+    /// [`ferrix_core::AxisOrder::MAX_RUNS`] instead of surprising the user at
+    /// it — the limit is meant to be seen, not felt.
+    pub fn row_order_runs(&self) -> (usize, usize) {
+        (
+            self.order.rows.as_ref().map_or(1, |o| o.run_count()),
+            ferrix_core::AxisOrder::MAX_RUNS,
+        )
     }
 
     /// How many undo entries are stacked. Exposed so tests can assert that a
