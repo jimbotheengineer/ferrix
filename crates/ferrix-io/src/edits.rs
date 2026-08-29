@@ -389,11 +389,18 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], EditError> {
-        if self.p + n > self.d.len() {
+        // `checked_add`, not `self.p + n`. A near-`usize::MAX` length read
+        // from the file wraps this sum back to a small number, which then
+        // PASSES the bounds test and drives `&self.d[self.p..self.p + n]`
+        // straight into a slice-range panic. An overflow is a corrupt or
+        // hostile sidecar, so it is the same Truncated error as running off
+        // the end — which is what it is.
+        let end = self.p.checked_add(n).ok_or(EditError::Truncated)?;
+        if end > self.d.len() {
             return Err(EditError::Truncated);
         }
-        let s = &self.d[self.p..self.p + n];
-        self.p += n;
+        let s = &self.d[self.p..end];
+        self.p = end;
         Ok(s)
     }
     fn u8(&mut self) -> Result<u8, EditError> {
@@ -458,7 +465,15 @@ pub fn load_edits(
     let span_count = c.u64()? as usize;
 
     let arena_bytes = c.take(arena_len)?.to_vec();
-    let mut spans = Vec::with_capacity(span_count);
+    // NOT `Vec::with_capacity(span_count)` / `HashMap::with_capacity(
+    // cell_count)`. Those counts come straight out of the file, so a crafted
+    // `0x0FFF_FFFF_FFFF_FFFF` reserves a petabyte BEFORE the read loop gets a
+    // chance to fail with `Truncated` — and an allocation failure is an
+    // ABORT, which `panic = "unwind"` cannot catch, so it takes the user's
+    // unsaved edits down with the process. The collections grow as records
+    // are actually read instead, so a lying count costs one wasted parse and
+    // yields a clean error. Same pattern as `format_sidecar::rules`.
+    let mut spans = Vec::new();
     for _ in 0..span_count {
         let off = c.u32()?;
         let len = c.u32()?;
@@ -466,7 +481,7 @@ pub fn load_edits(
     }
     let arena = StringArena::from_raw_parts(arena_bytes, spans);
 
-    let mut cells = HashMap::with_capacity(cell_count);
+    let mut cells = HashMap::new();
     for _ in 0..cell_count {
         let row = c.u32()?;
         let col = c.u32()?;
@@ -551,6 +566,90 @@ mod tests {
             Some(Value::Text(i)) => assert_eq!(back.resolve(i), Some("hello world")),
             other => panic!("expected text, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- hostile sidecar counts (issues #57, #58) ----
+
+    /// Overwrite a little-endian u64 field in a saved sidecar's header.
+    ///
+    /// Layout: magic 0..8, version 8..12, fingerprint 12..40, then
+    /// cell_count@40, arena_len@48, span_count@56.
+    fn poke_u64(path: &Path, off: usize, v: u64) {
+        let mut b = std::fs::read(path).unwrap();
+        assert!(b.len() >= off + 8, "header must be present");
+        b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        std::fs::write(path, &b).unwrap();
+    }
+
+    /// A lying `cell_count` must produce a clean error, not an allocation
+    /// abort.
+    ///
+    /// `HashMap::with_capacity(cell_count)` sized the map straight from the
+    /// file, so a crafted count reserved petabytes BEFORE the read loop could
+    /// fail with `Truncated`. An allocation failure ABORTS — `panic =
+    /// "unwind"` cannot catch it — so the user's unsaved edits die with the
+    /// process, which is exactly the outcome the unwind setting exists to
+    /// prevent. The collection now grows per record, so a lying count costs a
+    /// wasted parse and yields `Truncated`.
+    ///
+    /// Reachable from a `.fxedits` sidecar sitting beside a base file the
+    /// user opens.
+    #[test]
+    fn an_oversized_cell_count_is_an_error_not_an_allocation_abort() {
+        let p = scratch().join("evil_cells.fxedits");
+        save_edits(&p, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        poke_u64(&p, 40, 0x0FFF_FFFF_FFFF_FFFF);
+
+        let r = load_edits(&p, fp());
+        assert!(
+            matches!(r, Err(EditError::Truncated)),
+            "a cell_count far past the file's end must be refused as \
+             Truncated; got {r:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The same for `span_count`, which sized the arena's span vector.
+    #[test]
+    fn an_oversized_span_count_is_an_error_not_an_allocation_abort() {
+        let p = scratch().join("evil_spans.fxedits");
+        let mut ov = EditOverlay::new();
+        ov.intern("text");
+        ov.set(CellRef::new(0, 0), CellInput::Literal(Value::Number(1.0)));
+        save_edits(&p, &ov, fp()).unwrap();
+        poke_u64(&p, 56, 0x0FFF_FFFF_FFFF_FFFF);
+
+        let r = load_edits(&p, fp());
+        assert!(
+            matches!(r, Err(EditError::Truncated)),
+            "a span_count far past the file's end must be refused as \
+             Truncated; got {r:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A near-`usize::MAX` length must not wrap the cursor's bounds check.
+    ///
+    /// `Cursor::take` tested `self.p + n > self.d.len()` with unchecked
+    /// addition, so a huge `arena_len` wrapped the sum back to a small number,
+    /// PASSED the check, and then panicked on the slice range — a panic
+    /// inside a file load, from data an attacker controls. `checked_add`
+    /// turns it into the `Truncated` error it always was.
+    #[test]
+    fn a_length_that_overflows_the_cursor_bounds_check_is_rejected() {
+        let p = scratch().join("evil_wrap.fxedits");
+        save_edits(&p, &overlay_of(&[(0, 1.0)]), fp()).unwrap();
+        // arena_len@48. Chosen so `p + n` wraps: p is a small header offset,
+        // so u64::MAX - 8 is past the wrap point on any 64-bit target.
+        poke_u64(&p, 48, u64::MAX - 8);
+
+        let r = load_edits(&p, fp());
+        assert!(
+            matches!(r, Err(EditError::Truncated)),
+            "an arena_len that overflows the cursor's bounds arithmetic must \
+             be refused, not slice-panic; got {r:?}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

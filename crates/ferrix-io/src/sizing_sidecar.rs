@@ -150,11 +150,15 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], SizeSidecarError> {
-        if self.p + n > self.d.len() {
+        // `checked_add`, not `self.p + n` — same reason as the `.fxedits`
+        // cursor (issue #57): a near-`usize::MAX` length wraps the sum small,
+        // passes this check, and slice-panics on the range that follows.
+        let end = self.p.checked_add(n).ok_or(SizeSidecarError::Truncated)?;
+        if end > self.d.len() {
             return Err(SizeSidecarError::Truncated);
         }
-        let s = &self.d[self.p..self.p + n];
-        self.p += n;
+        let s = &self.d[self.p..end];
+        self.p = end;
         Ok(s)
     }
 
@@ -221,7 +225,12 @@ pub fn load_sizing(path: &Path) -> Result<Option<SheetSizing>, SizeSidecarError>
         (&mut row_outline, n_row_groups),
         (&mut col_outline, n_col_groups),
     ] {
-        let mut groups = Vec::with_capacity(n);
+        // Grown per record, NOT `Vec::with_capacity(n)`: `n` is a u32 read
+        // from the file, and 0xFFFFFFFF groups times ~12 bytes reserves ~51GB
+        // before the read loop can fail — an allocation abort, uncatchable
+        // under `panic = "unwind"`, taking unsaved edits with it. Same
+        // pattern as `format_sidecar::rules`.
+        let mut groups = Vec::new();
         for _ in 0..n {
             let first = c.u32()?;
             let last = c.u32()?;

@@ -345,11 +345,15 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], FormatSidecarError> {
-        if self.p + n > self.d.len() {
+        // `checked_add`, not `self.p + n` — same reason as the `.fxedits`
+        // cursor (issue #57): a near-`usize::MAX` length wraps the sum small,
+        // passes this check, and slice-panics on the range that follows.
+        let end = self.p.checked_add(n).ok_or(FormatSidecarError::Truncated)?;
+        if end > self.d.len() {
             return Err(FormatSidecarError::Truncated);
         }
-        let s = &self.d[self.p..self.p + n];
-        self.p += n;
+        let s = &self.d[self.p..end];
+        self.p = end;
         Ok(s)
     }
     fn u8(&mut self) -> Result<u8, FormatSidecarError> {
