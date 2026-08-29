@@ -54,6 +54,10 @@ pub struct Prefs {
     /// Recently opened files, newest first, with the session to restore for
     /// each. Capped at `recent::MAX_RECENT` (issue #45).
     pub recent: Vec<RecentEntry>,
+    /// Issue #40: command palette recency, most-recently-run first, stored as
+    /// command SLUGS rather than indices — a registry reorder must not
+    /// silently reassign somebody's history to different commands.
+    pub recent_commands: Vec<String>,
 }
 
 impl Prefs {
@@ -99,6 +103,24 @@ impl Prefs {
 const FILE: &str = "prefs.toml";
 
 pub fn config_dir() -> Option<PathBuf> {
+    // A PER-THREAD override, checked before the process-wide env var.
+    //
+    // Integration defect this exists to fix (#40 + #45): `FERRIX_CONFIG_DIR`
+    // is process-wide, so it can only isolate tests if EVERY prefs-writing
+    // test serialises on `CONFIG_ENV_LOCK`. Issue #45 made a completed file
+    // load call `persist_prefs()`, which silently turned every harness test
+    // that opens a file into a prefs WRITER — including the many that never
+    // took the lock. Those writes landed in whatever directory the env var
+    // happened to point at, so an unrelated test could truncate the prefs
+    // file a lock-holding test was mid-way through round-tripping. It
+    // presented as `recent_commands` coming back empty after a "restart".
+    //
+    // Each test runs on its own thread, so a thread-local override isolates
+    // by construction rather than by every author remembering a lock.
+    #[cfg(test)]
+    if let Some(dir) = test_config_dir() {
+        return Some(dir);
+    }
     if let Some(dir) = std::env::var_os("FERRIX_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -112,6 +134,27 @@ pub fn config_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
     base.map(|b| b.join("ferrix"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// This thread's config directory, if it has claimed one.
+#[cfg(test)]
+pub(crate) fn test_config_dir() -> Option<PathBuf> {
+    TEST_CONFIG_DIR.with(|d| d.borrow().clone())
+}
+
+/// Point THIS THREAD's prefs at `dir`, leaving every other thread alone.
+///
+/// Returns the previous value so a guard can restore it. Unlike setting
+/// `FERRIX_CONFIG_DIR`, this needs no process-wide lock.
+#[cfg(test)]
+pub(crate) fn set_test_config_dir(dir: Option<PathBuf>) -> Option<PathBuf> {
+    TEST_CONFIG_DIR.with(|d| std::mem::replace(&mut *d.borrow_mut(), dir))
 }
 
 fn prefs_path() -> Option<PathBuf> {
@@ -151,6 +194,18 @@ impl Prefs {
                 // cadence — never zero, which would silently disable
                 // autosave because of a typo in a config file.
                 "autosave_secs" => out.autosave_secs = v.parse::<u64>().ok(),
+                // Issue #40: `recent_commands = a,b,c`, most recent first.
+                // Unknown slugs are kept here and filtered where they are
+                // resolved, so a preference written by a newer build is not
+                // destroyed by an older one reading it.
+                "recent_commands" => {
+                    out.recent_commands = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
                 // `zoom.<path>|<sheet name> = 2` — one line per zoomed sheet
                 // of one workbook. Both halves are percent-escaped by
                 // `recent::encode_component`, so the '|' that splits them, and
@@ -196,6 +251,20 @@ impl Prefs {
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
         if let Some(secs) = self.autosave_secs {
             s.push_str(&format!("autosave_secs = {secs}\n"));
+        }
+        // Issue #40. Omitted entirely when nothing has been run, so a fresh
+        // install's file gains no line. Slugs contain no ',' or newline by
+        // construction, but both are stripped anyway — a preference file must
+        // never be able to forge an entry.
+        if !self.recent_commands.is_empty() {
+            let joined = self
+                .recent_commands
+                .iter()
+                .map(|c| c.replace([',', '\n', '\r'], ""))
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            s.push_str(&format!("recent_commands = {joined}\n"));
         }
         for (book, name, z) in &self.zoom {
             // Escaping covers the newline case too: a name carrying a newline
@@ -279,6 +348,7 @@ mod tests {
                         autosave_secs,
                         zoom: Vec::new(),
                         recent: Vec::new(),
+                        recent_commands: Vec::new(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -299,6 +369,9 @@ mod tests {
                         ("/mnt/c.csv".into(), "Sheet1".into(), 3.0),
                     ],
                     recent: vec![crate::recent::RecentEntry::new("/mnt/b.csv")],
+                    // Recency travels in the same file; a round trip that
+                    // omits it cannot catch the writer dropping it.
+                    recent_commands: vec!["view.zoom_in".into(), "file.save".into()],
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -363,6 +436,7 @@ mod tests {
             autosave_secs: None,
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 3.0)],
             recent: Vec::new(),
+            recent_commands: Vec::new(),
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -391,6 +465,7 @@ mod tests {
             autosave_secs: Some(45),
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 2.0)],
             recent: vec![crate::recent::RecentEntry::new("/a.csv")],
+            recent_commands: vec!["data.goal_seek".into(), "view.theme".into()],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

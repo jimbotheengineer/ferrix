@@ -2,6 +2,7 @@
 
 mod app;
 mod chart_panel;
+mod command;
 mod cond_format;
 mod grid;
 #[cfg(test)]

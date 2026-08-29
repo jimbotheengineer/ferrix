@@ -276,12 +276,12 @@ fn templates_are_offered_and_are_usable_as_written() {
 // Atomic write, and the missing/malformed fallback
 // ---------------------------------------------------------------------------
 
-/// Redirect `FERRIX_CONFIG_DIR` at a private temp dir for the duration of a
-/// test, restoring it after. The env var is process-wide, so the caller must
-/// already hold `CONFIG_ENV_LOCK`.
+/// Redirect this thread's config dir at a private temp dir for the duration of a
+/// test, restoring it after. Thread-local, so it isolates by construction
+/// rather than relying on every prefs-writing test taking `CONFIG_ENV_LOCK`.
 struct ConfigDirGuard {
     dir: PathBuf,
-    prev: Option<std::ffi::OsString>,
+    prev: Option<PathBuf>,
 }
 
 impl ConfigDirGuard {
@@ -289,8 +289,10 @@ impl ConfigDirGuard {
         let dir = std::env::temp_dir().join(format!("ferrix-cfg-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var_os("FERRIX_CONFIG_DIR");
-        std::env::set_var("FERRIX_CONFIG_DIR", &dir);
+        // Thread-local, not the process-wide env var. Since #45 every harness
+        // test that opens a file persists prefs, so a process-wide redirect
+        // let an unrelated test's write land in this test's directory.
+        let prev = crate::prefs::set_test_config_dir(Some(dir.clone()));
         Self { dir, prev }
     }
     fn prefs_file(&self) -> PathBuf {
@@ -300,10 +302,7 @@ impl ConfigDirGuard {
 
 impl Drop for ConfigDirGuard {
     fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("FERRIX_CONFIG_DIR", v),
-            None => std::env::remove_var("FERRIX_CONFIG_DIR"),
-        }
+        crate::prefs::set_test_config_dir(self.prev.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
