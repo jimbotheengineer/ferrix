@@ -6,3 +6,7 @@ benchdata/
 *.ferrix-tmp/
 *.fxedits
 *.fxedits.tmp
+
+# Agent-local helpers and handoff notes — never part of the source tree.
+.ghenv.sh
+REPORT.md
