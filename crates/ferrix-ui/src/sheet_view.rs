@@ -444,6 +444,27 @@ impl<'a> SheetView<'a> {
     }
 }
 
+/// Sorting reads its keys through the same composite view everything else
+/// reads through, which is what makes a sort see edits and mmap data alike.
+///
+/// Note what this does NOT do: it never builds a key column. Each call hands
+/// back a borrow — a `f64` or a `&str` pointing into the arena or the mapped
+/// file — so a sort of a 200M-row column pages cells in through the OS and
+/// copies none of them. The sorter's only allocation is its index vector.
+impl ferrix_core::CellKeys for SheetView<'_> {
+    #[inline]
+    fn key(&self, row: u32, col: u32) -> ferrix_core::SortCell<'_> {
+        use ferrix_core::SortCell;
+        match self.get(CellRef::new(row, col)) {
+            Value::Empty => SortCell::Empty,
+            Value::Number(n) => SortCell::Number(n),
+            Value::Bool(b) => SortCell::Bool(b),
+            Value::Text(id) => SortCell::Text(self.resolve(id)),
+            Value::Error(e) => SortCell::Error(e.as_str()),
+        }
+    }
+}
+
 /// Formulas evaluate against the composite view, so `=SUM(A1:A10)` sees edited
 /// cells and base cells alike.
 impl<'a> ferrix_formula::CellSource for SheetView<'a> {

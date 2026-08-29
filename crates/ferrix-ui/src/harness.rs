@@ -236,6 +236,34 @@ impl Harness {
         self.app.move_columns(from, count, to)
     }
 
+    /// Turn search filter mode on or off.
+    ///
+    /// Exposed because the toggle lives on a toolbar button whose pixel
+    /// position moves with the theme and the window width; a test about
+    /// SORT/FILTER COMPOSITION should not be a test about where that button
+    /// happens to be. The sort itself is still driven by real header clicks.
+    pub fn toggle_filter_mode(&mut self) -> &mut Self {
+        self.app.toggle_filter_mode();
+        self
+    }
+
+    /// Click a column header, cycling its sort. Real move/press/release at the
+    /// header's ACTUAL painted centre.
+    ///
+    /// The geometry is read back from the app rather than hard-coded: the
+    /// header band moves down whenever a bar opens above the grid — the search
+    /// bar alone shifts it — so fixed pixels would silently start clicking the
+    /// search bar and report sort as broken.
+    pub fn click_header(&mut self, col: usize) -> &mut Self {
+        self.step();
+        let (x, y) = self
+            .app
+            .header_center(col)
+            .unwrap_or_else(|| panic!("column {col} header is not on screen"));
+        self.click_at(x, y).steps(2);
+        self
+    }
+
     /// The app under test, for assertions.
     pub fn app(&self) -> &FerrixApp {
         &self.app
@@ -804,6 +832,383 @@ mod tests {
         h.type_text("5").step();
         h.press_key(Key::Enter).steps(2);
         assert!(h.app().is_dirty(), "an edit must mark the workbook dirty");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- column sort (view transform) ----
+
+    /// The value shown at each SCREEN row of column `col` — what the user is
+    /// actually looking at, resolved through the same mapping the grid paints
+    /// with. Every sort assertion below is against this, never against a
+    /// status string: a dead feature once passed a test that only checked the
+    /// status was non-empty, because the file-load message already satisfied
+    /// it.
+    fn screen_column(h: &Harness, col: u32) -> Vec<String> {
+        h.app()
+            .visible_row_order()
+            .into_iter()
+            .map(|r| h.app().display(CellRef::new(r, col)))
+            .collect()
+    }
+
+    /// Original row numbers as the row header paints them, one-based.
+    fn screen_row_numbers(h: &Harness) -> Vec<u32> {
+        h.app()
+            .visible_row_order()
+            .into_iter()
+            .map(|r| r + 1)
+            .collect()
+    }
+
+    const SORTABLE: &str = "name,qty\ndelta,40\nalpha,10\ncharlie,30\nbravo,20\n";
+
+    #[test]
+    fn three_header_clicks_cycle_ascending_descending_none() {
+        // THE acceptance criterion, driven through real click events rather
+        // than by calling the sort API — so a header that never reports its
+        // click fails here even though the sort engine is perfect.
+        let p = write_csv("sortcycle.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let original = screen_column(&h, 0);
+        assert_eq!(
+            original,
+            vec!["delta", "alpha", "charlie", "bravo"],
+            "setup: the file is deliberately not in sorted order"
+        );
+
+        // Click 1: ascending.
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["alpha", "bravo", "charlie", "delta"],
+            "first click must sort ascending; status: {}",
+            h.status()
+        );
+
+        // Click 2: descending.
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["delta", "charlie", "bravo", "alpha"],
+            "second click must sort descending; status: {}",
+            h.status()
+        );
+
+        // Click 3: back to the file's own order.
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            original,
+            "third click must clear the sort and restore the original order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sorting_is_a_view_transform_and_never_moves_data() {
+        // A sort that rewrote cells would pass every ordering test above and
+        // still be catastrophically wrong: it would dirty the workbook, and
+        // the addresses formulas and exports read would have changed.
+        let p = write_csv("sortview.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["alpha", "bravo", "charlie", "delta"],
+            "precondition: the view really is sorted"
+        );
+
+        // Underlying addresses are UNCHANGED: row 0 is still "delta".
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "delta");
+        assert_eq!(h.app().display(CellRef::new(1, 0)), "alpha");
+        assert_eq!(h.app().display(CellRef::new(3, 0)), "bravo");
+        assert_eq!(h.app().row_count(), 4, "sorting must not change row_count");
+        assert!(
+            !h.app().is_dirty(),
+            "a sort is a view, not an edit — it must never dirty the workbook"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn row_numbers_stay_the_original_underlying_rows_under_a_sort() {
+        // Same rule filter mode already follows: a sorted view that renumbered
+        // its rows 1..N would destroy the user's ability to say which record
+        // they are looking at.
+        let p = write_csv("sortrownums.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        assert_eq!(screen_row_numbers(&h), vec![1, 2, 3, 4]);
+        h.click_header(0);
+        assert_eq!(
+            screen_row_numbers(&h),
+            vec![2, 4, 3, 1],
+            "row headers must carry the ORIGINAL row numbers, reordered — not \
+             a fresh 1,2,3,4"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sort_composes_with_an_active_search_filter() {
+        // The composition contract, and the shape of the bug this project
+        // already hit once: two independent row mappings resolved from the
+        // same screen index painted WRONG RECORDS under CORRECT row numbers.
+        //
+        // Six rows, three of which contain "open". Sorting by qty while the
+        // filter is on must order THE THREE FILTERED ROWS — never reintroduce
+        // a hidden one, and never fall back to sorting the whole sheet.
+        let p = write_csv(
+            "sortfilter.csv",
+            "status,qty\nopen,50\nclosed,99\nopen,10\nclosed,1\nopen,30\nclosed,70\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(h.app().row_count(), 6);
+
+        h.ctrl(Key::F).steps(2);
+        h.type_text("open").steps(3);
+        h.toggle_filter_mode();
+        h.steps(2);
+
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["open", "open", "open"],
+            "precondition: filter mode shows only the three 'open' rows; \
+             status: {}",
+            h.status()
+        );
+        assert_eq!(screen_row_numbers(&h), vec![1, 3, 5]);
+
+        // Now sort by qty ascending. 50, 10, 30 -> 10, 30, 50.
+        h.click_header(1);
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["10", "30", "50"],
+            "sort must operate on the FILTERED rows; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            screen_row_numbers(&h),
+            vec![3, 5, 1],
+            "original row numbers, reordered by the sort"
+        );
+
+        // The decisive check: no hidden row leaked back in. 1, 70 and 99 all
+        // belong to 'closed' rows, and a sort that ran over the whole sheet
+        // instead of the filtered subset would surface them.
+        let shown = screen_column(&h, 1);
+        for hidden in ["1", "70", "99"] {
+            assert!(
+                !shown.contains(&hidden.to_string()),
+                "a filtered-out row reappeared after sorting: {shown:?}"
+            );
+        }
+        assert_eq!(shown.len(), 3, "the filter must still be narrowing to 3");
+        assert!(!h.app().is_dirty(), "neither filtering nor sorting edits");
+
+        // And descending still stays inside the filtered set.
+        h.click_header(1);
+        assert_eq!(screen_column(&h, 1), vec!["50", "30", "10"]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn empty_cells_sort_last_in_both_directions() {
+        // Excel's rule. A naive implementation gets ascending right by
+        // accident (empty compares low, so reversing floats it to the top)
+        // and descending wrong, which is why both directions are asserted.
+        let p = write_csv(
+            "sortblanks.csv",
+            "name,qty\nalpha,30\nbeta,\ngamma,10\ndelta,\nepsilon,20\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.click_header(1);
+        let asc = screen_column(&h, 1);
+        assert_eq!(
+            &asc[..3],
+            &["10", "20", "30"],
+            "ascending: values in order; got {asc:?}"
+        );
+        assert_eq!(
+            &asc[3..],
+            &["", ""],
+            "ascending: the two blanks must be at the BOTTOM"
+        );
+
+        h.click_header(1);
+        let desc = screen_column(&h, 1);
+        assert_eq!(
+            &desc[..3],
+            &["30", "20", "10"],
+            "descending: values reversed; got {desc:?}"
+        );
+        assert_eq!(
+            &desc[3..],
+            &["", ""],
+            "descending: blanks must STILL be at the bottom, not floated to \
+             the top — this is the half a reverse() gets wrong"
+        );
+
+        // Blanks stay stable relative to each other in both directions.
+        let order = h.app().visible_row_order();
+        assert_eq!(&order[3..], &[1, 3], "blank rows keep their original order");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn numeric_columns_sort_numerically_not_as_text() {
+        // The classic: as text, "100" < "9". A column of numbers must not do
+        // that, and this is cheap to get wrong by comparing display strings.
+        let p = write_csv("sortnum.csv", "n\n9\n100\n25\n3\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["3", "9", "25", "100"],
+            "numbers must sort numerically; lexicographic order would be \
+             100, 25, 3, 9"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn text_sorts_case_insensitively_through_the_real_app() {
+        let p = write_csv("sortcase.csv", "w\nZebra\napple\nMango\nbanana\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.click_header(0);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["apple", "banana", "Mango", "Zebra"],
+            "case-sensitive byte order would put every capital first"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_large_column_sort_does_not_materialise_the_column() {
+        // THE scale invariant, through the real app rather than the engine's
+        // own unit test: 60,000 rows loaded from a file, sorted by a header
+        // click, and the mapping must cost the INDEX (4 + 8 bytes per row)
+        // and nothing per cell.
+        //
+        // If sort ever starts collecting keys — Vec<String>, Vec<Value>, a
+        // materialised column — this fails immediately, and it fails for the
+        // right reason: the bound is expressed in rows, not in cell payload.
+        const N: usize = 20_000;
+        let mut body = String::from("name,qty\n");
+        for i in 0..N {
+            // Long-ish text keys, so a materialised key column would be
+            // conspicuously larger than the index bound.
+            body.push_str(&format!(
+                "row-{:08}-with-a-deliberately-long-label,{}\n",
+                (i * 7919) % N,
+                (i * 104_729) % N
+            ));
+        }
+        let p = write_csv("sortbig.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(4000, |a| a.row_count() >= N));
+        assert_eq!(h.app().row_count(), N);
+
+        h.click_header(0);
+        let order = h.app().visible_row_order();
+        assert_eq!(order.len(), N, "every row must still be addressable");
+
+        let bytes = h
+            .app()
+            .sort_order()
+            .expect("the click must have produced a sort")
+            .heap_bytes();
+        let bound = N * (4 + 8) + 4096;
+        assert!(
+            bytes <= bound,
+            "sort used {bytes} bytes for {N} rows (bound {bound}); the only \
+             way past this bound is materialising the key column"
+        );
+
+        // And it is genuinely sorted — the bound must not be met by doing
+        // nothing.
+        let first = h.app().display(CellRef::new(order[0], 0));
+        let last = h.app().display(CellRef::new(order[N - 1], 0));
+        assert!(first < last, "not actually sorted: {first} .. {last}");
+        assert_eq!(first, "row-00000000-with-a-deliberately-long-label");
+
+        // Painting stays viewport-bound: a sorted 60k-row sheet must not paint
+        // more than an unsorted one.
+        let shapes = h.paint_shape_count();
+        assert!(
+            shapes < 20_000,
+            "a sorted view painted {shapes} shapes — painting is supposed to \
+             be bounded by the viewport, not by the sort"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sorting_twice_gives_a_stable_secondary_order() {
+        // Stability is what makes "sort by qty, then by name" work by sorting
+        // twice — the behaviour users rely on even without a multi-key UI.
+        let p = write_csv(
+            "sortstable.csv",
+            "grp,name\nb,delta\na,charlie\nb,alpha\na,bravo\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Sort by name first, then by group. A stable group sort preserves
+        // the name ordering inside each group.
+        h.click_header(1);
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["alpha", "bravo", "charlie", "delta"]
+        );
+        // Re-sorting by group rebuilds from the sheet's own order, so this
+        // asserts stability WITHIN the group sort rather than a composition
+        // the UI does not claim to offer.
+        h.click_header(0);
+        assert_eq!(screen_column(&h, 0), vec!["a", "a", "b", "b"]);
+        assert_eq!(
+            screen_column(&h, 1),
+            vec!["charlie", "bravo", "delta", "alpha"],
+            "within a group, ties must keep the sheet's original row order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_header_drag_still_reorders_and_does_not_sort() {
+        // Sorting is keyed on a click that RELEASES on the column it pressed.
+        // A drag to a different column must remain a reorder, or the reorder
+        // feature silently becomes unreachable.
+        let p = write_csv("sortvsdrag.csv", "a,b,c\n3,2,1\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.drag((120.0, 85.0), (250.0, 85.0));
+        h.steps(3);
+
+        assert_ne!(
+            h.app().display(CellRef::new(0, 0)),
+            "3",
+            "dragging a header must still reorder columns; status: {}",
+            h.status()
+        );
+        assert!(
+            h.app().sort_dir(0).is_none() && h.app().sort_dir(2).is_none(),
+            "a drag must not also apply a sort"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }
