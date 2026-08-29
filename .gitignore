@@ -10,3 +10,25 @@ benchdata/
 # Agent-local helpers and handoff notes — never part of the source tree.
 .ghenv.sh
 REPORT.md
+
+# Credential-bearing filenames (issue #60).
+#
+# Defense in depth, not the primary control: the primary control is not
+# putting secrets in the working tree at all. This is the net that catches
+# the mistake anyway — after the .ghenv.sh incident (an agent-committed
+# token-sourcing helper, removed in #48), a `git add -A` from a tool or an
+# agent is a realistic way for a key to reach a commit, and a committed
+# secret is compromised the moment it is pushed, whether or not the commit
+# is later reverted.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+# Public halves are not secret and are sometimes legitimately checked in
+# (deploy keys, known-hosts fixtures), so they are exempted explicitly
+# rather than caught by `id_rsa*` / `*.key` above.
+!*.pub
