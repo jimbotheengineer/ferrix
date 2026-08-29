@@ -4103,6 +4103,43 @@ impl FerrixApp {
         &self.formula_input
     }
 
+    /// Commit the formula bar to the cursor cell — the same call the bar's
+    /// Enter branch makes.
+    ///
+    /// Exposed because the alternative is synthesising a click into a text
+    /// field and an Enter whose focus behaviour is egui's, which would test
+    /// widget focus rather than what a committed formula does.
+    pub fn commit_formula_bar_for_test(&mut self) {
+        let cell = self.selection.cursor;
+        let text = self.formula_input.clone();
+        self.wb.commit_edit(cell, &text);
+        self.sync_formula_bar();
+    }
+
+    /// Start an edit, as typing / F2 / double-click all do, through the one
+    /// chokepoint they share.
+    pub fn begin_edit_for_test(&mut self, cell: CellRef, seed: Option<&str>) {
+        self.selection.move_to(cell);
+        self.begin_edit(cell, seed.map(str::to_string));
+    }
+
+    /// Abandon an edit, as Escape does.
+    pub fn cancel_edit_for_test(&mut self) {
+        self.cancel_edit();
+    }
+
+    /// Put app-level focus in the formula bar and take the Escape snapshot,
+    /// as the widget's `gained_focus()` branch does.
+    pub fn focus_formula_bar_for_test(&mut self) {
+        self.focus = Focus::FormulaBar;
+        self.edit_pre_text.clone_from(&self.formula_input);
+    }
+
+    /// Add and switch to a fresh sheet, as the tab bar's + button does.
+    pub fn add_sheet_for_test(&mut self) {
+        self.add_sheet();
+    }
+
     /// Caret position in the live editor, in bytes.
     pub fn edit_caret(&self) -> usize {
         self.edit_caret

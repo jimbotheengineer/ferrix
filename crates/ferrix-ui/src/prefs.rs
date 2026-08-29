@@ -496,6 +496,7 @@ mod tests {
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 3.0)],
             recent: Vec::new(),
             recent_commands: Vec::new(),
+            formula_bar_rows: 1,
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -525,6 +526,9 @@ mod tests {
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 2.0)],
             recent: vec![crate::recent::RecentEntry::new("/a.csv")],
             recent_commands: vec!["data.goal_seek".into(), "view.theme".into()],
+            // Issue #38: the formula bar's height is part of the same
+            // restart-survival criterion as the theme.
+            formula_bar_rows: 3,
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.
