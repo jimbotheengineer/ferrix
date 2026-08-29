@@ -662,6 +662,9 @@ pub struct SheetExport<'a> {
     /// Cell comments, written as legacy Excel notes — see
     /// [`crate::table_xlsx::write_comments`] for exactly what Excel shows.
     pub comments: Option<&'a ferrix_core::CommentMap>,
+    /// Row heights, column widths, hidden spans and outline groups (issue
+    /// #29), written as `<cols>` attributes and per-`<row>` attributes.
+    pub sizing: Option<&'a ferrix_core::sizing::SheetSizing>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -673,6 +676,7 @@ impl<'a> SheetExport<'a> {
             tables: &[],
             merges: None,
             comments: None,
+            sizing: None,
         }
     }
 
@@ -695,6 +699,12 @@ impl<'a> SheetExport<'a> {
 
     pub fn with_tables(mut self, tables: &'a [ferrix_core::Table]) -> Self {
         self.tables = tables;
+        self
+    }
+
+    /// Attach row/column sizing, hiding and outline grouping.
+    pub fn with_sizing(mut self, sizing: &'a ferrix_core::sizing::SheetSizing) -> Self {
+        self.sizing = Some(sizing);
         self
     }
 }
@@ -771,9 +781,17 @@ pub fn export_workbook_with_names(
         // Notes join tables and merges on the non-constant-memory path: a
         // note is attached to a cell after the fact, which the streaming
         // writer cannot revisit.
+        // Sizing joins them for exactly the same reason (issue #29): row
+        // heights, hidden flags and outline levels are row PROPERTIES applied
+        // after the row's cells exist, and the constant-memory writer has
+        // already flushed that row to disk by then — the properties are
+        // silently dropped and the file comes back with no sizing at all.
+        // Sheets without sizing keep the streaming writer, so the 10GB export
+        // path is unchanged.
         let ws = if s.tables.is_empty()
             && s.merges.is_none_or(|m| m.is_empty())
             && s.comments.is_none_or(|c| c.is_empty())
+            && s.sizing.is_none_or(|z| z.is_empty())
         {
             wb.add_worksheet_with_constant_memory()
         } else {
@@ -884,7 +902,226 @@ fn write_sheet(
             }
         }
     }
+    // Sizing goes on AFTER the cells. `rust_xlsxwriter` merges row properties
+    // into the row records it has already created, and a row property set
+    // before that row has any cells is dropped — which is exactly how the
+    // outline levels silently failed to appear in the file the first time.
+    write_sizing(ws, s)?;
     Ok(())
+}
+
+/// Write row/column sizing, hiding and outline grouping (issue #29).
+///
+/// # Why this stays bounded
+///
+/// Row state is written per SPAN, and only spans that differ from the default
+/// are stored at all — but `rust_xlsxwriter` addresses rows one at a time, so
+/// a span is expanded to its rows HERE, capped at the rows the sheet actually
+/// writes. A hidden span past the sheet's extent contributes nothing: there is
+/// no `<row>` element for a row with no cells, so writing one would be both
+/// wasted bytes and a row Excel did not previously have.
+///
+/// # Excel's units
+///
+/// Ferrix stores widths in PIXELS; xlsx column widths are in character units.
+/// `set_column_width_pixels` does the conversion, so the number that goes into
+/// the file is the one Excel will render at, rather than a pixel count
+/// reinterpreted as characters (which would come back roughly 7x too wide).
+fn write_sizing(
+    ws: &mut rust_xlsxwriter::Worksheet,
+    s: &SheetExport,
+) -> Result<(), rust_xlsxwriter::XlsxError> {
+    let Some(sz) = s.sizing else {
+        return Ok(());
+    };
+    let (rows, _) = extent(s.sheet, s.formulas);
+
+    for (col, w) in sz.cols.widths() {
+        if col as usize <= XLSX_MAX_COLS {
+            ws.set_column_width_pixels(col as u16, w.round().max(1.0) as u32)?;
+        }
+    }
+    for col in sz.cols.hidden_cols() {
+        if col as usize <= XLSX_MAX_COLS {
+            ws.set_column_hidden(col as u16)?;
+        }
+    }
+    // A zero height IS hidden in Ferrix, and Excel spells that as the row's
+    // `hidden` attribute rather than a height of 0 — a literal 0 height opens
+    // as a visible row of minimum height in some versions. Written as `hidden`
+    // so the file means in Excel what it means here.
+    for (first, last, h) in sz.rows.spans() {
+        let last = (last as usize).min(rows.saturating_sub(1)) as u32;
+        for r in first..=last {
+            if h == 0.0 {
+                ws.set_row_hidden(r)?;
+            } else {
+                ws.set_row_height(r, h as f64)?;
+            }
+        }
+    }
+    for g in sz.row_outline.groups() {
+        let last = (g.last as usize).min(rows.saturating_sub(1)) as u32;
+        if g.first <= last {
+            ws.group_rows(g.first, last)?;
+            if g.collapsed {
+                // The summary row stays visible and the body folds, matching
+                // `Outline::collapsed_spans`.
+                for r in g.first + 1..=last {
+                    ws.set_row_hidden(r)?;
+                }
+            }
+        }
+    }
+    for g in sz.col_outline.groups() {
+        if (g.last as usize) <= XLSX_MAX_COLS {
+            ws.group_columns(g.first as u16, g.last as u16)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read row/column sizing back out of a worksheet part (issue #29).
+///
+/// calamine surfaces cell VALUES, not the `<cols>` element or the `<row>`
+/// attributes, so — exactly as `table_xlsx` does for tables and validations —
+/// the package is opened directly and the worksheet XML parsed for the
+/// attributes that carry sizing.
+///
+/// The import is the round-trip's other half: without it a width written on
+/// export would be dropped on the next open, and the user's layout would
+/// silently survive only until they reloaded their own file.
+pub fn import_sizing(
+    path: impl AsRef<Path>,
+) -> Result<Vec<(String, ferrix_core::sizing::SheetSizing)>, XlsxError> {
+    use ferrix_core::sizing::{Outline, OutlineGroup, SheetSizing};
+    use quick_xml::events::Event;
+
+    let path = path.as_ref();
+    let limits = crate::safeguard::Limits::default();
+    let disp = path.display().to_string();
+    let (mut zip, _) = crate::safeguard::open_checked(path, &limits)?;
+    let parts = crate::safeguard::read_all_parts(&mut zip, &disp, &limits, None)?;
+
+    // No workbook part means there is nothing to read sizing from. That is a
+    // malformed package, but it is `import_xlsx`'s job to report it — this
+    // function's contract is "the sizing that is there", so it returns none
+    // rather than a second, differently-worded error for the same file.
+    let Some(wb_xml) = parts.get("xl/workbook.xml") else {
+        return Ok(Vec::new());
+    };
+    let names = workbook_sheet_names(wb_xml, &disp)?;
+
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+        let Some(xml) = parts.get(&part) else {
+            continue;
+        };
+        let mut sizing = SheetSizing::new();
+        // Groups are collected as ranges: xlsx stores an `outlineLevel` PER
+        // ROW, so consecutive rows at the same level are coalesced back into
+        // the one range Ferrix stores. Reconstructing ranges here is what
+        // keeps the in-memory model O(groups) rather than O(rows) after an
+        // import.
+        let mut row_runs: Vec<(u32, u32, u8)> = Vec::new();
+        let mut col_runs: Vec<(u32, u32, u8)> = Vec::new();
+
+        let mut rdr = quick_xml::Reader::from_reader(xml.as_slice());
+        rdr.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        loop {
+            match rdr.read_event_into(&mut buf) {
+                Ok(Event::Empty(e)) | Ok(Event::Start(e)) => match e.name().as_ref() {
+                    b"col" => {
+                        let min = xattr(&e, b"min").and_then(|v| v.parse::<u32>().ok());
+                        let max = xattr(&e, b"max").and_then(|v| v.parse::<u32>().ok());
+                        let (Some(min), Some(max)) = (min, max) else {
+                            continue;
+                        };
+                        // xlsx column indices are 1-based and inclusive.
+                        let (first, last) = (min.saturating_sub(1), max.saturating_sub(1));
+                        let hidden = xattr(&e, b"hidden").is_some_and(|v| v == "1" || v == "true");
+                        let width = xattr(&e, b"width").and_then(|v| v.parse::<f64>().ok());
+                        let level = xattr(&e, b"outlineLevel")
+                            .and_then(|v| v.parse::<u8>().ok())
+                            .unwrap_or(0);
+                        // Excel's width is in character units; Ferrix keeps
+                        // pixels. This is the inverse of the conversion the
+                        // writer applies, so a width survives the round trip
+                        // instead of growing by a factor of seven each time.
+                        for c in first..=last.min(first + 4096) {
+                            if let Some(w) = width {
+                                sizing.cols.set_width(c, char_units_to_px(w));
+                            }
+                            if hidden {
+                                sizing.cols.hide(c);
+                            }
+                        }
+                        if level > 0 {
+                            col_runs.push((first, last, level));
+                        }
+                    }
+                    b"row" => {
+                        let Some(r) = xattr(&e, b"r").and_then(|v| v.parse::<u32>().ok()) else {
+                            continue;
+                        };
+                        let r = r.saturating_sub(1);
+                        let hidden = xattr(&e, b"hidden").is_some_and(|v| v == "1" || v == "true");
+                        let custom =
+                            xattr(&e, b"customHeight").is_some_and(|v| v == "1" || v == "true");
+                        let ht = xattr(&e, b"ht").and_then(|v| v.parse::<f32>().ok());
+                        if hidden {
+                            // Height 0 IS hidden — the same spelling the rest
+                            // of Ferrix uses, so an imported hidden row is
+                            // indistinguishable from a locally hidden one.
+                            sizing.rows.hide(r, r);
+                        } else if let (true, Some(h)) = (custom, ht) {
+                            sizing.rows.set(r, h);
+                        }
+                        if let Some(level) = xattr(&e, b"outlineLevel")
+                            .and_then(|v| v.parse::<u8>().ok())
+                            .filter(|&l| l > 0)
+                        {
+                            match row_runs.last_mut() {
+                                Some(run) if run.1 + 1 == r && run.2 == level => run.1 = r,
+                                _ => row_runs.push((r, r, level)),
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        // xlsx marks the ROWS INSIDE a group, and Excel keeps the summary row
+        // just outside it. Ferrix's range includes the summary row, so each
+        // run is widened by one at the front to name the same group.
+        let to_groups = |runs: Vec<(u32, u32, u8)>| {
+            Outline::from_groups(runs.into_iter().map(|(a, b, level)| OutlineGroup {
+                first: a.saturating_sub(1),
+                last: b,
+                level,
+                collapsed: false,
+            }))
+        };
+        sizing.row_outline = to_groups(row_runs);
+        sizing.col_outline = to_groups(col_runs);
+        out.push((name.clone(), sizing));
+    }
+    Ok(out)
+}
+
+/// Excel's column width unit is "characters of the default font". The factor
+/// below is the one Excel itself documents for the standard 11pt Calibri
+/// metric, and it is the exact inverse of what `set_column_width_pixels`
+/// applies on the way out.
+fn char_units_to_px(units: f64) -> f32 {
+    ((units * 7.0) + 5.0) as f32
 }
 
 /// Write an error value.
@@ -1879,6 +2116,145 @@ mod tests {
         assert_eq!(
             ferrix_formula::eval(&ferrix_formula::parse(src).unwrap(), &got.sheet),
             Value::Number(200.0)
+        );
+    }
+
+    // --- sizing round trip (issue #29) ---
+
+    /// A sheet with enough rows/columns for the sizing under test to land on
+    /// real `<row>` and `<col>` elements.
+    fn sizing_sheet() -> Sheet {
+        let mut s = Sheet::new("Sized");
+        for r in 0..40u32 {
+            for c in 0..6u32 {
+                s.set(CellRef::new(r, c), Value::Number((r * 10 + c) as f64));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn column_widths_round_trip_through_xlsx() {
+        let t = TempXlsx::new("size-widths");
+        let sheet = sizing_sheet();
+        let mut sz = ferrix_core::sizing::SheetSizing::new();
+        sz.cols.set_width(1, 240.0);
+        sz.cols.set_width(4, 60.0);
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Sized", &sheet).with_sizing(&sz)],
+        )
+        .unwrap();
+
+        let back = import_sizing(t.path()).unwrap();
+        let (_, got) = back.first().expect("one sheet");
+        // Exact pixel equality would pin Excel's own rounding, so the
+        // assertion is that the width came back CLOSE — and, critically, that
+        // the two columns are still different sizes and in the right order.
+        let w1 = got.cols.width_of(1).expect("column 1 width must survive");
+        let w4 = got.cols.width_of(4).expect("column 4 width must survive");
+        assert!(
+            (w1 - 240.0).abs() < 12.0,
+            "column 1 came back {w1}px, expected ~240px"
+        );
+        assert!(
+            (w4 - 60.0).abs() < 12.0,
+            "column 4 came back {w4}px, expected ~60px"
+        );
+        assert!(w1 > w4, "the wide column must still be the wider one");
+    }
+
+    #[test]
+    fn hidden_rows_and_columns_round_trip_through_xlsx() {
+        let t = TempXlsx::new("size-hidden");
+        let sheet = sizing_sheet();
+        let mut sz = ferrix_core::sizing::SheetSizing::new();
+        sz.cols.hide(2);
+        sz.rows.hide(5, 8);
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Sized", &sheet).with_sizing(&sz)],
+        )
+        .unwrap();
+
+        let back = import_sizing(t.path()).unwrap();
+        let (_, got) = back.first().expect("one sheet");
+        assert!(got.cols.is_hidden(2), "hidden column must come back hidden");
+        assert!(!got.cols.is_hidden(1), "column 1 was never hidden");
+        for r in 5..=8 {
+            assert!(got.rows.is_hidden(r), "row {r} must come back hidden");
+        }
+        assert!(!got.rows.is_hidden(4), "row 4 was never hidden");
+        assert!(!got.rows.is_hidden(9), "row 9 was never hidden");
+    }
+
+    #[test]
+    fn row_heights_round_trip_through_xlsx() {
+        let t = TempXlsx::new("size-heights");
+        let sheet = sizing_sheet();
+        let mut sz = ferrix_core::sizing::SheetSizing::new();
+        sz.rows.set_range(2, 4, 36.0);
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Sized", &sheet).with_sizing(&sz)],
+        )
+        .unwrap();
+
+        let back = import_sizing(t.path()).unwrap();
+        let (_, got) = back.first().expect("one sheet");
+        for r in 2..=4 {
+            assert_eq!(
+                got.rows.height_of(r),
+                Some(36.0),
+                "row {r} height must survive the round trip"
+            );
+        }
+        assert_eq!(got.rows.height_of(1), None, "row 1 had no explicit height");
+    }
+
+    #[test]
+    fn outline_groups_round_trip_through_xlsx() {
+        let t = TempXlsx::new("size-outline");
+        let sheet = sizing_sheet();
+        let mut sz = ferrix_core::sizing::SheetSizing::new();
+        sz.row_outline.group(10, 20).unwrap();
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Sized", &sheet).with_sizing(&sz)],
+        )
+        .unwrap();
+
+        let back = import_sizing(t.path()).unwrap();
+        let (_, got) = back.first().expect("one sheet");
+        assert!(
+            !got.row_outline.is_empty(),
+            "the group must survive as a group, not be flattened away"
+        );
+        // Rows inside the group carry a level; rows outside it do not. That is
+        // the property a reader actually depends on.
+        assert!(
+            got.row_outline.level_at(15) >= 1,
+            "row 15 is inside the group and must have an outline level"
+        );
+        assert_eq!(
+            got.row_outline.level_at(30),
+            0,
+            "row 30 is outside the group and must not be grouped"
+        );
+    }
+
+    #[test]
+    fn a_sheet_with_no_sizing_writes_no_sizing() {
+        // The default path must be untouched: exporting without sizing must
+        // not start emitting widths or heights for every column.
+        let t = TempXlsx::new("size-none");
+        let sheet = sizing_sheet();
+        export_workbook(t.path(), &[SheetExport::new("Sized", &sheet)]).unwrap();
+        let back = import_sizing(t.path()).unwrap();
+        let (_, got) = back.first().expect("one sheet");
+        assert!(
+            got.is_empty(),
+            "a sheet exported without sizing must import with none, got {got:?}"
         );
     }
 }

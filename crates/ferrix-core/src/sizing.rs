@@ -488,6 +488,26 @@ impl Outline {
         &self.groups
     }
 
+    /// Rebuild from stored groups, keeping their levels and collapsed state.
+    ///
+    /// The LOAD path. [`Outline::group`] re-derives a level from containment,
+    /// which is correct when the user creates a group and wrong when restoring
+    /// one — replaying an inner group before its parent would hand it level 1.
+    /// Levels are clamped to the supported range so a corrupt file cannot
+    /// produce an outline the gutter has no indent for.
+    pub fn from_groups(groups: impl IntoIterator<Item = OutlineGroup>) -> Self {
+        let mut groups: Vec<OutlineGroup> = groups
+            .into_iter()
+            .filter(|g| g.first <= g.last)
+            .map(|g| OutlineGroup {
+                level: g.level.clamp(1, MAX_OUTLINE_LEVEL),
+                ..g
+            })
+            .collect();
+        groups.sort_by(|a, b| a.first.cmp(&b.first).then(b.last.cmp(&a.last)));
+        Self { groups }
+    }
+
     /// Add a group over `first..=last`.
     ///
     /// The level is derived from how many existing groups enclose the range,
