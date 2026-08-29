@@ -184,3 +184,58 @@ fn corrupt_level_is_clamped_not_trusted() {
     let back = load_sizing(t.path()).unwrap().unwrap();
     assert!(back.row_outline.max_level() <= MAX_OUTLINE_LEVEL);
 }
+
+/// A crafted group count must be an error, not an allocation abort.
+///
+/// Issue #58. `Vec::with_capacity(n)` sized the outline-group vector directly
+/// from a u32 read out of the file: 0xFFFFFFFF groups times ~12 bytes reserves
+/// ~51GB BEFORE the read loop can fail with `Truncated`. An allocation failure
+/// is an ABORT — `panic = "unwind"` cannot catch it — so it takes the user's
+/// unsaved edits down with the process, which is the exact outcome the unwind
+/// setting exists to prevent. The vector now grows per record.
+///
+/// Reachable from a `.fxsize` sidecar sitting beside a base file the user
+/// opens.
+#[test]
+fn an_oversized_group_count_is_an_error_not_an_allocation_abort() {
+    let t = Temp::new("evil-groups");
+    save_sizing(t.path(), &fixture()).unwrap();
+
+    // Header: magic 0..8, version 8..12, then five u32 counts —
+    // n_row_spans@12, n_widths@16, n_hidden@20, n_row_groups@24,
+    // n_col_groups@28.
+    let mut b = std::fs::read(t.path()).unwrap();
+    assert!(b.len() >= 32, "header must be present");
+    b[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(t.path(), &b).unwrap();
+
+    let r = load_sizing(t.path());
+    assert!(
+        matches!(r, Err(SizeSidecarError::Truncated)),
+        "a group count far past the file's end must be refused as Truncated \
+         rather than reserving ~51GB; got {r:?}"
+    );
+}
+
+/// The cursor's bounds check must not wrap.
+///
+/// `take` used `self.p + n`, so a near-`usize::MAX` length wrapped the sum
+/// back to a small number, PASSED the check, and then panicked on the slice
+/// range — a panic during a file load, from attacker-controlled data.
+/// Exercised through `n_row_spans`, whose records the cursor reads directly.
+#[test]
+fn a_length_that_overflows_the_cursor_bounds_check_is_rejected() {
+    let t = Temp::new("evil-wrap");
+    save_sizing(t.path(), &fixture()).unwrap();
+
+    let mut b = std::fs::read(t.path()).unwrap();
+    assert!(b.len() >= 32, "header must be present");
+    b[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(t.path(), &b).unwrap();
+
+    let r = load_sizing(t.path());
+    assert!(
+        matches!(r, Err(SizeSidecarError::Truncated)),
+        "an oversized span count must be refused, not slice-panic; got {r:?}"
+    );
+}
