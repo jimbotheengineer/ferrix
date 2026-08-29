@@ -301,6 +301,7 @@ fn a_round_trip_preserves_values_formats_and_styling() {
         ClipCell {
             text: "1,234.50".into(),
             formula: None,
+            origin: None,
             format: Some(NumberFormat::Thousands { places: 2 }),
             style: ManualStyle {
                 fill: Some(Rgb(0xFF, 0xEE, 0x00)),

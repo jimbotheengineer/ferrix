@@ -25,4 +25,4 @@ pub use depgraph::{DepGraph, Precedent};
 pub use eval::{eval, eval_view, CellSource};
 pub use names::{DefinedName, NameError, NameScope, NameTable};
 pub use parser::{parse, parse_with_names, quote_sheet_name, BinOp, Expr, ParseError, UnOp};
-pub use remap::{remap_columns, remap_formula, remap_rows, AxisMap};
+pub use remap::{paste_formula, remap_columns, remap_formula, remap_rows, AxisMap};

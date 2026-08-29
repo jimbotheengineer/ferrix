@@ -270,6 +270,24 @@ pub struct FerrixApp {
     hidden_cols: std::collections::BTreeSet<u32>,
     /// Set when sizing changed and the sidecar has not been written yet.
     sizing_dirty: bool,
+    /// The rich payload of the LAST copy made in this window (issue #30).
+    ///
+    /// eframe's clipboard is plain text only, so the number formats and
+    /// styling a copy captured have nowhere to live on the system clipboard.
+    /// Holding them here means a Ferrix -> Ferrix round trip is lossless
+    /// within a session; a paste only uses it when the text clipboard still
+    /// matches, so copying elsewhere and pasting back never resurrects it.
+    clip_block: Option<ferrix_core::clipboard::ClipBlock>,
+    /// The same copy rendered as an HTML `<table>`.
+    ///
+    /// This is the flavour that WOULD be published beside the text one if
+    /// eframe could publish flavours. It is kept so the rendering is exercised
+    /// by the real copy path rather than only by unit tests, and so the wiring
+    /// is a one-line change if that ever becomes possible.
+    clip_html: Option<String>,
+    /// The Paste Special request being assembled in the dialog, and whether
+    /// the dialog is open.
+    paste_special: Option<ferrix_core::clipboard::PasteOptions>,
     /// Outline toggle buttons the grid painted last frame — real paint output
     /// a test can assert the gutter against.
     last_outline_buttons: usize,
@@ -595,6 +613,9 @@ impl FerrixApp {
             hidden_rows: None,
             hidden_cols: std::collections::BTreeSet::new(),
             sizing_dirty: false,
+            clip_block: None,
+            clip_html: None,
+            paste_special: None,
             last_outline_buttons: 0,
             sizing_path: None,
             header_hitboxes: Vec::new(),
@@ -1548,11 +1569,32 @@ impl FerrixApp {
         ferrix_core::Budget::sample().max_units(ferrix_core::budget::cost::OVERLAY_CELL)
     }
 
-    /// Copy the selection to the system clipboard as TSV.
+    /// Copy the selection to the system clipboard.
+    ///
+    /// # Clipboard flavours, and the platform limit (issue #30)
+    ///
+    /// Excel puts SEVERAL flavours on the clipboard at once — plain TSV and an
+    /// HTML `<table>` — and the receiver takes the richest one it understands.
+    /// Ferrix cannot: **eframe's clipboard API is plain text only**
+    /// (`Context::copy_text` takes a `String`), with no way to register
+    /// `CF_HTML` beside `CF_UNICODETEXT`.
+    ///
+    /// So what actually goes on the system clipboard is TSV, exactly as
+    /// before, which is what keeps Excel and every other consumer working. The
+    /// rich HTML rendering is built and kept in [`Self::clip_html`] for the
+    /// in-process round trip, and the paste path reads HTML whenever the text
+    /// arriving looks like a table — so pasting rich content FROM Excel works
+    /// while copying rich content TO Excel does not.
+    ///
+    /// Everything needed for the other half already exists and is unit tested
+    /// in `ferrix_core::clipboard`; only this one call has to change the day
+    /// eframe grows a flavoured clipboard or a native clipboard crate is added
+    /// deliberately.
     fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
         let sel = self.selection;
         let limit = self.max_block_cells();
-        let Some(block) = self.wb.copy_block(sel, limit) else {
+        let widths = self.sizing.cols.clone();
+        let Some(clip) = self.wb.copy_clip_block(sel, limit, |c| widths.width_of(c)) else {
             self.status = format!(
                 "{} cells is too many to copy — {} fit in the memory available now",
                 fmt_int(sel.cell_count() as usize),
@@ -1560,7 +1602,12 @@ impl FerrixApp {
             );
             return;
         };
-        let tsv = ferrix_core::tsv::to_tsv(&block);
+        let tsv = ferrix_core::tsv::to_tsv(&clip.to_text_grid());
+        // Held so a paste in this same window can read the rich flavour the
+        // text clipboard cannot carry. Replaced wholesale on every copy, so it
+        // can never be stale relative to what the user last copied.
+        self.clip_html = Some(ferrix_core::clipboard::to_html(&clip));
+        self.clip_block = Some(clip);
         let n = sel.cell_count();
         ctx.copy_text(tsv);
         if cut {
@@ -1581,21 +1628,55 @@ impl FerrixApp {
         }
     }
 
-    /// Paste TSV from the clipboard at the selection's top-left corner.
+    /// Paste whatever arrived from the clipboard at the selection's top-left.
+    ///
+    /// Prefers the HTML flavour: if the incoming text is an HTML table (what
+    /// Excel and browsers put on the clipboard) it is parsed as one, keeping
+    /// number formats and styling; otherwise it falls back to TSV, so the
+    /// plain-text path that always worked still works.
     fn paste_clipboard(&mut self, text: &str) {
-        let block = ferrix_core::tsv::from_tsv(text);
+        self.paste_clipboard_with(text, ferrix_core::clipboard::PasteOptions::plain());
+    }
+
+    /// The Paste Special path, and what plain Ctrl+V delegates to.
+    fn paste_clipboard_with(&mut self, text: &str, opts: ferrix_core::clipboard::PasteOptions) {
+        // The richest payload available, in preference order: the block this
+        // window last copied (which carries formats the text clipboard cannot
+        // hold), then an HTML table if the incoming text is one, then TSV.
+        //
+        // The in-process block is used only when the text clipboard still
+        // holds what that copy put there — otherwise the user copied something
+        // in ANOTHER application since, and pasting our stale block would
+        // silently ignore what they actually copied.
+        let ours = self
+            .clip_block
+            .as_ref()
+            .filter(|b| ferrix_core::tsv::to_tsv(&b.to_text_grid()) == text)
+            .cloned();
+        let block = match ours {
+            Some(b) => b,
+            None => ferrix_core::clipboard::parse_clipboard(text),
+        };
         if block.is_empty() {
             self.status = "Clipboard is empty".into();
             return;
         }
         let origin = self.selection.bounds().0;
         let limit = self.max_overlay_cells();
-        match self.wb.paste_block(origin, &block, limit) {
-            Ok(n) => {
+        match self.wb.paste_special(origin, &block, opts, limit) {
+            Ok(report) => {
+                // Column widths live in the sizing model, so the workbook hands
+                // them back rather than applying them itself.
+                for (col, w) in &report.col_widths {
+                    self.set_col_width(*col as usize, *w);
+                }
+                let (rows, cols) = if opts.transpose {
+                    (block.cols() as u32, block.rows() as u32)
+                } else {
+                    (block.rows() as u32, block.cols() as u32)
+                };
                 // Select what was pasted, so the user sees the affected region
                 // and can undo or overwrite it in one gesture.
-                let rows = block.len() as u32;
-                let cols = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
                 self.selection = Selection::new(
                     origin,
                     CellRef::new(
@@ -1603,11 +1684,54 @@ impl FerrixApp {
                         origin.col + cols.saturating_sub(1),
                     ),
                 );
-                self.status = format!("Pasted {} cells", fmt_int(n));
+                self.status = paste_status(&report, opts);
                 self.sync_formula_bar();
             }
             Err(e) => self.status = e,
         }
+    }
+
+    // ==================================== Paste Special (issue #30) ========
+    //
+    // These are the entry points the command palette and the headless harness
+    // both drive, so a test exercises the same code the menu item does rather
+    // than a parallel implementation of it.
+
+    /// The rich HTML flavour of the last copy, if there was one.
+    ///
+    /// Exposed so a test can assert that the copy path really rendered a
+    /// `<table>` — see the platform note on [`Self::copy_selection`] for why
+    /// this cannot reach the system clipboard.
+    pub fn clipboard_html(&self) -> Option<&str> {
+        self.clip_html.as_deref()
+    }
+
+    /// The rich payload of the last copy.
+    pub fn clipboard_block(&self) -> Option<&ferrix_core::clipboard::ClipBlock> {
+        self.clip_block.as_ref()
+    }
+
+    /// Paste the clipboard with an explicit Paste Special request.
+    ///
+    /// `text` is what the system clipboard holds; the app prefers its own
+    /// richer copy when that text still matches, and otherwise reads the HTML
+    /// or TSV flavour out of it.
+    pub fn paste_special(&mut self, text: &str, opts: ferrix_core::clipboard::PasteOptions) {
+        self.paste_clipboard_with(text, opts);
+    }
+
+    /// Is the Paste Special dialog open?
+    pub fn paste_special_is_open(&self) -> bool {
+        self.paste_special.is_some()
+    }
+
+    /// Open the Paste Special dialog with a default request.
+    pub fn paste_special_open(&mut self) {
+        self.paste_special = Some(ferrix_core::clipboard::PasteOptions::plain());
+    }
+
+    pub fn paste_special_close(&mut self) {
+        self.paste_special = None;
     }
 
     /// Clear every cell in the selection as one undo step.
@@ -8334,6 +8458,45 @@ fn fmt_int(n: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Status line for a completed paste (issue #30).
+///
+/// Says what actually happened rather than a generic "Pasted": which mode ran,
+/// how many cells and format rectangles it wrote, and any caveat. A test can
+/// assert on the numbers here, which a bare "Pasted" could never support.
+fn paste_status(
+    report: &crate::workbook::PasteReport,
+    opts: ferrix_core::clipboard::PasteOptions,
+) -> String {
+    let mut s = if !report.col_widths.is_empty() {
+        format!(
+            "Pasted column widths to {} column{}",
+            fmt_int(report.col_widths.len()),
+            if report.col_widths.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    } else if report.cells_written == 0 && report.format_rects > 0 {
+        format!(
+            "Pasted formatting to {} region{}",
+            fmt_int(report.format_rects),
+            if report.format_rects == 1 { "" } else { "s" }
+        )
+    } else if report.cells_written == 0 {
+        "Pasted nothing — every cell was skipped".to_string()
+    } else {
+        format!("Pasted {} cells", fmt_int(report.cells_written))
+    };
+    if opts.is_special() {
+        s.push_str(&format!(" · {}", opts.describe()));
+    }
+    if let Some(note) = &report.note {
+        s.push_str(&format!(" · {note}"));
+    }
+    s
 }
 
 /// Open a file, choosing storage based on size.

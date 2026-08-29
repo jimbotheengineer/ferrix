@@ -143,6 +143,33 @@ pub fn remap_rows<R: AxisMap>(src: &str, rows: &R) -> String {
     remap_formula(src, &Identity, rows)
 }
 
+/// Rewrite a formula for a COPY/PASTE that lands `(drow, dcol)` away from
+/// where it was copied.
+///
+/// This is the entry point the clipboard uses, and it is deliberately not
+/// [`remap_formula`]. The two cases pull in opposite directions:
+///
+/// * a **structural** remap (a column dragged elsewhere) moves absolute
+///   references too, because `$A$1` means "always this cell" and that cell has
+///   a new address — see the module docs; whereas
+/// * a **paste** is a fill by another name. `$A$1` means "always this cell"
+///   and the cell has NOT moved, so the anchor must pin the reference. Moving
+///   it would break the single most common spreadsheet idiom there is: a
+///   column of `=B2*$F$1` copied down.
+///
+/// So this delegates to [`crate::fill::offset_formula`], which honours `$`,
+/// rather than reimplementing the shift. One scanner, one set of rules about
+/// what counts as a reference: two implementations that could disagree about
+/// whether `LOG10(` is a reference is precisely the bug `refscan` exists to
+/// make impossible.
+///
+/// Like everything in this family it rewrites the formula TEXT. A round trip
+/// through the parser would drop every `$`, which for a paste is not a
+/// cosmetic loss — it is the difference between `=B2*$F$1` and `=B2*F1`.
+pub fn paste_formula(src: &str, drow: i64, dcol: i64) -> String {
+    crate::fill::offset_formula(src, drow, dcol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +309,50 @@ mod tests {
         let twice = remap_formula(&once, &Identity, &Identity);
         assert_eq!(once, src);
         assert_eq!(twice, src);
+    }
+
+    // --- paste (issue #30) ---
+
+    #[test]
+    fn a_pasted_formula_offsets_its_relative_references() {
+        // Copy =A1+B1 from row 1 and paste it three rows down: it must read
+        // the row it landed on, not the row it came from.
+        assert_eq!(paste_formula("=A1+B1", 3, 0), "=A4+B4");
+        assert_eq!(paste_formula("=A1", 0, 2), "=C1");
+        assert_eq!(paste_formula("=SUM(A1:A3)", 1, 0), "=SUM(A2:A4)");
+    }
+
+    #[test]
+    fn a_pasted_formula_pins_its_absolute_references() {
+        // THE difference from a structural remap, and the reason paste has
+        // its own entry point. `=B2*$F$1` copied down must still point at F1;
+        // if the anchor moved, every tax-rate and exchange-rate column in
+        // every spreadsheet ever written would silently read the wrong cell.
+        assert_eq!(paste_formula("=B2*$F$1", 5, 0), "=B7*$F$1");
+        assert_eq!(paste_formula("=$A1", 2, 0), "=$A3", "$col pins the column");
+        assert_eq!(paste_formula("=A$1", 2, 0), "=A$1", "$row pins the row");
+        assert_eq!(paste_formula("=$A$1", 9, 9), "=$A$1");
+    }
+
+    #[test]
+    fn a_pasted_formula_keeps_every_dollar_it_started_with() {
+        // The AST-round-trip failure this whole family exists to prevent: a
+        // parse-then-render would come back with the `$` gone and nothing
+        // would look wrong until the next fill.
+        let out = paste_formula("=SUM($B$2:$B$9)/$C$1+D5", 4, 0);
+        assert_eq!(out, "=SUM($B$2:$B$9)/$C$1+D9");
+        assert_eq!(out.matches('$').count(), 6, "every $ must survive: {out}");
+    }
+
+    #[test]
+    fn pasting_in_place_changes_nothing() {
+        let src = "=SUM($A$1:A1)*LOG10(B2)+\"text\"";
+        assert_eq!(paste_formula(src, 0, 0), src);
+    }
+
+    #[test]
+    fn a_pasted_formula_does_not_rewrite_text_or_function_names() {
+        assert_eq!(paste_formula("=LOG10(A1)", 1, 0), "=LOG10(A2)");
+        assert_eq!(paste_formula("=\"A1\"&A1", 1, 0), "=\"A1\"&A2");
     }
 }

@@ -74,6 +74,15 @@ pub struct ClipCell {
     pub format: Option<NumberFormat>,
     /// Fill, text colour and typography in effect on the cell.
     pub style: ManualStyle,
+    /// Where this cell was copied FROM, when it came from a Ferrix sheet.
+    ///
+    /// A pasted formula's references are offset by the distance between this
+    /// and where the cell lands, which is what makes `=A1+B1` copied three
+    /// rows down read `=A4+B4`. `None` — anything arriving from outside, where
+    /// there is no source coordinate to measure from — means the formula is
+    /// written exactly as it was received rather than being shifted by a
+    /// guessed amount.
+    pub origin: Option<crate::CellRef>,
 }
 
 impl ClipCell {
@@ -342,6 +351,17 @@ impl PasteOp {
     }
 }
 
+/// Warning attached to a transposing paste.
+///
+/// A transpose moves formulas to cells whose row/column relationship to their
+/// references is not the one they were written with, so their offsets are
+/// applied along the axes they actually travelled and the result may not be
+/// what the author meant. Excel warns here too. Reported rather than silently
+/// applied, in the same spirit as `rule_survives_xlsx`: the user learns in the
+/// editor, not after the numbers are wrong.
+pub const TRANSPOSE_NOTE: &str =
+    "transposed — formulas were offset along the axes they moved, check their references";
+
 /// The full Paste Special request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PasteOptions {
@@ -467,6 +487,13 @@ pub fn to_html(block: &ClipBlock) -> String {
             }
             if let Some(f) = &cell.formula {
                 s.push_str(&format!(" data-ferrix-formula=\"{}\"", escape_attr(f)));
+                // The source coordinate travels with the formula, so a paste
+                // through the text clipboard can still offset references by
+                // the distance actually moved. Only emitted alongside a
+                // formula, because nothing else consults it.
+                if let Some(o) = cell.origin {
+                    s.push_str(&format!(" data-ferrix-origin=\"{},{}\"", o.row, o.col));
+                }
             }
             s.push('>');
             s.push_str(&escape_text(&cell.text));
@@ -806,6 +833,16 @@ fn parse_cell(tag: &str, content: &str) -> ClipCell {
         .or_else(|| attr(tag, "x:fmla"))
         .map(|f| unescape(&f))
         .filter(|f| f.starts_with('='));
+
+    // Source coordinate, so a pasted formula can be offset by the distance
+    // actually travelled. Only meaningful beside a formula.
+    cell.origin = attr(tag, "data-ferrix-origin").and_then(|v| {
+        let (r, c) = v.split_once(',')?;
+        Some(crate::CellRef::new(
+            r.trim().parse().ok()?,
+            c.trim().parse().ok()?,
+        ))
+    });
 
     // Number format: Ferrix's unambiguous attribute wins over the CSS one,
     // because `mso-number-format` is quoted and escaped by whoever wrote it.

@@ -60,6 +60,38 @@ pub const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// a window of all-matching cells is kilobytes, not gigabytes.
 pub const REPLACE_WINDOW_ROWS: usize = 65_536;
 
+/// What a Paste Special actually did (issue #30).
+///
+/// Reported rather than inferred, so the status line can be specific and a
+/// test can assert on the numbers instead of on a non-empty string.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PasteReport {
+    /// Cells whose contents changed. Zero for a formats-only or widths-only
+    /// paste, and for one whose every cell was skipped.
+    pub cells_written: usize,
+    /// Formatting RECTANGLES stored — not cells. A uniform format over a
+    /// 100k-cell region is 1 here, which is the scale invariant made visible.
+    pub format_rects: usize,
+    /// Destination column widths to apply, as `(column, points)`. Non-empty
+    /// only for [`ferrix_core::clipboard::PasteWhat::ColumnWidths`], because
+    /// widths live in the app's sizing model rather than the workbook.
+    pub col_widths: Vec<(u32, f32)>,
+    pub transposed: bool,
+    /// A caveat the user should see, if there is one.
+    pub note: Option<String>,
+}
+
+/// `B2:D9` for a merged region, for a refusal message that names the region.
+fn merge_label(r: ferrix_core::TableRange) -> String {
+    format!(
+        "{}{}:{}{}",
+        ferrix_core::column_name(r.first_col),
+        r.first_row + 1,
+        ferrix_core::column_name(r.last_col),
+        r.last_row + 1
+    )
+}
+
 #[derive(Debug)]
 struct CellChange {
     cell: CellRef,
@@ -1832,6 +1864,12 @@ impl Workbook {
     /// and materializing that as text would exhaust memory. Returns `None`
     /// when the selection is too large, so the caller can say so rather than
     /// freeze.
+    ///
+    /// Superseded on the UI path by [`Self::copy_clip_block`], which carries
+    /// formats and formulas as well as text (issue #30). Kept because it is
+    /// the text-only contract — smaller, with no formatting to resolve — and
+    /// its tests pin the bounds behaviour both paths rely on.
+    #[allow(dead_code)]
     pub fn copy_block(&self, sel: Selection, max_cells: u64) -> Option<Vec<Vec<String>>> {
         if sel.cell_count() > max_cells {
             return None;
@@ -1847,6 +1885,390 @@ impl Workbook {
             rows.push(row);
         }
         Some(rows)
+    }
+
+    /// Read a rectangular block as a rich clipboard payload (issue #30).
+    ///
+    /// Carries what TSV cannot: the formula SOURCE TEXT behind each cell, the
+    /// number format in effect, and the resolved fill/text/typography. That is
+    /// what makes a Ferrix -> clipboard -> Ferrix round trip preserve values,
+    /// number formats and styling rather than only the text.
+    ///
+    /// Bounded by `max_cells` exactly as [`Self::copy_block`] is, and for the
+    /// same reason: a user can select a whole 200M-row column.
+    ///
+    /// `col_widths` is supplied by the caller because widths live in the app's
+    /// sizing model, not the workbook's.
+    pub fn copy_clip_block(
+        &self,
+        sel: Selection,
+        max_cells: u64,
+        col_widths: impl Fn(u32) -> Option<f32>,
+    ) -> Option<ferrix_core::clipboard::ClipBlock> {
+        use ferrix_core::clipboard::{ClipBlock, ClipCell};
+
+        if sel.cell_count() > max_cells {
+            return None;
+        }
+        let (tl, br) = sel.bounds();
+        let rows = sel.row_count() as usize;
+        let cols = sel.col_count() as usize;
+        let mut block = ClipBlock::new(rows, cols);
+
+        // Style resolution is per COLUMN per frame in the painter, and it is
+        // the same bargain here: build each column's rule plan once rather
+        // than once per cell, so a tall copy stays linear in cells with no
+        // per-cell plan allocation.
+        let view = self.view();
+        let mut plan = Vec::new();
+        for (dc, c) in (tl.col..=br.col).enumerate() {
+            self.format.plan(c, &mut plan);
+            let needs_text = ferrix_core::SheetFormat::plan_needs_text(&plan);
+            for (dr, r) in (tl.row..=br.row).enumerate() {
+                let cell = ferrix_core::CellRef::new(r, c);
+                let text = view.display(cell);
+                let value = view.get(cell);
+                // Window-dependent rules (top-N, colour scales) are skipped:
+                // they describe the SOURCE sheet's distribution, which is not
+                // a property of the copied cells and would be wrong the moment
+                // they landed anywhere else. `resolve` degrades correctly on a
+                // short `evals` slice, which is exactly this case.
+                let style = self.format.resolve(
+                    cell,
+                    &value,
+                    if needs_text { &text } else { "" },
+                    &plan,
+                    &[],
+                );
+                block.set(
+                    dr,
+                    dc,
+                    ClipCell {
+                        text,
+                        formula: self
+                            .overlay
+                            .get(cell)
+                            .and_then(|i| i.formula_src())
+                            .map(|s| s.to_string()),
+                        format: self.format.number_format(cell).cloned(),
+                        style: ferrix_core::ManualStyle {
+                            fill: style.fill,
+                            text: style.text,
+                            typography: style.typography,
+                        },
+                        // Where this came from, so a pasted formula can be
+                        // offset by the distance it actually travelled.
+                        origin: Some(cell),
+                    },
+                );
+            }
+        }
+        for (dc, c) in (tl.col..=br.col).enumerate() {
+            block.col_widths[dc] = col_widths(c);
+        }
+        Some(block)
+    }
+
+    /// Apply a Paste Special request as ONE undo step (issue #30).
+    ///
+    /// Everything the operation touches — every cell, whatever the mode —
+    /// goes into a single bulk [`UndoEntry`], so a 100k-cell paste is one
+    /// Ctrl+Z exactly like a bulk clear or a Replace All. That is not a new
+    /// mechanism: it is the same `bulk: true` entry those already push.
+    ///
+    /// Formats do NOT go through the undo stack, because they are not cell
+    /// contents; they are reported in [`PasteReport::format_rects`] so the
+    /// caller can say what happened.
+    pub fn paste_special(
+        &mut self,
+        origin: CellRef,
+        block: &ferrix_core::clipboard::ClipBlock,
+        opts: ferrix_core::clipboard::PasteOptions,
+        max_cells: u64,
+    ) -> Result<PasteReport, String> {
+        use ferrix_core::clipboard::{PasteWhat, TRANSPOSE_NOTE};
+
+        // Transpose first, so every bound, guard and write below sees the
+        // shape that will actually land. Checking the pre-transpose rectangle
+        // would guard the wrong cells — the merge check especially.
+        let transposed;
+        let block = if opts.transpose {
+            transposed = block.transposed();
+            &transposed
+        } else {
+            block
+        };
+
+        if block.is_empty() {
+            return Err("Clipboard is empty".into());
+        }
+        let cells = block.cell_count();
+        if cells > max_cells {
+            return Err(format!(
+                "pasting {cells} cells exceeds the {max_cells}-cell limit"
+            ));
+        }
+        let rows = block.rows() as u32;
+        let cols = block.cols() as u32;
+        let dest = Selection::new(
+            origin,
+            CellRef::new(origin.row + rows - 1, origin.col + cols - 1),
+        );
+
+        // Merged regions, BEFORE anything is written. A paste that would
+        // overwrite part of a merged region is refused outright rather than
+        // half-applied — the same instinct as `MergeError::Overlaps`, and the
+        // reason this check precedes the protection guard's own all-or-nothing
+        // contract instead of being interleaved with the writes.
+        if let Some(region) = self.merge_conflict(dest) {
+            return Err(format!(
+                "Paste refused — {} would overwrite part of the merged region {}. \
+                 Unmerge it first, or paste somewhere else.",
+                dest.label(),
+                merge_label(region)
+            ));
+        }
+
+        // Issue #42: same chokepoint as every other bulk write.
+        self.guard_range(dest).map_err(|d| d.to_string())?;
+
+        let mut report = PasteReport {
+            transposed: opts.transpose,
+            note: opts.transpose.then(|| TRANSPOSE_NOTE.to_string()),
+            ..Default::default()
+        };
+
+        if opts.what.writes_contents() {
+            report.cells_written = self.paste_contents(origin, block, opts)?;
+        }
+        if opts.what.writes_formats() {
+            report.format_rects = self.paste_formats(origin, block);
+        }
+        if opts.what == PasteWhat::ColumnWidths {
+            // Widths live in the app's sizing model, so they are handed back
+            // rather than applied here. Reported per destination column.
+            report.col_widths = (0..block.cols())
+                .filter_map(|c| {
+                    block
+                        .col_widths
+                        .get(c)
+                        .and_then(|w| *w)
+                        .map(|w| (origin.col + c as u32, w))
+                })
+                .collect();
+        }
+        Ok(report)
+    }
+
+    /// Write the cell contents half of a paste, as one bulk undo entry.
+    fn paste_contents(
+        &mut self,
+        origin: CellRef,
+        block: &ferrix_core::clipboard::ClipBlock,
+        opts: ferrix_core::clipboard::PasteOptions,
+    ) -> Result<usize, String> {
+        use ferrix_core::clipboard::PasteWhat;
+
+        let mut changes = Vec::new();
+        for r in 0..block.rows() {
+            for c in 0..block.cols() {
+                let Some(src) = block.get(r, c) else {
+                    continue;
+                };
+                let cell = CellRef::new(origin.row + r as u32, origin.col + c as u32);
+
+                // Skip Blanks: a blank clipboard cell leaves the destination
+                // exactly as it was, rather than clearing it. Checked before
+                // anything is recorded, so a skipped cell is not in the undo
+                // entry at all and an undo cannot "restore" a value that was
+                // never overwritten.
+                if opts.skip_blanks && src.text.trim().is_empty() && src.formula.is_none() {
+                    continue;
+                }
+
+                let text = self.paste_cell_text(cell, src, opts);
+                let before = self.overlay.get(cell).cloned();
+                let after = match &text {
+                    Some(t) => self.classify(t),
+                    // `None` means the arithmetic refused this pair; leave the
+                    // destination untouched rather than writing an error over
+                    // data the user did not ask to change.
+                    None => continue,
+                };
+                // Nothing actually changes: don't put it in the undo entry.
+                if before == after {
+                    continue;
+                }
+                match &after {
+                    Some(input) => {
+                        self.overlay.set(cell, input.clone());
+                    }
+                    None => {
+                        self.overlay.clear(cell);
+                    }
+                }
+                self.resync_graph(cell);
+                changes.push(CellChange {
+                    cell,
+                    before,
+                    after,
+                });
+                let _ = PasteWhat::All; // keeps the import honest across cfgs
+            }
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let n = changes.len();
+        self.dirty = true;
+        // ONE entry for the whole paste, `bulk: true` so it never coalesces
+        // with a neighbouring keystroke — identical to `paste_block`,
+        // `clear_range` and Replace All.
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: origin,
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+        });
+        self.recalc_all();
+        Ok(n)
+    }
+
+    /// What one destination cell should receive, or `None` to leave it alone.
+    fn paste_cell_text(
+        &self,
+        cell: CellRef,
+        src: &ferrix_core::clipboard::ClipCell,
+        opts: ferrix_core::clipboard::PasteOptions,
+    ) -> Option<String> {
+        use ferrix_core::clipboard::{PasteOp, PasteWhat};
+
+        // Arithmetic combines NUMBERS, so it is incompatible with pasting a
+        // formula: Excel resolves this the same way, by using the values.
+        if opts.op != PasteOp::None {
+            let dest = self.view().get(cell).as_number();
+            let combined = opts.op.apply(dest, src.as_number())?;
+            return Some(ferrix_core::format_number(combined));
+        }
+
+        match opts.what {
+            // Values: a formula lands as the number it evaluated to.
+            PasteWhat::Values => Some(src.text.clone()),
+            PasteWhat::All | PasteWhat::Formulas => match &src.formula {
+                Some(f) => {
+                    // Formula references are rewritten as TEXT for the offset
+                    // between where the cell was copied and where it landed.
+                    // `$` anchors are honoured — see
+                    // `ferrix_formula::paste_formula`.
+                    let (drow, dcol) = match src.origin {
+                        Some(from) => (
+                            cell.row as i64 - from.row as i64,
+                            cell.col as i64 - from.col as i64,
+                        ),
+                        None => (0, 0),
+                    };
+                    Some(ferrix_formula::paste_formula(f, drow, dcol))
+                }
+                // Formulas mode over a cell that never held one still writes
+                // the value; a mode that silently skipped them would leave
+                // holes in the pasted block.
+                None => Some(src.text.clone()),
+            },
+            PasteWhat::Formats | PasteWhat::ColumnWidths => None,
+        }
+    }
+
+    /// Write the formatting half of a paste.
+    ///
+    /// **This is where the scale invariant is kept.** The clipboard's per-cell
+    /// formats and styles are collapsed into maximal RECTANGLES first, so a
+    /// uniform format over a 100k-cell region becomes one
+    /// [`ferrix_core::RangeFormat`] entry — not 100k cell overrides, which
+    /// would be a per-cell format store by another name and would blow the
+    /// invariant `format.rs` exists to protect.
+    ///
+    /// Returns how many rectangles were stored.
+    fn paste_formats(
+        &mut self,
+        origin: CellRef,
+        block: &ferrix_core::clipboard::ClipBlock,
+    ) -> usize {
+        use ferrix_core::clipboard::merge_rectangles;
+
+        let (rows, cols) = (block.rows(), block.cols());
+        let cell_at = |i: usize| block.get(i / cols, i % cols);
+
+        // Number formats, keyed by the format itself so equal neighbours merge.
+        let fmt_keys: Vec<Option<ferrix_core::NumberFormat>> = (0..rows * cols)
+            .map(|i| cell_at(i).and_then(|c| c.format.clone()))
+            .collect();
+        let style_keys: Vec<Option<ferrix_core::ManualStyle>> = (0..rows * cols)
+            .map(|i| {
+                cell_at(i)
+                    .map(|c| c.style)
+                    .filter(|s: &ferrix_core::ManualStyle| !s.is_empty())
+            })
+            .collect();
+
+        let mut stored = 0usize;
+        for rect in merge_rectangles(&fmt_keys, rows, cols) {
+            let Some(fmt) = fmt_keys[rect.key_index].clone() else {
+                continue;
+            };
+            let range = ferrix_core::TableRange::new(
+                origin.row + rect.first_row as u32,
+                origin.col + rect.first_col as u32,
+                origin.row + rect.last_row as u32,
+                origin.col + rect.last_col as u32,
+            );
+            let mut rf = ferrix_core::RangeFormat::new(range);
+            rf.format = Some(fmt);
+            self.format.push_range(rf);
+            stored += 1;
+        }
+        for rect in merge_rectangles(&style_keys, rows, cols) {
+            let Some(style) = style_keys[rect.key_index] else {
+                continue;
+            };
+            let range = ferrix_core::TableRange::new(
+                origin.row + rect.first_row as u32,
+                origin.col + rect.first_col as u32,
+                origin.row + rect.last_row as u32,
+                origin.col + rect.last_col as u32,
+            );
+            self.format.set_range_manual(range, style);
+            stored += 1;
+        }
+        if stored > 0 {
+            self.dirty = true;
+        }
+        stored
+    }
+
+    /// The merged region a write over `dest` would partially overwrite.
+    ///
+    /// "Partially" is the whole point: a paste whose destination exactly
+    /// covers a merge is writing the merge as a unit and is fine, while one
+    /// that clips a corner off would put a value into a cell that displays as
+    /// part of its neighbour — invisible data loss. Only the second is
+    /// refused.
+    pub fn merge_conflict(&self, dest: Selection) -> Option<ferrix_core::TableRange> {
+        let (tl, br) = dest.bounds();
+        self.merges
+            .regions()
+            .find(|r| {
+                let intersects = r.first_row <= br.row
+                    && tl.row <= r.last_row
+                    && r.first_col <= br.col
+                    && tl.col <= r.last_col;
+                let fully_inside = r.first_row >= tl.row
+                    && r.last_row <= br.row
+                    && r.first_col >= tl.col
+                    && r.last_col <= br.col;
+                intersects && !fully_inside
+            })
+            .copied()
     }
 
     /// Clear every cell in a selection as ONE undo step.
@@ -2061,6 +2483,12 @@ impl Workbook {
 
     /// Paste a block of text with its top-left corner at `origin`, as ONE
     /// undo step. Returns how many cells were written.
+    ///
+    /// Superseded on the UI path by [`Self::paste_special`], which handles
+    /// formats, formulas and the Paste Special modes (issue #30). Kept as the
+    /// plain-text contract, and because its tests pin the one-undo-entry rule
+    /// that `paste_special` deliberately matches rather than reinvents.
+    #[allow(dead_code)]
     pub fn paste_block(
         &mut self,
         origin: CellRef,
