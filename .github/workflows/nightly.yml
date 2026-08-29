@@ -10,7 +10,13 @@ name: nightly
 # when no commit has landed since the last nightly, so idle days cost seconds.
 on:
   schedule:
-    - cron: '0 6 * * *'
+    # 07:00 UTC = 01:00 CST. Every 24 hours.
+    #
+    # GitHub's scheduler runs on fixed UTC and does not observe daylight saving,
+    # so this lands at 01:00 during CST and 02:00 during CDT. Pinning to CST
+    # keeps the winter time exact; change to '0 6 * * *' to make CDT exact
+    # instead. There is no cron expression that tracks both.
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       force:
