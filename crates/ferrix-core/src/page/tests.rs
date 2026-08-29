@@ -90,7 +90,8 @@ fn brute_force_bands(
 fn closed_form_matches_a_brute_force_walk() {
     // A spread of shapes: uniform, one odd row, hidden runs, mixed spans,
     // and capacities that divide evenly or leave a remainder.
-    let shapes: Vec<(&str, Box<dyn Fn(&mut RowSizes)>, u32, u32, f32)> = vec![
+    type Shape = (&'static str, Box<dyn Fn(&mut RowSizes)>, u32, u32, f32);
+    let shapes: Vec<Shape> = vec![
         ("uniform", Box::new(|_: &mut RowSizes| {}), 0, 99, 150.0),
         (
             "uniform-exact-fit",
@@ -603,14 +604,16 @@ fn landscape_fits_more_columns_and_fewer_rows() {
 
 #[test]
 fn absurd_margins_produce_an_empty_page_not_a_hang() {
-    let mut s = PageSetup::default();
-    s.margins = Margins {
-        left: 5000.0,
-        right: 5000.0,
-        top: 5000.0,
-        bottom: 5000.0,
-        header: 0.0,
-        footer: 0.0,
+    let s = PageSetup {
+        margins: Margins {
+            left: 5000.0,
+            right: 5000.0,
+            top: 5000.0,
+            bottom: 5000.0,
+            header: 0.0,
+            footer: 0.0,
+        },
+        ..Default::default()
     };
     let (w, h) = s.printable();
     assert_eq!((w, h), (0.0, 0.0), "printable area must clamp at zero");
