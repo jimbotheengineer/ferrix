@@ -519,6 +519,32 @@ impl SheetFormat {
         c.rules.len() - 1
     }
 
+    /// The rules on a column, in precedence order (later wins).
+    ///
+    /// Borrowed and empty-by-default so the editor can list a column that has
+    /// never been formatted without materialising an entry for it — asking
+    /// what a column looks like must not be what creates it.
+    pub fn column_rules(&self, col: u32) -> &[ConditionalRule] {
+        self.columns.get(&col).map_or(&[], |c| &c.rules)
+    }
+
+    /// Replace one column rule in place, keeping its position in the order.
+    ///
+    /// Distinct from remove-then-push because editing a rule must not silently
+    /// promote it to winning over everything else that was already there.
+    pub fn set_column_rule(&mut self, col: u32, i: usize, rule: ConditionalRule) -> bool {
+        let Some(c) = self.columns.get_mut(&col) else {
+            return false;
+        };
+        match c.rules.get_mut(i) {
+            Some(slot) => {
+                *slot = rule;
+                true
+            }
+            None => false,
+        }
+    }
+
     // --- range scope ---
 
     pub fn ranges(&self) -> &[RangeFormat] {
@@ -547,6 +573,55 @@ impl SheetFormat {
 
     pub fn remove_range(&mut self, i: usize) -> Option<RangeFormat> {
         (i < self.ranges.len()).then(|| self.ranges.remove(i))
+    }
+
+    /// Index of the range entry covering exactly `range`, if one exists.
+    ///
+    /// Exact match rather than overlap: the editor's unit of work is "the
+    /// rules on THIS selection", and two different selections that happen to
+    /// intersect are two different lists. Matching by overlap would let a rule
+    /// added to `B2:B9` silently appear in the list for `A1:C3`.
+    pub fn range_index_of(&self, range: TableRange) -> Option<usize> {
+        self.ranges.iter().position(|r| r.range == range)
+    }
+
+    /// The rules on an exact range, in precedence order.
+    pub fn rules_for_range(&self, range: TableRange) -> &[ConditionalRule] {
+        self.range_index_of(range)
+            .map_or(&[], |i| &self.ranges[i].rules)
+    }
+
+    /// Append a rule to the entry for `range`, creating the entry if needed.
+    ///
+    /// Returns `(range index, rule index)`. ONE entry however many cells the
+    /// rectangle spans — a rule over `B2:B100000000` costs exactly what one
+    /// over `B2:B3` costs.
+    pub fn push_rule_for_range(
+        &mut self,
+        range: TableRange,
+        rule: ConditionalRule,
+    ) -> (usize, usize) {
+        let ri = match self.range_index_of(range) {
+            Some(i) => i,
+            None => self.push_range(RangeFormat::new(range)),
+        };
+        let rules = &mut self.ranges[ri].rules;
+        rules.push(rule);
+        (ri, rules.len() - 1)
+    }
+
+    /// Replace one range rule in place, keeping its position in the order.
+    pub fn set_range_rule(&mut self, range_index: usize, i: usize, rule: ConditionalRule) -> bool {
+        let Some(r) = self.ranges.get_mut(range_index) else {
+            return false;
+        };
+        match r.rules.get_mut(i) {
+            Some(slot) => {
+                *slot = rule;
+                true
+            }
+            None => false,
+        }
     }
 
     // --- per-cell overrides ---

@@ -307,6 +307,15 @@ pub struct FerrixApp {
     /// Whether a new name typed in the Name Box is scoped to the active sheet.
     name_box_sheet_scope: bool,
 
+    /// The conditional-formatting editor, when it is open (roadmap #11).
+    ///
+    /// `None` is the overwhelmingly common case and costs nothing: no dialog,
+    /// no preview clone, and the grid paints straight from `wb.format`.
+    cond: Option<crate::cond_format::CondFormatState>,
+    /// Last lossy-export warning the editor produced, mirrored into the status
+    /// bar so it survives the dialog closing.
+    cond_warning: Option<String>,
+
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
 }
@@ -413,6 +422,8 @@ impl FerrixApp {
             name_edit_target: String::new(),
             name_error: None,
             name_box_sheet_scope: false,
+            cond: None,
+            cond_warning: None,
             prefs,
         };
         if let Some(p) = initial {
@@ -1933,6 +1944,160 @@ impl FerrixApp {
         }
         self.wb.mark_dirty();
         self.status = "Formatting applied".into();
+    }
+
+    // ============================ conditional formatting (roadmap #11) =====
+
+    /// Open the New Rule dialog on the current selection.
+    pub fn cond_new_rule(&mut self) {
+        let (a, b) = self.selection.bounds();
+        self.cond = Some(crate::cond_format::CondFormatState::new_rule(
+            crate::cond_format::CondTarget::from_selection(a, b),
+        ));
+    }
+
+    /// Open the Manage Rules list for the current selection.
+    ///
+    /// Prefers whichever scope ALREADY HAS RULES. A user who put a rule on the
+    /// whole column and then clicked one cell in it must not be told there are
+    /// no rules — that reads as data loss, and it is the single most likely
+    /// way for this dialog to lie.
+    pub fn cond_manage(&mut self) {
+        let (a, b) = self.selection.bounds();
+        let range = crate::cond_format::CondTarget::from_selection(a, b);
+        let target = if range.rules(&self.wb.format).is_empty() {
+            let col = range.widen();
+            if col.rules(&self.wb.format).is_empty() {
+                range
+            } else {
+                col
+            }
+        } else {
+            range
+        };
+        self.cond = Some(crate::cond_format::CondFormatState::manage(target));
+    }
+
+    /// Whether the editor is open. Read by tests and by the frame loop.
+    pub fn cond_is_open(&self) -> bool {
+        self.cond.is_some()
+    }
+
+    pub fn cond_state(&self) -> Option<&crate::cond_format::CondFormatState> {
+        self.cond.as_ref()
+    }
+
+    pub fn cond_state_mut(&mut self) -> Option<&mut crate::cond_format::CondFormatState> {
+        self.cond.as_mut()
+    }
+
+    /// The lossy-export warning currently in force, if any.
+    pub fn cond_warning(&self) -> Option<&str> {
+        self.cond_warning.as_deref()
+    }
+
+    /// The format the grid should paint with THIS FRAME.
+    ///
+    /// Either the real store, or — while a preview is live — a clone with the
+    /// pending rule spliced in. The clone is a handful of rules; it is never a
+    /// function of the row count, and it exists only while a modal is open.
+    /// The real store is not touched, which is what makes Cancel a no-op
+    /// rather than an undo.
+    fn cond_preview_format(&self) -> Option<ferrix_core::SheetFormat> {
+        self.cond
+            .as_ref()
+            .and_then(|c| c.preview_format(&self.wb.format))
+    }
+
+    /// Apply an outcome from the dialog. Returns whether anything was stored.
+    fn cond_apply(&mut self, out: crate::cond_format::CondOutcome) -> bool {
+        use crate::cond_format::{CondFormatState, CondMode, RuleForm};
+        let Some(st) = self.cond.as_mut() else {
+            return false;
+        };
+        let target = st.target;
+        let mut stored = false;
+
+        if out.cancel {
+            // Nothing to roll back: the preview never wrote anything.
+            self.cond = None;
+            return false;
+        }
+        if let Some(t) = out.retarget {
+            st.target = t;
+        }
+        if out.new_rule {
+            let t = st.target;
+            *st = CondFormatState::new_rule(t);
+        }
+        if let Some(i) = out.edit {
+            if let Some(rule) = target.rules(&self.wb.format).get(i) {
+                st.form = RuleForm::from_rule(rule);
+                st.mode = CondMode::Edit(i);
+                st.preview = true;
+            }
+        }
+        if out.back {
+            let t = st.target;
+            *st = CondFormatState::manage(t);
+        }
+        if let Some((i, delta)) = out.move_rule {
+            if target.move_rule(&mut self.wb.format, i, delta) {
+                self.wb.mark_dirty();
+                stored = true;
+                self.status = format!("Rule moved {} in precedence", pos_word(delta));
+            }
+        }
+        if let Some(i) = out.delete {
+            if target.remove(&mut self.wb.format, i) {
+                self.wb.mark_dirty();
+                stored = true;
+                self.status = format!("Rule deleted from {}", target.label());
+            }
+        }
+        if out.commit {
+            let st = self.cond.as_ref().expect("checked above");
+            let rule = st.form.to_rule();
+            let mode = st.mode;
+            let warn = crate::cond_format::xlsx_warning(&rule);
+            match mode {
+                CondMode::Edit(i) if target.replace(&mut self.wb.format, i, rule.clone()) => {}
+                // An index that no longer exists appends rather than silently
+                // dropping the user's work.
+                _ => target.push(&mut self.wb.format, rule.clone()),
+            }
+            self.wb.mark_dirty();
+            stored = true;
+            self.status = match &warn {
+                Some(w) => format!("{} on {} · {w}", rule.label(), target.label()),
+                None => format!("{} applied to {}", rule.label(), target.label()),
+            };
+            self.cond_warning = warn;
+            // Straight back to the list, so a second rule is one click away
+            // and the new precedence order is immediately visible.
+            self.cond = Some(CondFormatState::manage(target));
+        }
+        stored
+    }
+
+    /// Draw the editor and act on what it reported.
+    fn show_cond_editor(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        // The dialog borrows the format to LIST rules, so it is drawn against
+        // a detached state and every mutation comes back as an outcome. That
+        // is also what makes the read path provably read-only.
+        let Some(mut st) = self.cond.clone() else {
+            return;
+        };
+        let out = crate::cond_format::show(ctx, &mut st, &self.wb.format, th);
+        // Field edits (colours, the kind selector, the preview checkbox) live
+        // on the state itself and are adopted whatever the outcome says.
+        if self.cond.is_some() {
+            self.cond = Some(st);
+        }
+        if !out.is_empty() {
+            self.cond_apply(out);
+        }
     }
 
     fn open_xlsx_dialog_impl(&mut self) {
@@ -3646,6 +3811,9 @@ impl FerrixApp {
         // immediately without touching the disk.
         self.tick_autosave();
         self.show_chart_window(ctx);
+        if self.cond.is_some() {
+            self.show_cond_editor(ctx);
+        }
         {}
 
         self.handle_keys(ctx);
@@ -3660,6 +3828,9 @@ impl FerrixApp {
         // its choice is recorded and applied after the panel closure ends.
         let mut view_action: Option<ViewAction> = None;
         let mut toggle_empty = false;
+        // Some(true) = Manage, Some(false) = New. Recorded and applied after
+        // the panel closure, for the same borrow reason as the View menu.
+        let mut cond_action: Option<bool> = None;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
@@ -3764,6 +3935,35 @@ impl FerrixApp {
                     {
                         toggle_empty = true;
                     }
+                    // --- Format menu: conditional formatting (roadmap #11) ---
+                    ui.menu_button("Format", |ui| {
+                        ui.label(
+                            RichText::new(format!("Selection: {}", self.selection.label()))
+                                .color(th.text_dim)
+                                .small(),
+                        );
+                        ui.separator();
+                        if ui
+                            .button("🎨 Conditional Formatting — New Rule…")
+                            .on_hover_text(
+                                "Colour cells by their value. Stored once per column or \
+                                 range, never per cell.",
+                            )
+                            .clicked()
+                        {
+                            cond_action = Some(false);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("☰ Conditional Formatting — Manage Rules…")
+                            .on_hover_text("List, reorder, edit and delete the rules here.")
+                            .clicked()
+                        {
+                            cond_action = Some(true);
+                            ui.close_menu();
+                        }
+                    });
+
                     // --- View menu: freeze panes, split, zoom (roadmap #6) ---
                     ui.menu_button("View", |ui| {
                         let frozen = self.panes.is_active();
@@ -3905,6 +4105,11 @@ impl FerrixApp {
         }
         if toggle_empty {
             self.set_show_empty_rows(!self.show_empty_rows);
+        }
+        match cond_action {
+            Some(true) => self.cond_manage(),
+            Some(false) => self.cond_new_rule(),
+            None => {}
         }
 
         // --- formula bar ---
@@ -4378,6 +4583,10 @@ impl FerrixApp {
 
                 let resp = {
                     let view = self.wb.view();
+                    // The conditional-formatting editor's LIVE PREVIEW. `None`
+                    // whenever no dialog is previewing, and the grid then
+                    // paints the real store with no clone at all.
+                    let preview_fmt = self.cond_preview_format();
                     // Table decoration is prepared once per frame for the
                     // visible rows only, so its cost is independent of how
                     // many rows the table covers.
@@ -4414,7 +4623,7 @@ impl FerrixApp {
                             None
                         },
                         theme: th,
-                        format: Some(&self.wb.format),
+                        format: Some(preview_fmt.as_ref().unwrap_or(&self.wb.format)),
                         merges: Some(&self.wb.merges),
                         pad_rows: if self.show_empty_rows {
                             crate::grid::EMPTY_ROW_PADDING
@@ -4765,6 +4974,15 @@ fn parse_a1_selection(text: &str) -> Option<Selection> {
             Some(Selection::new(a, b))
         }
         None => Some(Selection::single(CellRef::from_a1(&text)?)),
+    }
+}
+
+/// "later" / "earlier", for the rule-reorder status message. Later WINS.
+fn pos_word(delta: isize) -> &'static str {
+    if delta > 0 {
+        "later (now wins over the rules above it)"
+    } else {
+        "earlier (now loses to the rules below it)"
     }
 }
 
