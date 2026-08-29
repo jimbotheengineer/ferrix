@@ -10388,15 +10388,18 @@ where
     let mut convert_note = String::new();
 
     if !reused {
-        // The out-of-core converter takes the DETECTED delimiter and header
-        // flag. It does not transcode: an out-of-core load of a non-UTF-8
-        // file still reads its bytes as UTF-8, which is a known gap recorded
-        // in REPORT.md rather than a silent one.
-        let stats = ferrix_io::convert_csv_cancellable(
+        // The out-of-core converter takes the full import settings, including
+        // the encoding the wizard resolved (issue #65). It used to take only
+        // the delimiter and header flag, which made a non-UTF-8 file decode
+        // correctly or not depending on its SIZE.
+        let stats = ferrix_io::convert_csv_opts(
             path,
             &cache,
-            opts.delimiter,
-            opts.has_headers,
+            ferrix_io::ConvertOptions {
+                delimiter: opts.delimiter,
+                has_headers: opts.has_headers,
+                encoding: opts.encoding,
+            },
             &mut progress,
             should_cancel,
         )
@@ -10411,7 +10414,7 @@ where
     let mut mapped = ferrix_io::MappedSheet::open(&cache).map_err(|e| e.to_string())?;
     // Recover header names from the source's first line; the cache stores data
     // only, and re-reading one line is instant even for a 10GB file.
-    if let Some(h) = read_header_line(path) {
+    if let Some(h) = read_header_line(path, opts.delimiter, opts.encoding) {
         mapped.set_headers(h);
     }
 
@@ -10815,15 +10818,34 @@ fn default_comment_author() -> String {
         .unwrap_or_default()
 }
 
-/// Read just the first line of a CSV for column headers.
-fn read_header_line(path: &Path) -> Option<Vec<String>> {
+/// Recover header names from the source's first line.
+///
+/// Reads BYTES rather than a `String` (issue #65). The old version used
+/// `BufReader::read_line`, which fails with `InvalidData` on any non-UTF-8
+/// byte — and the `.ok()?` turned that failure into `None`, so a windows-1252
+/// file with an accented header silently fell back to column letters. It also
+/// hardcoded a comma, collapsing a semicolon-delimited header into one name.
+fn read_header_line(
+    path: &Path,
+    delimiter: u8,
+    encoding: Option<&'static ferrix_io::Encoding>,
+) -> Option<Vec<String>> {
     use std::io::{BufRead, BufReader};
     let f = std::fs::File::open(path).ok()?;
-    let mut line = String::new();
-    BufReader::new(f).read_line(&mut line).ok()?;
+    let mut raw: Vec<u8> = Vec::new();
+    BufReader::new(f).read_until(b'\n', &mut raw).ok()?;
+
+    // Decode with the chosen encoding; lossy so one bad byte never costs the
+    // whole header row. `None`/UTF-8 keeps the previous behaviour bar the BOM.
+    let text = match encoding {
+        Some(enc) if enc.name() != "UTF-8" => enc.decode(&raw).0.into_owned(),
+        _ => String::from_utf8_lossy(raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw))
+            .into_owned(),
+    };
+
     Some(
-        line.trim_end()
-            .split(',')
+        text.trim_end()
+            .split(delimiter as char)
             .map(|s| s.trim().trim_matches('"').to_string())
             .collect(),
     )
@@ -11434,5 +11456,54 @@ mod tests {
         assert_eq!(wb.sheet_count(), 1);
         assert_eq!(wb.active_name(), "data");
         assert_eq!(wb.view().get(CellRef::new(0, 0)), Value::Number(5.0));
+    }
+
+    // ---- issue #65: header recovery must honour encoding and delimiter ----
+
+    fn write_header_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn header_recovery_decodes_a_non_utf8_header_instead_of_giving_up() {
+        // "id,année,prix" in windows-1252. The old `read_line` returned
+        // Err(InvalidData) on the 0xE9, and `.ok()?` turned that into None —
+        // so the sheet fell back to column LETTERS with no headers at all.
+        let mut raw = b"id,ann".to_vec();
+        raw.push(0xE9);
+        raw.extend_from_slice(b"e,prix\n1,2020,5\n");
+        let p = write_header_fixture("hdr_1252.csv", &raw);
+
+        let got = read_header_line(
+            &p,
+            b',',
+            Some(ferrix_io::encoding_for_label("windows-1252").unwrap()),
+        );
+
+        assert_eq!(
+            got,
+            Some(vec![
+                "id".to_string(),
+                "année".to_string(),
+                "prix".to_string()
+            ]),
+            "the accented header must decode, not vanish"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn header_recovery_splits_on_the_chosen_delimiter() {
+        // A semicolon file used to collapse into ONE header name because the
+        // split was hardcoded to a comma.
+        let p = write_header_fixture("hdr_semi.csv", b"id;name;prix\n1;a;2\n");
+
+        let got = read_header_line(&p, b';', None).unwrap();
+
+        assert_eq!(got, vec!["id", "name", "prix"]);
+        assert_eq!(got.len(), 3, "a hardcoded comma would yield one column");
+        let _ = std::fs::remove_file(&p);
     }
 }

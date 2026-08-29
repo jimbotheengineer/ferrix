@@ -58,6 +58,152 @@ use crate::format::{
 /// and still gives every core a multi-MB sub-chunk to chew on.
 const BLOCK: usize = 32 << 20;
 
+/// Source bytes read per block when transcoding (issue #65).
+///
+/// A third of `BLOCK` because the widest single-byte-to-UTF-8 expansion is 3x,
+/// so the *decoded* block this produces still lands at roughly `BLOCK`. Reading
+/// a full `BLOCK` of windows-1252 instead would need a 96MB output buffer to
+/// guarantee one decode call, tripling peak for no throughput gain.
+const RAW_BLOCK: usize = BLOCK / 3;
+
+/// How to interpret the source file (issue #65).
+///
+/// Exists so the encoding the import wizard resolved actually reaches the
+/// out-of-core converter. It used to stop at the in-RAM loader, which made
+/// correct decoding depend on file size — the one variable a user is least
+/// likely to connect to garbled text.
+#[derive(Debug, Clone, Copy)]
+pub struct ConvertOptions {
+    pub delimiter: u8,
+    pub has_headers: bool,
+    /// `None` means "the bytes are already UTF-8" and is handled by a plain
+    /// read with no transcode, exactly as before this option existed.
+    pub encoding: Option<&'static encoding_rs::Encoding>,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            has_headers: true,
+            encoding: None,
+        }
+    }
+}
+
+impl ConvertOptions {
+    /// The historical positional form, for the many call sites that only ever
+    /// wanted a comma-delimited UTF-8 file.
+    pub fn new(delimiter: u8, has_headers: bool) -> Self {
+        Self {
+            delimiter,
+            has_headers,
+            encoding: None,
+        }
+    }
+
+    pub fn with_encoding(mut self, encoding: Option<&'static encoding_rs::Encoding>) -> Self {
+        self.encoding = encoding;
+        self
+    }
+}
+
+/// Feeds the converter UTF-8 blocks, transcoding on the way when needed.
+///
+/// The reason this is a decoder held across blocks rather than a per-block
+/// `Encoding::decode` call: a multi-byte sequence can straddle a read
+/// boundary. Decoding each block independently would turn one character into
+/// two replacement characters at every boundary — roughly one corrupted
+/// character per 10MB, which is invisible in a test fixture and obvious in a
+/// 40GB file. `encoding_rs::Decoder` carries that partial state for us.
+struct BlockReader {
+    file: File,
+    /// `None` keeps the UTF-8 fast path a plain read into the caller's buffer.
+    decoder: Option<encoding_rs::Decoder>,
+    /// Raw source bytes, reused across blocks. Empty unless transcoding.
+    raw: Vec<u8>,
+    /// Strip a leading BOM on the first block. Only used on the pass-through
+    /// path; the decoder is built with BOM removal of its own.
+    strip_bom: bool,
+    first: bool,
+    done: bool,
+}
+
+impl BlockReader {
+    fn new(file: File, encoding: Option<&'static encoding_rs::Encoding>) -> Self {
+        // Matching `csv::decode_to_utf8`: `None` and an explicit UTF-8 both
+        // pass through, but an explicit UTF-8 still loses its BOM. Left in
+        // place a BOM becomes part of the first header cell, so `id` arrives
+        // as `\u{feff}id` and no formula referencing that column ever matches.
+        let transcode = matches!(encoding, Some(enc) if enc != encoding_rs::UTF_8);
+        Self {
+            file,
+            decoder: transcode.then(|| {
+                encoding
+                    .expect("transcode implies an encoding")
+                    .new_decoder_with_bom_removal()
+            }),
+            raw: if transcode {
+                vec![0u8; RAW_BLOCK]
+            } else {
+                Vec::new()
+            },
+            strip_bom: encoding == Some(encoding_rs::UTF_8),
+            first: true,
+            done: false,
+        }
+    }
+
+    /// Fill `out` with the next block of UTF-8 and report how many SOURCE
+    /// bytes it consumed (progress is about the file on disk, not its decoded
+    /// size). `Ok(None)` means the source is exhausted.
+    fn next_block(&mut self, out: &mut Vec<u8>) -> std::io::Result<Option<u64>> {
+        if self.done {
+            return Ok(None);
+        }
+        let Some(dec) = self.decoder.as_mut() else {
+            out.resize(BLOCK, 0);
+            let n = self.file.read(&mut out[..])?;
+            out.truncate(n);
+            if n == 0 {
+                self.done = true;
+                return Ok(None);
+            }
+            if std::mem::take(&mut self.first)
+                && self.strip_bom
+                && out.starts_with(&[0xEF, 0xBB, 0xBF])
+            {
+                out.drain(..3);
+            }
+            return Ok(Some(n as u64));
+        };
+
+        let n = self.file.read(&mut self.raw[..])?;
+        // The final call must set `last`, which flushes any half-finished
+        // sequence as U+FFFD instead of dropping the file's last character.
+        let last = n == 0;
+        self.done = last;
+        let cap = dec.max_utf8_buffer_length(n).unwrap_or(0).max(4);
+        out.resize(cap, 0);
+        let (_res, read, written, _had_errors) = dec.decode_to_utf8(&self.raw[..n], out, last);
+        debug_assert_eq!(read, n, "output buffer was sized to consume the whole read");
+        out.truncate(written);
+        if last && written == 0 {
+            return Ok(None);
+        }
+        Ok(Some(n as u64))
+    }
+
+    /// Steady-state buffer footprint, for the peak-memory stat.
+    fn buffer_bytes(&self) -> usize {
+        if self.decoder.is_some() {
+            RAW_BLOCK + BLOCK
+        } else {
+            BLOCK
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
     #[error("io error: {0}")]
@@ -342,6 +488,31 @@ pub fn convert_csv_cancellable<F, C>(
     dest: &Path,
     delimiter: u8,
     has_headers: bool,
+    progress: F,
+    should_cancel: C,
+) -> Result<ConvertStats, ConvertError>
+where
+    F: FnMut(u64, u64),
+    C: FnMut() -> bool,
+{
+    convert_csv_opts(
+        source,
+        dest,
+        ConvertOptions::new(delimiter, has_headers),
+        progress,
+        should_cancel,
+    )
+}
+
+/// Convert a CSV into a `.ferrix` cache honouring the full import settings,
+/// including the source encoding (issue #65).
+///
+/// This is the entry point the import wizard uses. The positional shims above
+/// stay for the batch tools and benchmarks, which only ever feed it UTF-8.
+pub fn convert_csv_opts<F, C>(
+    source: &Path,
+    dest: &Path,
+    opts: ConvertOptions,
     mut progress: F,
     mut should_cancel: C,
 ) -> Result<ConvertStats, ConvertError>
@@ -363,8 +534,7 @@ where
         source,
         dest,
         &scratch,
-        delimiter,
-        has_headers,
+        opts,
         source_bytes,
         &mut progress,
         &mut should_cancel,
@@ -387,8 +557,7 @@ fn convert_inner<F, C>(
     source: &Path,
     dest: &Path,
     scratch: &Path,
-    delimiter: u8,
-    has_headers: bool,
+    opts: ConvertOptions,
     source_bytes: u64,
     progress: &mut F,
     should_cancel: &mut C,
@@ -397,7 +566,12 @@ where
     F: FnMut(u64, u64),
     C: FnMut() -> bool,
 {
-    let mut file = File::open(source)?;
+    let ConvertOptions {
+        delimiter,
+        has_headers,
+        encoding,
+    } = opts;
+    let mut reader = BlockReader::new(File::open(source)?, encoding);
     let mut arena = StringArena::new();
     let mut spills: Vec<Spill> = Vec::new();
     let mut headers: Vec<String> = Vec::new();
@@ -408,11 +582,12 @@ where
     // what else the machine happened to be doing at byte 4,000,000,000.
     let arena_limit = arena_limit();
 
-    let mut buf = vec![0u8; BLOCK];
+    let block_bytes = reader.buffer_bytes();
+    let mut buf: Vec<u8> = Vec::new();
     let mut carry: Vec<u8> = Vec::new();
     let mut consumed: u64 = 0;
     let mut first_record = true;
-    let mut peak_bytes = BLOCK;
+    let mut peak_bytes = block_bytes;
 
     loop {
         // Poll before the read so a cancel issued while the previous block was
@@ -420,16 +595,15 @@ where
         if should_cancel() {
             return Err(ConvertError::Cancelled);
         }
-        let n = file.read(&mut buf)?;
-        if n == 0 {
+        let Some(n) = reader.next_block(&mut buf)? else {
             break;
-        }
-        consumed += n as u64;
+        };
+        consumed += n;
 
         // Prepend anything left over from the previous block.
-        let mut chunk = Vec::with_capacity(carry.len() + n);
+        let mut chunk = Vec::with_capacity(carry.len() + buf.len());
         chunk.extend_from_slice(&carry);
-        chunk.extend_from_slice(&buf[..n]);
+        chunk.extend_from_slice(&buf);
         carry.clear();
 
         // Find the last complete record; the tail carries to the next block.
@@ -448,6 +622,7 @@ where
             &mut rows,
             scratch,
             &mut peak_bytes,
+            block_bytes,
         )?;
 
         if arena.data_bytes() > arena_limit {
@@ -471,6 +646,7 @@ where
             &mut rows,
             scratch,
             &mut peak_bytes,
+            block_bytes,
         )?;
     }
 
@@ -636,6 +812,7 @@ fn parse_block_parallel(
     rows: &mut u64,
     scratch: &Path,
     peak_bytes: &mut usize,
+    block_bytes: usize,
 ) -> Result<(), ConvertError> {
     let mut body = data;
 
@@ -685,7 +862,8 @@ fn parse_block_parallel(
         .map(|&(s, e)| parse_chunk_cells(&body[s..e], delim))
         .collect();
 
-    *peak_bytes = (*peak_bytes).max(BLOCK + parsed.iter().map(|c| c.heap_bytes()).sum::<usize>());
+    *peak_bytes =
+        (*peak_bytes).max(block_bytes + parsed.iter().map(|c| c.heap_bytes()).sum::<usize>());
 
     for chunk in &parsed {
         // Replay this chunk's local strings into the global arena in
@@ -977,6 +1155,149 @@ mod tests {
         let d = b"a,\"x\ny\",b\nnext,row,here\npartial";
         let end = last_record_end(d);
         assert_eq!(&d[end..], b"partial");
+    }
+
+    // ---- issue #65: the wizard's encoding override must reach this path ----
+
+    /// Read a cell back out of a finished `.ferrix` cache as displayed text.
+    fn cell_text(cache: &Path, row: u64, col: usize) -> String {
+        let sheet = crate::MappedSheet::open(cache).unwrap();
+        sheet.display(ferrix_core::CellRef::new(row as u32, col as u32))
+    }
+
+    fn write_bytes(name: &str, bytes: &[u8]) -> PathBuf {
+        let p = temp_dir().join(name);
+        let mut f = File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn out_of_core_conversion_honours_a_windows_1252_override() {
+        // "café" and "naïve" in windows-1252: one byte per accented char.
+        let mut raw = b"id,name\n1,".to_vec();
+        raw.extend_from_slice(b"caf\xE9");
+        raw.extend_from_slice(b"\n2,");
+        raw.extend_from_slice(b"na\xEFve");
+        raw.push(b'\n');
+        let src = write_bytes("enc_1252.csv", &raw);
+        let dst = temp_dir().join("enc_1252.ferrix");
+
+        convert_csv_opts(
+            &src,
+            &dst,
+            ConvertOptions::new(b',', true).with_encoding(Some(encoding_rs::WINDOWS_1252)),
+            |_, _| {},
+            || false,
+        )
+        .unwrap();
+
+        // Reading 0xE9 as UTF-8 yields U+FFFD, so this asserts the actual
+        // character rather than merely "text came back".
+        assert_eq!(cell_text(&dst, 0, 1), "café");
+        assert_eq!(cell_text(&dst, 1, 1), "naïve");
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn a_multibyte_sequence_split_across_read_blocks_decodes_once() {
+        // The failure this pins: a decoder rebuilt per read block loses the
+        // half-finished sequence sitting on the boundary, turning one
+        // character into replacement characters.
+        //
+        // This MUST use a genuinely multi-byte encoding. An earlier draft of
+        // this test used windows-1252 and was worthless — every character is
+        // one byte, so nothing can straddle a boundary and the test passed
+        // against a deliberately per-block decoder. Shift_JIS gives a two-byte
+        // kanji we can land exactly on the seam.
+        const KANJI: [u8; 2] = [0x82, 0xA0]; // 'あ' in Shift_JIS
+
+        let mut raw: Vec<u8> = b"id,name\n".to_vec();
+        // Fixed-width filler rows, stopping short of the boundary.
+        while raw.len() + 64 < RAW_BLOCK - 1 {
+            raw.extend_from_slice(b"1,aaaaaaaa\n");
+        }
+        // Open the final record and pad it so the kanji's FIRST byte is the
+        // last byte of block one and its second byte opens block two.
+        raw.extend_from_slice(b"2,");
+        while raw.len() < RAW_BLOCK - 1 {
+            raw.push(b'b');
+        }
+        assert_eq!(raw.len(), RAW_BLOCK - 1, "kanji must start on the seam");
+        let pad_len = raw.len() - (raw.iter().rposition(|&b| b == b'\n').unwrap() + 3);
+        raw.extend_from_slice(&KANJI);
+        raw.push(b'\n');
+
+        let src = write_bytes("enc_split.csv", &raw);
+        let dst = temp_dir().join("enc_split.ferrix");
+
+        let stats = convert_csv_opts(
+            &src,
+            &dst,
+            ConvertOptions::new(b',', true).with_encoding(Some(encoding_rs::SHIFT_JIS)),
+            |_, _| {},
+            || false,
+        )
+        .unwrap();
+
+        let sheet = crate::MappedSheet::open(&dst).unwrap();
+        let last = sheet.display(ferrix_core::CellRef::new((stats.rows - 1) as u32, 1));
+
+        // The specific thing the boundary breaks: the character itself.
+        let mut expect = "b".repeat(pad_len);
+        expect.push('あ');
+        assert_eq!(
+            last, expect,
+            "the seam character did not survive the block boundary"
+        );
+        assert!(
+            !last.contains('\u{fffd}'),
+            "replacement char at the block seam: {last:?}"
+        );
+
+        drop(sheet);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn an_explicit_utf8_override_strips_the_bom_from_the_first_header() {
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice(b"id,name\n1,alice\n");
+        let src = write_bytes("enc_bom.csv", &raw);
+        let dst = temp_dir().join("enc_bom.ferrix");
+
+        convert_csv_opts(
+            &src,
+            &dst,
+            ConvertOptions::new(b',', true).with_encoding(Some(encoding_rs::UTF_8)),
+            |_, _| {},
+            || false,
+        )
+        .unwrap();
+
+        // A BOM left in place makes the first header "\u{feff}id", which no
+        // formula referencing that column would ever match.
+        let sheet = crate::MappedSheet::open(&dst).unwrap();
+        assert_eq!(sheet.display(ferrix_core::CellRef::new(0, 1)), "alice");
+
+        drop(sheet);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn no_override_leaves_utf8_bytes_untouched() {
+        // The common path must not gain a transcode. Same fixture, no
+        // encoding: the UTF-8 bytes arrive verbatim.
+        let src = write_csv("enc_none.csv", "id,name\n1,café\n");
+        let dst = temp_dir().join("enc_none.ferrix");
+        convert_csv_opts(&src, &dst, ConvertOptions::default(), |_, _| {}, || false).unwrap();
+        assert_eq!(cell_text(&dst, 0, 1), "café");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
     }
 
     #[test]

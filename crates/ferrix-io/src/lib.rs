@@ -39,11 +39,14 @@ pub use arrow_io::{
 pub use comment_sidecar::{comments_path_for, load_comments, save_comments, CommentSidecarError};
 pub use compact::{compact_cache, CompactError, CompactOutcome, CompactStats};
 pub use convert::{
-    cache_is_fresh, cache_path_for, convert_csv, convert_csv_cancellable, ConvertError,
-    ConvertStats,
+    cache_is_fresh, cache_path_for, convert_csv, convert_csv_cancellable, convert_csv_opts,
+    ConvertError, ConvertOptions, ConvertStats,
 };
 pub use csv::{load_csv, CsvError, CsvOptions, LoadStats};
 pub use decor_xlsx::{decor_survives_xlsx, decor_xlsx_loss, MAX_RANGE_CELLS};
+/// The encoding type used throughout the import settings. Re-exported so UI
+/// code can name it without taking its own `encoding_rs` dependency.
+pub use encoding_rs::Encoding;
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
