@@ -14,6 +14,7 @@ pub mod bitmap;
 pub mod budget;
 pub mod cancel;
 pub mod chart;
+pub mod clipboard;
 pub mod column;
 pub mod comment;
 pub mod filter;
