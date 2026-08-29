@@ -141,6 +141,20 @@ pub struct Qualifier {
     pub last_span: Option<(usize, usize)>,
 }
 
+/// The `#REF!` a broken reference collapses to, as it appears in text.
+const REF_CONSTANT: &str = "#REF!";
+
+/// Index one past a `#REF!` constant at `at`, if there is one.
+///
+/// Scanned as a unit by everything that walks formula text, because its
+/// interior looks exactly like a sheet qualifier: `REF!` would otherwise be
+/// read as the sheet named `REF`, so renaming a sheet called `REF` would
+/// rewrite every broken reference in the workbook.
+fn skip_ref_constant(src: &str, at: usize) -> Option<usize> {
+    let end = at + REF_CONSTANT.len();
+    (src.len() >= end && src[at..end].eq_ignore_ascii_case(REF_CONSTANT)).then_some(end)
+}
+
 /// Index one past the closing `'` of a quoted run starting at `at`.
 fn skip_quoted(b: &[u8], at: usize) -> Option<usize> {
     let mut i = at + 1;
@@ -248,6 +262,10 @@ pub fn qualifiers(src: &str) -> Vec<Qualifier> {
             }
             continue;
         }
+        if let Some(past) = skip_ref_constant(src, i) {
+            i = past;
+            continue;
+        }
         if let Some((q, past)) = qualifier_at(src, i) {
             out.push(q);
             i = past;
@@ -312,6 +330,12 @@ pub fn scan(src: &str) -> Vec<RefWord> {
                 }
                 i += 1;
             }
+            continue;
+        }
+
+        // A `#REF!` constant is one token, not a `REF!` qualifier.
+        if let Some(past) = skip_ref_constant(src, i) {
+            i = past;
             continue;
         }
 
@@ -553,6 +577,21 @@ mod tests {
         // sheet the formula points at.
         assert_eq!(words("=SUM(Sheet1:Sheet3!A1)"), vec!["A1"]);
         assert_eq!(words("=SUM('Q1 2024':'Q4 2024'!A1:B9)"), vec!["A1", "B9"]);
+    }
+
+    #[test]
+    fn a_ref_constant_is_not_a_sheet_named_ref() {
+        // `#REF!` contains `REF!`, which is a perfectly good sheet qualifier
+        // spelling. If it were read as one, renaming a sheet called REF would
+        // rewrite every broken reference in the workbook.
+        assert!(
+            quals("=#REF!*2").is_empty(),
+            "an error constant is not a qualifier"
+        );
+        assert!(words("=#REF!*2").is_empty());
+        // A real qualifier alongside one is still found.
+        assert_eq!(quals("=#REF!+Sheet2!A1"), vec![("Sheet2".into(), None)]);
+        assert_eq!(words("=#REF!+Sheet2!A1"), vec!["A1"]);
     }
 
     #[test]
