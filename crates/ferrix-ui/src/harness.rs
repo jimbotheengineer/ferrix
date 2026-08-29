@@ -825,8 +825,51 @@ impl Harness {
         self.app.ref_outlines().to_vec()
     }
 
-    /// Text actually rendered by the last frame, read out of the tessellated
-    /// output.
+    // ---- import wizard (issue #31) ----
+
+    /// Is the import wizard showing?
+    pub fn import_wizard_is_open(&self) -> bool {
+        self.app.import_wizard_is_open()
+    }
+
+    /// Mutate the wizard's settings, exactly as its widgets do.
+    ///
+    /// Direct field access rather than synthetic clicks, for the reason the
+    /// module header gives: a click on a combo box that has not been opened
+    /// lands nowhere, and that produces a false negative rather than a bug.
+    /// The wizard's PAINTED presence is asserted separately, so a dialog that
+    /// never draws still fails.
+    pub fn wizard(&mut self, f: impl FnOnce(&mut crate::import_wizard::ImportWizard)) -> &mut Self {
+        if let Some(w) = self.app.import_wizard_mut() {
+            f(w);
+        }
+        self
+    }
+
+    /// The wizard's live preview, rebuilt from the current settings.
+    pub fn wizard_preview(&mut self) -> ferrix_io::Preview {
+        match self.app.import_wizard_mut() {
+            Some(w) => {
+                w.refresh_preview();
+                w.preview().clone()
+            }
+            None => ferrix_io::Preview::default(),
+        }
+    }
+
+    /// Press the wizard's Import button.
+    pub fn wizard_accept(&mut self) -> &mut Self {
+        self.app.import_wizard_accept();
+        self
+    }
+
+    /// Reopen the wizard for the file already loaded.
+    pub fn wizard_reopen(&mut self) -> &mut Self {
+        self.app.reopen_import_wizard();
+        self
+    }
+
+    /// Every text galley painted by one frame.
     ///
     /// This is the assertion "show formulas" needs: a mode flag can be stored
     /// perfectly while the paint path never reads it, and a shape COUNT moves
@@ -882,6 +925,467 @@ mod tests {
         crate::prefs::CONFIG_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ================= import wizard (issue #31) =================
+
+    fn write_bytes(name: &str, body: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("ferrix_harness");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// A unique name per test so parallel tests never share a fixture file.
+    fn unique(stem: &str, ext: &str) -> String {
+        format!("{stem}-{:?}.{ext}", std::thread::current().id()).replace(['(', ')', ' '], "")
+    }
+
+    /// A clean file must NOT raise the wizard.
+    ///
+    /// This is the assertion that keeps the feature from being a regression:
+    /// without it, "always show the wizard" would pass every other test here.
+    #[test]
+    fn an_ordinary_csv_opens_without_the_wizard() {
+        let p = write_csv(&unique("clean", "csv"), SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+        assert!(
+            !h.import_wizard_is_open(),
+            "a plain UTF-8 comma CSV raised the import wizard"
+        );
+        assert_eq!(h.app().row_count(), 4);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A semicolon file must stop for the wizard rather than load as one
+    /// column of nonsense.
+    ///
+    /// What would this assert if the feature did nothing? The old behaviour
+    /// was to load immediately with col_count == 1, so both halves fail.
+    #[test]
+    fn a_semicolon_file_shows_the_wizard_instead_of_loading_nonsense() {
+        let mut body = String::from("id;name;qty\n");
+        for i in 0..40 {
+            body.push_str(&format!("{i};row{i};{}\n", i * 2));
+        }
+        let p = write_csv(&unique("semi", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "wizard never appeared; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().row_count(),
+            0,
+            "the file loaded anyway instead of waiting for settings"
+        );
+
+        // The dialog really PAINTS — a state flag nothing draws would
+        // otherwise satisfy every assertion above.
+        h.steps(2);
+        let texts = h.painted_texts();
+        assert!(
+            h.import_wizard_is_open(),
+            "the wizard closed itself during paint"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Import settings"),
+            "the wizard window never painted; painted: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Delimiter"),
+            "no delimiter control painted"
+        );
+
+        // Detection seeded the right delimiter, and the preview shows real
+        // columns rather than one wide one.
+        let prev = h.wizard_preview();
+        assert_eq!(prev.headers, vec!["id", "name", "qty"]);
+        assert_eq!(prev.rows[0], vec!["0", "row0", "0"]);
+
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+        assert_eq!(h.app().col_count(), 3, "loaded as one column after import");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "row0");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The Latin-1 criterion, asserted on the EXACT decoded string.
+    #[test]
+    fn a_latin1_file_loads_with_its_accents_intact() {
+        let mut bytes: Vec<u8> = b"ville,pays,n\n".to_vec();
+        for i in 0..30 {
+            bytes.extend_from_slice(b"caf\xe9,Z\xfcrich,");
+            bytes.extend_from_slice(i.to_string().as_bytes());
+            bytes.push(b'\n');
+        }
+        let p = write_bytes(&unique("latin1", "csv"), &bytes);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "a non-UTF-8 file loaded without asking; status: {}",
+            h.status()
+        );
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+
+        // The exact string, not "the load succeeded". Reading these bytes as
+        // UTF-8 yields "caf\u{fffd}", which is what this pins against.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "café");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "Zürich");
+        assert_eq!(h.app().display(CellRef::new(29, 0)), "café");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Every candidate delimiter reaches the grid as real columns.
+    #[test]
+    fn each_delimiter_loads_through_the_wizard() {
+        for (tag, sep) in [("semi", ";"), ("tab", "\t"), ("pipe", "|")] {
+            let mut body = format!("id{sep}name{sep}qty\n");
+            for i in 0..30 {
+                body.push_str(&format!("{i}{sep}row{i}{sep}{}\n", i * 2));
+            }
+            let p = write_csv(&unique(tag, "csv"), &body);
+            let mut h = Harness::new(Some(&p));
+            assert!(
+                h.step_until(200, |a| a.import_wizard_is_open()),
+                "{tag}: no wizard; status: {}",
+                h.status()
+            );
+            h.wizard_accept();
+            assert!(h.step_until(200, |a| a.row_count() > 0), "{tag}");
+            assert_eq!(h.app().col_count(), 3, "{tag} loaded as one column");
+            assert_eq!(h.app().display(CellRef::new(2, 1)), "row2", "{tag}");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// A custom delimiter the auto-detector does not offer.
+    #[test]
+    fn a_custom_delimiter_can_be_typed_in() {
+        let mut body = String::from("id~name~qty\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i}~row{i}~{}\n", i * 2));
+        }
+        let p = write_csv(&unique("tilde", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "no wizard"
+        );
+        h.wizard(|w| {
+            w.delim = crate::import_wizard::DelimChoice::Custom;
+            w.custom_delim = "~".into();
+        });
+        // The preview must reflect the typed delimiter BEFORE importing —
+        // that is what "live preview" means.
+        let prev = h.wizard_preview();
+        assert_eq!(prev.headers, vec!["id", "name", "qty"]);
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(h.app().col_count(), 3);
+        assert_eq!(h.app().display(CellRef::new(1, 1)), "row1");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Embedded delimiters and newlines inside quotes survive the import, the
+    /// same shape `export::round_trips_through_the_csv_loader` covers.
+    #[test]
+    fn quoted_fields_survive_a_non_default_quote_character() {
+        let mut body = String::from("a;b\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i};'has;semi and \nnewline'\n"));
+        }
+        let p = write_csv(&unique("quotes", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "no wizard"
+        );
+        h.wizard(|w| {
+            w.delim = crate::import_wizard::DelimChoice::Semicolon;
+            w.quote = "'".into();
+        });
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+        assert_eq!(
+            h.app().row_count(),
+            30,
+            "an embedded newline split records into extra rows"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "has;semi and \nnewline",
+            "the embedded delimiter or newline was lost"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A preamble: header at row N, plus skip-N-leading-rows.
+    #[test]
+    fn a_preamble_is_skipped_and_the_real_header_is_used() {
+        let mut body =
+            String::from("Widgets Inc quarterly export\ngenerated 2026-01-01\n\nid,name,qty\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i},row{i},{}\n", i * 2));
+        }
+        let p = write_csv(&unique("preamble", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "a preamble loaded silently; status: {}",
+            h.status()
+        );
+        // Detection should already have found the header at record 4.
+        h.wizard(|w| {
+            assert_eq!(w.effective_skip(), 3, "preamble not detected");
+            // Say it the other way round too: header AT row 4.
+            w.header = crate::import_wizard::HeaderChoice::AtRow;
+            w.header_row = 4;
+        });
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+        assert_eq!(h.app().row_count(), 30, "preamble rows became data");
+        assert_eq!(h.app().col_count(), 3);
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "row0");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Headers off keeps the first record as data.
+    #[test]
+    fn headers_can_be_turned_off_in_the_wizard() {
+        let mut body = String::from("id;name\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i};row{i}\n"));
+        }
+        let p = write_csv(&unique("nohdr", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "no wizard"
+        );
+        h.wizard(|w| w.header = crate::import_wizard::HeaderChoice::No);
+        h.wizard_accept();
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(h.app().row_count(), 31, "the header row was still eaten");
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "name");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The live preview must CHANGE when a setting changes. A preview that is
+    /// computed once and never refreshed passes every static assertion.
+    #[test]
+    fn the_preview_updates_when_settings_change() {
+        let mut body = String::from("id;name;qty\n");
+        for i in 0..40 {
+            body.push_str(&format!("{i};row{i};{}\n", i * 2));
+        }
+        let p = write_csv(&unique("preview", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "no wizard"
+        );
+
+        let semi = h.wizard_preview();
+        assert_eq!(semi.cols, 3);
+
+        // Switch to a delimiter the file does NOT use: the same bytes must now
+        // preview as one column.
+        h.wizard(|w| w.delim = crate::import_wizard::DelimChoice::Comma);
+        let comma = h.wizard_preview();
+        assert_eq!(
+            comma.cols, 1,
+            "the preview did not rebuild after the delimiter changed"
+        );
+        assert_ne!(semi.rows[0], comma.rows[0]);
+
+        // And back again.
+        h.wizard(|w| w.delim = crate::import_wizard::DelimChoice::Semicolon);
+        assert_eq!(h.wizard_preview().cols, 3);
+
+        // Bounded: never more than PREVIEW_ROWS regardless of file length.
+        assert!(
+            h.wizard_preview().rows.len() <= ferrix_io::PREVIEW_ROWS,
+            "preview held more than {} rows",
+            ferrix_io::PREVIEW_ROWS
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// "Remember these settings for this filename" skips the wizard next time.
+    ///
+    /// This test WRITES prefs, so it claims its own config directory on this
+    /// thread. The claim is structural: `Harness::new` reads
+    /// `test_config_dir()` first, so the second harness in this test — a
+    /// simulated app restart — sees the rule the first one wrote, and no
+    /// other test on another thread can see or clobber it.
+    #[test]
+    fn remembered_settings_skip_the_wizard_on_the_next_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix-import-remember-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = crate::prefs::set_test_config_dir(Some(dir.clone()));
+
+        let mut body = String::from("id;name;qty\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i};row{i};{}\n", i * 2));
+        }
+        let p = write_csv(&unique("remember", "csv"), &body);
+
+        // First open: the wizard appears, the user ticks Remember, imports.
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(
+                h.step_until(200, |a| a.import_wizard_is_open()),
+                "first open showed no wizard; status: {}",
+                h.status()
+            );
+            h.wizard(|w| w.remember = true);
+            h.wizard_accept();
+            assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+            assert_eq!(h.app().col_count(), 3);
+        }
+
+        // The rule really reached the preferences FILE, not just memory —
+        // otherwise this would only prove the field was set.
+        let saved = crate::prefs::Prefs::load();
+        let rule = saved
+            .import_rule_for(&p)
+            .expect("no import rule was persisted");
+        assert_eq!(rule.delimiter, b';');
+        assert!(rule.has_headers);
+
+        // Second open, a fresh app: no wizard, and the data is right.
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0), "{}", h.status());
+            assert!(
+                !h.import_wizard_is_open(),
+                "the wizard reappeared for a file whose settings were remembered"
+            );
+            assert_eq!(h.app().col_count(), 3, "remembered delimiter was ignored");
+            assert_eq!(h.app().display(CellRef::new(0, 1)), "row0");
+        }
+
+        crate::prefs::set_test_config_dir(prev);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proof that the thread-local config override is not vacuous.
+    ///
+    /// The isolation this feature relies on is `Harness::new` claiming a
+    /// per-thread config dir. If that claim were removed, a prefs-writing test
+    /// like `remembered_settings_skip_the_wizard_on_the_next_open` would write
+    /// into whatever directory the PROCESS-WIDE `FERRIX_CONFIG_DIR` names, and
+    /// two such tests would silently overwrite each other's file — the exact
+    /// #45 failure.
+    ///
+    /// This test pins the mechanism directly: with an override claimed, a
+    /// save+load round trip must see only THIS thread's data even though
+    /// another thread is concurrently writing a different rule to a different
+    /// directory. Deleting the `test_config_dir()` branch in
+    /// `prefs::config_dir` makes both threads share one file and this fails.
+    #[test]
+    fn the_per_thread_config_override_actually_isolates() {
+        let mine = std::env::temp_dir().join(format!(
+            "ferrix-iso-a-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&mine);
+        std::fs::create_dir_all(&mine).unwrap();
+        let prev = crate::prefs::set_test_config_dir(Some(mine.clone()));
+
+        let mut want = crate::prefs::Prefs::default();
+        want.set_import_rule(crate::prefs::ImportRule {
+            name: "mine.csv".into(),
+            encoding: "UTF-8".into(),
+            delimiter: b';',
+            quote: b'"',
+            has_headers: true,
+            skip_rows: 0,
+        });
+        want.save().expect("save");
+
+        // A second thread does its own claim-save-load, hammering the same
+        // API at the same time. Without the per-thread override both threads
+        // resolve to one directory and one file.
+        let other = std::thread::spawn(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "ferrix-iso-b-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::prefs::set_test_config_dir(Some(dir.clone()));
+            for _ in 0..50 {
+                let mut p = crate::prefs::Prefs::default();
+                p.set_import_rule(crate::prefs::ImportRule {
+                    name: "theirs.csv".into(),
+                    encoding: "windows-1252".into(),
+                    delimiter: b'|',
+                    quote: b'\'',
+                    has_headers: false,
+                    skip_rows: 7,
+                });
+                p.save().expect("save on other thread");
+                assert_eq!(
+                    crate::prefs::Prefs::load().import_rules.len(),
+                    1,
+                    "other thread saw a foreign prefs file"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+
+        for _ in 0..50 {
+            let got = crate::prefs::Prefs::load();
+            assert_eq!(
+                got.import_rules.len(),
+                1,
+                "another thread's prefs leaked into this one: {:?}",
+                got.import_rules
+            );
+            assert_eq!(
+                got.import_rules[0].name, "mine.csv",
+                "this thread read another thread's rule"
+            );
+            assert_eq!(got.import_rules[0].delimiter, b';');
+        }
+        other.join().expect("other thread panicked");
+
+        crate::prefs::set_test_config_dir(prev);
+        let _ = std::fs::remove_dir_all(&mine);
+    }
+
+    /// Cancelling opens nothing.
+    #[test]
+    fn cancelling_the_wizard_loads_no_data() {
+        let mut body = String::from("id;name\n");
+        for i in 0..30 {
+            body.push_str(&format!("{i};row{i}\n"));
+        }
+        let p = write_csv(&unique("cancel", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.import_wizard_is_open()),
+            "no wizard"
+        );
+        h.wizard(|w| w.cancelled = true);
+        h.steps(3);
+        assert!(!h.import_wizard_is_open(), "the wizard stayed open");
+        assert_eq!(h.app().row_count(), 0, "cancel loaded the file anyway");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

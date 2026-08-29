@@ -66,6 +66,15 @@ pub struct Prefs {
     /// default has to be 1, and a hand-written impl is the only way to say so
     /// once rather than at every construction site.
     pub formula_bar_rows: usize,
+    /// Issue #31: import settings the user chose to remember, keyed by FILE
+    /// NAME. When a file whose name is here is opened, the import wizard is
+    /// skipped and these settings are used.
+    ///
+    /// Keyed by name rather than full path deliberately — the recurring case
+    /// is the same weekly export arriving in a new directory, and a path key
+    /// makes the user re-answer the wizard for a file they configured last
+    /// week.
+    pub import_rules: Vec<ImportRule>,
 }
 
 impl Default for Prefs {
@@ -78,6 +87,7 @@ impl Default for Prefs {
             recent: Vec::new(),
             recent_commands: Vec::new(),
             formula_bar_rows: 1,
+            import_rules: Vec::new(),
         }
     }
 }
@@ -119,6 +129,68 @@ impl Prefs {
         if (z - 1.0).abs() > 1e-4 {
             self.zoom.push((book, sheet.to_string(), z));
         }
+    }
+}
+
+/// Remembered import settings for one file name (issue #31).
+///
+/// Stored as plain fields rather than a `CsvOptions`: the preferences file
+/// must round-trip through text, and `&'static Encoding` is not something a
+/// parse can conjure — the encoding travels as its label and is resolved on
+/// use. An unknown label resolves to `None`, i.e. UTF-8, which is the same
+/// thing an older build would have done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportRule {
+    /// The file NAME this applies to, e.g. `weekly-export.csv`.
+    pub name: String,
+    pub encoding: String,
+    pub delimiter: u8,
+    pub quote: u8,
+    pub has_headers: bool,
+    pub skip_rows: usize,
+}
+
+impl ImportRule {
+    /// The loader options this rule means.
+    pub fn to_options(&self) -> ferrix_io::CsvOptions {
+        ferrix_io::CsvOptions {
+            delimiter: self.delimiter,
+            has_headers: self.has_headers,
+            max_rows: None,
+            quote: self.quote,
+            skip_rows: self.skip_rows,
+            encoding: ferrix_io::encoding_for_label(&self.encoding),
+        }
+    }
+}
+
+impl Prefs {
+    /// The remembered rule for a path, matched on its file NAME.
+    pub fn import_rule_for(&self, path: &Path) -> Option<&ImportRule> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        self.import_rules.iter().find(|r| r.name == name)
+    }
+
+    /// Remember `rule`, replacing any previous rule for the same name.
+    ///
+    /// Replace rather than append: two rules for one name would make which
+    /// settings a file loads with depend on iteration order, and the user
+    /// would see their newest choice silently ignored.
+    pub fn set_import_rule(&mut self, rule: ImportRule) {
+        self.import_rules.retain(|r| r.name != rule.name);
+        self.import_rules.push(rule);
+    }
+
+    /// Forget the rule for a file name, so the wizard shows again.
+    ///
+    /// Returns whether anything was removed, so a caller can avoid writing
+    /// the preferences file when there was nothing to forget. That matters:
+    /// an unconditional write here would turn every file open into a prefs
+    /// WRITE, which is exactly the shared-state hazard issue #45 hit.
+    pub fn clear_import_rule(&mut self, name: &str) -> bool {
+        let before = self.import_rules.len();
+        self.import_rules.retain(|r| r.name != name);
+        before != self.import_rules.len()
     }
 }
 
@@ -271,6 +343,17 @@ impl Prefs {
                 }
                 // `recent.<n>.<field> = ...` — the recent-files list and the
                 // session remembered for each entry (issue #45).
+                // `import.<name> = enc|delim|quote|headers|skip` — remembered
+                // wizard settings for one file name (issue #31). The name is
+                // percent-escaped by `recent::encode_component`, so a name
+                // containing '|', '=' or a newline cannot forge another key.
+                k2 if k2.starts_with("import.") => {
+                    let name = k2.trim_start_matches("import.").trim().trim_matches('"');
+                    let name = crate::recent::decode_component(name);
+                    if let Some(rule) = parse_import_rule(&name, v) {
+                        out.set_import_rule(rule);
+                    }
+                }
                 k2 if k2.starts_with("recent.") => {
                     crate::recent::parse_line(&mut out.recent, k2.trim(), v);
                 }
@@ -312,6 +395,17 @@ impl Prefs {
             let book = crate::recent::encode_component(book);
             let name = crate::recent::encode_component(name);
             s.push_str(&format!("zoom.{book}|{name} = {z}\n"));
+        }
+        // Issue #31. Delimiter and quote go out as DECIMAL BYTE VALUES, not
+        // as characters: a tab or a '|' written literally would be
+        // indistinguishable from the field separator this format uses.
+        for r in &self.import_rules {
+            let name = crate::recent::encode_component(&r.name);
+            let enc = crate::recent::encode_component(&r.encoding);
+            s.push_str(&format!(
+                "import.{name} = {enc}|{}|{}|{}|{}\n",
+                r.delimiter, r.quote, r.has_headers, r.skip_rows
+            ));
         }
         s.push_str(&crate::recent::to_text(&self.recent));
         s
@@ -362,6 +456,38 @@ impl Prefs {
     }
 }
 
+/// Parse one `import.<name>` value. `None` for anything malformed — a
+/// corrupt rule must degrade to "show the wizard", never to a silently wrong
+/// delimiter.
+fn parse_import_rule(name: &str, v: &str) -> Option<ImportRule> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut parts = v.split('|');
+    let encoding = crate::recent::decode_component(parts.next()?);
+    let delimiter: u8 = parts.next()?.trim().parse().ok()?;
+    let quote: u8 = parts.next()?.trim().parse().ok()?;
+    let has_headers = match parts.next()?.trim() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    let skip_rows: usize = parts.next()?.trim().parse().ok()?;
+    // A zero delimiter would make every record one field; a rule that says so
+    // is corrupt rather than a preference to honour.
+    if delimiter == 0 || quote == 0 {
+        return None;
+    }
+    Some(ImportRule {
+        name: name.to_string(),
+        encoding,
+        delimiter,
+        quote,
+        has_headers,
+        skip_rows,
+    })
+}
+
 /// Serializes tests that redirect `FERRIX_CONFIG_DIR`.
 ///
 /// The environment is per-PROCESS, and every test in this binary runs in the
@@ -405,6 +531,7 @@ mod tests {
                         recent: Vec::new(),
                         recent_commands: Vec::new(),
                         formula_bar_rows: 1,
+                        import_rules: Vec::new(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -431,9 +558,114 @@ mod tests {
                     // Issue #38 travels in the same file; a round trip that
                     // omits it cannot catch the writer dropping it.
                     formula_bar_rows: 4,
+                    // Issue #31 travels in the same file, for the same
+                    // reason. A tab delimiter and a '|' quote are here on
+                    // purpose: both are the format's own punctuation, so a
+                    // writer that emitted them literally would round-trip
+                    // into a different rule.
+                    import_rules: vec![
+                        ImportRule {
+                            name: "weekly export.csv".into(),
+                            encoding: "windows-1252".into(),
+                            delimiter: b'\t',
+                            quote: b'|',
+                            has_headers: false,
+                            skip_rows: 3,
+                        },
+                        ImportRule {
+                            name: "a=b|c.csv".into(),
+                            encoding: "UTF-8".into(),
+                            delimiter: b';',
+                            quote: b'\'',
+                            has_headers: true,
+                            skip_rows: 0,
+                        },
+                    ],
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
+        }
+    }
+
+    /// Issue #31. A rule is matched on the file NAME, so the same export in a
+    /// different directory still skips the wizard.
+    #[test]
+    fn an_import_rule_matches_by_name_across_directories() {
+        let mut p = Prefs::default();
+        p.set_import_rule(ImportRule {
+            name: "weekly.csv".into(),
+            encoding: "windows-1252".into(),
+            delimiter: b';',
+            quote: b'"',
+            has_headers: true,
+            skip_rows: 2,
+        });
+        for dir in ["/downloads", "/archive/2026", "C:\\\\Users\\\\x\\\\Desktop"] {
+            let path = Path::new(dir).join("weekly.csv");
+            let r = p
+                .import_rule_for(&path)
+                .unwrap_or_else(|| panic!("no rule for {}", path.display()));
+            assert_eq!(r.delimiter, b';');
+            assert_eq!(r.skip_rows, 2);
+            assert_eq!(r.to_options().skip_rows, 2);
+            assert_eq!(
+                r.to_options().encoding.map(|e| e.name()),
+                Some("windows-1252")
+            );
+        }
+        // A different file must NOT pick up someone else's settings.
+        assert!(p
+            .import_rule_for(Path::new("/downloads/other.csv"))
+            .is_none());
+    }
+
+    #[test]
+    fn remembering_the_same_name_twice_replaces_rather_than_stacks() {
+        let mut p = Prefs::default();
+        for delim in *b";\t|" {
+            p.set_import_rule(ImportRule {
+                name: "x.csv".into(),
+                encoding: "UTF-8".into(),
+                delimiter: delim,
+                quote: b'"',
+                has_headers: true,
+                skip_rows: 0,
+            });
+        }
+        assert_eq!(p.import_rules.len(), 1, "duplicate rules accumulated");
+        assert_eq!(
+            p.import_rule_for(Path::new("x.csv")).unwrap().delimiter,
+            b'|'
+        );
+        assert!(
+            p.clear_import_rule("x.csv"),
+            "clearing must report a change"
+        );
+        assert!(p.import_rule_for(Path::new("x.csv")).is_none());
+        assert!(
+            !p.clear_import_rule("x.csv"),
+            "clearing nothing must report no change, so no prefs write happens"
+        );
+    }
+
+    /// A corrupt rule must send the user back to the wizard, never load the
+    /// file with a silently wrong delimiter.
+    #[test]
+    fn a_malformed_import_rule_is_dropped_not_guessed() {
+        for bad in [
+            "import.x.csv = UTF-8\n",
+            "import.x.csv = UTF-8|59\n",
+            "import.x.csv = UTF-8|59|34|maybe|0\n",
+            "import.x.csv = UTF-8|notanumber|34|true|0\n",
+            "import.x.csv = UTF-8|0|34|true|0\n",
+            "import. = UTF-8|59|34|true|0\n",
+        ] {
+            let p = Prefs::parse(bad);
+            assert!(
+                p.import_rules.is_empty(),
+                "{bad:?} parsed into {:?}",
+                p.import_rules
+            );
         }
     }
 
@@ -497,6 +729,7 @@ mod tests {
             recent: Vec::new(),
             recent_commands: Vec::new(),
             formula_bar_rows: 1,
+            import_rules: Vec::new(),
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -529,6 +762,16 @@ mod tests {
             // Issue #38: the formula bar's height is part of the same
             // restart-survival criterion as the theme.
             formula_bar_rows: 3,
+            // Issue #31: a remembered import rule must survive a restart too,
+            // or "remember these settings" only lasts until the app closes.
+            import_rules: vec![ImportRule {
+                name: "a.csv".into(),
+                encoding: "windows-1252".into(),
+                delimiter: b';',
+                quote: b'"',
+                has_headers: true,
+                skip_rows: 2,
+            }],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

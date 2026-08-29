@@ -50,10 +50,10 @@ pub const PREVIEW_ROWS: usize = 100;
 /// Comma first so a file that is genuinely ambiguous resolves to the
 /// conventional answer rather than to whichever candidate the iteration order
 /// happened to visit.
-pub const CANDIDATE_DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
+pub const CANDIDATE_DELIMITERS: [u8; 4] = *b",;\t|";
 
 /// Quote characters auto-detection will consider.
-pub const CANDIDATE_QUOTES: [u8; 2] = [b'"', b'\''];
+pub const CANDIDATE_QUOTES: [u8; 2] = *b"\"'";
 
 /// What detection concluded about a file.
 #[derive(Clone, Debug)]
@@ -165,9 +165,13 @@ pub fn sniff_bytes(prefix: &[u8]) -> Detection {
             "quoting looks like {}, not a double quote",
             describe_delimiter(quote)
         ));
-    } else if modal_fields <= 1 {
-        reason = Some("no delimiter found — the file may not be delimited text".to_string());
     }
+    // NOTE: a single-column file is deliberately NOT a reason. `modal_fields
+    // <= 1` means no delimiter was found, and for a one-column CSV — a list
+    // of ids, a column of numbers — that is the correct answer, not a
+    // problem. Treating it as one raised the wizard on every single-column
+    // file, which the existing suite caught immediately.
+    let _ = modal_fields;
 
     Detection {
         encoding,
@@ -298,7 +302,7 @@ fn count_fields(line: &str, delim: u8, quote: u8) -> usize {
 fn detect_delimiter_and_quote(lines: &[&str]) -> (u8, u8, usize, bool) {
     let mut best = (b'"', b',', 1usize, 0f64);
     for &quote in &CANDIDATE_QUOTES {
-        for &delim in &CANDIDATE_DELIMITERS {
+        for delim in candidates(lines) {
             let counts: Vec<usize> = lines
                 .iter()
                 .map(|l| count_fields(l, delim, quote))
@@ -328,6 +332,46 @@ fn detect_delimiter_and_quote(lines: &[&str]) -> (u8, u8, usize, bool) {
     // `detect_skip_rows`, so require agreement among the bulk rather than all.
     let consistent = !lines.is_empty() && agree * 10 >= lines.len() * 9;
     (quote, delim, modal, consistent)
+}
+
+/// The named candidates, plus any OTHER punctuation byte that occurs on
+/// nearly every sampled line.
+///
+/// Without this pass a `~`-delimited file matches no candidate, scores zero
+/// everywhere, and falls back to "comma, one field" — which reads as a clean
+/// single-column file and loads as one 900-character column, the exact
+/// failure issue #31 is about. Discovery is restricted to ASCII punctuation
+/// that is not part of ordinary text (letters, digits, quotes, and the
+/// `.-+` a number may contain are excluded) so a file of English sentences
+/// does not "discover" the space or the full stop.
+fn candidates(lines: &[&str]) -> Vec<u8> {
+    let mut out: Vec<u8> = CANDIDATE_DELIMITERS.to_vec();
+    if lines.is_empty() {
+        return out;
+    }
+    for b in 0x21u8..0x7F {
+        if out.contains(&b) || !is_discoverable_delimiter(b) {
+            continue;
+        }
+        // Present on essentially every line: a delimiter is structural, an
+        // incidental character is not.
+        let present = lines.iter().filter(|l| l.as_bytes().contains(&b)).count();
+        if present * 10 >= lines.len() * 9 {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Bytes that could plausibly be a delimiter nobody named.
+fn is_discoverable_delimiter(b: u8) -> bool {
+    !b.is_ascii_alphanumeric()
+        // Quote characters are handled by the quote pass, not as separators.
+        && b != b'"'
+        && b != b'\''
+        // These appear inside ordinary numbers and words; treating one as a
+        // delimiter would shred a column of decimals or hyphenated names.
+        && !matches!(b, b'.' | b'-' | b'+' | b'_')
 }
 
 fn modal_value(counts: &[usize]) -> Option<usize> {
@@ -369,20 +413,26 @@ fn detect_skip_rows(lines: &[&str], delim: u8, quote: u8, modal: usize) -> usize
 
 /// Does the first record look like column names rather than data?
 ///
-/// The signal that can actually fail: a header cell is non-numeric where the
-/// column below it is numeric. Comparing "is the first row text" alone would
-/// call every all-text file headed, which is how a real data row silently
-/// becomes column names.
+/// Answers TRUE unless there is positive evidence otherwise. That asymmetry is
+/// deliberate: `has_headers: true` has been this loader's default since it was
+/// written, and a detector that flipped it whenever it could not prove a
+/// header would turn every all-text file's column names into a data row —
+/// silently, and for files that used to open correctly.
+///
+/// The evidence that says "no header":
+///
+/// * a numeric cell in row 0, where the column below is also numeric — a name
+///   is not a number; or
+/// * a blank cell in row 0, which is what a data row looks like and never
+///   what a header looks like.
 fn detect_headers(lines: &[&str], delim: u8, quote: u8) -> bool {
     if lines.len() < 2 {
-        // One record and nothing to compare it to: treat it as a header, which
-        // matches the loader's long-standing default and is trivially
-        // overridable in the wizard.
+        // One record and nothing to compare it to: the default, overridable
+        // in the wizard.
         return true;
     }
     let first = split_simple(lines[0], delim, quote);
     if first.iter().any(|f| f.trim().is_empty()) {
-        // A blank column name is what a data row looks like, not a header.
         return false;
     }
     let body: Vec<Vec<String>> = lines[1..lines.len().min(PREVIEW_ROWS)]
@@ -392,12 +442,12 @@ fn detect_headers(lines: &[&str], delim: u8, quote: u8) -> bool {
     if body.is_empty() {
         return true;
     }
+    // Positive evidence of a data row: row 0 is numeric in a column whose
+    // body is also numeric. A header cell over a numeric column is a name.
     for (i, head) in first.iter().enumerate() {
-        if numeric(head) {
+        if !numeric(head) {
             continue;
         }
-        // This column is text in row 0. If it is numeric further down, row 0
-        // is a name and not a value.
         let below_numeric = body
             .iter()
             .filter_map(|r| r.get(i))
@@ -405,15 +455,10 @@ fn detect_headers(lines: &[&str], delim: u8, quote: u8) -> bool {
             .take(20)
             .any(|v| numeric(v));
         if below_numeric {
-            return true;
+            return false;
         }
     }
-    // No column changes type. Fall back to "all-text first row over a body
-    // that also contains numbers somewhere" — still a real signal, just a
-    // weaker one.
-    let first_all_text = first.iter().all(|f| !numeric(f));
-    let body_has_numbers = body.iter().flatten().any(|v| numeric(v));
-    first_all_text && body_has_numbers
+    true
 }
 
 fn numeric(s: &str) -> bool {
@@ -745,12 +790,56 @@ mod tests {
         assert_eq!(d.delimiter, b';', "quoted commas beat the real delimiter");
     }
 
+    /// A one-column file has no delimiter, and that is the CORRECT answer —
+    /// not a problem to raise a wizard about.
+    ///
+    /// Treating "no delimiter found" as a defect made the wizard appear for
+    /// every single-column CSV, which the UI suite caught as five unrelated
+    /// tests suddenly failing to load their fixtures.
     #[test]
-    fn a_single_column_file_is_not_forced_into_a_delimiter() {
+    fn a_single_column_file_is_clean_and_defaults_to_a_comma() {
         let text = "value\n1\n2\n3\n4\n5\n";
         let d = sniff_bytes(text.as_bytes());
-        assert!(!d.clean, "a file with no delimiter must reach the wizard");
+        assert!(
+            d.clean,
+            "a one-column file raised the wizard: {:?}",
+            d.reason
+        );
         assert_eq!(d.delimiter, b',', "fall back to the conventional default");
+        assert!(d.has_headers, "a text row over numbers is a header");
+    }
+
+    /// A delimiter nobody named must still be found, or the file loads as one
+    /// wide column and looks "clean" while being nonsense.
+    #[test]
+    fn an_unnamed_delimiter_is_discovered_rather_than_ignored() {
+        let mut text = String::from("id~name~qty\n");
+        for i in 0..40 {
+            text.push_str(&format!("{i}~row{i}~{}\n", i * 2));
+        }
+        let d = sniff_bytes(text.as_bytes());
+        assert_eq!(
+            d.delimiter, b'~',
+            "a ~-delimited file was read as one column"
+        );
+        assert!(!d.clean, "a non-comma delimiter must reach the wizard");
+        let p = preview_bytes(text.as_bytes(), d.to_options(), 10);
+        assert_eq!(p.headers, vec!["id", "name", "qty"]);
+    }
+
+    /// Discovery must NOT invent a delimiter out of ordinary prose.
+    #[test]
+    fn prose_does_not_get_a_discovered_delimiter() {
+        let mut text = String::from("note\n");
+        for i in 0..40 {
+            text.push_str(&format!("the quick brown fox jumped {i} times.\n"));
+        }
+        let d = sniff_bytes(text.as_bytes());
+        assert_eq!(
+            d.delimiter, b',',
+            "a space or full stop was mistaken for a delimiter"
+        );
+        assert!(d.clean, "prose raised the wizard: {:?}", d.reason);
     }
 
     // ---------- quote ----------

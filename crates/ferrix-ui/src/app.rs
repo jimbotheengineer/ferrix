@@ -509,6 +509,13 @@ pub struct FerrixApp {
     /// Show the start screen instead of the grid. True on a cold start with
     /// no file argument; any choice on that screen turns it off.
     show_start: bool,
+
+    /// The import wizard (issue #31), when a file did not parse cleanly and
+    /// the user has not yet chosen settings for it.
+    ///
+    /// `None` is the overwhelmingly common case — a well-formed UTF-8 comma
+    /// CSV never opens this — and costs one `Option` check per frame.
+    import_wizard: Option<crate::import_wizard::ImportWizard>,
 }
 
 /// The Goal Seek dialog's state: three input fields, a result line, and the
@@ -695,6 +702,7 @@ impl FerrixApp {
             // A file on the command line goes straight to the grid; only a
             // bare launch has nothing to show yet.
             show_start: false,
+            import_wizard: None,
         };
         if let Some(p) = initial {
             app.start_load(p);
@@ -704,9 +712,64 @@ impl FerrixApp {
         app
     }
 
+    /// Open a file, showing the import wizard first when it will not parse
+    /// cleanly (issue #31).
+    ///
+    /// Order matters and is the whole feature:
+    ///
+    /// 1. A REMEMBERED rule for this file name wins outright — that is what
+    ///    "remember these settings" buys, and consulting detection first
+    ///    would re-raise the wizard on a file the user already configured.
+    /// 2. Otherwise detection runs over a BOUNDED PREFIX. A 10GB file reaches
+    ///    this decision in the time it takes to read 128 KB.
+    /// 3. A clean file loads immediately, exactly as before. Only a file that
+    ///    would load as nonsense stops for the wizard.
+    ///
+    /// Detection is deliberately synchronous: it is a bounded read, so it
+    /// cannot be the thing that blocks the UI, and making it async would let
+    /// a frame paint an empty grid before the wizard appeared.
+    fn start_load(&mut self, path: PathBuf) {
+        if let Some(opts) = self.import_options_for(&path) {
+            self.start_load_with(path, opts);
+        }
+    }
+
+    /// Options to open `path` with, or `None` when the wizard took over.
+    fn import_options_for(&mut self, path: &Path) -> Option<CsvOptions> {
+        // Only delimited text has import settings. xlsx/parquet/arrow carry
+        // their own schema, and sniffing them would produce a wizard offering
+        // to change the delimiter of a binary file.
+        if !is_delimited_path(path) {
+            return Some(CsvOptions::default());
+        }
+        if let Some(rule) = self.prefs.import_rule_for(path) {
+            return Some(rule.to_options());
+        }
+        match ferrix_io::sniff_path(path) {
+            Ok(d) if d.clean => Some(d.to_options()),
+            Ok(d) => {
+                self.import_wizard =
+                    Some(crate::import_wizard::ImportWizard::from_detection(path, &d));
+                self.show_start = false;
+                self.status = format!(
+                    "{} needs import settings — {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    d.reason.unwrap_or_default()
+                );
+                None
+            }
+            // Unreadable at detection time: let the real load report the
+            // error properly rather than inventing a wizard for a file that
+            // does not open.
+            Err(_) => Some(CsvOptions::default()),
+        }
+    }
+
     /// Kick off a load on a worker thread so the UI never blocks — converting
     /// a 10GB file takes minutes and the window must stay responsive.
-    fn start_load(&mut self, path: PathBuf) {
+    fn start_load_with(&mut self, path: PathBuf, opts: CsvOptions) {
         let (tx, rx) = channel();
         let (ptx, prx) = channel::<Progress>();
         let cancel = ferrix_core::CancelToken::new();
@@ -720,6 +783,7 @@ impl FerrixApp {
         std::thread::spawn(move || {
             let result = load_any(
                 &path,
+                opts,
                 |done, total| {
                     let _ = ptx.send(Progress { done, total });
                 },
@@ -2533,6 +2597,87 @@ impl FerrixApp {
             self.commit_comment();
         } else if cancel {
             self.cancel_comment();
+        }
+    }
+
+    /// The Goal Seek dialog (issue #35).
+    ///
+    /// Records the real painted rects of Solve and Cancel into the state, so
+    /// Draw the import wizard and act on Import / Cancel (issue #31).
+    fn show_import_wizard(&mut self, ctx: &egui::Context) {
+        let Some(mut w) = self.import_wizard.take() else {
+            return;
+        };
+        crate::import_wizard::show(&mut w, ctx, &self.theme);
+        if w.accepted {
+            self.accept_import(w);
+        } else if w.cancelled {
+            // Cancelling opens nothing. The previously open file, if any, is
+            // untouched — this is the same contract as a failed load.
+            self.status = format!("Import cancelled — {} was not opened", w.path.display());
+            self.pending_path = None;
+            self.show_start = self.source_path.is_none();
+        } else {
+            self.import_wizard = Some(w);
+        }
+    }
+
+    /// Apply the wizard's settings: remember them if asked, then load.
+    fn accept_import(&mut self, w: crate::import_wizard::ImportWizard) {
+        if w.remember {
+            let o = w.options();
+            self.prefs.set_import_rule(crate::prefs::ImportRule {
+                name: w.remember_key(),
+                encoding: o.encoding.map(|e| e.name().to_string()).unwrap_or_default(),
+                delimiter: o.delimiter,
+                quote: o.quote,
+                has_headers: o.has_headers,
+                skip_rows: o.skip_rows,
+            });
+            self.persist_prefs();
+        } else {
+            // Unchecking the box on a file that HAD a rule means "stop
+            // remembering". Leaving the old rule in place would make the
+            // checkbox look like it did nothing, and the next open would
+            // silently use settings the user just declined.
+            if self.prefs.clear_import_rule(&w.remember_key()) {
+                self.persist_prefs();
+            }
+        }
+        self.start_load_with(w.path.clone(), w.options());
+    }
+
+    /// Open the wizard for the file already loaded, so settings can be
+    /// revisited without reopening from the menu.
+    pub fn reopen_import_wizard(&mut self) {
+        let Some(path) = self.source_path.clone() else {
+            self.status = "No file open to re-import".into();
+            return;
+        };
+        match crate::import_wizard::ImportWizard::for_path(&path) {
+            Ok(w) => self.import_wizard = Some(w),
+            Err(e) => self.status = format!("Cannot read {}: {e}", path.display()),
+        }
+    }
+
+    /// The wizard, for tests that need to drive it without synthetic input.
+    pub fn import_wizard(&self) -> Option<&crate::import_wizard::ImportWizard> {
+        self.import_wizard.as_ref()
+    }
+
+    pub fn import_wizard_mut(&mut self) -> Option<&mut crate::import_wizard::ImportWizard> {
+        self.import_wizard.as_mut()
+    }
+
+    pub fn import_wizard_is_open(&self) -> bool {
+        self.import_wizard.is_some()
+    }
+
+    /// Confirm the wizard from a test or a command, exactly as the Import
+    /// button does.
+    pub fn import_wizard_accept(&mut self) {
+        if let Some(w) = self.import_wizard.take() {
+            self.accept_import(w);
         }
     }
 
@@ -7236,6 +7381,9 @@ impl FerrixApp {
 
         // --- Goal Seek (issue #35) ---
         self.show_goal_seek(ctx);
+        // After Goal Seek so the wizard, being modal to the whole open, is
+        // the last window drawn and therefore on top.
+        self.show_import_wizard(ctx);
 
         // --- Protect Sheet / Workbook (issue #42) ---
         self.show_protect_dialog(ctx);
@@ -8336,12 +8484,33 @@ fn fmt_int(n: usize) -> String {
     out
 }
 
+/// Is this a delimited-text file, i.e. one the import wizard applies to?
+///
+/// A file with no extension counts: `data` from a shell pipeline is exactly
+/// the case where detection earns its keep. Binary formats are excluded by
+/// name because sniffing them would offer to change the delimiter of a zip
+/// archive.
+fn is_delimited_path(path: &Path) -> bool {
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
+        None => true,
+        Some(ext) => !matches!(
+            ext.as_str(),
+            "xlsx" | "xls" | "xlsm" | "parquet" | "pq" | "arrow" | "feather" | "ferrix"
+        ),
+    }
+}
+
 /// Open a file, choosing storage based on size.
 ///
 /// Small files parse straight into RAM. Large ones are converted once into the
 /// columnar `.ferrix` format beside the source and then memory-mapped, so the
 /// dataset is bounded by disk rather than memory and later opens are instant.
-fn load_any<F, C>(path: &Path, mut progress: F, should_cancel: &mut C) -> LoadResult
+fn load_any<F, C>(
+    path: &Path,
+    opts: CsvOptions,
+    mut progress: F,
+    should_cancel: &mut C,
+) -> LoadResult
 where
     F: FnMut(u64, u64),
     C: FnMut() -> bool,
@@ -8370,7 +8539,7 @@ where
         .unwrap_or_else(|| "Sheet1".to_string());
 
     if !ferrix_io::should_use_mmap(path) {
-        let (sheet, stats) = load_csv(path, CsvOptions::default()).map_err(|e| e.to_string())?;
+        let (sheet, stats) = load_csv(path, opts).map_err(|e| e.to_string())?;
         let widths = compute_col_widths_mem(&sheet);
         let summary = format!(
             "Loaded {} rows × {} cols in {} ms ({:.0} MB/s) · {:.2} GB resident",
@@ -8416,11 +8585,19 @@ where
     let mut convert_note = String::new();
 
     if !reused {
-        let stats =
-            ferrix_io::convert_csv_cancellable(path, &cache, b',', true, &mut progress, || {
-                should_cancel()
-            })
-            .map_err(|e| e.to_string())?;
+        // The out-of-core converter takes the DETECTED delimiter and header
+        // flag. It does not transcode: an out-of-core load of a non-UTF-8
+        // file still reads its bytes as UTF-8, which is a known gap recorded
+        // in REPORT.md rather than a silent one.
+        let stats = ferrix_io::convert_csv_cancellable(
+            path,
+            &cache,
+            opts.delimiter,
+            opts.has_headers,
+            &mut progress,
+            should_cancel,
+        )
+        .map_err(|e| e.to_string())?;
         convert_note = format!(
             "converted in {:.0}s at {:.0} MB/s · ",
             stats.millis as f64 / 1000.0,
@@ -9097,7 +9274,8 @@ mod tests {
         )
         .expect("write parquet fixture");
 
-        let loaded = load_any(&path, |_, _| {}, &mut || false).expect("parquet must open");
+        let loaded = load_any(&path, CsvOptions::default(), |_, _| {}, &mut || false)
+            .expect("parquet must open");
         assert_eq!(loaded.rows, 250, "every row must arrive");
         assert_eq!(loaded.cols, 3);
         // The sheet is named from the file, as csv's is.
@@ -9170,7 +9348,8 @@ mod tests {
         )
         .expect("write arrow fixture");
 
-        let loaded = load_any(&path, |_, _| {}, &mut || false).expect(".arrow must open");
+        let loaded = load_any(&path, CsvOptions::default(), |_, _| {}, &mut || false)
+            .expect(".arrow must open");
         assert_eq!(loaded.rows, 64);
         assert_eq!(loaded.cols, 2);
 
@@ -9207,7 +9386,7 @@ mod tests {
         let path = dir.join("junk.parquet");
         std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
 
-        let err = match load_any(&path, |_, _| {}, &mut || false) {
+        let err = match load_any(&path, CsvOptions::default(), |_, _| {}, &mut || false) {
             Ok(loaded) => panic!(
                 "a non-Parquet .parquet must not open; got {} rows x {} cols",
                 loaded.rows, loaded.cols
@@ -9227,7 +9406,8 @@ mod tests {
         let tmp = TempXlsx::new("multisheet");
         write_three_sheet_xlsx(tmp.path());
 
-        let loaded = load_any(tmp.path(), |_, _| {}, &mut || false).expect("load");
+        let loaded =
+            load_any(tmp.path(), CsvOptions::default(), |_, _| {}, &mut || false).expect("load");
         assert_eq!(loaded.sheet_name, "Alpha");
         assert_eq!(loaded.extra_sheets.len(), 2, "Beta and Gamma must load too");
 
@@ -9281,7 +9461,8 @@ mod tests {
     fn a_loaded_cross_sheet_formula_recalculates_on_edit() {
         let tmp = TempXlsx::new("recalc");
         write_three_sheet_xlsx(tmp.path());
-        let loaded = load_any(tmp.path(), |_, _| {}, &mut || false).expect("load");
+        let loaded =
+            load_any(tmp.path(), CsvOptions::default(), |_, _| {}, &mut || false).expect("load");
         let mut wb = build_workbook(
             loaded.base,
             loaded.sheet_name,

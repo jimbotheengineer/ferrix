@@ -7,6 +7,7 @@ mod cond_format;
 mod grid;
 #[cfg(test)]
 mod harness;
+mod import_wizard;
 mod prefs;
 mod protect_panel;
 mod recent;
