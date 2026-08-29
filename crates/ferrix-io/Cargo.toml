@@ -15,6 +15,8 @@ description = "File format ingest/export for Ferrix (CSV now, xlsx next)"
 # need the IPC ("arrow" file/stream) reader-writer and the base array kernels.
 arrow = { version = "56", default-features = false, features = ["ipc"] }
 calamine = "0.36"
+chardetng = "0.1"
+encoding_rs = "0.8"
 ferrix-core.workspace = true
 ferrix-formula.workspace = true
 memmap2 = "0.9"
