@@ -26,6 +26,7 @@ pub mod merge;
 pub mod numfmt;
 pub mod order;
 pub mod overlay;
+pub mod page;
 pub mod protect;
 pub mod scene;
 pub mod search;
