@@ -864,6 +864,93 @@ impl Harness {
         self.app.status_text()
     }
 
+    // ---- data validation & autocomplete (issue #41) ----
+    //
+    // Same reasoning as `cond_new_rule`: opening goes through the exact entry
+    // point the Data menu item calls, because a menu lives at a pixel that
+    // moves with the theme and window width. Everything AFTER that — filling
+    // the form, pressing OK — goes through the real dialog and its real,
+    // painted buttons.
+
+    /// Open the New Rule dialog, as the Data menu item does.
+    pub fn dv_new_rule(&mut self) -> &mut Self {
+        self.app.validation_new_rule();
+        self.steps(2);
+        self
+    }
+
+    /// Open the Manage Rules list.
+    pub fn dv_manage(&mut self) -> &mut Self {
+        self.app.validation_manage();
+        self.steps(2);
+        self
+    }
+
+    /// Edit the dialog's form the way the widgets would.
+    pub fn dv_form(
+        &mut self,
+        f: impl FnOnce(&mut crate::validation_panel::ValidationForm),
+    ) -> &mut Self {
+        if let Some(st) = self.app.validation_state_mut() {
+            f(&mut st.form);
+        }
+        self.steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL OK button, at wherever it was actually painted.
+    ///
+    /// Not a call to the commit handler: a genuine move-then-click at the
+    /// button's reported rect, so a dialog whose OK is disabled, covered, or
+    /// never drawn fails the test instead of passing it.
+    pub fn dv_click_ok(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .validation_state()
+            .and_then(|s| s.ok_rect)
+            .expect("the validation form's OK button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL Cancel button.
+    pub fn dv_click_cancel(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .validation_state()
+            .and_then(|s| s.cancel_rect)
+            .expect("the validation form's Cancel button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
+    /// The rules actually stored on the sheet.
+    pub fn dv_rules(&self) -> &[ferrix_core::RangeValidation] {
+        self.app.workbook().validation.rules()
+    }
+
+    /// Suggestions the app is offering right now, as strings.
+    pub fn suggestions(&self) -> Vec<String> {
+        self.app.autocomplete_state().suggestions.items.clone()
+    }
+
+    /// Is the suggestion popup open?
+    pub fn suggestions_open(&self) -> bool {
+        self.app.autocomplete_state().is_open()
+    }
+
+    /// Validation circles the LAST FRAME PAINTED.
+    ///
+    /// The specific shape this feature adds, read back from the app's own
+    /// paint counter — deliberately not `paint_shape_count`, which selection,
+    /// borders and comment markers all move for unrelated reasons.
+    pub fn painted_validation_circles(&mut self) -> usize {
+        self.step();
+        self.app.painted_validation_circles()
+    }
+
     // ---- issue #34: dedupe, subtotals, consolidate ----
     //
     // These go through `run_command`, the SAME dispatch the menu bar and the
@@ -1223,6 +1310,583 @@ mod tests {
         crate::prefs::CONFIG_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ============= data validation & autocomplete (issue #41) =============
+    //
+    // Everything below drives the app the way a user does: the command
+    // registry entry point, the real painted dialog buttons, real key events.
+    // Every assertion is on state the feature CHANGES — the value at a cell,
+    // the count of the specific circle shape, the suggestion list — because a
+    // status-line assertion passes against a dead gesture.
+
+    /// A column of repeated region names, so autocomplete has something to
+    /// find, plus a number column validation can bound.
+    const REGIONS: &str =
+        "region,qty\nNorthern,10\nSouthern,20\nNortheast,30\nNorthern,40\nWestern,50\n";
+
+    fn open_regions(tag: &str) -> Harness {
+        let p = write_csv(&unique(tag, "csv"), REGIONS);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(300, |a| a.row_count() > 0), "{}", h.status());
+        h
+    }
+
+    fn range(fr: u32, fc: u32, lr: u32, lc: u32) -> ferrix_core::TableRange {
+        ferrix_core::TableRange::new(fr, fc, lr, lc)
+    }
+
+    fn list_rule(r: ferrix_core::TableRange, vals: &[&str]) -> ferrix_core::RangeValidation {
+        ferrix_core::RangeValidation::list(r, vals.iter().map(|s| s.to_string()).collect())
+    }
+
+    // ---------------------------------------------------- the dialog ------
+
+    /// The registry command really creates a rule, through the real dialog.
+    ///
+    /// Runs the REGISTRY id — not the method behind it — so a row without a
+    /// dispatch arm, or a dispatch arm wired to the wrong method, fails here.
+    #[test]
+    fn the_data_menu_command_creates_a_validation_rule() {
+        use crate::command::CommandId;
+        let mut h = open_regions("dv-cmd");
+        h.select(CellRef::new(1, 0), CellRef::new(4, 0));
+        h.app_mut().run_command(CommandId::DataValidationNew);
+        h.steps(2);
+        assert!(
+            h.app().validation_is_open(),
+            "the registry command did not open the dialog; status: {}",
+            h.status()
+        );
+        h.dv_form(|f| {
+            f.domain = ferrix_core::ValueDomain::List;
+            f.list_text = "Northern\nSouthern".into();
+            f.message = "Pick a listed region".into();
+        });
+        h.dv_click_ok();
+
+        let rules = h.dv_rules();
+        assert_eq!(rules.len(), 1, "OK stored nothing; status: {}", h.status());
+        assert_eq!(
+            rules[0].range,
+            range(1, 0, 4, 0),
+            "the rule must cover the selection the user had"
+        );
+        assert_eq!(
+            rules[0].list_values(),
+            Some(&["Northern".to_string(), "Southern".to_string()][..])
+        );
+        assert_eq!(rules[0].message.as_deref(), Some("Pick a listed region"));
+    }
+
+    /// A rule over a huge selection is ONE entry.
+    ///
+    /// The scale criterion, asserted through the real dialog rather than on
+    /// the store directly, so a UI that expanded a selection into per-cell
+    /// rules would fail.
+    #[test]
+    fn validation_over_a_huge_selection_stores_one_entry() {
+        let mut h = open_regions("dv-scale");
+        h.select(CellRef::new(0, 0), CellRef::new(9_999_999, 0));
+        h.dv_new_rule();
+        h.dv_form(|f| {
+            f.domain = ferrix_core::ValueDomain::WholeNumber;
+            f.min_text = "1".into();
+            f.max_text = "5".into();
+        });
+        h.dv_click_ok();
+        let rules = h.dv_rules();
+        assert_eq!(rules.len(), 1, "one entry, however many rows");
+        assert_eq!(rules[0].range.rows(), 10_000_000);
+        assert!(
+            h.app().workbook().validation.heap_bytes() < 1024,
+            "a 10M-row rule cost {} bytes",
+            h.app().workbook().validation.heap_bytes()
+        );
+    }
+
+    /// Cancel stores nothing.
+    #[test]
+    fn cancelling_the_validation_dialog_stores_nothing() {
+        let mut h = open_regions("dv-cancel");
+        h.select(CellRef::new(1, 0), CellRef::new(4, 0));
+        h.dv_new_rule();
+        h.dv_form(|f| f.list_text = "Northern".into());
+        h.dv_click_cancel();
+        assert!(h.dv_rules().is_empty(), "Cancel wrote a rule");
+        assert!(!h.app().validation_is_open());
+    }
+
+    // --------------------------------------------- Stop versus Warning ----
+
+    /// A Stop rule REJECTS: the cell keeps its old value.
+    ///
+    /// Asserts on the VALUE AT THE CELL, not on the status line — a status
+    /// assertion would pass against an app that showed a message and wrote the
+    /// value anyway, which is precisely the bug worth catching.
+    #[test]
+    fn a_stop_rule_rejects_the_entry_and_shows_its_message() {
+        let mut h = open_regions("dv-stop");
+        h.app_mut().workbook_mut().validation.push(
+            list_rule(range(0, 0, 4, 0), &["Northern", "Southern"])
+                .with_message("Regions must come from the list"),
+        );
+        // Row 0 sits under the header band and is not clickable; row 1 is the
+        // first the grid really exposes.
+        let cell = CellRef::new(1, 0);
+        let before = h.app().display(cell);
+        assert_eq!(before, "Southern", "fixture sanity");
+
+        h.click_cell(cell);
+        // Pump the text event before Enter: without a frame in between, the
+        // app is not yet in edit mode and the keystroke is silently dropped.
+        h.type_text("Eastern").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+
+        assert_eq!(
+            h.app().display(cell),
+            "Southern",
+            "a Stop rule must leave the cell exactly as it was; status: {}",
+            h.status()
+        );
+        assert!(
+            h.status().contains("Regions must come from the list"),
+            "the rule's own message must be shown; got {:?}",
+            h.status()
+        );
+    }
+
+    /// A Warning rule ALLOWS: the cell takes the new value, and says so.
+    #[test]
+    fn a_warning_rule_allows_the_entry_and_still_warns() {
+        let mut h = open_regions("dv-warn");
+        h.app_mut().workbook_mut().validation.push(
+            list_rule(range(0, 0, 4, 0), &["Northern"])
+                .with_style(ferrix_core::ErrorStyle::Warning)
+                .with_message("that is not a known region"),
+        );
+        let cell = CellRef::new(1, 0);
+        h.click_cell(cell);
+        // Pump the text event before Enter (see the Stop-rule test above).
+        h.type_text("Eastern").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+
+        assert_eq!(
+            h.app().display(cell),
+            "Eastern",
+            "a Warning rule must NOT reject; status: {}",
+            h.status()
+        );
+        assert!(
+            h.status().contains("that is not a known region"),
+            "an allowed-but-invalid entry must still say why; got {:?}",
+            h.status()
+        );
+    }
+
+    /// A conforming entry is written with no complaint.
+    ///
+    /// The control: without it, "reject everything" would pass the two tests
+    /// above.
+    #[test]
+    fn a_valid_entry_passes_untouched() {
+        let mut h = open_regions("dv-ok");
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, 4, 0), &["Northern", "Southern"]));
+        // A cell whose value really changes, so "wrote nothing" cannot pass.
+        let cell = CellRef::new(2, 0);
+        assert_eq!(h.app().display(cell), "Northeast", "fixture sanity");
+        h.click_cell(cell);
+        // Pump the text event before Enter (see the Stop-rule test above).
+        h.type_text("Southern").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(cell), "Southern");
+    }
+
+    /// A whole-number rule rejects a fraction through the real edit path.
+    #[test]
+    fn a_whole_number_rule_rejects_a_fraction_in_the_editor() {
+        let mut h = open_regions("dv-whole");
+        h.app_mut().workbook_mut().validation.push(
+            ferrix_core::RangeValidation::new(
+                range(0, 1, 4, 1),
+                ferrix_core::ValueDomain::WholeNumber,
+                ferrix_core::ValidationRule::Between {
+                    min: 1.0,
+                    max: 100.0,
+                },
+            )
+            .with_message("whole numbers 1-100 only"),
+        );
+        let cell = CellRef::new(1, 1);
+        h.click_cell(cell);
+        // Pump the text event before Enter (see the Stop-rule test above).
+        h.type_text("7.5").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(
+            h.app().display(cell),
+            "20",
+            "the fraction should have been refused (row 1 holds 20); status: {}",
+            h.status()
+        );
+
+        // …and a whole number in range goes in.
+        // Clicking the cell that is ALREADY selected reads as a double click,
+        // which opens the editor seeded with the existing value. Escape first,
+        // or the keystrokes below append to it ("20" + "42" = "2042") and are
+        // refused again by the very rule this half of the test is clearing.
+        h.click_cell(cell);
+        h.press_key(Key::Escape);
+        h.steps(2);
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "the seeded editor must be closed before typing a fresh value"
+        );
+        // Pump the text event before Enter (see the Stop-rule test above).
+        h.type_text("42").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(
+            h.app().display(cell),
+            "42",
+            "a whole number in range must be accepted; status: {}",
+            h.status()
+        );
+    }
+
+    // ------------------------------------------------- autocomplete ------
+
+    /// Typing suggests matching values from the SAME column.
+    #[test]
+    fn typing_suggests_matching_values_from_the_column() {
+        let mut h = open_regions("ac-basic");
+        h.click_cell(CellRef::new(4, 0));
+        h.type_text("Nort");
+        h.steps(3);
+        let s = h.suggestions();
+        assert!(
+            s.contains(&"Northern".to_string()) && s.contains(&"Northeast".to_string()),
+            "both column values beginning `Nort` should be offered; got {s:?}"
+        );
+        assert!(
+            !s.contains(&"Southern".to_string()),
+            "a non-matching value leaked in; got {s:?}"
+        );
+    }
+
+    /// Values from a DIFFERENT column are not offered.
+    ///
+    /// This is what makes "from the same column" a real claim rather than a
+    /// comment: an implementation that enumerated the workbook-wide string
+    /// arena would pass the test above and fail this one.
+    #[test]
+    fn suggestions_do_not_leak_across_columns() {
+        let body = "a,b\nApricot,Zebra\nAvocado,Zither\nAlmond,Zenith\n";
+        let p = write_csv(&unique("ac-cols", "csv"), body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(300, |a| a.row_count() > 0), "{}", h.status());
+        h.click_cell(CellRef::new(1, 0));
+        h.type_text("Z").step();
+        h.steps(3);
+        assert!(
+            h.suggestions().is_empty(),
+            "column A must not suggest column B's values; got {:?}",
+            h.suggestions()
+        );
+        // …and column B does offer them, so the empty result above is not
+        // simply autocomplete being broken.
+        h.press_key(Key::Escape);
+        h.steps(2);
+        h.press_key(Key::Escape);
+        h.steps(2);
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "the column-A editor must be closed before moving to column B, or \
+             the next keystroke appends to it instead of starting a new entry"
+        );
+        h.click_cell(CellRef::new(1, 1));
+        // The click lands on a cell holding "Zither" and opens the editor
+        // SEEDED with it, so typing would make the buffer "ZitherZ" and match
+        // nothing. Escape back to a clean cell before typing the prefix.
+        h.press_key(Key::Escape);
+        h.steps(2);
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "the seeded editor must be closed before typing the prefix"
+        );
+        h.type_text("Z").step();
+        h.steps(3);
+        assert_eq!(
+            h.suggestions().len(),
+            3,
+            "column B must offer its own three Z-values (Zebra, Zither, \
+             Zenith), so the empty result above is the scoping working rather \
+             than autocomplete being broken; got {:?}",
+            h.suggestions()
+        );
+    }
+
+    /// ESCAPE DISMISSES WITHOUT ALTERING THE TYPED TEXT.
+    ///
+    /// The exact acceptance criterion. Asserts the buffer is untouched AND
+    /// that a subsequent Enter commits precisely what was typed — a popup that
+    /// closed by cancelling the edit would fail the second half even if the
+    /// buffer briefly looked right.
+    #[test]
+    fn escape_dismisses_the_popup_without_altering_the_typed_text() {
+        let mut h = open_regions("ac-esc");
+        let cell = CellRef::new(4, 0);
+        h.click_cell(cell);
+        h.type_text("Nort");
+        h.steps(3);
+        assert!(
+            h.suggestions_open(),
+            "no popup to dismiss; nothing is proven"
+        );
+
+        h.press_key(Key::Escape);
+        h.steps(2);
+        assert!(!h.suggestions_open(), "Escape did not close the popup");
+        assert_eq!(
+            h.app().live_edit_buffer().as_deref(),
+            Some("Nort"),
+            "Escape altered the typed text"
+        );
+
+        // The edit is still live, and Enter commits exactly what was typed.
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(
+            h.app().display(cell),
+            "Nort",
+            "Escape must not have cancelled the edit itself; status: {}",
+            h.status()
+        );
+    }
+
+    /// A second Escape, after the popup is gone, abandons the edit.
+    #[test]
+    fn a_second_escape_abandons_the_edit_as_it_always_did() {
+        let mut h = open_regions("ac-esc2");
+        let cell = CellRef::new(1, 0); // "Southern"
+        h.click_cell(cell);
+        h.type_text("Nort");
+        h.steps(3);
+        h.press_key(Key::Escape);
+        h.steps(2);
+        h.press_key(Key::Escape);
+        h.steps(2);
+        assert_eq!(
+            h.app().display(cell),
+            "Southern",
+            "the second Escape must restore the cell"
+        );
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "the edit is still open"
+        );
+    }
+
+    /// Tab accepts the highlighted suggestion into the cell.
+    #[test]
+    fn tab_accepts_the_highlighted_suggestion() {
+        let mut h = open_regions("ac-tab");
+        let cell = CellRef::new(4, 0);
+        h.click_cell(cell);
+        h.type_text("Northea");
+        h.steps(3);
+        assert_eq!(h.suggestions(), vec!["Northeast".to_string()]);
+        h.press_key(Key::Tab);
+        h.steps(2);
+        assert_eq!(
+            h.app().live_edit_buffer().as_deref(),
+            Some("Northeast"),
+            "Tab did not complete the value"
+        );
+    }
+
+    /// A cell governed by a LIST rule suggests the rule's values, not the
+    /// column's — the list is authoritative.
+    #[test]
+    fn a_list_rule_supplies_the_in_cell_dropdown() {
+        let mut h = open_regions("ac-list");
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, 9, 0), &["Alpha", "Beta", "Gamma"]));
+        let cell = CellRef::new(2, 0);
+        // Opening the dropdown is what the in-cell arrow does.
+        h.app_mut().open_validation_dropdown(cell);
+        h.steps(3);
+        assert_eq!(
+            h.suggestions(),
+            vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+            "the dropdown must list the RULE's values"
+        );
+        assert!(
+            !h.suggestions().contains(&"Northern".to_string()),
+            "the column's own values must not appear under a list rule"
+        );
+
+        // Picking one writes it.
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(cell), "Alpha");
+    }
+
+    /// The dropdown arrow is really PAINTED on the cursor cell.
+    ///
+    /// Reads the geometry the grid reported from its own paint loop, so a
+    /// model-only dropdown fails.
+    #[test]
+    fn a_list_rule_paints_an_in_cell_dropdown_arrow() {
+        let mut h = open_regions("ac-arrow");
+        h.click_cell(CellRef::new(1, 0));
+        h.steps(2);
+        assert!(
+            h.app().dropdown_button_rect().is_none(),
+            "an arrow appeared with no list rule in force"
+        );
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, 9, 0), &["Alpha", "Beta"]));
+        h.steps(3);
+        let r = h
+            .app()
+            .dropdown_button_rect()
+            .expect("no dropdown arrow was painted on the list-ruled cursor cell");
+        assert!(r.width() > 0.0 && r.height() > 0.0);
+
+        // …and it is on the cursor cell only.
+        h.click_cell(CellRef::new(1, 1));
+        h.steps(3);
+        assert!(
+            h.app().dropdown_button_rect().is_none(),
+            "the arrow followed the cursor onto a cell with no list rule"
+        );
+    }
+
+    // -------------------------------------------- circle invalid data ----
+
+    /// Circle Invalid Data rings the failing cells, and only those.
+    ///
+    /// Asserts on the count of the SPECIFIC circle shape this feature adds,
+    /// read back from the paint loop — not on a total shape count, which
+    /// selection and grid lines also move.
+    #[test]
+    fn circle_invalid_data_rings_exactly_the_failing_cells() {
+        use crate::command::CommandId;
+        let mut h = open_regions("dv-circle");
+        // Only "Northern" is allowed, so rows 2, 3 and 5 of column A fail
+        // (Southern, Northeast, Western) and rows 1 and 4 pass.
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, 4, 0), &["Northern"]));
+        h.steps(2);
+        assert_eq!(
+            h.painted_validation_circles(),
+            0,
+            "circles appeared before the command was ever run"
+        );
+
+        h.app_mut().run_command(CommandId::DataCircleInvalid);
+        h.steps(3);
+        let circled: Vec<CellRef> = h.app().circled_cells().to_vec();
+        assert_eq!(
+            circled,
+            vec![CellRef::new(1, 0), CellRef::new(2, 0), CellRef::new(4, 0)],
+            "the wrong cells were flagged; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.painted_validation_circles(),
+            3,
+            "the circles were computed but never PAINTED; status: {}",
+            h.status()
+        );
+
+        // Clearing removes them from the screen, not just from the model.
+        h.app_mut().run_command(CommandId::DataClearCircles);
+        h.steps(2);
+        assert_eq!(h.painted_validation_circles(), 0);
+        assert!(h.app().circled_cells().is_empty());
+    }
+
+    /// The circle pass is bounded by the VIEWPORT, not by the sheet.
+    ///
+    /// Every row of a tall column is invalid; the number of cells examined and
+    /// ringed must be a screenful, not the row count. Asserted as a hard
+    /// inequality against the sheet's own size, so an implementation that
+    /// scanned everything fails even though every cell really is invalid.
+    #[test]
+    fn circle_invalid_data_is_bounded_to_the_viewport() {
+        use crate::command::CommandId;
+        let mut body = String::from("v\n");
+        let rows = 20_000;
+        for i in 0..rows {
+            body.push_str(&format!("bad{i}\n"));
+        }
+        let p = write_csv(&unique("dv-vp", "csv"), &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(300, |a| a.row_count() > 0), "{}", h.status());
+        assert_eq!(h.app().row_count(), rows);
+
+        // A rule nothing in the column can satisfy.
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, rows as u32, 0), &["good"]));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::DataCircleInvalid);
+        h.steps(3);
+
+        let n = h.app().circled_cells().len();
+        assert!(n > 0, "nothing was circled at all; status: {}", h.status());
+        assert!(
+            n < 200,
+            "the pass ringed {n} cells out of {rows} rows — it is scanning the \
+             SHEET, not the viewport. This is the bound the scale invariant \
+             requires."
+        );
+        assert_eq!(
+            h.painted_validation_circles(),
+            n,
+            "every circled cell should be on screen and painted"
+        );
+    }
+
+    /// Clearing validation from the selection removes the rule and the rings.
+    #[test]
+    fn clearing_validation_removes_the_rule() {
+        use crate::command::CommandId;
+        let mut h = open_regions("dv-clear");
+        h.app_mut()
+            .workbook_mut()
+            .validation
+            .push(list_rule(range(0, 0, 4, 0), &["Northern"]));
+        h.select(CellRef::new(0, 0), CellRef::new(4, 0));
+        h.app_mut().run_command(CommandId::DataValidationClear);
+        h.steps(2);
+        assert!(h.dv_rules().is_empty(), "status: {}", h.status());
+
+        // …and the edit that was rejected a moment ago now goes through.
+        let cell = CellRef::new(1, 0);
+        h.click_cell(cell);
+        // Pump the text event before Enter (see the Stop-rule test above).
+        h.type_text("Eastern").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(cell), "Eastern");
     }
 
     // ================= import wizard (issue #31) =================

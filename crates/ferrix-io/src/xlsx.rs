@@ -721,6 +721,13 @@ pub struct SheetExport<'a> {
     /// note on why a column-scope decoration is one `<col>` record while a
     /// range-scope one is capped.
     pub format: Option<&'a ferrix_core::SheetFormat>,
+    /// Sheet-range data validation (issue #41), written as
+    /// `<dataValidations>` — see [`crate::validate_xlsx`].
+    ///
+    /// Distinct from the per-column validation `tables` carries: this one is
+    /// scoped to an arbitrary rectangle on the sheet, so a workbook with no
+    /// structured table on it can still carry rules.
+    pub validation: Option<&'a ferrix_core::SheetValidation>,
     /// Sparkline groups (issue #36), written as
     /// `<extLst><x14:sparklineGroups>`. See [`crate::sparkline_xlsx`] for why
     /// the group is EXPANDED to one element per destination cell (OOXML has
@@ -740,6 +747,7 @@ impl<'a> SheetExport<'a> {
             protection: None,
             sizing: None,
             format: None,
+            validation: None,
             sparklines: None,
         }
     }
@@ -783,6 +791,12 @@ impl<'a> SheetExport<'a> {
     /// Attach sheet formatting, so cell decoration reaches `xl/styles.xml`.
     pub fn with_format(mut self, format: &'a ferrix_core::SheetFormat) -> Self {
         self.format = Some(format);
+        self
+    }
+
+    /// Attach sheet-range data validation, written as `<dataValidations>`.
+    pub fn with_validation(mut self, v: &'a ferrix_core::SheetValidation) -> Self {
+        self.validation = Some(v);
         self
     }
 
@@ -903,6 +917,13 @@ pub fn export_workbook_full(
             // with no decoration keeps the streaming writer, so the 10GB
             // export path is unchanged.
             && s.format.is_none_or(|f| !f.has_decor())
+            // Sheet-range validation joins them (issue #41): a
+            // `<dataValidation>` is attached to a RANGE after its cells are
+            // written, and the constant-memory writer has already flushed
+            // them — the element would be silently dropped and the file would
+            // come back with no validation at all. A sheet with no rules keeps
+            // the streaming writer, so the 10GB export path is unchanged.
+            && s.validation.is_none_or(|v| v.is_empty())
             // Sparklines join them (issue #36): the `<extLst>` block is
             // emitted after the sheet data from a list the worksheet
             // accumulates, and the constant-memory writer has already flushed
@@ -929,6 +950,9 @@ pub fn export_workbook_full(
         }
         if let Some(p) = s.protection {
             crate::protect_xlsx::write_protection(ws, p).map_err(write_err)?;
+        }
+        if let Some(v) = s.validation {
+            crate::validate_xlsx::write_sheet_validation(ws, v).map_err(write_err)?;
         }
         if let Some(sp) = s.sparklines {
             crate::sparkline_xlsx::write_sparklines(ws, s.name, sp).map_err(write_err)?;

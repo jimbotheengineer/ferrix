@@ -259,6 +259,20 @@ registry! {
         "Delete the selected columns. Formulas referring to them become #REF! rather than silently reading a neighbour." }
 
     // ---- Data ----
+    // ---- Data: validation and autocomplete (issue #41) ----
+    DataValidationNew { "data.validation_new", Some(Menu::Data), "✓ Data Validation — New Rule…", None, true, Some(Note::Selection),
+        "Restrict what may be typed into the selection: a list, a number range, a date, a text length, or a custom formula. Stored once per range, never per cell." }
+    DataValidationManage { "data.validation_manage", Some(Menu::Data), "☰ Data Validation — Manage Rules…", None, false, None,
+        "List, edit and delete the validation rules on this sheet." }
+    DataValidationClear { "data.validation_clear", Some(Menu::Data), "✖ Clear validation from selection", None, false, None,
+        "Remove every validation rule covering the selection." }
+    DataCircleInvalid { "data.circle_invalid", Some(Menu::Data), "○ Circle Invalid Data", None, false, None,
+        "Ring every visible cell that fails its validation rule. Evaluated over the VIEWPORT only, so it costs the same on a 200M-row sheet." }
+    DataClearCircles { "data.clear_circles", Some(Menu::Data), "✖ Clear validation circles", None, false, None,
+        "Remove the circles." }
+    DataAutocomplete { "data.autocomplete", Some(Menu::Data), "⌨ Suggest values while typing", None, true, None,
+        "Offer matching values from the same column as you type. Suggestions come from a BOUNDED scan, never a full pass over the column." }
+
     DataGoalSeek { "data.goal_seek", Some(Menu::Data), "🎯 Goal Seek…", None, false, None,
         "Set a formula cell to a target value by changing one input cell. The whole run is a single undo step." }
     DataChart { "data.chart", Some(Menu::Data), "📈 Chart…", None, false, None,
@@ -363,6 +377,15 @@ impl Command {
                     .to_string(),
             ),
             FormulaTraceClear if !st.has_trace => Some("No trace arrows are drawn".to_string()),
+            DataValidationManage | DataValidationClear if !st.has_validation => {
+                Some("No validation rules on this sheet yet".to_string())
+            }
+            DataCircleInvalid if !st.has_validation => {
+                Some("Nothing to check — add a validation rule first".to_string())
+            }
+            DataClearCircles if !st.has_circles => {
+                Some("No validation circles are drawn".to_string())
+            }
             // Nothing to group and nothing to dedupe on an empty sheet, and a
             // consolidation of one sheet is a copy. Said out loud rather than
             // hidden: a user who searches "consolidate" and finds nothing
@@ -418,6 +441,10 @@ pub struct CommandState {
     pub busy_hint: String,
     pub has_tables: bool,
     pub has_trace: bool,
+    /// At least one sheet-range validation rule exists (issue #41).
+    pub has_validation: bool,
+    /// Validation circles are currently drawn.
+    pub has_circles: bool,
     pub frozen: bool,
     pub can_undo: bool,
     pub can_redo: bool,

@@ -28,6 +28,7 @@ pub mod sizing_sidecar;
 pub mod sniff;
 pub mod sparkline_xlsx;
 pub mod table_xlsx;
+pub mod validate_xlsx;
 pub mod xlsx;
 
 pub use arrow_io::{
@@ -65,6 +66,9 @@ pub use sparkline_xlsx::{
 };
 pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
+};
+pub use validate_xlsx::{
+    import_sheet_validation, sheet_validation_xlsx_loss, write_sheet_validation, ImportedValidation,
 };
 pub use xlsx::{
     export_workbook, export_workbook_full, export_workbook_with_names, export_xlsx,

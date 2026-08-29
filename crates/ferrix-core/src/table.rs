@@ -275,6 +275,12 @@ pub enum ValidationRule {
     TextLength { min: u32, max: u32 },
     /// No two non-empty cells in the column may be equal.
     Unique,
+    /// A user formula that must evaluate truthy. Excel's `custom` validation.
+    ///
+    /// The predicate cannot be decided here: `ferrix-core` has no evaluator,
+    /// and depends on nothing that does. Whoever owns one passes the answer in
+    /// — see `crate::validate::RangeValidation::check`.
+    CustomFormula(String),
 }
 
 /// A column's complete validation configuration.
@@ -344,6 +350,12 @@ pub enum Violation {
     Duplicate,
     /// The cell holds a spreadsheet error value.
     ErrorValue(ErrorKind),
+    /// A `whole number` domain got a value with a fractional part.
+    NotWhole,
+    /// A `date` domain got something outside the serial-date range.
+    NotADate,
+    /// A custom formula evaluated falsy.
+    CustomFailed,
 }
 
 impl Violation {
@@ -365,6 +377,9 @@ impl Violation {
             }
             Violation::Duplicate => "duplicate value".into(),
             Violation::ErrorValue(e) => format!("cell holds {}", e.as_str()),
+            Violation::NotWhole => "must be a whole number".into(),
+            Violation::NotADate => "must be a date".into(),
+            Violation::CustomFailed => "does not satisfy the custom formula".into(),
         }
     }
 }
@@ -1923,6 +1938,10 @@ impl Table {
             ValidationRule::Unique => unique
                 .is_some_and(|u| u.is_duplicate(value))
                 .then_some(Violation::Duplicate),
+            // A table column has no evaluator to hand, so a custom formula on
+            // one condemns nothing. Sheet-range validation, which does have
+            // one, is where this rule is reachable from the UI.
+            ValidationRule::CustomFormula(_) => None,
         }
     }
 }
@@ -1930,7 +1949,7 @@ impl Table {
 /// Anchor a user-supplied pattern to the whole cell, matching how Excel's
 /// list/length validations behave (and how people expect a validation regex to
 /// read). An already-anchored pattern is left alone.
-fn anchored(pat: &str) -> String {
+pub(crate) fn anchored(pat: &str) -> String {
     let has_start = pat.starts_with('^');
     let has_end = pat.ends_with('$') && !pat.ends_with("\\$");
     match (has_start, has_end) {

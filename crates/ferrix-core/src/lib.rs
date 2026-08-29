@@ -10,6 +10,7 @@
 
 pub mod annotation;
 pub mod arena;
+pub mod autocomplete;
 pub mod bitmap;
 pub mod budget;
 pub mod cancel;
@@ -36,9 +37,11 @@ pub mod sparkline;
 pub mod subtotal;
 pub mod table;
 pub mod tsv;
+pub mod validate;
 pub mod value;
 
 pub use arena::{StrId, StringArena};
+pub use autocomplete::{DistinctValues, ScanBudget, Suggestions};
 pub use bitmap::Bitmap;
 pub use budget::Budget;
 pub use cancel::CancelToken;
@@ -79,4 +82,5 @@ pub use table::{
     Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,
     ValidationReport, ValidationRule, Violation,
 };
+pub use validate::{Candidate, ErrorStyle, RangeValidation, SheetValidation, ValueDomain};
 pub use value::{format_number, ErrorKind, Value, ValueTag};
