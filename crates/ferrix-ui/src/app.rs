@@ -3816,11 +3816,6 @@ impl FerrixApp {
         self.wb.format.decor_count()
     }
 
-    /// Bytes the format store owns, for the under-1KB scale assertion.
-    pub fn format_heap_bytes(&self) -> usize {
-        self.wb.format.heap_bytes()
-    }
-
     /// Open the New Rule dialog on the current selection.
     pub fn cond_new_rule(&mut self) {
         let (a, b) = self.selection.bounds();
