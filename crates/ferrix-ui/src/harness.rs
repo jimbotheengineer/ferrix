@@ -1908,4 +1908,328 @@ xxx,yyy,zzz
         }
         let _ = std::fs::remove_file(&p);
     }
+
+    // ---- autosave and crash recovery (roadmap #8) ----
+    //
+    // The failure these guard against: edits live in a .fxedits sidecar and
+    // undo history is CLEARED on save, so a crash between saves loses
+    // everything typed since the last one with no undo left to recover it.
+
+    /// A private CSV plus a clean slate of sidecar/autosave files.
+    ///
+    /// Each autosave test gets its own base file so they can run in parallel
+    /// without one test's recovery prompt appearing in another's app.
+    fn autosave_fixture(name: &str) -> std::path::PathBuf {
+        let p = write_csv(&format!("autosave_{name}.csv"), SAMPLE);
+        let side = ferrix_io::edits::edits_path_for(&p);
+        let _ = std::fs::remove_file(&side);
+        let _ = std::fs::remove_file(ferrix_io::edits::autosave_path_for_sidecar(&side));
+        p
+    }
+
+    fn sidecar_of(base: &std::path::Path) -> std::path::PathBuf {
+        ferrix_io::edits::edits_path_for(base)
+    }
+
+    fn autosave_of(base: &std::path::Path) -> std::path::PathBuf {
+        ferrix_io::edits::autosave_path_for_sidecar(&sidecar_of(base))
+    }
+
+    /// Type `text` into the given cell and commit it.
+    fn edit_cell(h: &mut Harness, row: u32, col: u32, text: &str) {
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(row, col), CellRef::new(row, col));
+        h.step();
+        h.type_text(text).step();
+        h.press_key(Key::Enter).steps(2);
+    }
+
+    /// THE headline scenario: crash after edits plus one autosave tick,
+    /// restart, and Recover must restore every edit.
+    ///
+    /// "Crash" here means dropping the app WITHOUT any clean-exit path — no
+    /// save, no close prompt, no on_clean_exit. That is what makes the
+    /// autosave file survive into the next launch, and it is precisely the
+    /// state a killed process leaves behind.
+    #[test]
+    fn crash_after_an_autosave_tick_offers_recovery_and_recover_restores_every_edit() {
+        let p = autosave_fixture("crash_recover");
+        let edits = [(0u32, 0u32, "111"), (1, 1, "wombat"), (3, 2, "999")];
+
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            for (r, c, t) in edits {
+                edit_cell(&mut h, r, c, t);
+            }
+            // One autosave tick. This is the only thing standing between the
+            // user and losing all three edits.
+            h.app_mut().autosave_tick_now();
+            assert!(
+                autosave_of(&p).exists(),
+                "the autosave tick wrote nothing; there is nothing to recover from"
+            );
+            // Drop without a clean exit: no save, no close, no on_clean_exit.
+            // The autosave file must therefore outlive the process.
+            std::mem::drop(h);
+        }
+
+        assert!(
+            autosave_of(&p).exists(),
+            "a crash must leave the autosave behind"
+        );
+        assert!(
+            !sidecar_of(&p).exists(),
+            "nothing was ever saved, so there must be no official sidecar"
+        );
+
+        // Restart.
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        assert!(
+            h.app().recovery_prompt_open(),
+            "restart after a crash must offer to recover; status: {}",
+            h.status()
+        );
+        let prompt = h.app().recovery_prompt_text().unwrap();
+        assert!(
+            prompt.starts_with("Recover edits from ") && prompt.ends_with(" ago?"),
+            "prompt was {prompt:?}"
+        );
+
+        // Before recovering, the edits are NOT present -- otherwise this test
+        // could pass without recovery doing anything at all.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
+
+        h.app_mut().recover_autosave();
+        h.steps(2);
+
+        assert!(!h.app().recovery_prompt_open(), "prompt must close");
+        for (r, c, t) in edits {
+            assert_eq!(
+                h.app().display(CellRef::new(r, c)),
+                t,
+                "Recover must restore the edit at ({r},{c})"
+            );
+        }
+        assert!(
+            h.app().is_dirty(),
+            "recovered edits are unsaved, so the workbook must be dirty"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A manual save deletes the autosave file.
+    #[test]
+    fn a_manual_save_deletes_the_autosave() {
+        let p = autosave_fixture("save_clears");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        edit_cell(&mut h, 0, 0, "42");
+        h.app_mut().autosave_tick_now();
+        assert!(
+            autosave_of(&p).exists(),
+            "precondition: an autosave must exist before the save"
+        );
+
+        h.ctrl(Key::S).steps(3);
+
+        assert!(
+            sidecar_of(&p).exists(),
+            "Ctrl+S must write the official sidecar; status: {}",
+            h.status()
+        );
+        assert!(
+            !autosave_of(&p).exists(),
+            "a manual save must delete the now-redundant autosave"
+        );
+        // And the next launch must not offer to recover anything.
+        assert!(ferrix_io::edits::find_recovery(&sidecar_of(&p)).is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Discard deletes the autosave and leaves the official sidecar untouched.
+    #[test]
+    fn discard_deletes_the_autosave_and_leaves_the_sidecar_untouched() {
+        let p = autosave_fixture("discard");
+
+        // Session 1: save one edit officially, then autosave a second on top
+        // and crash. The sidecar and the autosave now disagree.
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            edit_cell(&mut h, 0, 0, "saved");
+            h.ctrl(Key::S).steps(3);
+            assert!(sidecar_of(&p).exists());
+            edit_cell(&mut h, 1, 0, "autosaved-only");
+            h.app_mut().autosave_tick_now();
+            assert!(autosave_of(&p).exists());
+            std::mem::drop(h);
+        }
+        let sidecar_bytes = std::fs::read(sidecar_of(&p)).unwrap();
+
+        // Session 2: decline the recovery.
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert!(h.app().recovery_prompt_open());
+
+        h.app_mut().discard_recovery();
+        h.steps(2);
+
+        assert!(
+            !autosave_of(&p).exists(),
+            "Discard must delete the autosave file"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_of(&p)).unwrap(),
+            sidecar_bytes,
+            "Discard must not touch the official sidecar"
+        );
+        // The officially saved edit is still there; the autosaved-only one is
+        // gone, which is exactly what the user asked for.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "saved");
+        assert_eq!(h.app().display(CellRef::new(1, 0)), "2");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A tick with nothing changed since the last one writes nothing at all.
+    ///
+    /// Asserted on the file's mtime AND its bytes: "wrote nothing" has to mean
+    /// the file was not touched, not merely that it ended up with the same
+    /// contents after a rewrite.
+    #[test]
+    fn a_no_change_tick_writes_nothing_at_all() {
+        let p = autosave_fixture("no_change");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        edit_cell(&mut h, 0, 0, "changed");
+        h.app_mut().autosave_tick_now();
+        let auto = autosave_of(&p);
+        assert!(auto.exists(), "precondition: first tick must write");
+        let first_mtime = std::fs::metadata(&auto).unwrap().modified().unwrap();
+        let first_bytes = std::fs::read(&auto).unwrap();
+
+        // Enough wall clock that a rewrite would certainly move the mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Several ticks, no edits in between.
+        for _ in 0..3 {
+            h.app_mut().autosave_tick_now();
+            h.steps(2);
+        }
+
+        assert_eq!(
+            std::fs::metadata(&auto).unwrap().modified().unwrap(),
+            first_mtime,
+            "an unchanged overlay must not rewrite the autosave file"
+        );
+        assert_eq!(std::fs::read(&auto).unwrap(), first_bytes);
+
+        // A real edit must still produce a write, or the check above would
+        // pass just as well against an autosave that never works again.
+        edit_cell(&mut h, 2, 0, "changed again");
+        h.app_mut().autosave_tick_now();
+        assert_ne!(
+            std::fs::metadata(&auto).unwrap().modified().unwrap(),
+            first_mtime,
+            "a changed overlay must write"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A clean exit leaves no autosave, so the next launch does not prompt.
+    #[test]
+    fn a_clean_exit_removes_the_autosave() {
+        let p = autosave_fixture("clean_exit");
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            edit_cell(&mut h, 0, 0, "5");
+            h.app_mut().autosave_tick_now();
+            assert!(autosave_of(&p).exists());
+
+            // The difference from the crash test: an orderly shutdown.
+            h.app_mut().on_clean_exit();
+            std::mem::drop(h);
+        }
+        assert!(
+            !autosave_of(&p).exists(),
+            "a clean exit must not leave an autosave behind"
+        );
+
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert!(
+            !h.app().recovery_prompt_open(),
+            "a clean exit must not produce a recovery prompt on the next launch"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// With no edits at all, an autosave tick creates no file.
+    #[test]
+    fn an_untouched_file_never_creates_an_autosave() {
+        let p = autosave_fixture("untouched");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        for _ in 0..3 {
+            h.app_mut().autosave_tick_now();
+            h.steps(2);
+        }
+        assert!(
+            !autosave_of(&p).exists(),
+            "opening a file and touching nothing must not write an autosave"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Autosave off means no file, however much is typed.
+    #[test]
+    fn autosave_can_be_disabled() {
+        let p = autosave_fixture("disabled");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.app_mut().set_autosave_secs(0);
+        edit_cell(&mut h, 0, 0, "nope");
+        h.app_mut().autosave_tick_now();
+
+        assert!(
+            !autosave_of(&p).exists(),
+            "autosave_secs = 0 must disable autosave entirely"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Recovery restores formulas by SOURCE, re-evaluated against the base --
+    /// not just a stale cached number.
+    #[test]
+    fn recovery_restores_formulas_not_just_their_cached_values() {
+        let p = autosave_fixture("formula");
+        {
+            let mut h = Harness::new(Some(&p));
+            assert!(h.step_until(200, |a| a.row_count() > 0));
+            edit_cell(&mut h, 0, 2, "=10+32");
+            h.app_mut().autosave_tick_now();
+            std::mem::drop(h);
+        }
+
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert!(h.app().recovery_prompt_open());
+        h.app_mut().recover_autosave();
+        h.steps(2);
+
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "42");
+        assert_eq!(
+            h.app().edit_text(CellRef::new(0, 2)),
+            "=10+32",
+            "the formula SOURCE must survive recovery, not only its result"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }

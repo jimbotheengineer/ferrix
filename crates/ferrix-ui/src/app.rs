@@ -1045,7 +1045,7 @@ impl FerrixApp {
     /// dirty: recovered edits are unsaved by definition, and the Save button
     /// must reflect that. The autosave file is left in place until the user
     /// saves or exits cleanly, so a crash during recovery does not lose it.
-    fn recover_autosave(&mut self) {
+    pub fn recover_autosave(&mut self) {
         self.recovery = None;
         self.recovery_resolved = true;
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
@@ -1078,7 +1078,7 @@ impl FerrixApp {
     }
 
     /// Throw the autosave away, leaving the official sidecar untouched.
-    fn discard_recovery(&mut self) {
+    pub fn discard_recovery(&mut self) {
         self.recovery = None;
         self.recovery_resolved = true;
         if let Some(path) = self.edits_path.clone() {
