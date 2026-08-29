@@ -194,6 +194,32 @@ pub struct FerrixApp {
 
     /// Display column being dragged by its header, between press and release.
     header_drag: Option<usize>,
+    /// Row/column sizes, hidden spans and outline groups for the active sheet
+    /// (issue #29).
+    sizing: ferrix_core::sizing::SheetSizing,
+    /// Column being resized by its border: (column, pointer x at press, width
+    /// at press). OWNED HERE rather than read from egui's `is_dragging`, which
+    /// is cleared on the release frame — the width would be lost exactly when
+    /// the release needs it.
+    col_resize: Option<(usize, f32, f32)>,
+    /// Header the hide/unhide context menu is open on.
+    header_menu: Option<(usize, egui::Pos2)>,
+    /// Rows the last autofit actually inspected. The acceptance criterion is a
+    /// BOUND, not a width, so the bound is measured rather than assumed.
+    last_autofit_rows: usize,
+    /// The folded hidden-row index, rebuilt whenever hiding changes and
+    /// composed into `RowResolver` as ONE stage. `None` when nothing is
+    /// hidden, which keeps the default resolve path free of lookups.
+    hidden_rows: Option<ferrix_core::sizing::HiddenRows>,
+    /// Columns hidden explicitly or by a collapsed column group.
+    hidden_cols: std::collections::BTreeSet<u32>,
+    /// Set when sizing changed and the sidecar has not been written yet.
+    sizing_dirty: bool,
+    /// Outline toggle buttons the grid painted last frame — real paint output
+    /// a test can assert the gutter against.
+    last_outline_buttons: usize,
+    /// Where sizing is persisted, beside the base file.
+    sizing_path: Option<PathBuf>,
     /// Where each visible column header was painted last frame. Recorded from
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
@@ -499,6 +525,15 @@ impl FerrixApp {
             sort_keys: Vec::new(),
             sort_order: None,
             header_drag: None,
+            sizing: ferrix_core::sizing::SheetSizing::new(),
+            col_resize: None,
+            header_menu: None,
+            last_autofit_rows: 0,
+            hidden_rows: None,
+            hidden_cols: std::collections::BTreeSet::new(),
+            sizing_dirty: false,
+            last_outline_buttons: 0,
+            sizing_path: None,
             header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
             last_frozen_rows: 0,
@@ -722,6 +757,13 @@ impl FerrixApp {
                 self.panes = crate::grid::Panes::default();
                 // The load succeeded, so this file is now the open one.
                 self.source_path = self.pending_path.take();
+                // Sizing lives beside the base file (issue #29). Loaded right
+                // after the source path is known, so the first painted frame
+                // already has the user's widths, hidden spans and outline —
+                // rather than painting defaults and snapping a frame later.
+                self.sizing_path = self.source_path.as_deref().map(ferrix_io::sizing_path_for);
+                self.set_sizing(ferrix_core::sizing::SheetSizing::new());
+                self.load_sizing_sidecar();
                 // The workbook we just built has the FILE's sheet name, which
                 // is only known now — so this is where the sheet's remembered
                 // zoom is adopted. Doing it at construction would read the
@@ -1112,6 +1154,13 @@ impl FerrixApp {
         self.edits_path = None;
         self.fingerprint = None;
         self.comments_path = None;
+        // Sizing belongs to the file that is closing. Leaving it would apply
+        // the last file's widths and hidden rows to the next one — the same
+        // class of bug as writing this workbook's edits into the previous
+        // file's sidecar.
+        self.sizing_path = None;
+        self.set_sizing(ferrix_core::sizing::SheetSizing::new());
+        self.sizing_dirty = false;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -1505,6 +1554,9 @@ impl FerrixApp {
         // early when there is nothing in the overlay, and a session that only
         // added a comment must not lose it to that early return.
         let comments_written = self.save_comments();
+        // Sizing, for exactly the same reason: resizing a column leaves the
+        // overlay empty, so it must be written before any early return.
+        let sizing_written = self.save_sizing();
         let comment_count = self.wb.comments.len();
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
@@ -1517,10 +1569,13 @@ impl FerrixApp {
                     fmt_int(comment_count),
                     if comment_count == 1 { "" } else { "s" }
                 )
+            } else if sizing_written && !self.sizing.is_empty() {
+                "Saved row and column sizing".into()
             } else {
                 "No edits to save".into()
             };
-            return comments_written && comment_count > 0;
+            return (comments_written && comment_count > 0)
+                || (sizing_written && !self.sizing.is_empty());
         }
         let t = std::time::Instant::now();
         match ferrix_io::edits::save_edits(&path, &self.wb.overlay, fp) {
@@ -3057,6 +3112,46 @@ impl FerrixApp {
             return false;
         };
         ferrix_io::save_comments(&path, &self.wb.comments).is_ok()
+    }
+
+    /// Persist the sizing sidecar beside the base file (issue #29).
+    ///
+    /// Written from `save_edits` unconditionally, like comments: a session
+    /// that only resized a column has an EMPTY overlay, and the edits path
+    /// returns early on that — so gating sizing behind it would silently
+    /// discard exactly the work this feature exists to keep.
+    pub fn save_sizing(&mut self) -> bool {
+        let Some(path) = self.sizing_path.clone() else {
+            return false;
+        };
+        // An empty sizing state writes an empty sidecar rather than skipping:
+        // the user may have RESET a width back to default, and leaving the old
+        // file in place would restore a size they explicitly removed.
+        let ok = ferrix_io::save_sizing(&path, &self.sizing).is_ok();
+        if ok {
+            self.sizing_dirty = false;
+        }
+        ok
+    }
+
+    /// Load the sizing sidecar for the file that was just opened.
+    pub fn load_sizing_sidecar(&mut self) {
+        let Some(path) = self.sizing_path.clone() else {
+            return;
+        };
+        // A corrupt or unreadable sidecar leaves sizing at its defaults rather
+        // than failing the whole load: the user's DATA is fine, and refusing
+        // to open a 10GB file because a layout file is damaged would be a poor
+        // trade.
+        if let Ok(Some(s)) = ferrix_io::load_sizing(&path) {
+            self.set_sizing(s);
+            self.sizing_dirty = false;
+        }
+    }
+
+    /// Whether sizing has unsaved changes.
+    pub fn sizing_is_dirty(&self) -> bool {
+        self.sizing_dirty
     }
 
     /// Merge the current selection, or unmerge if it already covers merges.
@@ -5006,7 +5101,367 @@ impl FerrixApp {
             // grid's own resolver handles it.
             table: None,
             pad,
+            hidden: self.hidden_rows.as_ref(),
         }
+    }
+
+    // --- row and column sizing, hiding, grouping (issue #29) ---
+    //
+    // Every operation below is a PLAIN METHOD with no gesture attached, and
+    // the harness tests drive these directly. The pointer gestures in the
+    // paint loop are thin wrappers that call them, so a test proves the
+    // operation preserves meaning rather than proving drag arithmetic.
+
+    /// How many rows autofit is allowed to inspect beyond the viewport.
+    ///
+    /// The whole point of the bound: autofitting a column of a 200M-row sheet
+    /// must return instantly, so it measures what is on screen plus a capped
+    /// sample and NEVER the column. A wider sample buys a slightly better
+    /// width and costs unbounded time on exactly the files Ferrix exists for.
+    pub const AUTOFIT_SAMPLE: usize = 1000;
+
+    /// Width column `col` should take to fit its visible content.
+    ///
+    /// Returns the width AND the number of rows actually inspected, so the
+    /// bound can be asserted rather than inferred from a suspiciously fast
+    /// test. The count is the honest one: every row whose display string was
+    /// materialised.
+    pub fn autofit_width_measured(&self, col: usize) -> (f32, usize) {
+        let view = self.wb.view();
+        let rows = view.row_count();
+        let mut inspected = 0usize;
+        let mut widest = view.header_or_letter(col).len();
+
+        // 1. The rows actually on screen — what the user is looking at, and
+        //    the reason a visible long value is never clipped by autofit.
+        let mut seen: Vec<u32> = self.last_painted_rows.iter().map(|&(_, r)| r).collect();
+
+        // 2. A bounded sample STRIDED over the sheet, so the width reflects
+        //    the whole column's shape rather than just its first screenful.
+        //    The stride is what keeps this O(SAMPLE) instead of O(rows).
+        let budget = Self::AUTOFIT_SAMPLE;
+        let step = (rows / budget).max(1);
+        let mut r = 0usize;
+        while r < rows && seen.len() < budget + self.last_painted_rows.len() {
+            seen.push(r as u32);
+            r += step;
+        }
+        seen.sort_unstable();
+        seen.dedup();
+
+        for row in seen {
+            if (row as usize) >= rows && rows > 0 {
+                continue;
+            }
+            let text = view.display(CellRef::new(row, col as u32));
+            widest = widest.max(text.chars().count());
+            inspected += 1;
+        }
+        (width_for(widest), inspected)
+    }
+
+    /// Autofit a column to its visible content, bounded by [`Self::AUTOFIT_SAMPLE`].
+    pub fn autofit_column(&mut self, col: usize) {
+        let (w, inspected) = self.autofit_width_measured(col);
+        self.last_autofit_rows = inspected;
+        self.set_col_width(col, w);
+        self.status = format!(
+            "Autofit column {} to {:.0}px from {} sampled row{}",
+            ferrix_core::column_name(col as u32),
+            w,
+            inspected,
+            if inspected == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Rows the last autofit inspected, for tests that assert the BOUND.
+    pub fn last_autofit_rows(&self) -> usize {
+        self.last_autofit_rows
+    }
+
+    /// Outline toggle buttons the gutter painted last frame.
+    pub fn outline_button_count(&self) -> usize {
+        self.last_outline_buttons
+    }
+
+    /// The header hide/unhide menu, when open. `(column, position)`.
+    pub fn header_menu_col(&self) -> Option<usize> {
+        self.header_menu.map(|(c, _)| c)
+    }
+
+    /// Open the header menu without a pointer, for the harness.
+    pub fn open_header_menu(&mut self, col: usize) {
+        self.header_menu = Some((col, egui::pos2(0.0, 0.0)));
+    }
+
+    /// The hide/unhide menu a right-click on a header opens.
+    ///
+    /// Painted as an egui Area so it floats above the grid; the grid already
+    /// suppresses its own hit-testing while the pointer is over a floating
+    /// area, so clicking a menu item cannot also land on the cell beneath.
+    fn show_header_menu(&mut self, ctx: &egui::Context) {
+        let Some((col, pos)) = self.header_menu else {
+            return;
+        };
+        let mut close = false;
+        egui::Area::new(egui::Id::new("ferrix_header_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(
+                        RichText::new(format!("Column {}", ferrix_core::column_name(col as u32)))
+                            .strong(),
+                    );
+                    ui.separator();
+                    if ui.button("Hide").clicked() {
+                        self.set_col_hidden(col, true);
+                        close = true;
+                    }
+                    // Unhiding names the NEIGHBOURS, because a hidden column
+                    // cannot be right-clicked: it has no pixels. This is the
+                    // only way back for the column the user just hid.
+                    let hidden_left = (0..col).rev().find(|&c| self.is_col_hidden(c));
+                    let hidden_right = (col + 1..self.stats_cols).find(|&c| self.is_col_hidden(c));
+                    if let Some(h) = hidden_left {
+                        if ui
+                            .button(format!(
+                                "Unhide {} (left)",
+                                ferrix_core::column_name(h as u32)
+                            ))
+                            .clicked()
+                        {
+                            self.set_col_hidden(h, false);
+                            close = true;
+                        }
+                    }
+                    if let Some(h) = hidden_right {
+                        if ui
+                            .button(format!(
+                                "Unhide {} (right)",
+                                ferrix_core::column_name(h as u32)
+                            ))
+                            .clicked()
+                        {
+                            self.set_col_hidden(h, false);
+                            close = true;
+                        }
+                    }
+                    if ui.button("Unhide all columns").clicked() {
+                        self.unhide_all_cols();
+                        close = true;
+                    }
+                    ui.separator();
+                    if ui.button("Autofit width").clicked() {
+                        self.autofit_column(col);
+                        close = true;
+                    }
+                    if ui.button("Reset width").clicked() {
+                        self.set_col_width(col, crate::grid::DEFAULT_COL_WIDTH);
+                        close = true;
+                    }
+                    ui.separator();
+                    // Row operations on the current selection, so grouping and
+                    // hiding rows are reachable without a second menu.
+                    let (r0, r1) = self.selection.row_range();
+                    if ui
+                        .button(format!("Hide rows {}–{}", r0 + 1, r1 + 1))
+                        .clicked()
+                    {
+                        self.hide_rows(r0, r1);
+                        close = true;
+                    }
+                    if ui.button("Unhide all rows").clicked() {
+                        let n = self.wb.view().row_count() as u32;
+                        self.unhide_rows(0, n.saturating_sub(1));
+                        close = true;
+                    }
+                    if ui
+                        .button(format!("Group rows {}–{}", r0 + 1, r1 + 1))
+                        .clicked()
+                    {
+                        if let Err(e) = self.group_rows(r0, r1) {
+                            self.status = format!("Group failed: {e}");
+                        }
+                        close = true;
+                    }
+                    if ui.button("Ungroup rows").clicked() {
+                        if !self.ungroup_rows(r0) {
+                            self.status = "No group at that row".to_string();
+                        }
+                        close = true;
+                    }
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.header_menu = None;
+        }
+    }
+
+    /// Set a column's width, keeping the dense paint vector and the persisted
+    /// sizing map in step. Both are updated HERE, in one place, so a width can
+    /// never paint at one size and save at another.
+    pub fn set_col_width(&mut self, col: usize, w: f32) {
+        let w = w.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+        if self.col_widths.len() <= col {
+            self.col_widths
+                .resize(col + 1, crate::grid::DEFAULT_COL_WIDTH);
+        }
+        self.col_widths[col] = w;
+        self.sizing.cols.set_width(col as u32, w);
+        self.mark_sizing_dirty();
+    }
+
+    /// Width a column currently paints at.
+    pub fn col_width(&self, col: usize) -> f32 {
+        self.col_widths
+            .get(col)
+            .copied()
+            .unwrap_or(crate::grid::DEFAULT_COL_WIDTH)
+    }
+
+    /// Hide or unhide a column.
+    pub fn set_col_hidden(&mut self, col: usize, hidden: bool) {
+        if hidden {
+            self.sizing.cols.hide(col as u32);
+        } else {
+            self.sizing.cols.unhide(col as u32);
+        }
+        self.hidden_cols = self.sizing.hidden_col_set();
+        self.mark_sizing_dirty();
+        self.status = format!(
+            "{} column {}",
+            if hidden { "Hid" } else { "Unhid" },
+            ferrix_core::column_name(col as u32)
+        );
+    }
+
+    pub fn toggle_col_hidden(&mut self, col: usize) {
+        self.set_col_hidden(col, !self.is_col_hidden(col));
+    }
+
+    pub fn is_col_hidden(&self, col: usize) -> bool {
+        self.hidden_cols.contains(&(col as u32))
+    }
+
+    /// Unhide every column — the escape hatch for a column the user cannot
+    /// select because it is not on screen.
+    pub fn unhide_all_cols(&mut self) {
+        let n = self.sizing.cols.hidden_count();
+        self.sizing.cols.unhide_all();
+        self.hidden_cols = self.sizing.hidden_col_set();
+        self.mark_sizing_dirty();
+        self.status = format!("Unhid {n} column{}", if n == 1 { "" } else { "s" });
+    }
+
+    /// Set an explicit row height. Zero hides the row, matching Excel.
+    pub fn set_row_height(&mut self, first: u32, last: u32, h: f32) {
+        self.sizing.rows.set_range(first, last, h);
+        self.rebuild_hidden_rows();
+    }
+
+    /// Hide rows by setting their height to zero.
+    pub fn hide_rows(&mut self, first: u32, last: u32) {
+        self.sizing.rows.hide(first, last);
+        self.rebuild_hidden_rows();
+        self.status = format!("Hid rows {}–{}", first + 1, last + 1);
+    }
+
+    pub fn unhide_rows(&mut self, first: u32, last: u32) {
+        self.sizing.rows.unhide(first, last);
+        self.rebuild_hidden_rows();
+        self.status = format!("Unhid rows {}–{}", first + 1, last + 1);
+    }
+
+    pub fn is_row_hidden(&self, row: u32) -> bool {
+        self.hidden_rows.as_ref().is_some_and(|h| h.is_hidden(row))
+    }
+
+    /// Group rows into an outline level.
+    pub fn group_rows(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<u8, ferrix_core::sizing::OutlineError> {
+        let level = self.sizing.row_outline.group(first, last)?;
+        self.rebuild_hidden_rows();
+        self.status = format!("Grouped rows {}–{} at level {level}", first + 1, last + 1);
+        Ok(level)
+    }
+
+    /// Remove the innermost group covering a row.
+    pub fn ungroup_rows(&mut self, row: u32) -> bool {
+        let removed = self.sizing.row_outline.ungroup_at(row).is_some();
+        if removed {
+            self.rebuild_hidden_rows();
+            self.status = format!("Ungrouped at row {}", row + 1);
+        }
+        removed
+    }
+
+    /// Collapse or expand the group starting at `row`.
+    pub fn toggle_row_group(&mut self, row: u32) -> Option<bool> {
+        let collapsed = self.sizing.row_outline.toggle_at(row)?;
+        self.rebuild_hidden_rows();
+        self.status = format!(
+            "{} group at row {}",
+            if collapsed { "Collapsed" } else { "Expanded" },
+            row + 1
+        );
+        Some(collapsed)
+    }
+
+    /// Outline nesting level covering a row, 0 when ungrouped.
+    pub fn row_outline_level(&self, row: u32) -> u8 {
+        self.sizing.row_outline.level_at(row)
+    }
+
+    /// Show only outline levels up to `level`.
+    pub fn collapse_rows_to_level(&mut self, level: u8) {
+        self.sizing.row_outline.collapse_to_level(level);
+        self.rebuild_hidden_rows();
+        self.status = format!("Showing outline levels 1–{level}");
+    }
+
+    /// The sizing state, for persistence and tests.
+    pub fn sizing(&self) -> &ferrix_core::sizing::SheetSizing {
+        &self.sizing
+    }
+
+    /// Replace the sizing state wholesale — the load path.
+    pub fn set_sizing(&mut self, s: ferrix_core::sizing::SheetSizing) {
+        self.sizing = s;
+        // The dense width vector is the paint path's copy of the same facts,
+        // so it is rebuilt from the loaded map rather than left stale.
+        for (c, w) in self.sizing.cols.widths() {
+            let c = c as usize;
+            if self.col_widths.len() <= c {
+                self.col_widths
+                    .resize(c + 1, crate::grid::DEFAULT_COL_WIDTH);
+            }
+            self.col_widths[c] = w;
+        }
+        self.hidden_cols = self.sizing.hidden_col_set();
+        self.rebuild_hidden_rows();
+    }
+
+    /// Rebuild the folded hidden-row index.
+    ///
+    /// ONE index, rebuilt whenever anything that hides a row changes, and
+    /// handed to the resolver as a single stage. Cost is O(spans).
+    fn rebuild_hidden_rows(&mut self) {
+        let h = self.sizing.hidden_rows();
+        self.hidden_rows = (!h.is_empty()).then_some(h);
+        self.mark_sizing_dirty();
+    }
+
+    fn mark_sizing_dirty(&mut self) {
+        self.sizing_dirty = true;
     }
 
     /// Turn filter mode on or off, keeping the viewport and selection anchored
@@ -6630,6 +7085,10 @@ impl FerrixApp {
         // --- sheet tabs (below the status bar, like every spreadsheet) ---
         self.show_sheet_tabs(ctx);
 
+        // The header hide/unhide menu floats over the grid, so it is shown
+        // before the CentralPanel paints underneath it.
+        self.show_header_menu(ctx);
+
         // --- grid ---
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(th.bg))
@@ -6715,6 +7174,10 @@ impl FerrixApp {
                         },
                         metrics: crate::grid::Metrics::new(self.zoom),
                         panes: &mut self.panes,
+                        hidden_cols: Some(&self.hidden_cols),
+                        hidden_rows: self.hidden_rows.as_ref(),
+                        row_outline: Some(&self.sizing.row_outline),
+                        col_resizing: self.col_resize,
                     }
                     .show(ui)
                 };
@@ -6860,6 +7323,47 @@ impl FerrixApp {
                         );
                     }
                 }
+                // --- column resize / autofit / hide, outline (issue #29) ---
+                //
+                // Each branch calls the plain method the harness tests drive
+                // directly. The gesture supplies coordinates; the method owns
+                // the meaning.
+                if let Some((c, x, w)) = resp.resize_started {
+                    self.col_resize = Some((c, x, w));
+                }
+                if let Some((c, w)) = resp.resize_to {
+                    // Live preview in the status bar while the drag is in
+                    // flight; the width is only committed on release.
+                    self.status = format!(
+                        "Column {} width {:.0}px",
+                        ferrix_core::column_name(c as u32),
+                        w.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+                    );
+                }
+                if resp.resize_released {
+                    // Committed from the app's OWN drag state plus this
+                    // frame's pointer, so the release frame — on which egui
+                    // has already cleared `is_dragging` — still lands.
+                    if let (Some((c, _, _)), Some((_, w))) = (self.col_resize, resp.resize_to) {
+                        self.set_col_width(c, w);
+                        self.status = format!(
+                            "Column {} resized to {:.0}px",
+                            ferrix_core::column_name(c as u32),
+                            self.col_width(c)
+                        );
+                    }
+                    self.col_resize = None;
+                }
+                if let Some(c) = resp.col_autofit {
+                    self.autofit_column(c);
+                }
+                if let Some((c, pos)) = resp.header_context {
+                    self.header_menu = Some((c, pos));
+                }
+                if let Some(row) = resp.outline_toggle {
+                    self.toggle_row_group(row);
+                }
+                self.last_outline_buttons = resp.outline_buttons;
                 // --- header reorder ---
                 //
                 // Press starts the drag and selects the whole column, so the
@@ -7732,6 +8236,14 @@ fn compute_col_widths_mapped(m: &ferrix_io::MappedSheet) -> Vec<f32> {
         })
         .collect()
 }
+
+/// Narrowest a column may be dragged. A column the user can drag to nothing is
+/// a column they cannot find again; hiding is the deliberate way to make one
+/// disappear, and it is reversible from the header menu.
+pub const MIN_COL_WIDTH: f32 = 24.0;
+/// Widest a single column may be, so one runaway value cannot push every other
+/// column off screen.
+pub const MAX_COL_WIDTH: f32 = 1200.0;
 
 fn width_for(chars: usize) -> f32 {
     let w = chars as f32 * 7.2 + 20.0;

@@ -27,6 +27,7 @@ pub mod scene;
 pub mod search;
 pub mod selection;
 pub mod sheet;
+pub mod sizing;
 pub mod sort;
 pub mod table;
 pub mod tsv;
@@ -53,6 +54,10 @@ pub use search::{
 };
 pub use selection::Selection;
 pub use sheet::{column_name, CellRef, Sheet, SheetCell, SheetId};
+pub use sizing::{
+    ColSizes, HiddenRows, Outline, OutlineError, OutlineGroup, RowSizes, SheetSizing,
+    MAX_OUTLINE_LEVEL,
+};
 pub use sort::{cycle_click, CellKeys, SortCell, SortDir, SortKey, SortOrder};
 pub use table::{
     CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,

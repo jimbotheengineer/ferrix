@@ -23,6 +23,7 @@ pub mod mapped;
 pub mod pool;
 pub mod protect_xlsx;
 pub mod safeguard;
+pub mod sizing_sidecar;
 pub mod table_xlsx;
 pub mod xlsx;
 
@@ -49,6 +50,7 @@ pub use safeguard::{
     inspect_archive, open_checked, safe_entry_path, safe_extract_path, ArchiveReport, Limits,
     SafeguardError,
 };
+pub use sizing_sidecar::{load_sizing, save_sizing, sizing_path_for, SizeSidecarError};
 pub use table_xlsx::{
     import_comments, import_tables, write_table, FerrixTag, ImportedComment, ImportedTable,
 };

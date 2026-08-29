@@ -29,7 +29,10 @@
 //! stays exact past 10^15 rows — far beyond any file that fits on a disk.
 
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
+use ferrix_core::sizing::{HiddenRows, Outline};
 use ferrix_core::{column_name, CellRef, RowFilter, Selection, SortOrder, Value};
+
+use std::collections::BTreeSet;
 
 use crate::sheet_view::SheetView;
 use crate::table_view::TableDecor;
@@ -322,6 +325,19 @@ pub struct RowResolver<'a> {
     pub table: Option<&'a TableDecor<'a>>,
     /// Empty rows offered past the end of the sheet, when the toggle is on.
     pub pad: Option<PadSpace>,
+    /// Rows hidden by a zero height or a collapsed outline group (issue #29).
+    ///
+    /// A STAGE OF THIS RESOLVER, not a lookup the painter does for itself.
+    /// Hiding narrows the screen index before the filter/sort mappings see
+    /// it, exactly as the table filter narrows before the search filter: the
+    /// paint loop asks for screen row N and gets the Nth row that survives
+    /// every transform, so no caller can pair a hidden-row test with a row
+    /// number that came from a different mapping.
+    ///
+    /// Indexed in the space the mappings below it consume — see
+    /// [`HiddenRows`] and `FerrixApp::hidden_index`, which projects underlying
+    /// spans into view space when a sort or filter is also active.
+    pub hidden: Option<&'a HiddenRows>,
 }
 
 impl<'a> RowResolver<'a> {
@@ -331,6 +347,15 @@ impl<'a> RowResolver<'a> {
         if let Some(row) = self.pad.and_then(|p| p.data_row(r)) {
             return Some(ScreenRow::Pad(row));
         }
+        // Hiding is applied FIRST among the real transforms: it turns "the Nth
+        // row on screen" into "the Nth row that is not hidden", which is the
+        // index the filter and sort mappings are built over. Applying it after
+        // them would test a hidden row against an already-mapped index and
+        // skip the wrong record.
+        let r = match self.hidden {
+            Some(h) if !h.is_empty() => h.nth_visible(r),
+            _ => r,
+        };
         // Sort is composed AFTER the filters: its candidate set was the rows
         // they kept, so its values are underlying rows and asking a filter
         // again would map an already-mapped index a second time.
@@ -358,26 +383,43 @@ impl<'a> RowResolver<'a> {
         if let Some(v) = self.pad.and_then(|p| p.screen_row(row)) {
             return Some(v);
         }
-        if let Some(s) = self.sort {
-            return s.visible_of(row);
-        }
-        match self.filter {
-            Some(f) => f.visible_of(row),
-            None => Some(row as usize),
+        // Mirror of `resolve`, in reverse order: undo the mappings first, then
+        // undo the hiding. A hidden row has no screen position at all, which
+        // is what stops the in-cell editor drawing over the row that took its
+        // place.
+        let pre_hide = if let Some(s) = self.sort {
+            s.visible_of(row)?
+        } else {
+            match self.filter {
+                Some(f) => f.visible_of(row)?,
+                None => row as usize,
+            }
+        };
+        match self.hidden {
+            Some(h) if !h.is_empty() => h.visible_index(pre_hide as u32),
+            _ => Some(pre_hide),
         }
     }
 
     /// Rows the view transforms resolve, before padding is added on top.
     pub fn resolved_rows(&self, data_rows: usize) -> usize {
-        if let Some(s) = self.sort {
-            return s.len();
-        }
-        match self.filter {
-            Some(f) => f.len(),
-            None => match self.table {
-                Some(t) => t.visible_row_count(data_rows),
-                None => data_rows,
-            },
+        let mapped = if let Some(s) = self.sort {
+            s.len()
+        } else {
+            match self.filter {
+                Some(f) => f.len(),
+                None => match self.table {
+                    Some(t) => t.visible_row_count(data_rows),
+                    None => data_rows,
+                },
+            }
+        };
+        // Hidden rows shorten the view, so the scrollable extent — and with it
+        // where the empty-row padding starts — has to shrink by the same
+        // amount. Otherwise the last screen rows resolve past the end.
+        match self.hidden {
+            Some(h) if !h.is_empty() => h.visible_count(mapped),
+            _ => mapped,
         }
     }
 }
@@ -490,6 +532,31 @@ pub struct GridResponse {
     /// a test asserting "the marker is gone" reads the screen rather than the
     /// model.
     pub comment_markers: usize,
+    /// Column whose RIGHT BORDER was pressed, with the pointer x and the
+    /// column's current width. Reported on PRESS — see [`GridResponse::header_press`]
+    /// for why keying a gesture off a click (which fires on release) makes it
+    /// never start.
+    pub resize_started: Option<(usize, f32, f32)>,
+    /// Column and the width the in-flight resize drag currently implies.
+    ///
+    /// Reported from the app's OWN press/release state, never from egui's
+    /// `is_dragging`: that flag only turns on past a movement threshold and is
+    /// cleared on the release frame, so the target would vanish exactly when
+    /// the drop needs it.
+    pub resize_to: Option<(usize, f32)>,
+    /// Set on the frame a resize drag is released.
+    pub resize_released: bool,
+    /// Column whose border was double-clicked — the autofit gesture.
+    pub col_autofit: Option<usize>,
+    /// Header that was right-clicked, and where, for the hide/unhide menu.
+    pub header_context: Option<(usize, egui::Pos2)>,
+    /// Outline group whose expand/collapse button was clicked, named by the
+    /// group's first row.
+    pub outline_toggle: Option<u32>,
+    /// Outline toggle buttons painted this frame. Real paint output, so a test
+    /// can assert the gutter actually drew a control rather than trusting the
+    /// model.
+    pub outline_buttons: usize,
 }
 
 pub struct Grid<'a> {
@@ -558,6 +625,21 @@ pub struct Grid<'a> {
     /// Frozen / split leading band. Mutable because a SPLIT band scrolls
     /// independently, and the wheel over the band is what moves it.
     pub panes: &'a mut Panes,
+    /// Columns hidden explicitly or by a collapsed column group (issue #29).
+    ///
+    /// Consumed through `width_of`, which reports a hidden column as ZERO
+    /// WIDE. Paint and hit-testing both derive from that one function, so a
+    /// hidden column cannot be skipped by one and hit by the other.
+    pub hidden_cols: Option<&'a BTreeSet<u32>>,
+    /// Rows hidden by a zero height or a collapsed group. Composed into
+    /// [`RowResolver`] as a stage — never consulted directly by the painter.
+    pub hidden_rows: Option<&'a HiddenRows>,
+    /// Row outline groups, for the expand/collapse gutter.
+    pub row_outline: Option<&'a Outline>,
+    /// Column currently being resized by its border, with the pointer x the
+    /// drag started at and the width it started from. Owned by the APP between
+    /// press and release, so the gesture survives the release frame.
+    pub col_resizing: Option<(usize, f32, f32)>,
 }
 
 fn sheet_c32(c: ferrix_core::Rgb) -> egui::Color32 {
@@ -653,6 +735,7 @@ impl<'a> Grid<'a> {
             sort: self.sort,
             table: self.table,
             pad: None,
+            hidden: self.hidden_rows,
         };
         let filtered_rows = unpadded.resolved_rows(data_rows);
         // Empty padding (issue #20) extends only the scrollable EXTENT. It is
@@ -678,7 +761,19 @@ impl<'a> Grid<'a> {
 
         let m = self.metrics;
         let row_h = m.row_h;
+        // THE column width. A hidden column is ZERO WIDE rather than absent
+        // from a separate list, so the prefix sum, the paint loop, the header
+        // band and the hit test all agree by construction: a zero-wide column
+        // occupies no pixels to paint into and no pixels to click on, and its
+        // NEIGHBOUR keeps the x range the hidden column gave up. A parallel
+        // "visible columns" vector would have needed every one of those call
+        // sites to consult it, and the one that forgot would hit-test a
+        // column the user cannot see.
+        let hidden_cols = self.hidden_cols;
         let width_of = |c: usize| -> f32 {
+            if hidden_cols.is_some_and(|h| h.contains(&(c as u32))) {
+                return 0.0;
+            }
             m.col_width(self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH))
         };
 
@@ -1642,9 +1737,74 @@ impl<'a> Grid<'a> {
             header_hitboxes.push((c, r.center()));
         }
         let pointer_in_header = pointer_pos.is_some_and(|p| col_header.contains(p));
+
+        // --- column resize / autofit gesture (issue #29) ---
+        //
+        // The grab zone is a few pixels either side of a column's RIGHT edge.
+        // Hidden columns are zero wide, so their edge coincides with the
+        // neighbour's; `rev()` makes the last (visible) column at a given x
+        // win, which is what lets the user drag the border of the column
+        // AFTER a hidden one rather than silently resizing the invisible one.
+        let mut resize_started = None;
+        let mut resize_to = None;
+        let mut resize_released = false;
+        let mut col_autofit = None;
+        let mut header_context = None;
+        let grab = 4.0 * m.zoom;
+        let edge_col = |px: f32| -> Option<usize> {
+            col_bands
+                .iter()
+                .rev()
+                .find(|&&(c, x)| {
+                    let right = x + width_of(c);
+                    width_of(c) > 0.0 && (px - right).abs() <= grab
+                })
+                .map(|&(c, _)| c)
+        };
+        let on_edge = pointer_pos
+            .filter(|_| pointer_in_header)
+            .and_then(|p| edge_col(p.x));
+        if let Some(c) = on_edge {
+            // A resize press must not ALSO start a header reorder drag: the
+            // two gestures begin with the same button on overlapping pixels,
+            // and letting both fire moved the column the user meant to widen.
+            if primary_pressed {
+                resize_started = pointer_pos.map(|p| (c, p.x, width_of(c)));
+            }
+            if primary_double {
+                col_autofit = Some(c);
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        // Right-click a header: the hide/unhide menu. Resolved through the
+        // same `col_at_x` a left press uses, so the menu cannot open on a
+        // different column than a click would select.
+        if pointer_in_header && secondary_clicked {
+            header_context = pointer_pos.and_then(|p| col_at_x(p.x).map(|c| (c, p)));
+        }
+        // The in-flight drag is tracked from the APP's own state, not egui's
+        // `is_dragging` — that flag is cleared on the release frame, so the
+        // final width would be lost exactly when it is needed.
+        if let Some((c, from_x, start_w)) = self.col_resizing {
+            if let Some(p) = pointer_pos {
+                resize_to = Some((c, (start_w + (p.x - from_x)).max(0.0)));
+                // Preview line at the width the release would commit.
+                hp.vline(
+                    p.x,
+                    outer.min.y..=outer.max.y,
+                    Stroke::new(1.5_f32, th.accent),
+                );
+            }
+            if !dragging {
+                resize_released = true;
+            }
+        }
         if pointer_in_header {
             if primary_pressed {
-                header_press = pointer_pos.and_then(|p| col_at_x(p.x));
+                // A press on a border is a RESIZE, not a reorder.
+                header_press = pointer_pos
+                    .filter(|_| on_edge.is_none())
+                    .and_then(|p| col_at_x(p.x));
             }
             // Report the hovered column whenever a header drag is in flight,
             // WITHOUT requiring egui's `dragging` flag. That flag only turns on
@@ -1710,6 +1870,21 @@ impl<'a> Grid<'a> {
         );
         hp.rect_filled(row_header, 0.0, th.header_bg);
         let rhp = hp.with_clip_rect(row_header);
+        // --- outline gutter (issue #29) ---
+        //
+        // A strip on the LEFT of the row numbers, one indent per nesting
+        // level, carrying a [-]/[+] button on each group's summary row. Width
+        // is driven by how deep the outline actually goes, so a sheet with no
+        // groups loses no space at all.
+        let outline_depth = self.row_outline.map(|o| o.max_level()).unwrap_or(0);
+        let indent = 11.0 * m.zoom;
+        let gutter_w = if outline_depth == 0 {
+            0.0
+        } else {
+            (outline_depth as f32 + 1.0) * indent
+        };
+        let mut outline_toggle: Option<u32> = None;
+        let mut outline_buttons = 0usize;
         // Row headers carry the ORIGINAL row number even under a filter. A
         // filtered view that renumbered its rows 1..N would be actively
         // misleading: the whole point of finding row 4,912,733 is knowing it
@@ -1734,6 +1909,10 @@ impl<'a> Grid<'a> {
             // user must always be able to tell which rows are hidden.
             let rect =
                 Rect::from_min_size(egui::pos2(outer.min.x, y), Vec2::new(m.row_header_w, row_h));
+            // The number is pushed right of the outline gutter so a group
+            // spine never draws through it.
+            let num_rect =
+                Rect::from_min_max(egui::pos2(rect.min.x + gutter_w, rect.min.y), rect.max);
             let selected = self.selection.is_some_and(|s| {
                 let (a, b) = s.row_range();
                 row >= a && row <= b
@@ -1744,11 +1923,54 @@ impl<'a> Grid<'a> {
             if selected {
                 rhp.rect_filled(rect, 0.0, th.accent_soft);
             }
+            // Outline gutter for this row: the nesting spine, plus the
+            // collapse/expand button on a group's first row. Only real rows
+            // carry groups — padding is past the end of every range.
+            if let (Some(outline), false) = (self.row_outline, resolved.is_pad()) {
+                let level = outline.level_at(row);
+                if level > 0 {
+                    let x = rect.min.x + (level as f32 - 0.5) * indent;
+                    rhp.vline(
+                        x,
+                        rect.min.y..=rect.max.y,
+                        Stroke::new(1.0_f32, th.grid_line),
+                    );
+                }
+                if let Some(g) = outline.group_starting_at(row) {
+                    let bx = rect.min.x + (g.level as f32 - 0.5) * indent;
+                    let btn = Rect::from_center_size(
+                        egui::pos2(bx, rect.center().y),
+                        Vec2::splat(9.0 * m.zoom),
+                    );
+                    rhp.rect_filled(btn, 1.0, th.panel);
+                    rhp.rect_stroke(btn, 1.0, Stroke::new(1.0_f32, th.text_dim));
+                    // Minus when open, plus when collapsed — the same glyph
+                    // convention Excel uses.
+                    rhp.hline(
+                        btn.min.x + 2.0..=btn.max.x - 2.0,
+                        btn.center().y,
+                        Stroke::new(1.2_f32, th.text),
+                    );
+                    if g.collapsed {
+                        rhp.vline(
+                            btn.center().x,
+                            btn.min.y + 2.0..=btn.max.y - 2.0,
+                            Stroke::new(1.2_f32, th.text),
+                        );
+                    }
+                    outline_buttons += 1;
+                    // Hit-tested here, from the rect that was just painted, so
+                    // the button cannot drift from where it is drawn.
+                    if primary_clicked && pointer_pos.is_some_and(|p| btn.expand(2.0).contains(p)) {
+                        outline_toggle = Some(row);
+                    }
+                }
+            }
             // A padding row still shows its would-be number, so the user can
             // see where they are, but dimmed — it is not a row of the file
             // yet. Typing into it is what makes it one.
             rhp.text(
-                egui::pos2(rect.max.x - 8.0 * m.zoom, rect.center().y),
+                egui::pos2(num_rect.max.x - 8.0 * m.zoom, num_rect.center().y),
                 Align2::RIGHT_CENTER,
                 (row as u64 + 1).to_string(),
                 FontId::proportional(11.5 * m.zoom),
@@ -1801,6 +2023,13 @@ impl<'a> Grid<'a> {
             hovered_comment,
             comment_markers,
             context_click,
+            resize_started,
+            resize_to,
+            resize_released,
+            col_autofit,
+            header_context,
+            outline_toggle,
+            outline_buttons,
         }
     }
 }
