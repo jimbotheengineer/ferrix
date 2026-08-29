@@ -5953,4 +5953,77 @@ xxx,yyy,zzz
         );
         let _ = std::fs::remove_file(&p);
     }
+
+    /// Wrapping composes with a SORT: the tall row follows its record.
+    ///
+    /// The composition case the guide's one-row-resolution rule exists for.
+    /// Row heights are resolved through `RowResolver` like everything else,
+    /// so sorting must move the tall row to wherever its RECORD went. A second
+    /// height mapping keyed on screen position would leave the tall row parked
+    /// at its old screen index — the "wrong records under correct row numbers"
+    /// failure, wearing a different hat.
+    ///
+    /// Asserted on the cell's own painted rect, so it reads the geometry the
+    /// grid produced rather than a model of it.
+    #[test]
+    fn a_wrapped_row_follows_its_record_through_a_sort() {
+        // `zz` sorts last and `aa` first, so sorting ascending on column 0
+        // moves the long-note record from the top to the bottom.
+        let p = write_csv(
+            "decor_wrap_sort.csv",
+            "key,note\nzz,a very long note that must wrap across several lines to fit the cell\naa,short\nmm,tiny\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+
+        let tall = CellRef::new(0, 1);
+        h.select(tall, tall);
+        h.steps(2);
+        h.apply_decor(ferrix_core::CellDecor::default().with_wrap(true));
+
+        let base = h
+            .painted_row_height(CellRef::new(1, 1))
+            .expect("short row on screen");
+        let before = h.painted_row_height(tall).expect("tall row on screen");
+        assert!(
+            before > base + 1.0,
+            "the wrapped row is not actually taller: {base} -> {before}"
+        );
+        let y_before = h.app().cell_rect(tall).expect("rect").min.y;
+
+        // Sort ascending on the key column. `zz` goes last, so the wrapped
+        // record moves DOWN the screen.
+        h.click_header(0);
+        h.steps(2);
+
+        let after = h
+            .painted_row_height(tall)
+            .expect("the tall row is still on screen after the sort");
+        assert_eq!(
+            after, before,
+            "the wrapped row changed height when it was sorted — its height is \
+             being derived from a screen position rather than from its record"
+        );
+        let y_after = h.app().cell_rect(tall).expect("rect").min.y;
+        assert!(
+            y_after > y_before,
+            "the record that sorts last did not move down: {y_before} -> {y_after}"
+        );
+        assert_eq!(
+            h.painted_wrapped_texts(),
+            1,
+            "exactly one cell should still be wrapped after the sort"
+        );
+
+        // And a click at the sorted position still lands on that record.
+        let rect = h.app().cell_rect(tall).expect("rect");
+        h.click_point(rect.center().x, rect.max.y - 3.0);
+        assert_eq!(
+            h.app().selection().cursor,
+            tall,
+            "a click inside the sorted, wrapped row resolved to a different cell"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }
