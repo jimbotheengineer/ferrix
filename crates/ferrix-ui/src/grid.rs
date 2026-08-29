@@ -29,7 +29,7 @@
 //! stays exact past 10^15 rows — far beyond any file that fits on a disk.
 
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, Vec2};
-use ferrix_core::{column_name, CellRef, RowFilter, Selection, Value};
+use ferrix_core::{column_name, CellRef, RowFilter, Selection, SortOrder, Value};
 
 use crate::sheet_view::SheetView;
 use crate::table_view::TableDecor;
@@ -87,7 +87,7 @@ impl PadSpace {
 
 /// What a screen row turned out to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScreenRow {
+pub enum ScreenRow {
     /// A real row, resolved through whichever filters are active.
     Data(u32),
     /// Empty padding past the end of the sheet. Addressable — typing here
@@ -98,15 +98,107 @@ enum ScreenRow {
 
 impl ScreenRow {
     #[inline]
-    fn row(self) -> u32 {
+    pub fn row(self) -> u32 {
         match self {
             ScreenRow::Data(r) | ScreenRow::Pad(r) => r,
         }
     }
 
     #[inline]
-    fn is_pad(self) -> bool {
+    pub fn is_pad(self) -> bool {
         matches!(self, ScreenRow::Pad(_))
+    }
+}
+
+/// THE row resolution. One implementation, every caller.
+///
+/// Up to three view transforms can narrow or reorder the rows at once, and
+/// they compose in a FIXED order:
+///
+/// 1. the table's header filter maps a screen row to a data row by rank;
+/// 2. search filter mode selects among data rows;
+/// 3. sort permutes whatever survived — it is built OVER the filtered rows,
+///    so its values are already underlying data rows and it is consulted
+///    last, never alongside a filter.
+///
+/// Resolving these separately from the same screen index is exactly the bug
+/// that once painted WRONG RECORDS under CORRECT row numbers: whichever
+/// variable the caller happened to read won, and the other transform was
+/// silently ignored. So there is one resolver, it is built once per frame, and
+/// painting, row headers, hit-testing and the cell editor all go through it.
+///
+/// Padding is checked FIRST and short-circuits everything else. A padding row
+/// is not a filterable or sortable row: feeding its screen index to any of the
+/// three mappings would run off the end, or — under a shorter view — alias
+/// onto an unrelated record.
+#[derive(Clone, Copy, Default)]
+pub struct RowResolver<'a> {
+    /// Search filter mode's mapping, when on.
+    pub filter: Option<&'a RowFilter>,
+    /// Sort mapping, when a column is sorted. Built over the rows the filters
+    /// kept, so it supersedes them on the read path rather than competing.
+    pub sort: Option<&'a SortOrder>,
+    /// The table's header-filter mapping, when a filtered table is shown.
+    pub table: Option<&'a TableDecor<'a>>,
+    /// Empty rows offered past the end of the sheet, when the toggle is on.
+    pub pad: Option<PadSpace>,
+}
+
+impl<'a> RowResolver<'a> {
+    /// Screen row -> the row it actually shows.
+    #[inline]
+    pub fn resolve(&self, r: usize) -> Option<ScreenRow> {
+        if let Some(row) = self.pad.and_then(|p| p.data_row(r)) {
+            return Some(ScreenRow::Pad(row));
+        }
+        // Sort is composed AFTER the filters: its candidate set was the rows
+        // they kept, so its values are underlying rows and asking a filter
+        // again would map an already-mapped index a second time.
+        if let Some(s) = self.sort {
+            return s.underlying(r).map(ScreenRow::Data);
+        }
+        match self.filter {
+            // Search filter active: it already indexes data rows.
+            Some(f) => f.underlying(r),
+            // Otherwise the table mapping (identity when there is no table).
+            None => match self.table {
+                Some(t) => t.data_row(r).map(|d| d as u32),
+                None => Some(r as u32),
+            },
+        }
+        .map(ScreenRow::Data)
+    }
+
+    /// Underlying row -> screen row, or `None` when the view hides it.
+    #[inline]
+    pub fn visible_of(&self, row: u32) -> Option<usize> {
+        // A padding row is in no mapping, so it is resolved from the pad space
+        // FIRST — asking a filter about it would return None and the in-cell
+        // editor would have nowhere to draw.
+        if let Some(v) = self.pad.and_then(|p| p.screen_row(row)) {
+            return Some(v);
+        }
+        if let Some(s) = self.sort {
+            return s.visible_of(row);
+        }
+        match self.filter {
+            Some(f) => f.visible_of(row),
+            None => Some(row as usize),
+        }
+    }
+
+    /// Rows the view transforms resolve, before padding is added on top.
+    pub fn resolved_rows(&self, data_rows: usize) -> usize {
+        if let Some(s) = self.sort {
+            return s.len();
+        }
+        match self.filter {
+            Some(f) => f.len(),
+            None => match self.table {
+                Some(t) => t.visible_row_count(data_rows),
+                None => data_rows,
+            },
+        }
     }
 }
 
@@ -157,6 +249,15 @@ pub struct GridResponse {
     /// Set on the frame a header drag is released.
     pub header_released: bool,
     pub painted_cells: usize,
+    /// Where each visible column's header was actually painted this frame:
+    /// (display column, centre point).
+    ///
+    /// The header band's y moves whenever a bar above the grid opens — the
+    /// search bar alone shifts it by tens of pixels — so a test that hard-codes
+    /// header pixels silently starts clicking the search bar instead and
+    /// reports the feature as broken. This reports the real geometry so a
+    /// caller can aim at it.
+    pub header_hitboxes: Vec<(usize, egui::Pos2)>,
     /// Reported for callers that want to size scrollbars or prefetch; the app
     /// does not consume it yet, but it is part of the Grid's public response.
     #[allow(dead_code)]
@@ -210,27 +311,10 @@ pub struct Grid<'a> {
     /// Merged regions. `None` when the sheet has none, keeping the default
     /// paint path free of lookups.
     pub merges: Option<&'a ferrix_core::merge::MergeMap>,
-}
-
-impl<'a> Grid<'a> {
-    /// Underlying row for a visible row index, honouring the active filter.
-    #[inline]
-    fn underlying_row(filter: Option<&RowFilter>, visible: usize) -> Option<u32> {
-        match filter {
-            Some(f) => f.underlying(visible),
-            None => Some(visible as u32),
-        }
-    }
-
-    /// Visible row index for an underlying row, or `None` when the filter
-    /// hides it.
-    #[inline]
-    fn visible_row(filter: Option<&RowFilter>, underlying: u32) -> Option<usize> {
-        match filter {
-            Some(f) => f.visible_of(underlying),
-            None => Some(underlying as usize),
-        }
-    }
+    /// Active sort, when a column header has been clicked. A VIEW TRANSFORM:
+    /// it permutes which underlying row each screen row shows and never moves
+    /// a byte of data. Composed after the filters through [`RowResolver`].
+    pub sort: Option<&'a ferrix_core::SortOrder>,
 }
 
 impl<'a> Grid<'a> {
@@ -245,17 +329,12 @@ impl<'a> Grid<'a> {
         outer: Rect,
         scroll: &ScrollState,
         col_widths: &[f32],
-        filter: Option<&RowFilter>,
-        pad: Option<PadSpace>,
+        resolver: &RowResolver<'_>,
     ) -> Option<Rect> {
         let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
-        // A padding row is not in the filter's mapping, so it is resolved from
-        // the pad space FIRST — asking the filter about it would return None
-        // and the in-cell editor would have nowhere to draw.
-        let visible = match pad.and_then(|p| p.screen_row(cell.row)) {
-            Some(v) => v,
-            None => Self::visible_row(filter, cell.row)?,
-        };
+        // Through THE resolver, so the editor lands on the same screen row the
+        // paint loop drew the cell on — under a filter, a sort, or both.
+        let visible = resolver.visible_of(cell.row)?;
         let rel_row = visible as f64 - scroll.row_offset;
         let y = body_origin.y + (rel_row * ROW_HEIGHT as f64) as f32;
         if y + ROW_HEIGHT < body_origin.y || y > outer.max.y {
@@ -293,15 +372,16 @@ impl<'a> Grid<'a> {
         // the wrong records.
         let th = self.theme;
         let data_rows = view.row_count().max(1);
-        let table_rows = self
-            .table
-            .map_or(data_rows, |t| t.visible_row_count(data_rows));
-        // Rows the FILTERS resolve. Padding is added on top of this and is
-        // never part of it, which is what keeps padding out of both mappings.
-        let filtered_rows = match filter {
-            Some(f) => f.len(),
-            None => table_rows,
+        // Rows the view transforms resolve. Padding is added on top of this
+        // and is never part of it, which is what keeps padding out of every
+        // mapping. Built without the pad so it can size the pad itself.
+        let unpadded = RowResolver {
+            filter,
+            sort: self.sort,
+            table: self.table,
+            pad: None,
         };
+        let filtered_rows = unpadded.resolved_rows(data_rows);
         // Empty padding (issue #20) extends only the scrollable EXTENT. It is
         // added after the filtered rows, so a padding screen index is by
         // construction past the end of every mapping, and `view.row_count()`
@@ -316,41 +396,12 @@ impl<'a> Grid<'a> {
         });
         let total_rows = (filtered_rows + self.pad_rows).max(1);
         let total_cols = view.col_count().max(1);
-        // Map a view row to the underlying data row. Identity when unfiltered.
-        let to_data = |r: usize| -> Option<usize> {
-            match self.table {
-                None => Some(r),
-                Some(t) => t.data_row(r),
-            }
-        };
 
-        // THE single row resolution, used by painting, row headers and
-        // hit-testing alike.
-        //
-        // Two filters can narrow the view at once and they compose in a fixed
-        // order: the table's header filter maps a screen row to a data row by
-        // rank, and search filter mode selects among data rows. Resolving them
-        // separately from the same screen index — which is what merging the two
-        // branches naively produced — lets whichever variable the caller
-        // happens to use win, silently ignoring the other filter and painting
-        // the wrong records under the right row numbers.
-        // Padding is checked FIRST and short-circuits both filters. A padding
-        // row is not a filterable row: feeding its screen index to
-        // `RowFilter::underlying` or `TableDecor::data_row` would run off the
-        // end of the mapping, and under a *shorter* filtered view could alias
-        // straight onto an unrelated record.
-        let resolve_row = |r: usize| -> Option<ScreenRow> {
-            if let Some(row) = pad.and_then(|p| p.data_row(r)) {
-                return Some(ScreenRow::Pad(row));
-            }
-            match filter {
-                // Search filter active: it already indexes data rows.
-                Some(_) => Self::underlying_row(filter, r),
-                // Otherwise the table mapping (identity when there is no table).
-                None => to_data(r).map(|d| d as u32),
-            }
-            .map(ScreenRow::Data)
-        };
+        // THE single row resolution, used by painting, row headers,
+        // hit-testing and the cell editor alike. Filters compose first, sort
+        // last, padding short-circuits everything — see [`RowResolver`].
+        let resolver = RowResolver { pad, ..unpadded };
+        let resolve_row = |r: usize| -> Option<ScreenRow> { resolver.resolve(r) };
 
         let width_of =
             |c: usize| -> f32 { self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH) };
@@ -442,8 +493,20 @@ impl<'a> Grid<'a> {
         // Search matches only ever live in real rows, so the narrowing window
         // is clamped to the filtered range before the mapping is consulted.
         let match_last = last_row.min(filtered_rows);
-        let (match_lo_row, match_hi_row) = match filter {
-            Some(f) => {
+        let (match_lo_row, match_hi_row) = match (self.sort, filter) {
+            // Under a sort the visible window is an arbitrary subset of
+            // underlying rows, not an ascending run, so the narrowing bounds
+            // are the min/max of the window rather than its ends. Still
+            // viewport-sized work — never a scan of the mapping.
+            (Some(s), _) => {
+                let lo = first_row.min(match_last);
+                let w = &s.rows()[lo.min(s.len())..match_last.clamp(lo, s.len())];
+                match (w.iter().min(), w.iter().max()) {
+                    (Some(&a), Some(&b)) => (a as usize, b as usize + 1),
+                    _ => (0, 0),
+                }
+            }
+            (None, Some(f)) => {
                 let w = f.window(first_row.min(match_last), match_last);
                 match (w.first(), w.last()) {
                     // `last + 1` because the narrowing bound is exclusive.
@@ -451,7 +514,7 @@ impl<'a> Grid<'a> {
                     _ => (0, 0),
                 }
             }
-            None => (first_row.min(match_last), match_last),
+            (None, None) => (first_row.min(match_last), match_last),
         };
         let vis_lo = self
             .matches
@@ -761,10 +824,9 @@ impl<'a> Grid<'a> {
                 .filter(|_| self.editing.is_none())
                 .and_then(|sel| {
                     let (_, br) = sel.bounds();
-                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, filter, pad)
-                        .map(|r| {
-                            Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0)
-                        })
+                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, &resolver).map(
+                        |r| Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0),
+                    )
                 });
         let on_handle = pointer_pos
             .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && body_rect.contains(p)));
@@ -894,6 +956,15 @@ impl<'a> Grid<'a> {
         let mut header_press: Option<usize> = None;
         let mut header_drag_to: Option<usize> = None;
         let mut header_released = false;
+        let mut header_hitboxes: Vec<(usize, egui::Pos2)> = Vec::new();
+        for c in col_range.clone() {
+            let x = body_origin.x + col_x[c] - self.scroll.col_px;
+            let r = Rect::from_min_size(
+                egui::pos2(x, outer.min.y),
+                Vec2::new(width_of(c), HEADER_HEIGHT),
+            );
+            header_hitboxes.push((c, r.center()));
+        }
         let pointer_in_header = pointer_pos.is_some_and(|p| col_header.contains(p));
         if pointer_in_header {
             if primary_pressed {
@@ -939,6 +1010,13 @@ impl<'a> Grid<'a> {
                 label
             } else {
                 format!("{label}  ·  {letter}")
+            };
+            // Sort indicator. Without it a sorted view is indistinguishable
+            // from a file that happened to arrive in that order, and the user
+            // has no way to tell which column is driving it.
+            let shown = match self.sort.and_then(|s| s.dir_of(c as u32)) {
+                Some(d) => format!("{shown} {}", d.glyph()),
+                None => shown,
             };
             chp.text(
                 r.center(),
@@ -1032,6 +1110,7 @@ impl<'a> Grid<'a> {
             header_drag_to,
             header_released,
             painted_cells,
+            header_hitboxes,
             visible_rows: row_range,
         }
     }
@@ -1133,21 +1212,40 @@ mod tests {
         RowFilter::from_matches(&cells, false, cells.len())
     }
 
+    /// The resolver a filtered (and optionally padded) view would build.
+    fn resolver_of<'a>(f: Option<&'a RowFilter>, pad: Option<PadSpace>) -> RowResolver<'a> {
+        RowResolver {
+            filter: f,
+            pad,
+            ..Default::default()
+        }
+    }
+
+    /// Screen row -> underlying row, through THE resolver.
+    fn underlying(f: Option<&RowFilter>, visible: usize) -> Option<u32> {
+        resolver_of(f, None).resolve(visible).map(|s| s.row())
+    }
+
+    /// Underlying row -> screen row, through THE resolver.
+    fn visible(f: Option<&RowFilter>, row: u32) -> Option<usize> {
+        resolver_of(f, None).visible_of(row)
+    }
+
     #[test]
     fn unfiltered_row_lookup_is_the_identity() {
-        assert_eq!(Grid::underlying_row(None, 0), Some(0));
-        assert_eq!(Grid::underlying_row(None, 199_999_999), Some(199_999_999));
-        assert_eq!(Grid::visible_row(None, 4_912_733), Some(4_912_733));
+        assert_eq!(underlying(None, 0), Some(0));
+        assert_eq!(underlying(None, 199_999_999), Some(199_999_999));
+        assert_eq!(visible(None, 4_912_733), Some(4_912_733));
     }
 
     #[test]
     fn filtered_row_lookup_uses_the_mapping_both_ways() {
         let f = filter_of(&[3, 9, 4_912_733]);
-        assert_eq!(Grid::underlying_row(Some(&f), 0), Some(3));
-        assert_eq!(Grid::underlying_row(Some(&f), 2), Some(4_912_733));
-        assert_eq!(Grid::underlying_row(Some(&f), 3), None, "past the end");
-        assert_eq!(Grid::visible_row(Some(&f), 4_912_733), Some(2));
-        assert_eq!(Grid::visible_row(Some(&f), 4), None, "hidden row");
+        assert_eq!(underlying(Some(&f), 0), Some(3));
+        assert_eq!(underlying(Some(&f), 2), Some(4_912_733));
+        assert_eq!(underlying(Some(&f), 3), None, "past the end");
+        assert_eq!(visible(Some(&f), 4_912_733), Some(2));
+        assert_eq!(visible(Some(&f), 4), None, "hidden row");
     }
 
     #[test]
@@ -1157,7 +1255,7 @@ mod tests {
         let f = filter_of(&[0, 41, 199_999_999]);
         let painted: Vec<String> = (0..f.len())
             .map(|r| {
-                let row = Grid::underlying_row(Some(&f), r).unwrap();
+                let row = underlying(Some(&f), r).unwrap();
                 (row as u64 + 1).to_string()
             })
             .collect();
@@ -1174,7 +1272,7 @@ mod tests {
         let frac_px = 0.0f32;
         let click_y_offset = ROW_HEIGHT * 3.0 + 4.0;
         let visible = first_row as f64 + ((click_y_offset + frac_px) / ROW_HEIGHT) as f64;
-        let cell = CellRef::new(Grid::underlying_row(Some(&f), visible as usize).unwrap(), 2);
+        let cell = CellRef::new(underlying(Some(&f), visible as usize).unwrap(), 2);
         assert_eq!(cell.row, 199_999_999, "edit would hit the wrong row");
         assert_eq!(cell.col, 2);
     }
@@ -1196,8 +1294,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            Some(&f),
-            None,
+            &resolver_of(Some(&f), None),
         )
         .expect("kept row must have a rect");
         let expected_y = outer.min.y + HEADER_HEIGHT + 2.0 * ROW_HEIGHT;
@@ -1210,8 +1307,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            Some(&f),
-            None
+            &resolver_of(Some(&f), None)
         )
         .is_none());
 
@@ -1221,8 +1317,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            None,
-            None
+            &resolver_of(None, None)
         )
         .is_none());
     }
@@ -1260,10 +1355,10 @@ mod tests {
         let f = filter_of(&[0, 100_000_000, 199_999_998, 199_999_999]);
         let last_visible = f.len() - 1;
         let offset = last_visible as f64;
-        let resolved = Grid::underlying_row(Some(&f), offset.floor() as usize).unwrap();
+        let resolved = underlying(Some(&f), offset.floor() as usize).unwrap();
         assert_eq!(resolved, 199_999_999);
-        assert_eq!(Grid::visible_row(Some(&f), 199_999_998), Some(2));
-        assert_eq!(Grid::visible_row(Some(&f), 199_999_999), Some(3));
+        assert_eq!(visible(Some(&f), 199_999_998), Some(2));
+        assert_eq!(visible(Some(&f), 199_999_999), Some(3));
     }
 
     // --- empty-row padding (issue #20) ---
@@ -1321,11 +1416,11 @@ mod tests {
         // Every kept row stays owned by the filter, untouched by pad space.
         for v in 0..f.len() {
             assert_eq!(p.data_row(v), None, "pad space stole a filtered row");
-            assert!(Grid::underlying_row(Some(&f), v).is_some());
+            assert!(underlying(Some(&f), v).is_some());
         }
         // A padding row's data row is in NEITHER mapping — which is exactly
         // why it must never be looked up in one.
-        assert_eq!(Grid::visible_row(Some(&f), 200), None);
+        assert_eq!(visible(Some(&f), 200), None);
     }
 
     /// The same for a table's header filter, whose mapping is a rank lookup.
@@ -1369,8 +1464,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            Some(&f),
-            None
+            &resolver_of(Some(&f), None)
         )
         .is_none());
         // With it, the first padding row sits directly under the last kept row.
@@ -1379,8 +1473,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            Some(&f),
-            Some(p),
+            &resolver_of(Some(&f), Some(p)),
         )
         .expect("a padding row must be editable");
         let expected_y = outer.min.y + HEADER_HEIGHT + 3.0 * ROW_HEIGHT;
@@ -1391,8 +1484,7 @@ mod tests {
             outer,
             &scroll,
             &widths,
-            Some(&f),
-            Some(p),
+            &resolver_of(Some(&f), Some(p)),
         )
         .expect("kept row");
         let expect_real = outer.min.y + HEADER_HEIGHT + ROW_HEIGHT;

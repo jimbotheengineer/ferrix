@@ -98,11 +98,28 @@ pub struct FerrixApp {
     /// frame. `None` whenever filter mode is off.
     row_filter: Option<ferrix_core::RowFilter>,
 
+    /// Columns the view is sorted by, in priority order. Empty means unsorted.
+    ///
+    /// This is the SPEC; `sort_order` below is the mapping derived from it.
+    /// Keeping them apart is what lets the spec survive a search change while
+    /// the mapping is rebuilt over the new candidate rows.
+    sort_keys: Vec<ferrix_core::SortKey>,
+    /// The visible-row -> underlying-row mapping a sort produces.
+    ///
+    /// Rebuilt only when the spec, the filters, or the data change — never per
+    /// frame. `None` whenever nothing is sorted, so an unsorted sheet pays
+    /// exactly nothing.
+    sort_order: Option<ferrix_core::SortOrder>,
+
     /// Chart panel state: the built scene, its annotations, and the window.
     chart: crate::chart_panel::ChartPanel,
 
     /// Display column being dragged by its header, between press and release.
     header_drag: Option<usize>,
+    /// Where each visible column header was painted last frame. Recorded from
+    /// the grid's own response so a caller never has to guess at header
+    /// pixels, which move with every bar that opens above the grid.
+    header_hitboxes: Vec<(usize, egui::Pos2)>,
 
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
@@ -218,7 +235,10 @@ impl FerrixApp {
             chart: crate::chart_panel::ChartPanel::default(),
             search_filter_mode: false,
             row_filter: None,
+            sort_keys: Vec::new(),
+            sort_order: None,
             header_drag: None,
+            header_hitboxes: Vec::new(),
             fill_source: None,
             fill_target: None,
             tables: Vec::new(),
@@ -481,9 +501,13 @@ impl FerrixApp {
         }
         let view = self.wb.view();
         let data_rows = view.row_count().max(1);
-        let filtered = match &self.row_filter {
-            Some(f) => f.len(),
-            None => match (self.tables.first(), &self.table_mask) {
+        let filtered = match (&self.sort_order, &self.row_filter) {
+            // A sort is built over the filtered rows, so its length already
+            // accounts for both — padding still begins after the last row the
+            // view resolves.
+            (Some(s), _) => s.len(),
+            (None, Some(f)) => f.len(),
+            (None, None) => match (self.tables.first(), &self.table_mask) {
                 (Some(_), Some(m)) => m.visible_rows(),
                 _ => data_rows,
             },
@@ -523,8 +547,20 @@ impl FerrixApp {
         // must land on the next row the user can actually see, not on a hidden
         // neighbour. The result is converted straight back to an underlying
         // row, so every downstream consumer keeps working in real addresses.
-        let r = match (&self.row_filter, drow) {
-            (Some(f), d) if d != 0 && !f.is_empty() => {
+        // A SORT reorders the same rows, so "down" is equally not "+1" under
+        // one: pressing Down must land on the row drawn beneath, which under a
+        // sort is an arbitrary underlying row. Both transforms are handled by
+        // the same visible-space arithmetic.
+        let r = match (&self.sort_order, &self.row_filter, drow) {
+            (Some(s), _, d) if d != 0 && !s.is_empty() => {
+                let here = s
+                    .visible_of(self.selection.cursor.row)
+                    .unwrap_or_else(|| s.visible_at_or_after(self.selection.cursor.row))
+                    as i64;
+                let target = (here + d).clamp(0, s.len() as i64 - 1);
+                s.underlying(target as usize).unwrap_or(0) as i64
+            }
+            (None, Some(f), d) if d != 0 && !f.is_empty() => {
                 let here = f
                     .visible_of(self.selection.cursor.row)
                     .unwrap_or_else(|| f.visible_at_or_after(self.selection.cursor.row))
@@ -1829,11 +1865,132 @@ impl FerrixApp {
         } else {
             None
         };
+        // The sort is built OVER the rows the filters kept, so any change to
+        // the filters invalidates it. Rebuilding here — one call site, right
+        // where the filter changes — is what keeps the two composed rather
+        // than racing.
+        self.rebuild_sort_order();
+    }
+
+    /// The rows a sort is allowed to choose from: whatever the filters left.
+    ///
+    /// This is the composition contract. Sorting the whole sheet and then
+    /// filtering would show hidden records; filtering and then sorting the
+    /// survivors is the only order that keeps both true at once.
+    fn sort_candidates(&self) -> Vec<u32> {
+        if let Some(f) = &self.row_filter {
+            return f.rows().to_vec();
+        }
+        let rows = self.wb.view().row_count();
+        match (self.tables.first(), &self.table_mask) {
+            (Some(_), Some(m)) => (0..m.visible_rows())
+                .filter_map(|v| m.nth_visible(v).map(|d| d as u32))
+                .collect(),
+            _ => (0..rows as u32).collect(),
+        }
+    }
+
+    /// Rebuild the sort mapping from the current spec and candidate rows.
+    ///
+    /// Called when a header is clicked and when the filters change — never
+    /// from the paint path, which only borrows the finished mapping.
+    fn rebuild_sort_order(&mut self) {
+        if self.sort_keys.is_empty() {
+            self.sort_order = None;
+            return;
+        }
+        let candidates = self.sort_candidates();
+        let view = self.wb.view();
+        self.sort_order = Some(ferrix_core::SortOrder::build(
+            &candidates,
+            &self.sort_keys,
+            &view,
+        ));
+    }
+
+    /// A column header was clicked: cycle its sort asc -> desc -> none.
+    ///
+    /// `additive` (shift-click) makes the column a secondary key instead of
+    /// replacing the spec, which is the "sort by this, then by that" case.
+    ///
+    /// Sorting is a VIEW TRANSFORM: nothing is written, so this must not
+    /// dirty the workbook and must not push an undo entry. The user undoes a
+    /// sort by clicking the header again.
+    pub fn sort_by_column(&mut self, col: usize, additive: bool) {
+        // An open edit belongs to a row whose screen position is about to
+        // change underneath it; commit rather than let it land elsewhere.
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        ferrix_core::cycle_click(&mut self.sort_keys, col as u32, additive);
+        self.rebuild_sort_order();
+        self.status = match self.sort_order.as_ref().and_then(|o| o.dir_of(col as u32)) {
+            Some(ferrix_core::SortDir::Asc) => format!(
+                "Sorted by {} ascending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+            Some(ferrix_core::SortDir::Desc) => format!(
+                "Sorted by {} descending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+            None => "Sort cleared — original order restored".to_string(),
+        };
+        // The cursor keeps its underlying row, so it follows its record to
+        // wherever the sort put it rather than staying at a screen position.
+        self.scroll_to_selection();
+    }
+
+    /// The sort mapping the grid should render through, if any.
+    pub fn sort_order(&self) -> Option<&ferrix_core::SortOrder> {
+        self.sort_order.as_ref()
+    }
+
+    /// Centre of a display column's header, as painted last frame.
+    pub fn header_center(&self, col: usize) -> Option<(f32, f32)> {
+        self.header_hitboxes
+            .iter()
+            .find(|(c, _)| *c == col)
+            .map(|(_, p)| (p.x, p.y))
+    }
+
+    /// Direction currently applied to a display column, for tests and the
+    /// header indicator.
+    pub fn sort_dir(&self, col: usize) -> Option<ferrix_core::SortDir> {
+        self.sort_order.as_ref().and_then(|o| o.dir_of(col as u32))
+    }
+
+    /// The underlying row shown at a given screen row — the single question a
+    /// test about ordering actually wants answered.
+    pub fn visible_row_order(&self) -> Vec<u32> {
+        match (&self.sort_order, &self.row_filter) {
+            (Some(s), _) => s.rows().to_vec(),
+            (None, Some(f)) => f.rows().to_vec(),
+            (None, None) => (0..self.wb.view().row_count() as u32).collect(),
+        }
+    }
+
+    /// The row resolution the grid builds, for callers outside `show()` (the
+    /// cell editor) and for tests. ONE construction site, so a caller cannot
+    /// accidentally resolve through a subset of the active transforms.
+    fn row_resolver<'a>(
+        &'a self,
+        pad: Option<crate::grid::PadSpace>,
+    ) -> crate::grid::RowResolver<'a> {
+        crate::grid::RowResolver {
+            filter: self.row_filter.as_ref(),
+            sort: self.sort_order.as_ref(),
+            // The table's own decoration is rebuilt per frame inside the
+            // paint closure; outside it the mask is only needed when neither
+            // of the other two transforms is active, and in that case the
+            // grid's own resolver handles it.
+            table: None,
+            pad,
+        }
     }
 
     /// Turn filter mode on or off, keeping the viewport and selection anchored
     /// to the row the user was looking at.
-    fn toggle_filter_mode(&mut self) {
+    pub fn toggle_filter_mode(&mut self) {
         self.search_filter_mode = !self.search_filter_mode;
         // An in-progress edit belongs to a row whose screen position is about
         // to change underneath it; commit rather than let it land elsewhere.
@@ -1891,10 +2048,12 @@ impl FerrixApp {
     /// Scroll offset space is VISIBLE rows, so an underlying row has to be
     /// mapped before it can be compared against `scroll.row_offset`.
     fn visible_row_of(&self, row: u32) -> Option<f64> {
-        match &self.row_filter {
-            Some(f) => f.visible_of(row).map(|v| v as f64),
-            None => Some(row as f64),
-        }
+        // Through the SAME resolver the grid paints with — a sorted view puts
+        // a row somewhere the filter alone would not, and scrolling to a stale
+        // position is how "the cursor is off screen after a sort" happens.
+        self.row_resolver(self.pad_space())
+            .visible_of(row)
+            .map(|v| v as f64)
     }
 
     /// Move the selection to the active match and scroll it into view.
@@ -2797,6 +2956,7 @@ impl FerrixApp {
                         filling: self.fill_source.is_some(),
                         header_dragging: self.header_drag,
                         filter: self.row_filter.as_ref(),
+                        sort: self.sort_order.as_ref(),
                         table: decor.as_ref(),
                         current_match: if self.search_open {
                             self.search_results.wrapped(self.search_index)
@@ -2816,6 +2976,10 @@ impl FerrixApp {
                 };
 
                 self.last_painted = resp.painted_cells;
+                // Where the headers really landed this frame, so a caller can
+                // click one without guessing at pixels that move whenever a
+                // bar above the grid opens.
+                self.header_hitboxes = resp.header_hitboxes.clone();
 
                 if let Some(cell) = resp.clicked {
                     if self.editing.is_some() && self.editing != Some(cell) {
@@ -2866,7 +3030,19 @@ impl FerrixApp {
                 }
                 if resp.header_released {
                     if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
-                        if src != dst {
+                        if src == dst {
+                            // Released on the column it was pressed on: that is
+                            // a CLICK, not a reorder, and a click on a header
+                            // cycles that column's sort asc -> desc -> none.
+                            //
+                            // Keyed on release rather than press on purpose:
+                            // pressing must be free to become a drag, and
+                            // sorting on press would fire a full sort every
+                            // time the user started to move a column.
+                            let additive = ui.input(|i| i.modifiers.shift);
+                            self.header_drag = None;
+                            self.sort_by_column(src, additive);
+                        } else {
                             // `to` is an insertion point in the ORIGINAL
                             // indexing: dropping onto a column to the right
                             // means landing after it, hence dst + 1.
@@ -2964,13 +3140,13 @@ impl FerrixApp {
                     // a padding row is in no filter's mapping — so the pad
                     // space is handed over alongside the filter.
                     let pad = self.pad_space();
+                    let resolver = self.row_resolver(pad);
                     if let Some(rect) = Grid::cell_screen_rect(
                         cell,
                         outer,
                         &self.scroll,
                         &self.col_widths,
-                        self.row_filter.as_ref(),
-                        pad,
+                        &resolver,
                     ) {
                         let id = egui::Id::new("cell_editor");
                         let mut child = ui.new_child(
