@@ -690,6 +690,20 @@ impl FerrixApp {
                 // Workbook and would otherwise discard them.
                 let restored_comments = loaded_comments.len();
                 self.wb.comments = loaded_comments;
+                // Protection read from the file, for the same reason (issue
+                // #42). Only the ACTIVE sheet's is adopted, matching how
+                // comments and merges are handled; the workbook-structure
+                // flags are global and always apply. Honouring the flags we
+                // find is the whole point of the issue — an imported
+                // protected sheet must not silently become editable.
+                self.wb.adopt_protection(
+                    loaded
+                        .protection
+                        .iter()
+                        .find(|(i, _)| *i == 0)
+                        .map(|(_, p)| p.clone()),
+                    loaded.wb_protection,
+                );
                 if let Some(w) = loaded.edit_warning {
                     self.status = format!("Saved edits not applied — {w}");
                 } else if let Some(n) = restored_count {
@@ -3896,6 +3910,16 @@ impl FerrixApp {
         else {
             return;
         };
+        self.export_xlsx_to(&path);
+    }
+
+    /// The body of the xlsx export, with the file picker factored out.
+    ///
+    /// Split so a test can drive the REAL export the menu item runs. Testing
+    /// `ferrix_io::export_workbook_full` directly would pass even if this
+    /// method called a variant that silently dropped protection — which is
+    /// exactly the bug this split exists to catch (issue #42).
+    pub fn export_xlsx_to(&mut self, path: &std::path::Path) {
         // Only the in-RAM path can be handed to the writer; a mapped base has
         // no `Sheet` to give it.
         let BaseData::Memory(sheet) = &*self.wb.base else {
@@ -3904,12 +3928,20 @@ impl FerrixApp {
                     .into();
             return;
         };
-        self.status = match ferrix_io::export_workbook_with_names(
-            &path,
+        // Protection must survive the round trip (issue #42): a workbook
+        // opened with a protected sheet and re-exported must still be
+        // protected, including a password hash we only ever saw as a hash.
+        // `export_workbook_full` is the variant that writes
+        // `<sheetProtection>` and injects `<workbookProtection>`; the
+        // plain `_with_names` call this used to make silently stripped both.
+        self.status = match ferrix_io::export_workbook_full(
+            path,
             &[ferrix_io::SheetExport::new("Sheet1", sheet)
                 .with_formulas(&self.wb.overlay)
-                .with_tables(&self.tables)],
+                .with_tables(&self.tables)
+                .with_protection(self.wb.protection())],
             &self.wb.names,
+            self.wb.workbook_protection(),
         ) {
             Ok(()) => format!(
                 "Exported {} table(s), {} name(s) → {}",
@@ -7104,6 +7136,10 @@ where
             sheet_name: stem,
             extra_sheets: Vec::new(),
             first_formulas: None,
+            // A delimited file carries no protection: the concept exists only
+            // in the xlsx package (issue #42).
+            protection: Vec::new(),
+            wb_protection: ferrix_core::WorkbookProtection::default(),
             edits_path: restored_edits.path,
             fingerprint: restored_edits.fingerprint,
             comments_path: restored_edits.comments_path,
@@ -7169,6 +7205,9 @@ where
         sheet_name: stem,
         extra_sheets: Vec::new(),
         first_formulas: None,
+        // As above: no protection concept in a delimited source.
+        protection: Vec::new(),
+        wb_protection: ferrix_core::WorkbookProtection::default(),
         edits_path: restored_edits.path,
         fingerprint: restored_edits.fingerprint,
         comments_path: restored_edits.comments_path,
@@ -7194,6 +7233,16 @@ fn load_xlsx(path: &Path) -> LoadResult {
     // the per-sheet import never opens. A file with no names yields an empty
     // table rather than an error.
     let names = ferrix_io::import_defined_names(path).unwrap_or_default();
+    // Protection lives in each sheet's own `<sheetProtection>` element and in
+    // xl/workbook.xml's `<workbookProtection>` — neither of which the cell
+    // import opens (issue #42). A file with none yields empty/default rather
+    // than an error, so unprotected workbooks are unaffected.
+    let protection: Vec<(usize, ferrix_core::SheetProtection)> = ferrix_io::import_protection(path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.sheet_index, p.protection))
+        .collect();
+    let wb_protection = ferrix_io::import_workbook_protection(path).unwrap_or_default();
     // Comments live in xl/comments*.xml, which neither calamine nor the
     // per-sheet import opens. Only the FIRST sheet's are adopted, because the
     // workbook holds one comment map for the ACTIVE sheet — the same
@@ -7251,6 +7300,8 @@ fn load_xlsx(path: &Path) -> LoadResult {
         sheet_name: first.name,
         extra_sheets,
         first_formulas: Some(first.formulas),
+        protection,
+        wb_protection,
         // Sidecar edits are a CSV/mmap concept: an xlsx carries its own
         // formulas, and pairing a sidecar with a re-saved workbook would be a
         // silent mismatch waiting to happen.
@@ -7509,6 +7560,57 @@ mod tests {
     /// A temp .xlsx that deletes itself, so a failed assert cannot leave a
     /// stray file behind for the next run to trip over.
     struct TempXlsx(PathBuf);
+
+    /// Issue #42: the EXPORT the menu item runs must preserve protection.
+    ///
+    /// Asserts through `export_xlsx_to` — the production path — rather than
+    /// through `ferrix_io::export_workbook_full`. That distinction is the
+    /// whole point: the io layer's own tests passed for the entire time this
+    /// method was calling `export_workbook_with_names`, which writes no
+    /// `<sheetProtection>` at all, so a protected workbook silently exported
+    /// unprotected. Re-importing is what proves the bytes carry it.
+    #[test]
+    fn exporting_preserves_sheet_and_workbook_protection() {
+        let mut app = FerrixApp::new(None);
+        app.wb.commit_edit(CellRef::new(0, 0), "1");
+
+        let secret = ferrix_core::PasswordHash::of("hunter2");
+        app.wb
+            .protection_mut()
+            .protect(ferrix_core::Allowances::default(), secret);
+        app.wb.workbook_protection_mut().protect_structure(secret);
+
+        let tmp = TempXlsx::new("protect-roundtrip");
+        app.export_xlsx_to(tmp.path());
+        assert!(
+            tmp.path().exists(),
+            "export did not write a file; status: {}",
+            app.status
+        );
+
+        let sheets = ferrix_io::import_protection(tmp.path()).expect("re-import protection");
+        let sp = sheets
+            .iter()
+            .find(|p| p.sheet_index == 0)
+            .map(|p| &p.protection)
+            .expect("the exported sheet must carry a <sheetProtection> element");
+        assert!(
+            sp.is_enabled(),
+            "the re-imported sheet is unprotected — export stripped it"
+        );
+        assert_eq!(
+            sp.hash(),
+            secret,
+            "the password hash must survive the round trip"
+        );
+
+        let wbp =
+            ferrix_io::import_workbook_protection(tmp.path()).expect("re-import wb protection");
+        assert!(
+            wbp.structure_locked(),
+            "workbook structure protection was stripped by export"
+        );
+    }
 
     impl TempXlsx {
         fn new(tag: &str) -> Self {

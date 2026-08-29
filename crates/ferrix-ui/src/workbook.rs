@@ -435,6 +435,15 @@ impl Workbook {
 
     /// Another sheet's protection, by id. Used by export, which must write
     /// every sheet's `<sheetProtection>`, not only the visible one.
+    ///
+    /// Not yet called: the xlsx export path writes ONE sheet ("Sheet1"), so
+    /// only the active sheet's protection currently reaches a file. These
+    /// stay because they are the correct API for multi-sheet export, and are
+    /// covered by `protect.rs`'s own tests — but the multi-sheet export
+    /// itself remains open work under issue #42, and this comment is the
+    /// marker for it. Do NOT read this as "multi-sheet protection export
+    /// works".
+    #[allow(dead_code)]
     pub fn protection_of(&self, id: SheetId) -> Option<&ferrix_core::SheetProtection> {
         self.sheets
             .iter()
@@ -442,12 +451,37 @@ impl Workbook {
             .map(|s| &s.protection)
     }
 
+    #[allow(dead_code)]
     pub fn protection_of_mut(&mut self, id: SheetId) -> Option<&mut ferrix_core::SheetProtection> {
         self.dirty = true;
         self.sheets
             .iter_mut()
             .find(|s| s.id == id)
             .map(|s| &mut s.protection)
+    }
+
+    /// Adopt protection read from the FILE, without marking the workbook
+    /// dirty (issue #42).
+    ///
+    /// Separate from `protection_mut` on purpose. That method marks dirty
+    /// because a user changing the rules is a real change worth saving;
+    /// loading a file that already carried those rules is not. Routing the
+    /// load through `protection_mut` made every open — including a CSV with
+    /// no protection at all — report unsaved changes, which broke five
+    /// existing tests asserting that loading, searching and sorting never
+    /// dirty the workbook.
+    pub fn adopt_protection(
+        &mut self,
+        sheet: Option<ferrix_core::SheetProtection>,
+        wb: ferrix_core::WorkbookProtection,
+    ) {
+        let was_dirty = self.dirty;
+        if let Some(p) = sheet {
+            let i = self.active;
+            self.sheets[i].protection = p;
+        }
+        self.wb_protection = wb;
+        self.dirty = was_dirty;
     }
 
     /// Workbook-structure protection.
@@ -462,13 +496,18 @@ impl Workbook {
 
     /// The most recent protection refusal, if the last operation was refused.
     ///
-    /// The UI reads this to explain a no-op. Cleared by anything that
-    /// succeeds, so it can never describe an operation the user has since
-    /// completed.
+    /// A SECOND channel for the same information, kept for callers that act
+    /// on a refusal outside a commit. The UI does not use it: single edits
+    /// read `CommitReport::denied` (see `FerrixApp::commit_edit`, which puts
+    /// the reason in the status bar) and Replace All reports through
+    /// `ReplaceReport::describe`. Both of those are exercised by tests; this
+    /// pair is not, so it is marked rather than assumed live.
+    #[allow(dead_code)]
     pub fn last_denial(&self) -> Option<ferrix_core::Denied> {
         self.last_denial
     }
 
+    #[allow(dead_code)]
     pub fn clear_denial(&mut self) {
         self.last_denial = None;
     }

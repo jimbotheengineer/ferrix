@@ -92,7 +92,7 @@ pub fn import_protection_guarded(
                     // "cannot do this" flags is 0 = allowed. Reading a missing
                     // attribute as "denied" would silently tighten a file
                     // every time it passed through Ferrix.
-                    let on = |name: &[u8]| xattr_bool(&e, name);
+                    let on = |name: &[u8]| xattr_bool(e, name);
                     allow = Allowances {
                         select_locked_cells: !on(b"selectLockedCells").unwrap_or(false),
                         select_unlocked_cells: !on(b"selectUnlockedCells").unwrap_or(false),
@@ -104,7 +104,7 @@ pub fn import_protection_guarded(
                         sort: !on(b"sort").unwrap_or(true),
                         use_autofilter: !on(b"autoFilter").unwrap_or(true),
                     };
-                    if let Some(p) = crate::table_xlsx::attr_for(&e, b"password") {
+                    if let Some(p) = crate::table_xlsx::attr_for(e, b"password") {
                         if let Some(h) = PasswordHash::from_hex(&p) {
                             hash = h;
                         }
@@ -112,7 +112,7 @@ pub fn import_protection_guarded(
                 }
                 b"protectedRange" => {
                     // `sqref` may list several rectangles, space separated.
-                    if let Some(sq) = crate::table_xlsx::attr_for(&e, b"sqref") {
+                    if let Some(sq) = crate::table_xlsx::attr_for(e, b"sqref") {
                         for token in sq.split_whitespace() {
                             if let Some(r) = parse_sqref_token(token) {
                                 unlocked.push(r);
@@ -158,9 +158,9 @@ pub fn import_workbook_protection(path: impl AsRef<Path>) -> Result<WorkbookProt
         use quick_xml::events::Event as E;
         if let E::Empty(e) | E::Start(e) = ev {
             if e.local_name().as_ref() == b"workbookProtection" {
-                structure = xattr_bool(&e, b"lockStructure").unwrap_or(false);
-                windows = xattr_bool(&e, b"lockWindows").unwrap_or(false);
-                if let Some(p) = crate::table_xlsx::attr_for(&e, b"workbookPassword") {
+                structure = xattr_bool(e, b"lockStructure").unwrap_or(false);
+                windows = xattr_bool(e, b"lockWindows").unwrap_or(false);
+                if let Some(p) = crate::table_xlsx::attr_for(e, b"workbookPassword") {
                     if let Some(h) = PasswordHash::from_hex(&p) {
                         hash = h;
                     }
