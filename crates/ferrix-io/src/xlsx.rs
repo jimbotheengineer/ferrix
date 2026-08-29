@@ -721,6 +721,11 @@ pub struct SheetExport<'a> {
     /// note on why a column-scope decoration is one `<col>` record while a
     /// range-scope one is capped.
     pub format: Option<&'a ferrix_core::SheetFormat>,
+    /// Sparkline groups (issue #36), written as
+    /// `<extLst><x14:sparklineGroups>`. See [`crate::sparkline_xlsx`] for why
+    /// the group is EXPANDED to one element per destination cell (OOXML has
+    /// no other spelling) and what is reported rather than written.
+    pub sparklines: Option<&'a ferrix_core::SparklineMap>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -735,6 +740,7 @@ impl<'a> SheetExport<'a> {
             protection: None,
             sizing: None,
             format: None,
+            sparklines: None,
         }
     }
 
@@ -777,6 +783,12 @@ impl<'a> SheetExport<'a> {
     /// Attach sheet formatting, so cell decoration reaches `xl/styles.xml`.
     pub fn with_format(mut self, format: &'a ferrix_core::SheetFormat) -> Self {
         self.format = Some(format);
+        self
+    }
+
+    /// Attach sparkline groups, written as `<extLst><x14:sparklineGroups>`.
+    pub fn with_sparklines(mut self, map: &'a ferrix_core::SparklineMap) -> Self {
+        self.sparklines = Some(map);
         self
     }
 }
@@ -891,6 +903,14 @@ pub fn export_workbook_full(
             // with no decoration keeps the streaming writer, so the 10GB
             // export path is unchanged.
             && s.format.is_none_or(|f| !f.has_decor())
+            // Sparklines join them (issue #36): the `<extLst>` block is
+            // emitted after the sheet data from a list the worksheet
+            // accumulates, and the constant-memory writer has already flushed
+            // by then -- the groups would be silently dropped and the file
+            // would come back with no sparklines at all. A sheet with no
+            // groups keeps the streaming writer, so the 10GB export path is
+            // unchanged.
+            && s.sparklines.is_none_or(|m| m.is_empty())
         {
             wb.add_worksheet_with_constant_memory()
         } else {
@@ -909,6 +929,9 @@ pub fn export_workbook_full(
         }
         if let Some(p) = s.protection {
             crate::protect_xlsx::write_protection(ws, p).map_err(write_err)?;
+        }
+        if let Some(sp) = s.sparklines {
+            crate::sparkline_xlsx::write_sparklines(ws, s.name, sp).map_err(write_err)?;
         }
     }
     write_defined_names(&mut wb, names)?;

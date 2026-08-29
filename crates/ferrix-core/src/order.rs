@@ -487,6 +487,114 @@ impl AxisOrder {
     }
 }
 
+/// What a structural edit did to one axis, as a map over DISPLAY positions.
+///
+/// [`AxisOrder`] answers "which data does display position N show". This
+/// answers the other question every side table needs: "the thing that used to
+/// be at display position N — where is it now, if anywhere?".
+///
+/// Insert and delete are the only two edits with a well-defined answer for a
+/// RECTANGLE as well as for a point, which is why merges and format ranges are
+/// remapped through this rather than through a general permutation. A move
+/// cannot keep a rectangle a rectangle (display columns A:C can become 0, 2, 3),
+/// so the move path remaps only per-cell stores and leaves rectangles alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AxisShift {
+    /// `count` fresh entries appeared at display position `at`.
+    Insert { at: u32, count: u32 },
+    /// `count` entries were removed starting at display position `at`.
+    Delete { at: u32, count: u32 },
+}
+
+impl AxisShift {
+    /// Where the entry formerly at display position `old` is now, or `None`
+    /// when the edit deleted it.
+    ///
+    /// This is exactly the [`crate::order`] half of what
+    /// `ferrix_formula::remap::AxisMap` wants, so a reference to a deleted row
+    /// or column collapses to `#REF!` instead of silently sliding onto its
+    /// neighbour.
+    #[inline]
+    pub fn map(&self, old: u32) -> Option<u32> {
+        match *self {
+            AxisShift::Insert { at, count } => Some(if old >= at {
+                old.saturating_add(count)
+            } else {
+                old
+            }),
+            AxisShift::Delete { at, count } => {
+                let end = at.saturating_add(count);
+                if old < at {
+                    Some(old)
+                } else if old < end {
+                    // The entry itself is gone. Not clamped to a neighbour:
+                    // silently reading different data is the failure mode the
+                    // whole remap family exists to prevent.
+                    None
+                } else {
+                    Some(old - count)
+                }
+            }
+        }
+    }
+
+    /// Where the span `first..=last` ends up, or `None` when the edit removed
+    /// every position in it.
+    ///
+    /// The rectangle rule, and the reason it is here rather than open-coded in
+    /// three side tables:
+    ///
+    /// * an insert **inside** a span grows the span, matching what a user means
+    ///   by inserting a row into a merged block or a formatted range;
+    /// * a delete that eats only part of a span shrinks it to the survivors;
+    /// * a delete that eats all of it returns `None`, and the caller drops the
+    ///   entry rather than keeping a rectangle over rows that no longer exist.
+    pub fn map_span(&self, first: u32, last: u32) -> Option<(u32, u32)> {
+        if first > last {
+            return None;
+        }
+        match *self {
+            AxisShift::Insert { at, count } => {
+                let f = if first >= at {
+                    first.saturating_add(count)
+                } else {
+                    first
+                };
+                // `>=` on the start and `>=` on the end together mean an insert
+                // strictly inside the span moves only its end, i.e. the span
+                // grows by `count`.
+                let l = if last >= at {
+                    last.saturating_add(count)
+                } else {
+                    last
+                };
+                Some((f, l))
+            }
+            AxisShift::Delete { at, count } => {
+                let end = at.saturating_add(count);
+                // Lowest surviving position at or after `first`.
+                let f = if first < at {
+                    first
+                } else if first < end {
+                    at
+                } else {
+                    first - count
+                };
+                // Highest surviving position at or before `last`.
+                let l = if last < at {
+                    last
+                } else if last < end {
+                    // Everything from `at` up is gone; fall back to at - 1.
+                    at.checked_sub(1)?
+                } else {
+                    last - count
+                };
+                (f <= l).then_some((f, l))
+            }
+        }
+    }
+}
+
 /// Both axes of one sheet's display order.
 ///
 /// ## Which space is which
@@ -896,5 +1004,131 @@ mod tests {
         for (d, &data) in all.iter().enumerate() {
             assert_eq!(o.display_of(data), Some(d as u64));
         }
+    }
+
+    // --- AxisShift: the display-position map every side table is remapped by ---
+
+    #[test]
+    fn an_insert_shifts_everything_at_or_after_it() {
+        let s = AxisShift::Insert { at: 2, count: 1 };
+        assert_eq!(s.map(0), Some(0));
+        assert_eq!(s.map(1), Some(1));
+        // The entry that WAS at 2 is now at 3 — the inserted one took its slot.
+        assert_eq!(s.map(2), Some(3));
+        assert_eq!(s.map(9), Some(10));
+    }
+
+    #[test]
+    fn a_delete_drops_its_own_span_and_pulls_the_rest_back() {
+        let s = AxisShift::Delete { at: 2, count: 2 };
+        assert_eq!(s.map(1), Some(1));
+        // Deleted: None, never a neighbour. Clamping to 1 or 2 here is exactly
+        // the silent-wrong-data bug #REF! exists to make visible.
+        assert_eq!(s.map(2), None);
+        assert_eq!(s.map(3), None);
+        assert_eq!(s.map(4), Some(2));
+        assert_eq!(s.map(10), Some(8));
+    }
+
+    #[test]
+    fn an_insert_inside_a_span_grows_it() {
+        // A merge over rows 2..=5 with a row inserted at 3 must still cover
+        // the same records, plus the new blank one in the middle.
+        let s = AxisShift::Insert { at: 3, count: 1 };
+        assert_eq!(s.map_span(2, 5), Some((2, 6)));
+        // Inserted before: the whole span slides.
+        assert_eq!(s.map_span(4, 6), Some((5, 7)));
+        // Inserted after: untouched.
+        assert_eq!(
+            AxisShift::Insert { at: 9, count: 1 }.map_span(2, 5),
+            Some((2, 5))
+        );
+        // Inserted exactly at the start pushes the span down whole, so the new
+        // blank row lands OUTSIDE the merge rather than inside it.
+        assert_eq!(
+            AxisShift::Insert { at: 2, count: 1 }.map_span(2, 5),
+            Some((3, 6))
+        );
+    }
+
+    #[test]
+    fn a_delete_shrinks_a_span_to_its_survivors() {
+        // Overlapping the tail.
+        assert_eq!(
+            AxisShift::Delete { at: 4, count: 2 }.map_span(2, 5),
+            Some((2, 3))
+        );
+        // Overlapping the head.
+        assert_eq!(
+            AxisShift::Delete { at: 1, count: 2 }.map_span(2, 5),
+            Some((1, 3))
+        );
+        // Strictly inside.
+        assert_eq!(
+            AxisShift::Delete { at: 3, count: 1 }.map_span(2, 5),
+            Some((2, 4))
+        );
+        // Entirely before / entirely after.
+        assert_eq!(
+            AxisShift::Delete { at: 8, count: 2 }.map_span(2, 5),
+            Some((2, 5))
+        );
+        assert_eq!(
+            AxisShift::Delete { at: 0, count: 1 }.map_span(2, 5),
+            Some((1, 4))
+        );
+    }
+
+    #[test]
+    fn a_delete_that_eats_a_whole_span_removes_it() {
+        // The caller must DROP the entry, not keep a rectangle over rows that
+        // no longer exist — a merge left behind here would paint over live data.
+        assert_eq!(AxisShift::Delete { at: 2, count: 4 }.map_span(2, 5), None);
+        assert_eq!(AxisShift::Delete { at: 0, count: 9 }.map_span(2, 5), None);
+        assert_eq!(AxisShift::Delete { at: 0, count: 1 }.map_span(0, 0), None);
+    }
+
+    #[test]
+    fn insert_then_its_matching_delete_is_the_identity_map() {
+        // Undoing an insert must put every surviving position back exactly, or
+        // a side table would drift one column per undo cycle.
+        let ins = AxisShift::Insert { at: 3, count: 2 };
+        let del = AxisShift::Delete { at: 3, count: 2 };
+        for old in 0..20u32 {
+            let there = ins.map(old).unwrap();
+            assert_eq!(
+                del.map(there),
+                Some(old),
+                "position {old} did not round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_move_over_200m_rows_stays_a_handful_of_runs() {
+        // Issue #17 scope item 4. A row MOVE is affordable at this size
+        // precisely because it is O(runs): this is the measurement the choice
+        // of option (a) over "refuse above a threshold" rests on.
+        let mut o = AxisOrder::identity(200_000_000);
+        let before = o.heap_bytes();
+
+        o.move_span(5, 1, 150_000_000).unwrap();
+
+        assert_eq!(o.len(), 200_000_000, "no rows lost");
+        assert!(
+            o.run_count() <= 4,
+            "one row move needed {} runs",
+            o.run_count()
+        );
+        assert!(
+            o.heap_bytes() < before + 512,
+            "a row move over 200M rows allocated {} bytes; a Vec<u32> \
+             permutation would be 800MB",
+            o.heap_bytes() - before
+        );
+        // Exact at both ends, so "cheap" has not been bought with wrongness.
+        assert_eq!(o.data_of(149_999_999), Some(5));
+        assert_eq!(o.data_of(5), Some(6));
+        assert_eq!(o.data_of(199_999_999), Some(199_999_999));
     }
 }

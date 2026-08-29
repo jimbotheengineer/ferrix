@@ -407,6 +407,44 @@ impl<'a> SheetView<'a> {
             BaseData::Memory(s) => s.search(query, limit),
             BaseData::Mapped(m) => m.search(query, limit),
         };
+        // The base reports DATA coordinates. Everything downstream — the
+        // filter mapping, the match cursor, the selection it moves — works in
+        // DISPLAY space, so a reordered sheet has to translate here.
+        //
+        // Missing this is the two-mapping bug in its most convincing disguise:
+        // the search reports the right NUMBER of hits, `RowFilter` builds a
+        // mapping of the right SIZE, and the grid then shows that many rows —
+        // just the wrong ones. Nothing looks broken until you read a record.
+        //
+        // Cost is O(matches), which is already bounded by `limit`, and the
+        // whole block is skipped for an unreordered sheet.
+        if let Some(order) = self.order {
+            if !order.is_identity() {
+                results.matches.retain_mut(|cell| {
+                    let row = match &order.rows {
+                        None => Some(cell.row),
+                        // A data row with no display position was deleted; it
+                        // is not on screen, so it is not a hit.
+                        Some(a) => a.display_of(cell.row).and_then(|d| u32::try_from(d).ok()),
+                    };
+                    let col = match &order.cols {
+                        None => Some(cell.col),
+                        Some(a) => a.display_of(cell.col).and_then(|d| u32::try_from(d).ok()),
+                    };
+                    match (row, col) {
+                        (Some(r), Some(c)) => {
+                            *cell = CellRef::new(r, c);
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                // Row-major order is a contract of `SearchResults` (the filter
+                // mapping and `index_at_or_after` both binary search it), and
+                // a permutation does not preserve it.
+                results.matches.sort_by_key(|c| (c.row, c.col));
+            }
+        }
         if self.overlay.is_empty() {
             return results;
         }
