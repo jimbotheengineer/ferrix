@@ -466,6 +466,10 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                 None => Value::Error(ErrorKind::NotAvailable),
             }
         }
+        // Text functions live entirely in `crate::text`. Kept to ONE arm here
+        // on purpose: the whole library is one module file, so it can grow
+        // without touching this match again.
+        name if crate::text::is_text_fn(name) => crate::text::call(name, args, src),
         _ => Value::Error(ErrorKind::Name),
     }
 }
