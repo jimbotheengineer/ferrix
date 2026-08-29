@@ -108,6 +108,7 @@ fn configure(rows: u32) -> SheetFormat {
         ManualStyle {
             fill: Some(Rgb(0xF0, 0xF0, 0xF8)),
             text: None,
+            typography: Default::default(),
         },
     );
     f.push_column_rule(0, presets::sign_colors());
@@ -169,6 +170,7 @@ fn colouring_a_whole_column_costs_one_rule_not_one_entry_per_row() {
             ManualStyle {
                 fill: Some(Rgb(255, 240, 0)),
                 text: None,
+                typography: Default::default(),
             },
         );
     });
@@ -192,6 +194,7 @@ fn colouring_a_whole_column_costs_one_rule_not_one_entry_per_row() {
                 ManualStyle {
                     fill: Some(Rgb(255, 240, 0)),
                     text: None,
+                    typography: Default::default(),
                 },
             );
         }
@@ -225,6 +228,7 @@ fn a_selection_range_of_any_size_is_a_single_entry() {
             ManualStyle {
                 fill: Some(Rgb(1, 2, 3)),
                 text: None,
+                typography: Default::default(),
             },
         );
     });
@@ -235,6 +239,7 @@ fn a_selection_range_of_any_size_is_a_single_entry() {
             ManualStyle {
                 fill: Some(Rgb(1, 2, 3)),
                 text: None,
+                typography: Default::default(),
             },
         );
     });

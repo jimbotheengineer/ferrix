@@ -154,15 +154,145 @@ impl PlanEntry<'_> {
 /// Modelled as `Option` per channel rather than a `CellStyle` so that setting
 /// only a fill leaves a lower-precedence text colour alone, which is what
 /// "set the background" means in every spreadsheet.
+/// Type styling for a cell: family, size, and the weight/slant/underline
+/// switches every spreadsheet is expected to have.
+///
+/// Every field is optional and `None` means "inherit". That is what lets a
+/// column-level rule set the family while a single cell overrides only the
+/// weight, without either having to know about the other — and it is why this
+/// is a handful of bytes rather than a resolved font per cell. At 200M rows a
+/// resolved-per-cell representation would be tens of gigabytes for something
+/// that is almost always uniform.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Typography {
+    pub family: Option<FontFamily>,
+    /// Points. `None` inherits the grid's default.
+    pub size: Option<f32>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub strikethrough: Option<bool>,
+}
+
+/// The font families Ferrix ships.
+///
+/// Deliberately a small closed set rather than an arbitrary string: a font
+/// name that is not installed renders as something else entirely, and a
+/// spreadsheet that silently changes appearance between machines is worse
+/// than one with fewer choices. `Monospace` matters for data: digits line up
+/// in columns, which is most of the reason to look at a spreadsheet at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FontFamily {
+    #[default]
+    Proportional,
+    Monospace,
+}
+
+impl Typography {
+    pub fn is_empty(&self) -> bool {
+        self.family.is_none()
+            && self.size.is_none()
+            && self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.strikethrough.is_none()
+    }
+
+    /// Layer `self` over `out`: set fields win, `None` fields leave `out`
+    /// alone. Applied outermost-scope-first, so a cell override beats a
+    /// column default.
+    #[inline]
+    pub fn apply_to(&self, out: &mut Typography) {
+        if self.family.is_some() {
+            out.family = self.family;
+        }
+        if self.size.is_some() {
+            out.size = self.size;
+        }
+        if self.bold.is_some() {
+            out.bold = self.bold;
+        }
+        if self.italic.is_some() {
+            out.italic = self.italic;
+        }
+        if self.underline.is_some() {
+            out.underline = self.underline;
+        }
+        if self.strikethrough.is_some() {
+            out.strikethrough = self.strikethrough;
+        }
+    }
+
+    /// Resolved values, for a renderer that needs concrete answers.
+    pub fn resolved(&self, default_size: f32) -> ResolvedType {
+        ResolvedType {
+            family: self.family.unwrap_or_default(),
+            size: self.size.unwrap_or(default_size),
+            bold: self.bold.unwrap_or(false),
+            italic: self.italic.unwrap_or(false),
+            underline: self.underline.unwrap_or(false),
+            strikethrough: self.strikethrough.unwrap_or(false),
+        }
+    }
+
+    /// Flip one switch, used by the toolbar toggles.
+    pub fn with_bold(mut self, on: bool) -> Self {
+        self.bold = Some(on);
+        self
+    }
+    pub fn with_italic(mut self, on: bool) -> Self {
+        self.italic = Some(on);
+        self
+    }
+    pub fn with_underline(mut self, on: bool) -> Self {
+        self.underline = Some(on);
+        self
+    }
+    pub fn with_size(mut self, pt: f32) -> Self {
+        self.size = Some(pt);
+        self
+    }
+    pub fn with_family(mut self, f: FontFamily) -> Self {
+        self.family = Some(f);
+        self
+    }
+}
+
+/// A fully resolved type style — no inheritance left to do.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResolvedType {
+    pub family: FontFamily,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+/// Smallest and largest point size the UI offers.
+///
+/// Bounded because the row height is fixed: a 200pt font in a 22px row draws
+/// over its neighbours, and a 1pt font is unreadable. Clamping here means no
+/// caller can produce an unrenderable sheet.
+pub const MIN_FONT_PT: f32 = 6.0;
+pub const MAX_FONT_PT: f32 = 72.0;
+
+/// Clamp a requested point size into the renderable range.
+pub fn clamp_font_pt(pt: f32) -> f32 {
+    pt.clamp(MIN_FONT_PT, MAX_FONT_PT)
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ManualStyle {
     pub fill: Option<Rgb>,
     pub text: Option<Rgb>,
+    /// Font family, size, and the bold/italic/underline switches.
+    pub typography: Typography,
 }
 
 impl ManualStyle {
     pub fn is_empty(&self) -> bool {
-        self.fill.is_none() && self.text.is_none()
+        self.fill.is_none() && self.text.is_none() && self.typography.is_empty()
     }
 
     #[inline]
@@ -173,6 +303,7 @@ impl ManualStyle {
         if let Some(t) = self.text {
             out.text = Some(t);
         }
+        self.typography.apply_to(&mut out.typography);
     }
 }
 
@@ -374,6 +505,7 @@ impl SheetFormat {
                 ConditionalRule::Manual {
                     fill: manual.fill,
                     text: manual.text,
+                    typography: manual.typography,
                 },
             );
         }
@@ -409,6 +541,7 @@ impl SheetFormat {
         self.push_range(RangeFormat::new(range).with_rule(ConditionalRule::Manual {
             fill: manual.fill,
             text: manual.text,
+            typography: manual.typography,
         }))
     }
 

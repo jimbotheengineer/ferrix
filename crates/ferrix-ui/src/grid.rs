@@ -203,6 +203,10 @@ pub struct Grid<'a> {
     /// Empty rows to offer past the end of the sheet, or 0 when the "show
     /// empty rows" toggle is off (issue #20).
     pub pad_rows: usize,
+    /// Sheet-wide formatting: manual colours and type styling that apply to
+    /// any cell, table or not. `None` when nothing has been formatted, which
+    /// keeps the default path free of lookups.
+    pub format: Option<&'a ferrix_core::SheetFormat>,
 }
 
 impl<'a> Grid<'a> {
@@ -607,9 +611,48 @@ impl<'a> Grid<'a> {
                         Align2::CENTER_CENTER => cell_rect.center(),
                         _ => egui::pos2(cell_rect.min.x + pad, cell_rect.center().y),
                     };
-                    painter
-                        .with_clip_rect(cell_rect.intersect(body_rect).shrink2(Vec2::new(2.0, 0.0)))
-                        .text(anchor, align, text, FontId::proportional(12.5), color);
+                    // Type styling. `decor` is None for the overwhelming
+                    // majority of cells, so the default path allocates and
+                    // branches no more than before.
+                    let mut ty = ferrix_core::format::Typography::default();
+                    if let Some(f) = self.format {
+                        if let Some(ov) = f.cell_override(cref) {
+                            ov.manual.typography.apply_to(&mut ty);
+                        }
+                    }
+                    if let Some(d) = &decor {
+                        d.typography.apply_to(&mut ty);
+                    }
+                    let ty = ty.resolved(12.5);
+
+                    let font = match ty.family {
+                        ferrix_core::format::FontFamily::Monospace => FontId::monospace(ty.size),
+                        _ => FontId::proportional(ty.size),
+                    };
+
+                    let clip = painter.with_clip_rect(
+                        cell_rect.intersect(body_rect).shrink2(Vec2::new(2.0, 0.0)),
+                    );
+
+                    // Bold is faked by over-painting with a sub-pixel offset.
+                    // egui ships one weight per family, so the alternative is
+                    // bundling a second font file; this reads as bold at the
+                    // sizes a grid actually uses and costs one extra draw on
+                    // the rare cells that ask for it.
+                    let galley = clip.layout_no_wrap(text.clone(), font.clone(), color);
+                    let rect = align.anchor_size(anchor, galley.size());
+                    clip.galley(rect.min, galley.clone(), color);
+                    if ty.bold {
+                        clip.galley(rect.min + Vec2::new(0.4, 0.0), galley.clone(), color);
+                    }
+                    if ty.underline {
+                        let y = rect.max.y - 2.0;
+                        clip.hline(rect.min.x..=rect.max.x, y, Stroke::new(1.0_f32, color));
+                    }
+                    if ty.strikethrough {
+                        let y = rect.center().y;
+                        clip.hline(rect.min.x..=rect.max.x, y, Stroke::new(1.0_f32, color));
+                    }
                 }
 
                 // The validation flag goes on LAST, over everything else. A

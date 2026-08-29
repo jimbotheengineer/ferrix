@@ -48,6 +48,8 @@ pub struct CellDecor {
     pub violation: Option<Violation>,
     /// True when this row falls on the table's banded stripe.
     pub banded: bool,
+    /// Type styling resolved for this cell. Empty means the grid default.
+    pub typography: ferrix_core::format::Typography,
 }
 
 impl CellDecor {

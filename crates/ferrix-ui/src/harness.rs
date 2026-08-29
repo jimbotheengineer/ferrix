@@ -47,6 +47,8 @@ pub struct Harness {
     pointer: Pos2,
     screen: Vec2,
     frame: u64,
+    /// Paint shapes emitted by the last frame.
+    last_shapes: usize,
     /// Aggregate modifier state for the next frame.
     ///
     /// egui exposes `i.modifiers` from `RawInput.modifiers`, NOT from the
@@ -73,6 +75,7 @@ impl Harness {
             pointer: Pos2::new(400.0, 300.0),
             screen: Vec2::new(1400.0, 880.0),
             frame: 0,
+            last_shapes: 0,
             pending_modifiers: Modifiers::default(),
         }
     }
@@ -94,13 +97,25 @@ impl Harness {
         // be constructed outside eframe, and update() only forwards to this,
         // so the harness exercises identical code without it.
         let app = &mut self.app;
-        let _ = self.ctx.run(raw, |ctx| app.frame(ctx));
+        let out = self.ctx.run(raw, |ctx| app.frame(ctx));
+        // Tessellated shape count for the frame just drawn. This is the real
+        // paint output, not a proxy for it, which is what lets a test assert
+        // that a style change reached the screen rather than only the model.
+        self.last_shapes = out.shapes.len();
         self.frame += 1;
         self
     }
 
     /// Run `n` frames. Loading happens on a worker thread, so a test that opens
     /// a file steps until the load lands rather than sleeping.
+    /// Number of paint shapes emitted by the most recent frame.
+    pub fn paint_shape_count(&mut self) -> usize {
+        // Draw one fresh frame so the count reflects current state rather
+        // than whatever the last queued input happened to leave behind.
+        self.step();
+        self.last_shapes
+    }
+
     pub fn steps(&mut self, n: usize) -> &mut Self {
         for _ in 0..n {
             self.step();
@@ -701,6 +716,79 @@ mod tests {
                 "column selection reaches the last row"
             );
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ctrl_b_bolds_the_selected_cell() {
+        // The whole point of the harness: modifier chords go through
+        // RawInput.modifiers, which is what the app actually reads.
+        let p = write_csv("bold.csv", "a,b\n1,2\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        assert!(
+            !h.app().selection_typography().resolved(12.5).bold,
+            "a freshly loaded cell must not be bold"
+        );
+
+        h.key(Key::B, Modifiers::COMMAND);
+        h.steps(2);
+        assert!(
+            h.app().selection_typography().resolved(12.5).bold,
+            "Ctrl+B must bold the cursor cell"
+        );
+
+        // Toggling is symmetric: pressing again turns it back off, so the
+        // button can always express the state it produced.
+        h.key(Key::B, Modifiers::COMMAND);
+        h.steps(2);
+        assert!(
+            !h.app().selection_typography().resolved(12.5).bold,
+            "Ctrl+B a second time must un-bold"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn type_shortcuts_do_not_fire_while_editing_a_cell() {
+        // Ctrl+B inside a text field belongs to the field. If the sheet also
+        // acted on it, typing would silently restyle the cell underneath.
+        let p = write_csv("boldedit.csv", "a,b\n1,2\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.type_text("99");
+        h.steps(2);
+        h.key(Key::B, Modifiers::COMMAND);
+        h.steps(2);
+
+        assert!(
+            !h.app().selection_typography().resolved(12.5).bold,
+            "Ctrl+B must be inert while a cell edit is open"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bold_changes_what_is_actually_painted() {
+        // Storing `bold: true` proves nothing about the screen. The grid fakes
+        // bold with a second over-painted galley, so a bold cell must emit
+        // MORE paint output than the same cell unbolded. Without this, the
+        // whole feature could be inert and every other test would still pass.
+        let p = write_csv("boldpaint.csv", "a,b\n1,2\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let plain = h.paint_shape_count();
+        h.key(Key::B, Modifiers::COMMAND);
+        h.steps(3);
+        let bolded = h.paint_shape_count();
+
+        assert!(
+            bolded > plain,
+            "a bold cell must paint more than a plain one (plain {plain}, bold {bolded})"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

@@ -816,6 +816,9 @@ pub enum ConditionalRule {
     Manual {
         fill: Option<Rgb>,
         text: Option<Rgb>,
+        /// Type styling applied with the colours, so one "format this
+        /// selection" action covers both in a single rule.
+        typography: crate::format::Typography,
     },
     /// Two-colour scale between the column's min and max.
     ColorScale2 { min: Rgb, max: Rgb },
@@ -866,11 +869,17 @@ pub struct CellStyle {
     pub text: Option<Rgb>,
     /// Bar fraction in `0.0..=1.0`, and its colour.
     pub bar: Option<(f32, Rgb)>,
+    /// Resolved type styling. Empty means "use the grid default", which is
+    /// the overwhelmingly common case and costs nothing to represent.
+    pub typography: crate::format::Typography,
 }
 
 impl CellStyle {
     pub fn is_plain(&self) -> bool {
-        self.fill.is_none() && self.text.is_none() && self.bar.is_none()
+        self.fill.is_none()
+            && self.text.is_none()
+            && self.bar.is_none()
+            && self.typography.is_empty()
     }
 }
 
@@ -907,7 +916,7 @@ impl ConditionalRule {
     /// A short human label for the rules editor.
     pub fn label(&self) -> String {
         match self {
-            ConditionalRule::Manual { fill, text } => match (fill, text) {
+            ConditionalRule::Manual { fill, text, .. } => match (fill, text) {
                 (Some(_), Some(_)) => "Fill + text colour".into(),
                 (Some(_), None) => "Fill colour".into(),
                 (None, Some(_)) => "Text colour".into(),
@@ -965,13 +974,19 @@ impl ConditionalRule {
     ) {
         // A manual colour is unconditional and so is the only rule that
         // applies to a non-numeric cell without further thought.
-        if let ConditionalRule::Manual { fill, text: tc } = self {
+        if let ConditionalRule::Manual {
+            fill,
+            text: tc,
+            typography,
+        } = self
+        {
             if let Some(f) = fill {
                 out.fill = Some(*f);
             }
             if let Some(t) = tc {
                 out.text = Some(*t);
             }
+            typography.apply_to(&mut out.typography);
             return;
         }
 

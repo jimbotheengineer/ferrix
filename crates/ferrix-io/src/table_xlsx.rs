@@ -492,13 +492,37 @@ fn write_conditional(
         // is a rule that always holds; "not equal to a sentinel no cell will
         // hold" is the conventional spelling, and it survives round-tripping
         // where a bare cell format on a table column does not.
-        ConditionalRule::Manual { fill, text } => {
+        ConditionalRule::Manual {
+            fill,
+            text,
+            typography,
+        } => {
             let mut fmt = Format::new();
             if let Some(f) = fill {
                 fmt = fmt.set_background_color(to_color(*f));
             }
             if let Some(t) = text {
                 fmt = fmt.set_font_color(to_color(*t));
+            }
+            // Type styling maps onto real OOXML font attributes, so bold and
+            // friends survive the trip into Excel rather than being dropped.
+            if typography.bold == Some(true) {
+                fmt = fmt.set_bold();
+            }
+            if typography.italic == Some(true) {
+                fmt = fmt.set_italic();
+            }
+            if typography.underline == Some(true) {
+                fmt = fmt.set_underline(rust_xlsxwriter::FormatUnderline::Single);
+            }
+            if let Some(pt) = typography.size {
+                fmt = fmt.set_font_size(pt);
+            }
+            if let Some(fam) = typography.family {
+                fmt = fmt.set_font_name(match fam {
+                    ferrix_core::format::FontFamily::Monospace => "Consolas",
+                    ferrix_core::format::FontFamily::Proportional => "Calibri",
+                });
             }
             let cf = ConditionalFormatCell::new()
                 .set_rule(ConditionalFormatCellRule::NotEqualTo(f64::MIN))

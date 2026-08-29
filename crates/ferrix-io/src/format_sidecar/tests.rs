@@ -33,6 +33,7 @@ fn kitchen_sink() -> SheetFormat {
         ManualStyle {
             fill: Some(Rgb(0xEE, 0xEE, 0xF5)),
             text: None,
+            typography: Default::default(),
         },
     );
     f.push_column_rule(0, presets::sign_colors());
@@ -62,6 +63,7 @@ fn kitchen_sink() -> SheetFormat {
             .with_rule(ConditionalRule::Manual {
                 fill: Some(Rgb(10, 20, 30)),
                 text: Some(Rgb(40, 50, 60)),
+                typography: Default::default(),
             })
             .with_rule(ConditionalRule::Threshold {
                 op: CmpOp::Ne,
@@ -78,6 +80,17 @@ fn kitchen_sink() -> SheetFormat {
             manual: ManualStyle {
                 fill: Some(Rgb(255, 255, 0)),
                 text: Some(Rgb(0, 0, 0)),
+                // Every typography field set to a NON-default value, so the
+                // round-trip proves each one is actually written and read
+                // back rather than silently defaulting on both sides.
+                typography: ferrix_core::format::Typography {
+                    family: Some(ferrix_core::format::FontFamily::Monospace),
+                    size: Some(15.25),
+                    bold: Some(true),
+                    italic: Some(true),
+                    underline: Some(true),
+                    strikethrough: Some(false),
+                },
             },
             format: Some(NumberFormat::Decimal { places: 4 }),
         },
@@ -158,6 +171,7 @@ fn a_200m_row_range_writes_a_tiny_file() {
         ManualStyle {
             fill: Some(Rgb(1, 2, 3)),
             text: None,
+            typography: Default::default(),
         },
     );
     let p = tmp("huge.fxfmt");

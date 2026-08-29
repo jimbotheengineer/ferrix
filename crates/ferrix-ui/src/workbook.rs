@@ -148,6 +148,13 @@ pub struct Workbook {
     sheets: Vec<SheetMeta>,
     /// Index into `sheets` of the sheet whose data is in `base`/`overlay`.
     active: usize,
+    /// Sheet-wide formatting for the ACTIVE sheet: manual colours and type
+    /// styling.
+    ///
+    /// Beside the data, never inside it. Formatting a whole column or a
+    /// 200M-row selection is one small entry, so styling costs nothing per
+    /// row and appending rows inherits it for free.
+    pub format: ferrix_core::SheetFormat,
     /// Display-order permutation for the ACTIVE sheet.
     ///
     /// Reordering a column must not move data: on a 200M-row sheet that would
@@ -195,6 +202,7 @@ impl Workbook {
             }],
             active: 0,
             order: ferrix_core::SheetOrder::new(),
+            format: ferrix_core::SheetFormat::new(),
             parked: std::collections::HashMap::new(),
             next_id: 1,
             undo: Vec::new(),

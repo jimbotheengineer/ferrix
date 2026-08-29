@@ -46,6 +46,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use ferrix_core::format::{FontFamily, Typography};
 use ferrix_core::table::ConditionalRule;
 use ferrix_core::{
     CellOverride, CellRef, CmpOp, ColumnFormat, DateStyle, ManualStyle, NumberFormat, RangeFormat,
@@ -53,7 +54,14 @@ use ferrix_core::{
 };
 
 pub const FMT_MAGIC: &[u8; 8] = b"FXFMT001";
-pub const FMT_VERSION: u32 = 1;
+/// Bumped to 2 when typography joined `ManualStyle` and the `Manual` rule.
+///
+/// A v1 file has no typography bytes, so reading one with the v2 layout would
+/// pull the following field's bytes into a font size and produce plausible
+/// nonsense rather than an error. The version check at load rejects it
+/// outright instead — a refused file is recoverable, a silently misread one
+/// is not.
+pub const FMT_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum FormatSidecarError {
@@ -176,10 +184,15 @@ fn write_opt_format<W: Write>(w: &mut W, f: Option<&NumberFormat>) -> io::Result
 /// silently dropping a user's rule is the failure mode that loses work.
 fn write_rule<W: Write>(w: &mut W, r: &ConditionalRule) -> io::Result<()> {
     match r {
-        ConditionalRule::Manual { fill, text } => {
+        ConditionalRule::Manual {
+            fill,
+            text,
+            typography,
+        } => {
             w.write_all(&[0])?;
             put_opt_rgb(w, *fill)?;
-            put_opt_rgb(w, *text)
+            put_opt_rgb(w, *text)?;
+            put_typography(w, typography)
         }
         ConditionalRule::ColorScale2 { min, max } => {
             w.write_all(&[1])?;
@@ -301,6 +314,7 @@ pub fn save_format(path: &Path, fmt: &SheetFormat) -> Result<u64, FormatSidecarE
             put_u32(&mut w, cell.col)?;
             put_opt_rgb(&mut w, ov.manual.fill)?;
             put_opt_rgb(&mut w, ov.manual.text)?;
+            put_typography(&mut w, &ov.manual.typography)?;
             write_opt_format(&mut w, ov.format.as_ref())?;
         }
         w.flush()?;
@@ -351,6 +365,39 @@ impl<'a> Cursor<'a> {
             _ => Ok(Some(self.rgb()?)),
         }
     }
+    /// Read the fixed 7-byte typography record written by `put_typography`.
+    ///
+    /// An unknown family byte degrades to `None` (inherit) rather than
+    /// erroring, so a sidecar written by a newer build stays readable instead
+    /// of taking the whole file down with it.
+    fn typography(&mut self) -> Result<Typography, FormatSidecarError> {
+        let family = match self.u8()? {
+            1 => Some(FontFamily::Proportional),
+            2 => Some(FontFamily::Monospace),
+            _ => None,
+        };
+        let q = u16::from_le_bytes([self.u8()?, self.u8()?]);
+        let size = if q == 0 { None } else { Some(q as f32 / 4.0) };
+        let mut flag = || -> Result<Option<bool>, FormatSidecarError> {
+            Ok(match self.u8()? {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
+            })
+        };
+        let bold = flag()?;
+        let italic = flag()?;
+        let underline = flag()?;
+        let strikethrough = flag()?;
+        Ok(Typography {
+            family,
+            size,
+            bold,
+            italic,
+            underline,
+            strikethrough,
+        })
+    }
     fn format(&mut self) -> Result<NumberFormat, FormatSidecarError> {
         Ok(match self.u8()? {
             0 => NumberFormat::General,
@@ -387,6 +434,7 @@ impl<'a> Cursor<'a> {
             0 => ConditionalRule::Manual {
                 fill: self.opt_rgb()?,
                 text: self.opt_rgb()?,
+                typography: self.typography()?,
             },
             1 => ConditionalRule::ColorScale2 {
                 min: self.rgb()?,
@@ -487,11 +535,39 @@ pub fn load_format(path: &Path) -> Result<Option<SheetFormat>, FormatSidecarErro
         let manual = ManualStyle {
             fill: c.opt_rgb()?,
             text: c.opt_rgb()?,
+            typography: c.typography()?,
         };
         let format = c.opt_format()?;
         fmt.set_cell_override(cell, CellOverride { manual, format });
     }
     Ok(Some(fmt))
+}
+
+/// Write a [`Typography`] as a fixed 7-byte record.
+///
+/// Fixed width on purpose: a variable-length style would make every later
+/// record's offset depend on this one, and the sidecar is read back by
+/// seeking. Six optional fields plus a family byte is 7 bytes, and an unset
+/// style is seven zeros.
+fn put_typography<W: std::io::Write>(w: &mut W, t: &Typography) -> std::io::Result<()> {
+    // Family: 0 = inherit, 1 = proportional, 2 = monospace.
+    let fam = match t.family {
+        None => 0u8,
+        Some(FontFamily::Proportional) => 1,
+        Some(FontFamily::Monospace) => 2,
+    };
+    w.write_all(&[fam])?;
+    // Size in quarter-points, so 0 means inherit and 12.5pt survives exactly.
+    let size = t.size.map(|p| (p * 4.0).round() as u16).unwrap_or(0);
+    w.write_all(&size.to_le_bytes())?;
+    for flag in [t.bold, t.italic, t.underline, t.strikethrough] {
+        w.write_all(&[match flag {
+            None => 0u8,
+            Some(false) => 1,
+            Some(true) => 2,
+        }])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

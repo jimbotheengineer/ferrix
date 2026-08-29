@@ -1182,6 +1182,128 @@ impl FerrixApp {
     /// live in different parts of the package: calamine reads the cells,
     /// [`ferrix_io::import_tables`] reads `xl/tables/*.xml` plus the
     /// worksheet's validation and conditional-format elements.
+    /// Font family, size, and the B/I/U toggles.
+    ///
+    /// The toggles are three-state underneath but two-state to the user: a
+    /// mixed selection shows unpressed, and pressing it sets the whole
+    /// selection on. That is what people expect from a word processor, and it
+    /// means a selection is never left in a state the button cannot express.
+    fn type_controls(&mut self, ui: &mut egui::Ui, th: crate::theme::Theme) {
+        let cur = self.selection_typography();
+        let res = cur.resolved(12.5);
+
+        // Family. A closed set, so an unavailable font can never silently
+        // change how a saved sheet looks on another machine.
+        let fam_label = match res.family {
+            ferrix_core::format::FontFamily::Monospace => "Mono",
+            ferrix_core::format::FontFamily::Proportional => "Sans",
+        };
+        egui::ComboBox::from_id_salt("font_family")
+            .selected_text(fam_label)
+            .width(64.0)
+            .show_ui(ui, |ui| {
+                for (fam, label) in [
+                    (ferrix_core::format::FontFamily::Proportional, "Sans"),
+                    (ferrix_core::format::FontFamily::Monospace, "Mono"),
+                ] {
+                    if ui.selectable_label(res.family == fam, label).clicked() {
+                        self.apply_typography(|t| {
+                            t.family = Some(fam);
+                        });
+                    }
+                }
+            });
+
+        // Size. Clamped in core, so no path can produce an unrenderable sheet.
+        let mut pt = res.size;
+        let resp = ui.add(
+            egui::DragValue::new(&mut pt)
+                .speed(0.5)
+                .range(ferrix_core::format::MIN_FONT_PT..=ferrix_core::format::MAX_FONT_PT)
+                .suffix(" pt"),
+        );
+        if resp.changed() {
+            let clamped = ferrix_core::format::clamp_font_pt(pt);
+            self.apply_typography(move |t| {
+                t.size = Some(clamped);
+            });
+        }
+
+        let toggle = |ui: &mut egui::Ui, on: bool, label: &str, hover: &str| -> bool {
+            let text = if on {
+                RichText::new(label).color(th.accent).strong()
+            } else {
+                RichText::new(label)
+            };
+            ui.selectable_label(on, text).on_hover_text(hover).clicked()
+        };
+
+        if toggle(ui, res.bold, "B", "Bold (Ctrl+B)") {
+            let on = !res.bold;
+            self.apply_typography(move |t| {
+                t.bold = Some(on);
+            });
+        }
+        if toggle(ui, res.italic, "I", "Italic (Ctrl+I)") {
+            let on = !res.italic;
+            self.apply_typography(move |t| {
+                t.italic = Some(on);
+            });
+        }
+        if toggle(ui, res.underline, "U", "Underline (Ctrl+U)") {
+            let on = !res.underline;
+            self.apply_typography(move |t| {
+                t.underline = Some(on);
+            });
+        }
+    }
+
+    /// Typography of the cursor cell — what the toolbar reflects.
+    ///
+    /// Reading the cursor rather than polling the whole selection keeps this
+    /// O(1): a 200M-row selection must not cost a scan just to draw a toolbar
+    /// once per frame.
+    pub fn selection_typography(&self) -> ferrix_core::format::Typography {
+        self.wb
+            .format
+            .cell_override(self.cursor())
+            .map(|o| o.manual.typography)
+            .unwrap_or_default()
+    }
+
+    /// Apply a type change across the selection.
+    ///
+    /// A multi-cell selection becomes ONE range entry rather than an override
+    /// per cell, so bolding a whole column is a few dozen bytes and does not
+    /// depend on the row count. A single cell stays a cell override, which is
+    /// what makes the common case cheap to look up while painting.
+    pub fn apply_typography(&mut self, f: impl Fn(&mut ferrix_core::format::Typography)) {
+        let (a, b) = self.selection.bounds();
+        let single = a == b;
+
+        if single {
+            let mut ov = self.wb.format.cell_override(a).cloned().unwrap_or_default();
+            f(&mut ov.manual.typography);
+            self.wb.format.set_cell_override(a, ov);
+        } else {
+            // Seed from the cursor so a toggle over a range starts from what
+            // the toolbar was showing, then apply to the whole rectangle.
+            let mut ty = self.selection_typography();
+            f(&mut ty);
+            let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+            self.wb.format.set_range_manual(
+                range,
+                ferrix_core::ManualStyle {
+                    fill: None,
+                    text: None,
+                    typography: ty,
+                },
+            );
+        }
+        self.wb.mark_dirty();
+        self.status = "Formatting applied".into();
+    }
+
     fn open_xlsx_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel workbook", &["xlsx"])
@@ -1808,6 +1930,30 @@ impl FerrixApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // Ctrl+F works from anywhere, including while the search box has focus
         // (where it re-focuses and selects, matching browser behaviour).
+        let (ctrl_b, ctrl_i, ctrl_u) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::B),
+                i.modifiers.command && i.key_pressed(Key::I),
+                i.modifiers.command && i.key_pressed(Key::U),
+            )
+        });
+        // Type shortcuts are ignored while editing a cell, where the same keys
+        // belong to the text field.
+        if self.editing.is_none() {
+            if ctrl_b {
+                let on = !self.selection_typography().resolved(12.5).bold;
+                self.apply_typography(move |t| t.bold = Some(on));
+            }
+            if ctrl_i {
+                let on = !self.selection_typography().resolved(12.5).italic;
+                self.apply_typography(move |t| t.italic = Some(on));
+            }
+            if ctrl_u {
+                let on = !self.selection_typography().resolved(12.5).underline;
+                self.apply_typography(move |t| t.underline = Some(on));
+            }
+        }
+
         let (ctrl_f, ctrl_s, escape, f3, shift_f3) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::F),
@@ -2095,6 +2241,9 @@ impl FerrixApp {
                     {
                         self.open_chart();
                     }
+                    ui.separator();
+                    self.type_controls(ui, th);
+                    ui.separator();
                     if ui
                         .button("Open xlsx…")
                         .on_hover_text(
@@ -2600,6 +2749,7 @@ impl FerrixApp {
                             None
                         },
                         theme: th,
+                        format: Some(&self.wb.format),
                         pad_rows: if self.show_empty_rows {
                             crate::grid::EMPTY_ROW_PADDING
                         } else {

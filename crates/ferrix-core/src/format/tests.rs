@@ -39,6 +39,7 @@ fn a_manual_column_colour_applies_to_every_row_including_unwritten_ones() {
         ManualStyle {
             fill: Some(Rgb(10, 20, 30)),
             text: None,
+            typography: Default::default(),
         },
     );
     // Row 0 and row 199,999,999 must agree: the rule is about the column, not
@@ -61,6 +62,7 @@ fn a_manual_colour_covers_non_numeric_cells_too() {
         ManualStyle {
             fill: Some(Rgb(1, 2, 3)),
             text: Some(Rgb(4, 5, 6)),
+            typography: Default::default(),
         },
     );
     // Text, bools and empties are all coloured — a fill is not a numeric idea.
@@ -90,6 +92,7 @@ fn a_manual_selection_colour_is_one_entry_whatever_the_selection_size() {
         ManualStyle {
             fill: Some(Rgb(9, 9, 9)),
             text: None,
+            typography: Default::default(),
         },
     );
     assert_eq!(f.ranges().len(), 1);
@@ -107,6 +110,7 @@ fn a_range_rule_stops_at_the_range_edges() {
         ManualStyle {
             fill: Some(Rgb(7, 7, 7)),
             text: None,
+            typography: Default::default(),
         },
     );
     let n = Value::Number(1.0);
@@ -125,6 +129,7 @@ fn clearing_a_manual_colour_removes_the_entry_rather_than_leaving_an_inert_one()
         ManualStyle {
             fill: Some(Rgb(1, 1, 1)),
             text: None,
+            typography: Default::default(),
         },
     );
     assert_eq!(f.rule_count(), 1);
@@ -398,6 +403,7 @@ fn range_rules_are_evaluated_after_column_rules() {
         ManualStyle {
             fill: Some(Rgb(1, 1, 1)),
             text: None,
+            typography: Default::default(),
         },
     );
     f.set_range_manual(
@@ -405,6 +411,7 @@ fn range_rules_are_evaluated_after_column_rules() {
         ManualStyle {
             fill: Some(Rgb(2, 2, 2)),
             text: None,
+            typography: Default::default(),
         },
     );
     let n = Value::Number(0.0);
@@ -428,6 +435,7 @@ fn a_per_cell_override_beats_every_rule_and_is_the_only_per_cell_storage() {
             manual: ManualStyle {
                 fill: Some(Rgb(255, 255, 0)),
                 text: Some(Rgb(0, 0, 0)),
+                typography: Default::default(),
             },
             format: None,
         },
@@ -456,6 +464,7 @@ fn clearing_an_override_removes_its_entry() {
             manual: ManualStyle {
                 fill: Some(Rgb(1, 2, 3)),
                 text: None,
+                typography: Default::default(),
             },
             format: None,
         },
@@ -593,6 +602,7 @@ fn heap_cost_tracks_rule_count_not_row_count() {
         ManualStyle {
             fill: Some(Rgb(1, 2, 3)),
             text: None,
+            typography: Default::default(),
         },
     );
     let mut b = SheetFormat::new();
@@ -601,6 +611,7 @@ fn heap_cost_tracks_rule_count_not_row_count() {
         ManualStyle {
             fill: Some(Rgb(1, 2, 3)),
             text: None,
+            typography: Default::default(),
         },
     );
     assert_eq!(
