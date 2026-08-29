@@ -112,6 +112,15 @@ pub struct Theme {
     /// Must differ from both `bg` and `row_alt`, so "there is no row here" is
     /// visibly different from "this row holds empty strings".
     pub pad_row: Color32,
+    /// Outline colours for the references highlighted while a formula is being
+    /// edited (issue #38), assigned round-robin in source order.
+    ///
+    /// A cycle rather than a per-reference colour: the point is that the FIRST
+    /// argument's outline is distinguishable from the SECOND's, and a formula
+    /// with more references than colours reuses them far enough apart to still
+    /// read. They are strokes over the live grid, so each must be legible
+    /// against `bg`, `row_alt` and the selection fill — asserted below.
+    pub ref_colors: [Color32; 5],
 }
 
 impl Default for Theme {
@@ -172,6 +181,17 @@ impl Theme {
             comment_flag: Color32::from_rgb(0xf2, 0xb1, 0x3c),
             // Darker than `bg`: past the end of the sheet reads as a recess.
             pad_row: Color32::from_rgb(0x0c, 0x0d, 0x10),
+            // Bright and saturated: these are 1.5px strokes over a near-black
+            // grid, and a desaturated outline at that width simply vanishes.
+            // Blue is deliberately absent — `accent` already means "the
+            // selection", and a blue reference outline would be read as one.
+            ref_colors: [
+                Color32::from_rgb(0x6f, 0xd6, 0x8a),
+                Color32::from_rgb(0xe8, 0x8d, 0x3c),
+                Color32::from_rgb(0xc4, 0x8b, 0xf0),
+                Color32::from_rgb(0x4f, 0xd0, 0xd6),
+                Color32::from_rgb(0xf0, 0x72, 0xa8),
+            ],
         }
     }
 
@@ -210,6 +230,16 @@ impl Theme {
             comment_flag: Color32::from_rgb(0xb8, 0x7a, 0x00),
             // Slightly grey against the near-white sheet.
             pad_row: Color32::from_rgb(0xe8, 0xea, 0xef),
+            // Mirror reasoning: dark and saturated so a thin stroke survives
+            // against a near-white sheet. Same five hues, same order, so a
+            // formula's third reference is "the purple one" in both themes.
+            ref_colors: [
+                Color32::from_rgb(0x1a, 0x7f, 0x45),
+                Color32::from_rgb(0xa5, 0x54, 0x00),
+                Color32::from_rgb(0x7b, 0x3f, 0xb8),
+                Color32::from_rgb(0x0a, 0x71, 0x7a),
+                Color32::from_rgb(0xb0, 0x2c, 0x6e),
+            ],
         }
     }
 
@@ -511,6 +541,43 @@ mod tests {
                 "{:?}: grid lines invisible",
                 t.mode
             );
+        }
+    }
+
+    /// Issue #38. The reference outlines are the whole point of the coloured
+    /// highlighting: if two of them look the same, or one vanishes against the
+    /// grid, the feature has failed even though it "works".
+    #[test]
+    fn reference_outline_colours_are_distinct_and_visible_in_both_themes() {
+        for t in both() {
+            let d = |a: Color32, b: Color32| {
+                (a.r() as i32 - b.r() as i32).abs()
+                    + (a.g() as i32 - b.g() as i32).abs()
+                    + (a.b() as i32 - b.b() as i32).abs()
+            };
+            for (i, c) in t.ref_colors.iter().enumerate() {
+                for surface in [t.bg, t.row_alt, over(t.range_fill, t.bg)] {
+                    let ratio = contrast(*c, surface);
+                    assert!(
+                        ratio >= 3.0,
+                        "{:?}: reference outline {i} is {ratio:.2}:1 against the grid — invisible",
+                        t.mode
+                    );
+                }
+                // Not the selection colour: a blue outline reads as "selected".
+                assert!(
+                    d(*c, t.accent) >= 90,
+                    "{:?}: reference outline {i} is too close to the selection accent",
+                    t.mode
+                );
+                for (j, other) in t.ref_colors.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        d(*c, *other) >= 90,
+                        "{:?}: reference outlines {i} and {j} are the same colour",
+                        t.mode
+                    );
+                }
+            }
         }
     }
 

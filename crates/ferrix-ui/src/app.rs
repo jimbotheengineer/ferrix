@@ -108,6 +108,27 @@ enum Focus {
     FormulaBar,
 }
 
+/// Widget ids for the two places a formula can be typed (issue #38).
+///
+/// Named constants because F4 and the caret read-back have to address the
+/// SAME widget the editor was drawn with; two spellings of the same string
+/// would silently read an empty caret and put F4 on the wrong reference.
+const CELL_EDITOR_ID: &str = "cell_editor";
+const FORMULA_BAR_ID: &str = "formula_bar_edit";
+
+/// A highlighted reference outline being dragged onto another cell.
+#[derive(Clone, Copy, Debug)]
+struct RefDrag {
+    /// Which reference in the formula, by source order.
+    span: usize,
+    /// Cell the pointer was over when the outline was grabbed. The offset is
+    /// measured from HERE rather than from the reference's own corner, so
+    /// grabbing an outline anywhere inside it and dropping it one cell right
+    /// moves the reference one cell right — not to wherever the pointer
+    /// happened to land relative to the corner.
+    from: CellRef,
+}
+
 pub struct FerrixApp {
     wb: Workbook,
     stats_rows: usize,
@@ -125,6 +146,40 @@ pub struct FerrixApp {
 
     formula_input: String,
     formula_result: Option<String>,
+
+    // ---- formula bar upgrades (issue #38) ----
+    /// The cell's text as it stood the instant the edit began, kept so Escape
+    /// can restore it EXACTLY.
+    ///
+    /// The edit buffer cannot answer this once the edit was seeded by typing:
+    /// the first keystroke replaces the cell, so by the time Escape arrives
+    /// the only copy of `=SUM(B1:B3)` left is this one.
+    edit_pre_text: String,
+    /// Caret position, in BYTES, inside whichever editor is live. Read back
+    /// from egui's own `TextEditState` each frame, because F4 has to act on
+    /// the reference the user is actually parked on rather than on the first
+    /// one in the formula.
+    edit_caret: usize,
+    /// Caret to install on the next frame, after a rewrite moved it.
+    pending_caret: Option<usize>,
+    /// Formula bar height in text rows. 1 is the classic single-line bar;
+    /// anything more makes it a real multi-line editor. Persisted.
+    formula_bar_rows: usize,
+    /// Height the formula bar panel actually occupied last frame — real
+    /// layout output, so a test can tell the drag handle apart from a field
+    /// that merely stores a number.
+    last_formula_bar_h: f32,
+    /// Sheets showing formula SOURCE instead of values (Ctrl+`). Per sheet,
+    /// because it is a way of looking at one sheet, not a global mode.
+    show_formulas: std::collections::HashSet<ferrix_core::SheetId>,
+    /// Reference outlines painted over the grid on the last frame, recorded
+    /// AT THE POINT OF PAINTING: `(the span's rect, its colour)`.
+    ///
+    /// A test reads this rather than the model, so an outline that is
+    /// computed but never drawn reports as absent.
+    ref_outlines: Vec<(egui::Rect, egui::Color32)>,
+    /// An in-progress drag of one of those outlines.
+    ref_drag: Option<RefDrag>,
 
     /// Search state. `results` is kept sorted row-major so the grid can
     /// binary-search the visible slice each frame.
@@ -470,6 +525,14 @@ impl FerrixApp {
             just_started_edit: false,
             formula_input: String::new(),
             formula_result: None,
+            edit_pre_text: String::new(),
+            edit_caret: 0,
+            pending_caret: None,
+            formula_bar_rows: prefs.formula_bar_rows,
+            last_formula_bar_h: 0.0,
+            show_formulas: std::collections::HashSet::new(),
+            ref_outlines: Vec::new(),
+            ref_drag: None,
             search_open: false,
             search_input: String::new(),
             search_results: ferrix_core::SearchResults::default(),
@@ -770,10 +833,46 @@ impl FerrixApp {
         // double-click), which is why the check lives here and not in three
         // call sites that could drift apart.
         let cell = self.wb.merges.resolve(cell);
+        // Captured BEFORE the seed is applied. When the edit began by typing
+        // over the cell, the seed is the single character the user pressed and
+        // the cell's real text exists nowhere else by the time Escape arrives
+        // — this is the only copy (issue #38).
+        self.edit_pre_text = self.wb.view().edit_text(cell);
         self.editing = Some(cell);
         self.edit_buffer = seed.unwrap_or_else(|| self.wb.view().edit_text(cell));
+        // The formula bar mirrors the cell editor while an edit is live, so
+        // the multi-line bar is usable for the edit and so the user can see
+        // the whole of a long formula they are typing into a narrow column.
+        self.formula_input.clone_from(&self.edit_buffer);
+        self.recompute_formula();
+        self.edit_caret = self.edit_buffer.len();
         self.focus = Focus::Cell;
         self.just_started_edit = true;
+    }
+
+    /// Text being edited right now, and whether it lives in the CELL editor.
+    ///
+    /// One accessor for both editors, so F4, the reference outlines and the
+    /// outline drag all act on whichever field the user is actually in rather
+    /// than each keeping its own idea of "the formula".
+    fn live_edit_text(&self) -> Option<(bool, String)> {
+        if self.editing.is_some() {
+            return Some((true, self.edit_buffer.clone()));
+        }
+        if self.focus == Focus::FormulaBar {
+            return Some((false, self.formula_input.clone()));
+        }
+        None
+    }
+
+    /// Write back through the same door [`Self::live_edit_text`] read from,
+    /// keeping the mirrored copy and the live preview in step.
+    fn set_live_edit_text(&mut self, is_cell: bool, text: String) {
+        if is_cell {
+            self.edit_buffer.clone_from(&text);
+        }
+        self.formula_input = text;
+        self.recompute_formula();
     }
 
     fn commit_edit(&mut self) {
@@ -802,9 +901,30 @@ impl FerrixApp {
         self.sync_formula_bar();
     }
 
+    /// Escape. Puts back EXACTLY what was there before the edit started.
+    ///
+    /// The cell's stored value was never touched — nothing is committed until
+    /// Enter — but the formula bar mirrors the edit buffer while an edit is
+    /// live, so abandoning the edit has to restore the bar too. Restored from
+    /// the snapshot rather than re-read from the cell, because the two are the
+    /// same thing only when nothing else moved in between, and "restores what
+    /// you had" should not depend on that.
     fn cancel_edit(&mut self) {
         self.editing = None;
         self.edit_buffer.clear();
+        self.formula_input = std::mem::take(&mut self.edit_pre_text);
+        self.recompute_formula();
+        self.ref_drag = None;
+        self.focus = Focus::Grid;
+    }
+
+    /// Escape with no cell edit open, i.e. the user was typing in the formula
+    /// bar itself. Same contract: the bar goes back to what it showed when it
+    /// gained focus.
+    fn cancel_formula_bar(&mut self) {
+        self.formula_input = std::mem::take(&mut self.edit_pre_text);
+        self.recompute_formula();
+        self.ref_drag = None;
         self.focus = Focus::Grid;
     }
 
@@ -3909,6 +4029,164 @@ impl FerrixApp {
         self.recompute_formula();
     }
 
+    // ------------------------------------------- formula bar upgrades (#38)
+
+    /// Ctrl+` — show formula SOURCE instead of values, for THIS sheet.
+    ///
+    /// Per sheet rather than global because it is a way of looking at one
+    /// sheet: flipping to a lookup table to read a number should not require
+    /// turning the mode off and back on again.
+    ///
+    /// Nothing is precomputed here. The set holds sheet ids, and the grid
+    /// fetches each visible cell's source in its paint loop — so turning this
+    /// on over a 200M-row sheet allocates a viewport of strings, not a sheet
+    /// of them.
+    pub fn toggle_show_formulas(&mut self) {
+        let id = self.wb.active_sheet();
+        let on = if self.show_formulas.contains(&id) {
+            self.show_formulas.remove(&id);
+            false
+        } else {
+            self.show_formulas.insert(id);
+            true
+        };
+        self.status = format!(
+            "{}: showing {}",
+            self.wb.active_name(),
+            if on { "formulas" } else { "values" }
+        );
+    }
+
+    /// Whether the ACTIVE sheet is in show-formulas mode.
+    pub fn showing_formulas(&self) -> bool {
+        self.show_formulas.contains(&self.wb.active_sheet())
+    }
+
+    /// Whether a named sheet is, for the per-sheet assertion.
+    pub fn showing_formulas_on(&self, id: ferrix_core::SheetId) -> bool {
+        self.show_formulas.contains(&id)
+    }
+
+    /// How many text rows tall the formula bar is.
+    pub fn formula_bar_rows(&self) -> usize {
+        self.formula_bar_rows
+    }
+
+    /// The height the formula bar panel actually occupied last frame.
+    ///
+    /// Real layout output rather than `rows * something`, so a test can tell
+    /// "the number changed" apart from "the bar grew".
+    pub fn formula_bar_height(&self) -> f32 {
+        self.last_formula_bar_h
+    }
+
+    /// Resize the formula bar. The entry point the drag handle calls, and the
+    /// one that persists the choice.
+    pub fn set_formula_bar_rows(&mut self, rows: usize) {
+        let rows = rows.clamp(
+            crate::prefs::MIN_FORMULA_BAR_ROWS,
+            crate::prefs::MAX_FORMULA_BAR_ROWS,
+        );
+        if rows == self.formula_bar_rows {
+            return;
+        }
+        self.formula_bar_rows = rows;
+        self.prefs.formula_bar_rows = rows;
+        // Persisted on the change, not at shutdown: a preference that only
+        // survives a clean exit does not survive a crash, and this one is
+        // cheap to write.
+        self.persist_prefs();
+    }
+
+    /// The formula bar's live text, for assertions.
+    pub fn formula_bar_text(&self) -> &str {
+        &self.formula_input
+    }
+
+    /// Caret position in the live editor, in bytes.
+    pub fn edit_caret(&self) -> usize {
+        self.edit_caret
+    }
+
+    /// Move the caret in the live editor, in bytes. Used by tests to park on
+    /// a particular reference before pressing F4; the running app gets this
+    /// from egui.
+    pub fn set_edit_caret(&mut self, byte: usize) {
+        self.edit_caret = byte;
+        self.pending_caret = Some(byte);
+    }
+
+    /// F4: cycle the anchoring of the reference under the caret.
+    ///
+    /// Rewrites the formula TEXT through `refedit`, which splices the one
+    /// reference's bytes and copies everything else verbatim. Going through
+    /// the parser here would re-render every reference in the formula and drop
+    /// the `$` markers on the ones the user did not touch — see the module
+    /// docs on `ferrix_formula::refedit`.
+    pub fn cycle_reference_anchor(&mut self) -> bool {
+        let Some((is_cell, text)) = self.live_edit_text() else {
+            return false;
+        };
+        let caret = self.edit_caret.min(text.len());
+        // Byte offsets from egui are always on a char boundary, but a caret
+        // restored from a stale frame need not be — clamp rather than panic.
+        let caret = (0..=caret).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+        let Some((next, span)) = ferrix_formula::refedit::cycle_at(&text, caret) else {
+            self.status = "F4: no cell reference under the cursor".into();
+            return false;
+        };
+        let shown = next[span.clone()].to_string();
+        self.set_live_edit_text(is_cell, next);
+        self.edit_caret = span.end;
+        self.pending_caret = Some(span.end);
+        self.status = format!("F4: {shown}");
+        true
+    }
+
+    /// The reference spans in whatever is being edited, in source order.
+    ///
+    /// Empty when nothing is being edited, which is what makes the outlines
+    /// disappear the moment the edit ends.
+    fn live_ref_spans(&self) -> Vec<ferrix_formula::refedit::RefSpan> {
+        match self.live_edit_text() {
+            // Only a FORMULA has references. A cell holding the literal text
+            // `A1` must not sprout an outline.
+            Some((_, t)) if t.starts_with('=') => ferrix_formula::refedit::spans(&t),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Reference outlines painted by the last frame: `(rect, colour)`.
+    ///
+    /// Recorded at the point of painting, so a test reading this is reading
+    /// the screen. An outline that is computed but never drawn is absent here.
+    pub fn ref_outlines(&self) -> &[(egui::Rect, egui::Color32)] {
+        &self.ref_outlines
+    }
+
+    /// Move the reference at `span` by a whole-cell offset, as dropping its
+    /// dragged outline does. Returns false when the move was refused.
+    fn move_reference(&mut self, span_index: usize, d_row: i64, d_col: i64) -> bool {
+        if d_row == 0 && d_col == 0 {
+            return false;
+        }
+        let Some((is_cell, text)) = self.live_edit_text() else {
+            return false;
+        };
+        let spans = ferrix_formula::refedit::spans(&text);
+        let Some(span) = spans.get(span_index) else {
+            return false;
+        };
+        let Some(next) = ferrix_formula::refedit::shift_span(&text, span, d_row, d_col) else {
+            self.status = "That would move the reference off the sheet".into();
+            return false;
+        };
+        let label = next[span.start..].split(['+', '-', '*', '/', ')', ',']).next().unwrap_or("");
+        self.status = format!("Reference moved to {}", label.trim());
+        self.set_live_edit_text(is_cell, next);
+        true
+    }
+
     // ------------------------------------------------------------ Name Box
 
     /// What the Name Box shows: the selection's defined name if it has one,
@@ -4573,6 +4851,42 @@ impl FerrixApp {
         Some((c.x, c.y))
     }
 
+    /// Which cell a viewport point is over (issue #38).
+    ///
+    /// The inverse of [`Self::cell_center`], and deliberately built the same
+    /// way — by asking `cell_screen_rect` where each cell IS rather than by
+    /// inverting the layout arithmetic by hand. A second, independent
+    /// coordinate mapping is precisely what the guide warns about: it would
+    /// agree with the paint loop until a freeze, a filter or a sort was
+    /// active, and then quietly point at the wrong row.
+    ///
+    /// Bounded by the viewport: it searches only the rows the last frame
+    /// actually painted, so this is a viewport-sized scan on any sheet.
+    fn cell_at_point(&self, p: egui::Pos2, outer: egui::Rect) -> Option<CellRef> {
+        let resolver = self.row_resolver(self.pad_space());
+        let metrics = crate::grid::Metrics::new(self.zoom);
+        let cols = self.col_widths.len().max(self.wb.view().col_count());
+        for (_, row) in &self.last_painted_rows {
+            for c in 0..cols {
+                let cell = CellRef::new(*row, c as u32);
+                if let Some(r) = Grid::cell_screen_rect(
+                    cell,
+                    outer,
+                    &self.scroll,
+                    &self.col_widths,
+                    &resolver,
+                    metrics,
+                    self.panes,
+                ) {
+                    if r.contains(p) {
+                        return Some(cell);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Centre of a display column's header, as painted last frame.
     pub fn header_center(&self, col: usize) -> Option<(f32, f32)> {
         self.header_hitboxes
@@ -4986,6 +5300,28 @@ impl FerrixApp {
             }
         }
 
+        // --- issue #38: Ctrl+` and F4 ---
+        //
+        // Handled here, ahead of the `grid_has_keys` gate below, because both
+        // have to work while a TextEdit owns the keyboard: F4 is meaningless
+        // anywhere else, and Ctrl+` is a view toggle the user reaches for
+        // mid-edit. `i.modifiers.command` is read from the AGGREGATE modifier
+        // state, which is the only place egui reports it reliably.
+        let (show_formulas_key, f4) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::Backtick),
+                i.key_pressed(Key::F4),
+            )
+        });
+        if show_formulas_key {
+            self.toggle_show_formulas();
+            return;
+        }
+        if f4 {
+            self.cycle_reference_anchor();
+            return;
+        }
+
         let (ctrl_f, ctrl_h, ctrl_s, escape, f3, shift_f3) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::F),
@@ -5338,6 +5674,7 @@ impl FerrixApp {
             C::ViewZoomReset => self.zoom_reset(),
             C::ViewTheme => self.set_theme(self.theme.mode.toggled()),
             C::ViewEmptyRows => self.set_show_empty_rows(!self.show_empty_rows),
+            C::ViewShowFormulas => self.toggle_show_formulas(),
             C::EditUndo => {
                 if let Some(c) = self.wb.undo() {
                     self.selection.move_to(c);
@@ -5665,6 +6002,13 @@ impl FerrixApp {
                     }
                     // --- empty rows toggle (issue #20) ---
                     if ui
+                        .selectable_label(self.showing_formulas(), "ƒ Formulas")
+                        .on_hover_text("Ctrl+` — show formula source instead of values, for this sheet")
+                        .clicked()
+                    {
+                        chosen_command = Some(crate::command::CommandId::ViewShowFormulas);
+                    }
+                    if ui
                         .selectable_label(self.show_empty_rows, "⬓ Empty rows")
                         .on_hover_text(
                             "Show empty rows past the end of the sheet so there is \
@@ -5776,7 +6120,21 @@ impl FerrixApp {
         }
 
         // --- formula bar ---
-        egui::TopBottomPanel::top("formula_bar")
+        //
+        // Issue #38: expandable to multiple lines, with a drag handle along
+        // its bottom edge. The panel's height is derived from
+        // `formula_bar_rows`, which is persisted, so the size the user chose
+        // survives a restart.
+        let bar_rows = self.formula_bar_rows;
+        let row_px = ctx
+            .fonts(|f| f.row_height(&egui::FontId::monospace(13.0)))
+            .max(12.0);
+        // Set by the drag handle inside the panel closure, applied after it
+        // closes: `set_formula_bar_rows` takes `&mut self`, which the closure
+        // already holds borrowed.
+        let mut drag_rows: Option<usize> = None;
+        let _ = row_px * bar_rows as f32 + 10.0;
+        let formula_panel = egui::TopBottomPanel::top("formula_bar")
             .frame(
                 egui::Frame::none()
                     .fill(th.header_bg)
@@ -5822,20 +6180,85 @@ impl FerrixApp {
                     ui.separator();
                     ui.label(RichText::new("fx").color(th.text_dim).italics());
 
-                    let resp = ui.add_sized(
-                        [ui.available_width() * 0.5, 22.0],
-                        egui::TextEdit::singleline(&mut self.formula_input)
-                            .hint_text("=SUM(E1:E10000000)")
-                            .font(egui::TextStyle::Monospace),
-                    );
+                    let fid = egui::Id::new(FORMULA_BAR_ID);
+                    let bar_w = ui.available_width() * 0.5;
+                    // ONE id for both shapes, so the caret survives the bar
+                    // being expanded mid-formula.
+                    //
+                    // A multi-line bar keeps Enter as COMMIT rather than
+                    // "insert a newline": Enter is how every spreadsheet
+                    // commits a formula, and a bar that swallowed it would
+                    // strand the user in a field they cannot leave. Alt+Enter
+                    // inserts the newline, matching Excel.
+                    let resp = if bar_rows > 1 {
+                        ui.add_sized(
+                            [bar_w, row_px * bar_rows as f32],
+                            egui::TextEdit::multiline(&mut self.formula_input)
+                                .id(fid)
+                                .hint_text("=SUM(E1:E10000000)")
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(bar_rows)
+                                .return_key(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::ALT,
+                                    Key::Enter,
+                                )),
+                        )
+                    } else {
+                        ui.add_sized(
+                            [bar_w, 22.0],
+                            egui::TextEdit::singleline(&mut self.formula_input)
+                                .id(fid)
+                                .hint_text("=SUM(E1:E10000000)")
+                                .font(egui::TextStyle::Monospace),
+                        )
+                    };
                     if resp.gained_focus() {
                         self.focus = Focus::FormulaBar;
+                        // The Escape snapshot for a bar-only edit. Taken on
+                        // FOCUS, which is the moment "before the edit" means.
+                        self.edit_pre_text.clone_from(&self.formula_input);
                     }
                     if resp.changed() {
                         self.recompute_formula();
+                        // A cell edit mirrored into the bar has to flow back,
+                        // or typing in the bar mid-edit would be discarded on
+                        // commit.
+                        if self.editing.is_some() {
+                            self.edit_buffer.clone_from(&self.formula_input);
+                        }
+                    }
+                    // Caret read-back. F4 acts on the reference the user is
+                    // parked on, so it needs egui's OWN cursor rather than a
+                    // guess; and a rewrite that moved the caret installs the
+                    // new position here.
+                    if resp.has_focus() && self.editing.is_none() {
+                        if let Some(mut st) = egui::TextEdit::load_state(ctx, fid) {
+                            if let Some(want) = self.pending_caret.take() {
+                                let ch = byte_to_char(&self.formula_input, want);
+                                st.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::one(egui::text::CCursor::new(ch)),
+                                ));
+                                st.clone().store(ctx, fid);
+                                self.edit_caret = want;
+                            } else if let Some(r) = st.cursor.char_range() {
+                                self.edit_caret =
+                                    char_to_byte(&self.formula_input, r.primary.index);
+                            }
+                        }
+                    }
+                    // Escape abandons a bar edit and puts the text back.
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                        if self.editing.is_some() {
+                            self.cancel_edit();
+                        } else {
+                            self.cancel_formula_bar();
+                        }
+                        if let Some(id) = ctx.memory(|m| m.focused()) {
+                            ctx.memory_mut(|m| m.surrender_focus(id));
+                        }
                     }
                     // Enter in the formula bar commits it to the selected cell.
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    else if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         let cell = self.selection.cursor;
                         let text = self.formula_input.clone();
                         let report = self.wb.commit_edit(cell, &text);
@@ -5864,7 +6287,53 @@ impl FerrixApp {
                         ui.label(RichText::new(format!("= {r}")).color(color).monospace());
                     }
                 });
+
+                // --- drag handle (issue #38) ---
+                //
+                // A full-width strip along the bar's bottom edge. Dragging it
+                // down adds rows, up removes them. The row count is derived
+                // from the pointer's CURRENT distance from the bar's top
+                // rather than accumulated per frame, so a fast drag cannot
+                // drift out of step with the pointer.
+                let handle = ui.allocate_response(
+                    egui::vec2(ui.available_width(), 6.0),
+                    egui::Sense::drag(),
+                );
+                let bright = handle.hovered() || handle.dragged();
+                ui.painter().hline(
+                    handle.rect.x_range(),
+                    handle.rect.center().y,
+                    egui::Stroke::new(if bright { 2.0_f32 } else { 1.0_f32 }, if bright {
+                        th.accent
+                    } else {
+                        th.grid_line
+                    }),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx()
+                        .set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if handle.dragged() {
+                    if let Some(p) = ui.ctx().pointer_interact_pos() {
+                        let top = ui.min_rect().top();
+                        let rows = ((p.y - top) / row_px).round().max(1.0) as usize;
+                        drag_rows = Some(rows);
+                    }
+                }
+                // Double-clicking the handle snaps between one row and a
+                // comfortable multi-line height, so the expansion does not
+                // require a steady hand.
+                if handle.double_clicked() {
+                    drag_rows = Some(if bar_rows > 1 { 1 } else { 4 });
+                }
             });
+        // Real layout output: the height the panel ACTUALLY occupied. A test
+        // asserting the bar grew reads this rather than the row count, so a
+        // stored number that never reaches layout fails.
+        self.last_formula_bar_h = formula_panel.response.rect.height();
+        if let Some(rows) = drag_rows {
+            self.set_formula_bar_rows(rows);
+        }
 
         // --- Name Manager ---
         if self.names_open {
@@ -6262,6 +6731,9 @@ impl FerrixApp {
                     return;
                 }
 
+                // Read before the view borrow: `showing_formulas` needs
+                // `&self`, and the Grid below holds `&mut self.scroll`.
+                let show_formulas_now = self.showing_formulas();
                 let resp = {
                     let view = self.wb.view();
                     // The conditional-formatting editor's LIVE PREVIEW. `None`
@@ -6314,6 +6786,7 @@ impl FerrixApp {
                         },
                         metrics: crate::grid::Metrics::new(self.zoom),
                         panes: &mut self.panes,
+                        show_formulas: show_formulas_now,
                     }
                     .show(ui)
                 };
@@ -6392,6 +6865,102 @@ impl FerrixApp {
                 } else {
                     self.last_trace_arrows = 0;
                     self.last_trace_total = 0;
+                }
+
+                // --- coloured reference highlighting (issue #38) ---
+                //
+                // Every reference in the formula being edited gets an outline
+                // over the range it points at, colour-matched to its position
+                // in the formula. Painted onto the grid's own Painter, the way
+                // the trace arrows above are, and through the SAME
+                // `cell_screen_rect` — a second copy of the geometry would
+                // drift the moment a freeze or a filter is active.
+                //
+                // Bounded by the viewport by construction: `cell_screen_rect`
+                // returns None for anything off screen, so a reference to
+                // `A1:A200000000` paints one rectangle clipped to the window
+                // rather than two hundred million.
+                self.ref_outlines.clear();
+                let spans = self.live_ref_spans();
+                if spans.is_empty() {
+                    self.ref_drag = None;
+                } else {
+                    let pad = self.pad_space();
+                    let resolver = self.row_resolver(pad);
+                    let metrics = crate::grid::Metrics::new(self.zoom);
+                    let painter = ui.painter().with_clip_rect(outer);
+                    let mut hit: Option<usize> = None;
+                    let ptr = ui.ctx().pointer_interact_pos();
+                    // Collected, then stored after the resolver's borrow of
+                    // `self` ends.
+                    let mut drawn: Vec<(egui::Rect, egui::Color32)> = Vec::new();
+                    for (i, sp) in spans.iter().enumerate() {
+                        let (r0, c0, r1, c1) = sp.bounds();
+                        let tl = Grid::cell_screen_rect(
+                            CellRef::new(r0, c0),
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        );
+                        let br = Grid::cell_screen_rect(
+                            CellRef::new(r1, c1),
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        );
+                        // Either corner alone is enough to place a rectangle:
+                        // a range half off screen still shows the half the
+                        // user can see.
+                        let rect = match (tl, br) {
+                            (Some(a), Some(b)) => a.union(b),
+                            (Some(a), None) => a,
+                            (None, Some(b)) => b,
+                            (None, None) => continue,
+                        };
+                        let rect = rect.intersect(outer);
+                        if !rect.is_positive() {
+                            continue;
+                        }
+                        let color = th.ref_colors[i % th.ref_colors.len()];
+                        painter.rect_stroke(rect, 1.0, egui::Stroke::new(1.5_f32, color));
+                        drawn.push((rect, color));
+                        if ptr.is_some_and(|p| rect.contains(p)) {
+                            // Later spans win: an outline drawn on top is the
+                            // one the user is pointing at.
+                            hit = Some(i);
+                        }
+                    }
+                    self.ref_outlines = drawn;
+
+                    // --- dragging an outline rewrites its reference ---
+                    //
+                    // Keyed on PRESS, not click. egui reports `primary_clicked`
+                    // on release, and keying a drag off it is exactly the bug
+                    // that made the fill handle silently do nothing.
+                    let (pressed, down) = ui
+                        .ctx()
+                        .input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));
+                    if pressed {
+                        if let (Some(i), Some(p)) = (hit, ptr) {
+                            if let Some(cell) = self.cell_at_point(p, outer) {
+                                self.ref_drag = Some(RefDrag { span: i, from: cell });
+                            }
+                        }
+                    } else if !down {
+                        if let Some(d) = self.ref_drag.take() {
+                            if let Some(to) = ptr.and_then(|p| self.cell_at_point(p, outer)) {
+                                let d_row = i64::from(to.row) - i64::from(d.from.row);
+                                let d_col = i64::from(to.col) - i64::from(d.from.col);
+                                self.move_reference(d.span, d_row, d_col);
+                            }
+                        }
+                    }
                 }
 
                 // Right-click opens the cell menu. Anchored at the click
@@ -6601,7 +7170,7 @@ impl FerrixApp {
                         crate::grid::Metrics::new(self.zoom),
                         self.panes,
                     ) {
-                        let id = egui::Id::new("cell_editor");
+                        let id = egui::Id::new(CELL_EDITOR_ID);
                         let mut child = ui.new_child(
                             egui::UiBuilder::new()
                                 .max_rect(rect.expand(1.0))
@@ -6626,6 +7195,29 @@ impl FerrixApp {
                                 state.store(ctx, id);
                             }
                             self.just_started_edit = false;
+                            self.pending_caret = None;
+                        }
+                        // Caret read-back for the in-cell editor, so F4 acts
+                        // on the reference the user is parked on there too.
+                        if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
+                            if let Some(want) = self.pending_caret.take() {
+                                let ch = byte_to_char(&self.edit_buffer, want);
+                                st.cursor.set_char_range(Some(
+                                    egui::text::CCursorRange::one(egui::text::CCursor::new(ch)),
+                                ));
+                                st.clone().store(ctx, id);
+                                self.edit_caret = want;
+                            } else if let Some(r) = st.cursor.char_range() {
+                                self.edit_caret =
+                                    char_to_byte(&self.edit_buffer, r.primary.index);
+                            }
+                        }
+                        // The bar mirrors the cell editor while an edit is
+                        // live (issue #38), so a long formula is readable in
+                        // the expanded bar even when the column is narrow.
+                        if edit.changed() {
+                            self.formula_input.clone_from(&self.edit_buffer);
+                            self.recompute_formula();
                         }
                         let enter = child.input(|i| i.key_pressed(Key::Enter));
                         let esc = child.input(|i| i.key_pressed(Key::Escape));
@@ -6684,6 +7276,19 @@ impl ferrix_io::export::ExportSource for crate::sheet_view::SheetView<'_> {
 /// Split out of `poll_load` so the multi-sheet wiring — tab order, per-sheet
 /// formula overlays, and the cross-sheet graph build — is testable without an
 /// egui context.
+/// egui's caret is a CHAR index; `refscan`/`refedit` work in BYTES.
+///
+/// Two tiny conversions rather than one shared "position" type, because the
+/// two libraries genuinely disagree and hiding that behind a type is how an
+/// off-by-one on a formula with a non-ASCII sheet name gets written.
+fn char_to_byte(s: &str, ch: usize) -> usize {
+    s.char_indices().nth(ch).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+fn byte_to_char(s: &str, byte: usize) -> usize {
+    s.char_indices().take_while(|(i, _)| *i < byte).count()
+}
+
 fn build_workbook(
     base: BaseData,
     sheet_name: String,

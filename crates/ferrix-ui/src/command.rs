@@ -211,6 +211,8 @@ registry! {
         "Back to 100%." }
     ViewTheme { "view.theme", Some(Menu::View), "◐ Switch light / dark theme", None, true, None,
         "Switch between light and dark. Remembered between runs." }
+    ViewShowFormulas { "view.show_formulas", Some(Menu::View), "ƒ Show formulas", Some("Ctrl+`"), false, None,
+        "Show each cell's formula source instead of its value, for this sheet. Rendered from the viewport, so it costs the same on a 200M-row sheet." }
     ViewEmptyRows { "view.empty_rows", Some(Menu::View), "⬓ Show empty rows", None, false, None,
         "Show empty rows past the end of the sheet so there is somewhere to type. They are not data: exports, SUM and the row count ignore them until you type in one." }
 
