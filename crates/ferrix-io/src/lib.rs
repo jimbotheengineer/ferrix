@@ -23,7 +23,6 @@ pub mod format_sidecar;
 pub mod mapped;
 pub mod pdf;
 pub mod pool;
-pub mod print;
 pub mod protect_xlsx;
 pub mod render;
 pub mod safeguard;

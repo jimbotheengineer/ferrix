@@ -36,6 +36,14 @@ use ferrix_core::{column_name, CellRef, ColSizes, HAlign, Rgb, RowSizes, TableRa
 use crate::export::{ExportError, ExportSource};
 use crate::pdf::{self, Color, Content, PdfDoc, FONT_BOLD, FONT_REGULAR};
 
+/// A temp path next to `path`, so the final rename stays on one filesystem
+/// (a cross-device rename would fall back to a copy and defeat atomicity).
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".rendering");
+    std::path::PathBuf::from(s)
+}
+
 /// Everything the renderer needs about one cell beyond its text.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CellPaint {
@@ -334,7 +342,12 @@ where
     }
 
     let media = setup.paper_size();
-    let file = std::fs::File::create(path)?;
+    // Write to a temp sibling and rename into place at the end. A crash, a full
+    // disk, or a cancel then leaves the PREVIOUS file intact rather than a
+    // truncated or deleted one — the failure mode that silently destroys the
+    // export the user was replacing.
+    let tmp = temp_sibling(path);
+    let file = std::fs::File::create(&tmp)?;
     let mut doc = PdfDoc::new(BufWriter::with_capacity(1 << 20, file), media)?;
 
     let printable = setup.printable();
@@ -350,7 +363,7 @@ where
         if i % 16 == 0 {
             if should_cancel() {
                 drop(doc);
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&tmp);
                 return Err(RenderError::Cancelled);
             }
             progress(i as u64, total);
@@ -375,6 +388,11 @@ where
     }
 
     let bytes = doc.finish()?;
+    // Windows will not rename onto an existing file; remove the old one first.
+    // Only reached after a fully-written temp, so the destination is replaced
+    // atomically from the reader's point of view.
+    let _ = std::fs::remove_file(path);
+    std::fs::rename(&tmp, path)?;
     progress(total, total);
     Ok(RenderStats {
         pages: total,
@@ -590,7 +608,9 @@ where
         return Err(RenderError::TooManyPages(total));
     }
 
-    let file = std::fs::File::create(path)?;
+    // Temp sibling + rename, so a cancel or crash preserves the prior file.
+    let tmp = temp_sibling(path);
+    let file = std::fs::File::create(&tmp)?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
     let mut written: u64 = 0;
     let mut buf = String::with_capacity(64 * 1024);
@@ -622,7 +642,7 @@ td{padding:1px 4px;white-space:nowrap;overflow:hidden}\
         if i % 16 == 0 {
             if should_cancel() {
                 drop(w);
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&tmp);
                 return Err(RenderError::Cancelled);
             }
             progress(i as u64, total);
@@ -716,6 +736,9 @@ td{padding:1px 4px;white-space:nowrap;overflow:hidden}\
     w.write_all(tail.as_bytes())?;
     written += tail.len() as u64;
     w.flush()?;
+    drop(w);
+    let _ = std::fs::remove_file(path);
+    std::fs::rename(&tmp, path)?;
     progress(total, total);
 
     Ok(RenderStats {
