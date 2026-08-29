@@ -121,6 +121,16 @@ enum Focus {
 const CELL_EDITOR_ID: &str = "cell_editor";
 const FORMULA_BAR_ID: &str = "formula_bar_edit";
 
+/// How many DISJOINT selection ranges are kept (issue #17).
+///
+/// Ctrl+clicking headers accumulates ranges, and without a cap a user leaning
+/// on Ctrl would grow the list without bound. 64 is far more scattered ranges
+/// than anyone assembles by hand, each is 16 bytes, and the paint loop tests
+/// membership against all of them per visible cell — so the bound is what keeps
+/// that per-cell cost a small constant rather than something that grows with
+/// the session. The cap is REPORTED when it bites, never silently enforced.
+pub const MAX_DISJOINT_SELECTIONS: usize = 64;
+
 /// A highlighted reference outline being dragged onto another cell.
 #[derive(Clone, Copy, Debug)]
 struct RefDrag {
@@ -141,6 +151,15 @@ pub struct FerrixApp {
     col_widths: Vec<f32>,
     /// Active selection. `cursor` is the cell that typing lands in.
     selection: Selection,
+    /// Additional DISJOINT ranges, from Ctrl+clicking row or column headers
+    /// (issue #17).
+    ///
+    /// Bounded on purpose. Each entry is two corners, so a hundred disjoint
+    /// full-column selections over a 200M-row sheet is a few kilobytes rather
+    /// than a row list — but the list itself still has to stop somewhere, or a
+    /// held-down Ctrl+click would grow it without limit. See
+    /// [`MAX_DISJOINT_SELECTIONS`].
+    extra_selections: Vec<Selection>,
     scroll: ScrollState,
 
     focus: Focus,
@@ -297,6 +316,9 @@ pub struct FerrixApp {
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
     header_hitboxes: Vec<(usize, egui::Pos2)>,
+    /// Where each visible ROW header was painted last frame (issue #17).
+    /// Same purpose as `header_hitboxes`, for the other axis.
+    row_header_hitboxes: Vec<(u32, egui::Pos2)>,
     /// (screen row, underlying row) for every row the LAST FRAME painted,
     /// frozen band first. Read back by tests as the app's own account of what
     /// is on screen.
@@ -584,6 +606,7 @@ impl FerrixApp {
             stats_cols: 0,
             col_widths: Vec::new(),
             selection: Selection::default(),
+            extra_selections: Vec::new(),
             scroll: ScrollState::default(),
             focus: Focus::Grid,
             editing: None,
@@ -634,6 +657,7 @@ impl FerrixApp {
             last_outline_buttons: 0,
             sizing_path: None,
             header_hitboxes: Vec::new(),
+            row_header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
             last_frozen_rows: 0,
             last_grid_rect: None,
@@ -5010,6 +5034,138 @@ impl FerrixApp {
         self.selection = Selection::new(clamp(self.selection.anchor), clamp(self.selection.cursor));
     }
 
+    // ---- row / column header selection (issue #17) ----
+    //
+    // The COLUMN case existed (press selects the whole column); the ROW case
+    // did not, and neither had Ctrl for disjoint or Shift for a span. All
+    // three go through one pair of methods so a row and a column cannot end up
+    // behaving differently by accident.
+
+    /// Select the whole of display row `row`.
+    ///
+    /// `mods` decides how it composes with what is already selected:
+    /// * plain — replace the selection with this row;
+    /// * Shift — extend from the anchor to cover every row between;
+    /// * Ctrl  — ADD this row as a disjoint range, leaving the others alone.
+    ///
+    /// The selection stays two corners in every case. Selecting row 1 and row
+    /// 50,000,000 of a 200M-row sheet must not materialise the 50M rows
+    /// between them, which is exactly what a bounding-box-only model would do
+    /// and why Ctrl needs its own list.
+    pub fn select_row(&mut self, row: u32, mods: egui::Modifiers) {
+        let last_col = self.stats_cols.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(row, 0), CellRef::new(row, last_col));
+        let note = self.apply_header_selection(band, mods, true);
+        // A warning outranks the routine confirmation: "row 4 selected" is
+        // what the user can already see, whereas "the oldest was dropped" is
+        // the only signal that the cap just bit.
+        self.status = note.unwrap_or_else(|| format!("Row {} selected", row as u64 + 1));
+    }
+
+    /// Select the whole of display column `col`. Same modifier rules as
+    /// [`Self::select_row`].
+    pub fn select_column(&mut self, col: u32, mods: egui::Modifiers) {
+        let last_row = self.stats_rows.saturating_sub(1) as u32;
+        let band = Selection::new(CellRef::new(0, col), CellRef::new(last_row, col));
+        let note = self.apply_header_selection(band, mods, false);
+        self.status =
+            note.unwrap_or_else(|| format!("Column {} selected", ferrix_core::column_name(col)));
+    }
+
+    /// Compose a header band with the existing selection per the modifiers.
+    ///
+    /// Returns a status message the caller must PREFER over its own, when the
+    /// composition did something the user needs told about.
+    fn apply_header_selection(
+        &mut self,
+        band: Selection,
+        mods: egui::Modifiers,
+        is_row: bool,
+    ) -> Option<String> {
+        let mut note = None;
+        if mods.command {
+            // Ctrl: a DISJOINT addition. The current selection is pushed into
+            // the extra list and the new band becomes the active one, so the
+            // cursor — and therefore where typing lands — is always the band
+            // the user just clicked.
+            if self.extra_selections.len() < MAX_DISJOINT_SELECTIONS {
+                self.extra_selections.push(self.selection);
+            } else {
+                // Visible, not silent. A cap the user cannot see is a cap they
+                // experience as the feature randomly not working.
+                note = Some(format!(
+                    "Only {MAX_DISJOINT_SELECTIONS} separate selections are kept — \
+                     the oldest was dropped"
+                ));
+                self.extra_selections.remove(0);
+                self.extra_selections.push(self.selection);
+            }
+            self.selection = band;
+        } else if mods.shift {
+            // Shift: one contiguous span from the existing ANCHOR to this
+            // band. Disjoint ranges are cleared, matching what every
+            // spreadsheet does — a span replaces a scattering.
+            self.extra_selections.clear();
+            let anchor = self.selection.anchor;
+            self.selection = if is_row {
+                Selection::new(
+                    CellRef::new(anchor.row, band.anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            } else {
+                Selection::new(
+                    CellRef::new(band.anchor.row, anchor.col),
+                    CellRef::new(band.cursor.row, band.cursor.col),
+                )
+            };
+        } else {
+            self.extra_selections.clear();
+            self.selection = band;
+        }
+        self.focus = Focus::Grid;
+        self.sync_formula_bar();
+        note
+    }
+
+    /// The disjoint ranges currently held, for tests and for the paint call.
+    pub fn extra_selections(&self) -> &[Selection] {
+        &self.extra_selections
+    }
+
+    /// Whether a cell is inside ANY selected range, active or disjoint.
+    pub fn cell_is_selected(&self, cell: CellRef) -> bool {
+        self.selection.contains(cell) || self.extra_selections.iter().any(|s| s.contains(cell))
+    }
+
+    /// Whether a display row is fully or partly selected, counting disjoint
+    /// ranges. This is what the row header highlight reads.
+    pub fn row_is_selected(&self, row: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.row_range();
+            row >= a && row <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Whether a display column is fully or partly selected, counting disjoint
+    /// ranges.
+    pub fn column_is_selected(&self, col: u32) -> bool {
+        let hits = |s: &Selection| {
+            let (a, b) = s.col_range();
+            col >= a && col <= b
+        };
+        hits(&self.selection) || self.extra_selections.iter().any(hits)
+    }
+
+    /// Where each visible ROW header was painted last frame, for tests that
+    /// need to click one without guessing pixels.
+    pub fn row_header_center(&self, row: u32) -> Option<(f32, f32)> {
+        self.row_header_hitboxes
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, p)| (p.x, p.y))
+    }
+
     /// Whether a load is still in flight.
     pub fn is_loading(&self) -> bool {
         self.loading
@@ -8291,6 +8447,7 @@ impl FerrixApp {
                     Grid {
                         view: &view,
                         selection: Some(self.selection),
+                        extra_selections: &self.extra_selections,
                         col_widths: &self.col_widths,
                         scroll: &mut self.scroll,
                         editing: self.editing,
@@ -8534,6 +8691,7 @@ impl FerrixApp {
                 // click one without guessing at pixels that move whenever a
                 // bar above the grid opens.
                 self.header_hitboxes = resp.header_hitboxes.clone();
+                self.row_header_hitboxes = resp.row_header_hitboxes.clone();
                 self.last_painted_rows = resp.painted_rows.clone();
                 self.last_frozen_rows = resp.frozen_row_count;
                 // The grid clamps the zoom (a band taller than the window is
@@ -8615,10 +8773,22 @@ impl FerrixApp {
                 // user sees what they grabbed. Release commits the move.
                 if let Some(c) = resp.header_press {
                     self.header_drag = Some(c);
-                    let last = self.stats_rows.saturating_sub(1) as u32;
-                    self.selection =
-                        Selection::new(CellRef::new(0, c as u32), CellRef::new(last, c as u32));
-                    self.status = format!("Column {} selected", ferrix_core::column_name(c as u32));
+                    // Plain / Ctrl / Shift all go through the SAME method the
+                    // row case uses, so the two axes cannot drift apart.
+                    let mods = ui.input(|i| i.modifiers);
+                    self.select_column(c as u32, mods);
+                }
+                // --- row header selection (issue #17) ---
+                //
+                // The mirror of the column press above. Reported on PRESS with
+                // the modifiers captured on that frame, because egui's
+                // aggregate `i.modifiers` is only correct while the frame that
+                // produced the press is still being handled.
+                if let Some((row, mods)) = resp.row_header_press {
+                    if self.editing.is_some() {
+                        self.commit_edit();
+                    }
+                    self.select_row(row, mods);
                 }
                 if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
                     if src != dst {

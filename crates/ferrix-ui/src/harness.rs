@@ -320,6 +320,38 @@ impl Harness {
         self.app.toggle_merge();
     }
 
+    /// Set the modifiers the NEXT frame reports on `RawInput.modifiers`.
+    ///
+    /// They lift after that frame, matching how the real app sees a held key.
+    /// This is the aggregate the app reads via `i.modifiers`; per-event
+    /// modifiers alone make a Ctrl+click arrive as a plain click, which is the
+    /// exact failure synthetic OS input produces.
+    pub fn set_modifiers(&mut self, modifiers: Modifiers) -> &mut Self {
+        self.pending_modifiers = modifiers;
+        self
+    }
+
+    /// Click a ROW header (issue #17), optionally with modifiers.
+    ///
+    /// Reads the row header's ACTUAL painted centre back from the app, for the
+    /// same reason `click_header` does: the row band's y depends on the scroll
+    /// offset, the zoom, per-row heights and the frozen band, so hard-coded
+    /// pixels test arithmetic rather than the gesture. Three wrong guesses at
+    /// a header y-band cost a compile-test round each in an earlier session.
+    ///
+    /// Modifiers go on `RawInput.modifiers` via `set_modifiers`, NOT per event:
+    /// the app reads `i.modifiers` from the aggregate.
+    pub fn click_row_header(&mut self, row: u32, modifiers: Modifiers) -> &mut Self {
+        self.step();
+        let (x, y) = self
+            .app
+            .row_header_center(row)
+            .unwrap_or_else(|| panic!("row {row} header is not on screen"));
+        self.pending_modifiers = modifiers;
+        self.click_at(x, y).steps(2);
+        self
+    }
+
     /// Run a registry command by id — the REAL dispatch path (issue #17).
     ///
     /// Structural-edit tests go through this rather than calling the workbook
@@ -7687,6 +7719,221 @@ xxx,yyy,zzz
         assert_eq!(
             before, after,
             "insert/delete must permute the display order, never rewrite the source file"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---------------------------------------------------------------------
+    // issue #17: row header selection, Ctrl for disjoint, Shift for a span
+    //
+    // The COLUMN case already existed. These cover the row case and the two
+    // modifiers on both axes. Every assertion reads the app's own selection
+    // state back, and the "did nothing at all" question is answered by
+    // asserting the row that must NOT be selected as well as the one that must.
+
+    #[test]
+    fn pressing_a_row_header_selects_the_whole_row() {
+        let (p, mut h) = structural_fixture("rowsel.csv");
+
+        // Baseline: only the cursor cell is selected, so a dead gesture cannot
+        // pass this test by accident.
+        assert!(
+            !h.app().row_is_selected(2),
+            "baseline: row 2 must not already be selected"
+        );
+
+        h.click_row_header(2, Modifiers::default());
+
+        let (tl, br) = h.app().selection_bounds();
+        assert_eq!(tl.row, 2, "the selection must start on the pressed row");
+        assert_eq!(br.row, 2, "and must not spill onto its neighbours");
+        assert_eq!(tl.col, 0, "a row selection starts at column 0");
+        assert_eq!(
+            br.col as usize,
+            h.app().col_count().saturating_sub(1),
+            "a row selection reaches the last column"
+        );
+        assert!(h.app().row_is_selected(2));
+        assert!(
+            !h.app().row_is_selected(1) && !h.app().row_is_selected(3),
+            "pressing one row header must not select its neighbours"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_full_row_selection_stays_two_corners_not_a_cell_list() {
+        // The scale invariant. A row of a 200M-column sheet is absurd, but the
+        // COLUMN case is real: selecting a column of a 200M-row sheet as a
+        // Vec<CellRef> would be 1.6 GB. Both are stored as bounds.
+        let (p, mut h) = structural_fixture("rowsel_bounds.csv");
+
+        h.click_row_header(1, Modifiers::default());
+        let sel = h.app().selection_bounds();
+        // Two corners fully describe it: the count is derived, not stored.
+        let cells = (u64::from(sel.1.row - sel.0.row) + 1) * (u64::from(sel.1.col - sel.0.col) + 1);
+        assert!(cells >= 3, "the row must actually span the sheet's columns");
+        assert_eq!(
+            std::mem::size_of::<ferrix_core::Selection>(),
+            16,
+            "a selection must stay two corners, whatever it covers"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ctrl_clicking_row_headers_selects_disjoint_rows_not_the_span_between() {
+        // THE point of disjoint selection. A bounding box from row 0 to row 3
+        // would also cover rows 1 and 2, which is precisely what the user did
+        // NOT ask for — and on a big sheet is the difference between two rows
+        // and fifty million.
+        let (p, mut h) = structural_fixture("rowsel_ctrl.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(3, Modifiers::COMMAND);
+
+        assert!(h.app().row_is_selected(0), "the first row stays selected");
+        assert!(
+            h.app().row_is_selected(3),
+            "the Ctrl+clicked row is selected"
+        );
+        assert!(
+            !h.app().row_is_selected(1) && !h.app().row_is_selected(2),
+            "Ctrl+click must NOT select the rows between — that is the whole \
+             difference between disjoint selection and a span"
+        );
+        assert_eq!(
+            h.app().extra_selections().len(),
+            1,
+            "the earlier row must be kept as a separate range"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn shift_clicking_a_row_header_selects_the_span() {
+        // The counterpart: Shift DOES want everything between.
+        let (p, mut h) = structural_fixture("rowsel_shift.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(3, Modifiers::SHIFT);
+
+        for row in 0..=3u32 {
+            assert!(
+                h.app().row_is_selected(row),
+                "Shift+click must select the whole span, missing row {row}"
+            );
+        }
+        assert!(
+            h.app().extra_selections().is_empty(),
+            "a span replaces any scattering rather than adding to it"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ctrl_clicking_column_headers_selects_disjoint_columns() {
+        // The same rule on the other axis, driven through the real column
+        // header gesture that already existed.
+        let (p, mut h) = structural_fixture("colsel_ctrl.csv");
+
+        h.click_header(0);
+        assert!(h.app().column_is_selected(0));
+
+        // Ctrl+click column 2, skipping column 1.
+        h.step();
+        let (x, y) = h.app().header_center(2).expect("column 2 header on screen");
+        h.set_modifiers(Modifiers::COMMAND);
+        h.click_at(x, y).steps(2);
+
+        assert!(h.app().column_is_selected(0), "the first column stays");
+        assert!(
+            h.app().column_is_selected(2),
+            "the Ctrl+clicked column joins"
+        );
+        assert!(
+            !h.app().column_is_selected(1),
+            "Ctrl+click must skip the column between"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_plain_row_header_press_replaces_a_disjoint_selection() {
+        // Without this, the scattering accumulates forever and the user has no
+        // way back to a single row except restarting.
+        let (p, mut h) = structural_fixture("rowsel_reset.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        h.click_row_header(2, Modifiers::COMMAND);
+        assert_eq!(h.app().extra_selections().len(), 1, "setup: two ranges");
+
+        h.click_row_header(3, Modifiers::default());
+        assert!(
+            h.app().extra_selections().is_empty(),
+            "a plain press must clear the disjoint ranges"
+        );
+        assert!(h.app().row_is_selected(3));
+        assert!(
+            !h.app().row_is_selected(0) && !h.app().row_is_selected(2),
+            "and must deselect what was scattered"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn disjoint_selections_are_bounded_and_the_cap_is_reported() {
+        // A cap the user cannot see is one they experience as the feature
+        // randomly not working. This asserts BOTH that the list stops growing
+        // and that the app says so.
+        let (p, mut h) = structural_fixture("rowsel_cap.csv");
+
+        h.click_row_header(0, Modifiers::default());
+        // Far more Ctrl+clicks than the cap, cycling over the rows available.
+        for i in 0..(crate::app::MAX_DISJOINT_SELECTIONS + 20) {
+            let row = (i % 4) as u32;
+            h.click_row_header(row, Modifiers::COMMAND);
+        }
+
+        assert!(
+            h.app().extra_selections().len() <= crate::app::MAX_DISJOINT_SELECTIONS,
+            "the disjoint list must stay bounded, got {}",
+            h.app().extra_selections().len()
+        );
+        assert!(
+            h.app().status_text().contains("separate selections"),
+            "the cap must be REPORTED, not silently enforced; status was {:?}",
+            h.app().status_text()
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_row_header_press_selects_the_row_the_number_beside_it_names() {
+        // The single-mapping rule. Row headers show the ORIGINAL row number
+        // even under a filter, and the press is resolved from the SAME band
+        // walk that paints that number — so the two cannot disagree. A second
+        // row mapping is exactly what once painted wrong records under correct
+        // row numbers here.
+        let (p, mut h) = structural_fixture("rowsel_mapping.csv");
+
+        // Row 2 holds "gamma". Press its header and read the value back at the
+        // selected coordinate: if the press resolved through a different
+        // mapping than the paint, this reads the wrong record.
+        h.click_row_header(2, Modifiers::default());
+        let (tl, _) = h.app().selection_bounds();
+        assert_eq!(
+            h.app().display(CellRef::new(tl.row, 1)),
+            "gamma",
+            "the selected row must hold the record whose number was painted"
         );
 
         let _ = std::fs::remove_file(&p);
