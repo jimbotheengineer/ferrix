@@ -148,6 +148,11 @@ pub struct Workbook {
     sheets: Vec<SheetMeta>,
     /// Index into `sheets` of the sheet whose data is in `base`/`overlay`.
     active: usize,
+    /// Merged regions for the ACTIVE sheet.
+    ///
+    /// Sparse rectangles beside the data, so merged headers cost nothing per
+    /// row on a 200M-row sheet.
+    pub merges: ferrix_core::merge::MergeMap,
     /// Sheet-wide formatting for the ACTIVE sheet: manual colours and type
     /// styling.
     ///
@@ -203,6 +208,7 @@ impl Workbook {
             active: 0,
             order: ferrix_core::SheetOrder::new(),
             format: ferrix_core::SheetFormat::new(),
+            merges: ferrix_core::merge::MergeMap::new(),
             parked: std::collections::HashMap::new(),
             next_id: 1,
             undo: Vec::new(),

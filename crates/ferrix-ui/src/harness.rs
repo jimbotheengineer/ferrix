@@ -49,6 +49,8 @@ pub struct Harness {
     frame: u64,
     /// Paint shapes emitted by the last frame.
     last_shapes: usize,
+    /// Text shapes emitted by the last frame.
+    last_texts: usize,
     /// Aggregate modifier state for the next frame.
     ///
     /// egui exposes `i.modifiers` from `RawInput.modifiers`, NOT from the
@@ -76,6 +78,7 @@ impl Harness {
             screen: Vec2::new(1400.0, 880.0),
             frame: 0,
             last_shapes: 0,
+            last_texts: 0,
             pending_modifiers: Modifiers::default(),
         }
     }
@@ -102,12 +105,26 @@ impl Harness {
         // paint output, not a proxy for it, which is what lets a test assert
         // that a style change reached the screen rather than only the model.
         self.last_shapes = out.shapes.len();
+        self.last_texts = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(s.shape, egui::epaint::Shape::Text(_)))
+            .count();
         self.frame += 1;
         self
     }
 
     /// Run `n` frames. Loading happens on a worker thread, so a test that opens
     /// a file steps until the load lands rather than sleeping.
+    /// Text shapes emitted by the most recent frame.
+    ///
+    /// Separate from the total because a style change may swap one shape kind
+    /// for another; text count is what answers "did this cell draw its value".
+    pub fn paint_text_count(&mut self) -> usize {
+        self.step();
+        self.last_texts
+    }
+
     /// Number of paint shapes emitted by the most recent frame.
     pub fn paint_shape_count(&mut self) -> usize {
         // Draw one fresh frame so the count reflects current state rather
@@ -234,6 +251,21 @@ impl Harness {
     /// arithmetic rather than whether a reorder preserves meaning.
     pub fn move_columns(&mut self, from: u64, count: u64, to: u64) -> Result<(), String> {
         self.app.move_columns(from, count, to)
+    }
+
+    /// Merge the current selection, for the merge tests.
+    ///
+    /// Same justification as `move_columns`: the alternative is synthesising a
+    /// toolbar click in pixels, which tests button geometry rather than
+    /// whether merging preserves the user's data.
+    pub fn merge_selection(&mut self) {
+        self.app.toggle_merge();
+    }
+
+    /// Set the selection directly, so a test can say what it means instead of
+    /// spelling a drag in coordinates.
+    pub fn select(&mut self, a: ferrix_core::CellRef, b: ferrix_core::CellRef) {
+        self.app.set_selection_for_test(a, b);
     }
 
     /// The app under test, for assertions.
@@ -788,6 +820,92 @@ mod tests {
         assert!(
             bolded > plain,
             "a bold cell must paint more than a plain one (plain {plain}, bold {bolded})"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn typing_into_a_covered_cell_edits_the_merge_anchor() {
+        // A covered cell holds no value of its own. Without redirection the
+        // user types into a cell they cannot see, the anchor keeps its old
+        // text, and the edit appears to vanish.
+        let p = write_csv("mergeedit.csv", "a,b,c\n1,2,3\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Merge A1:C1 (the header row), then type into what is now covered.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 2));
+        h.steps(1);
+        h.merge_selection();
+        h.steps(2);
+
+        // Aim the edit at a COVERED cell by selecting it, then typing.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.steps(1);
+        h.type_text("hello").step();
+        h.press_key(Key::Enter).steps(2);
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 0)),
+            "hello",
+            "an edit aimed at a covered cell must land on the anchor"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_covered_cell_paints_no_text_of_its_own() {
+        // The observable consequence of merging: the covered cells stop
+        // drawing their labels. Asserting on the model alone would pass even
+        // if the grid ignored merges entirely.
+        //
+        // This counts TEXT shapes specifically. Total shape count is the wrong
+        // measure and said so when I tried it: the anchor adds a background
+        // fill, so merging three cells removed two texts and added one rect
+        // for a net INCREASE of one. Counting all shapes would have made this
+        // test fail for a correct implementation.
+        let p = write_csv(
+            "mergepaint.csv",
+            "aaa,bbb,ccc
+xxx,yyy,zzz
+",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let before = h.paint_text_count();
+        h.select(CellRef::new(0, 0), CellRef::new(0, 2));
+        h.steps(1);
+        h.merge_selection();
+        h.steps(3);
+        let after = h.paint_text_count();
+
+        assert_eq!(
+            after,
+            before - 2,
+            "merging three cells must leave exactly one of their three texts              drawn (before {before}, after {after})"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn merging_then_merging_again_unmerges() {
+        let p = write_csv("mergetoggle.csv", "a,b\n1,2\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 1));
+        h.steps(1);
+        h.merge_selection();
+        h.steps(2);
+        assert!(h.status().contains("Merged"), "status: {}", h.status());
+
+        h.merge_selection();
+        h.steps(2);
+        assert!(
+            h.status().contains("Unmerged"),
+            "a second merge over the same range must unmerge; status: {}",
+            h.status()
         );
         let _ = std::fs::remove_file(&p);
     }

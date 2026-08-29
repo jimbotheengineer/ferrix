@@ -207,6 +207,9 @@ pub struct Grid<'a> {
     /// any cell, table or not. `None` when nothing has been formatted, which
     /// keeps the default path free of lookups.
     pub format: Option<&'a ferrix_core::SheetFormat>,
+    /// Merged regions. `None` when the sheet has none, keeping the default
+    /// paint path free of lookups.
+    pub merges: Option<&'a ferrix_core::merge::MergeMap>,
 }
 
 impl<'a> Grid<'a> {
@@ -560,6 +563,27 @@ impl<'a> Grid<'a> {
                 if self.editing == Some(cref) {
                     painted_cells += 1;
                     continue;
+                }
+
+                // Merged regions. A covered cell paints nothing at all — its
+                // value lives on the anchor, and drawing anything here would
+                // either repeat the anchor's text in every covered cell or
+                // show a stale value the user cannot edit. The anchor instead
+                // paints across the whole rectangle.
+                let merge_region = self.merges.and_then(|m| m.region_at(cref));
+                let mut cell_rect = cell_rect;
+                if let Some(mr) = merge_region {
+                    if mr.first_row != row || mr.first_col != c as u32 {
+                        // Covered: skip this cell entirely.
+                        continue;
+                    }
+                    // Anchor: widen to the region's full extent so long text
+                    // is not clipped at the first column's edge.
+                    let last = (mr.last_col as usize).min(col_x.len().saturating_sub(1));
+                    let right = body_origin.x + col_x[last] - self.scroll.col_px + width_of(last);
+                    let bottom = y + ROW_HEIGHT * (mr.last_row - mr.first_row + 1) as f32;
+                    cell_rect = Rect::from_min_max(cell_rect.min, egui::pos2(right, bottom));
+                    painter.rect_filled(cell_rect, 0.0, th.bg);
                 }
 
                 let value = view.get(cref);

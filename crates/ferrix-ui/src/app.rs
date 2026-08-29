@@ -377,6 +377,15 @@ impl FerrixApp {
     }
 
     fn begin_edit(&mut self, cell: CellRef, seed: Option<String>) {
+        // A cell covered by a merge holds no value of its own — the anchor
+        // does. Redirect the edit there rather than refusing it outright, so
+        // typing into a merged block edits the thing the user can see instead
+        // of silently doing nothing.
+        //
+        // This is the single chokepoint for every edit path (typing, F2,
+        // double-click), which is why the check lives here and not in three
+        // call sites that could drift apart.
+        let cell = self.wb.merges.resolve(cell);
         self.editing = Some(cell);
         self.edit_buffer = seed.unwrap_or_else(|| self.wb.view().edit_text(cell));
         self.focus = Focus::Cell;
@@ -1182,6 +1191,45 @@ impl FerrixApp {
     /// live in different parts of the package: calamine reads the cells,
     /// [`ferrix_io::import_tables`] reads `xl/tables/*.xml` plus the
     /// worksheet's validation and conditional-format elements.
+    fn open_xlsx_dialog(&mut self) {
+        self.open_xlsx_dialog_impl()
+    }
+
+    /// Set the selection, for the headless harness only.
+    #[cfg(test)]
+    pub fn set_selection_for_test(&mut self, a: CellRef, b: CellRef) {
+        // Selection::new carries the cursor, so there is nothing else to set.
+        self.selection = Selection::new(a, b);
+    }
+
+    /// Merge the current selection, or unmerge if it already covers merges.
+    ///
+    /// One button for both directions because that is how the user thinks
+    /// about it — the selection either is merged or it is not.
+    pub fn toggle_merge(&mut self) {
+        let (a, b) = self.selection.bounds();
+        let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+
+        let existing = self.wb.merges.unmerge_range(range);
+        if existing > 0 {
+            self.wb.mark_dirty();
+            self.status = format!(
+                "Unmerged {existing} region{}",
+                if existing == 1 { "" } else { "s" }
+            );
+            return;
+        }
+        match self.wb.merges.merge(range) {
+            Ok(()) => {
+                self.wb.mark_dirty();
+                self.status = "Merged".into();
+            }
+            // A refusal is reported, never silent: the user pressed a button
+            // and must learn why nothing happened.
+            Err(e) => self.status = format!("Cannot merge: {e}"),
+        }
+    }
+
     /// Font family, size, and the B/I/U toggles.
     ///
     /// The toggles are three-state underneath but two-state to the user: a
@@ -1304,7 +1352,7 @@ impl FerrixApp {
         self.status = "Formatting applied".into();
     }
 
-    fn open_xlsx_dialog(&mut self) {
+    fn open_xlsx_dialog_impl(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel workbook", &["xlsx"])
             .pick_file()
@@ -2242,6 +2290,13 @@ impl FerrixApp {
                         self.open_chart();
                     }
                     ui.separator();
+                    if ui
+                        .button("⬓ Merge")
+                        .on_hover_text("Merge the selection, or unmerge it if already merged")
+                        .clicked()
+                    {
+                        self.toggle_merge();
+                    }
                     self.type_controls(ui, th);
                     ui.separator();
                     if ui
@@ -2750,6 +2805,7 @@ impl FerrixApp {
                         },
                         theme: th,
                         format: Some(&self.wb.format),
+                        merges: Some(&self.wb.merges),
                         pad_rows: if self.show_empty_rows {
                             crate::grid::EMPTY_ROW_PADDING
                         } else {
