@@ -5563,6 +5563,21 @@ impl FerrixApp {
                                 .monospace(),
                             );
                         }
+                        // Trace arrow badge (roadmap #39). Same discipline as
+                        // the invalid-cell badge above: when the arrow list
+                        // was capped, say "showing N of M" rather than
+                        // reporting the capped number as if it were the
+                        // whole truth. A cell with 500k dependents must not
+                        // silently look like it has 100.
+                        if self.trace.is_some() {
+                            let (drawn, total) = self.trace_counts();
+                            let text = if total > drawn {
+                                format!("↗ showing {drawn} of {total} arrows")
+                            } else {
+                                format!("↗ {drawn} arrow{}", plural(drawn))
+                            };
+                            ui.label(RichText::new(text).color(th.accent).size(11.5).monospace());
+                        }
                     });
                 });
             });

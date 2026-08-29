@@ -4199,6 +4199,46 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&p);
     }
 
+    /// The "showing N of M" note the issue asks for, at the point where it
+    /// actually matters: MORE dependents than MAX_ARROWS, so the drawn count
+    /// and the true total genuinely differ. A capped trace that reported
+    /// only "100 arrows" would be lying by omission.
+    #[test]
+    fn exceeding_the_cap_reports_showing_n_of_m_honestly() {
+        let mut body = String::from("id,qty\n");
+        for i in 1..=200u32 {
+            body.push_str(&format!("{i},{i}\n"));
+        }
+        let p = write_csv("trace_over_cap.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+
+        // 120 dependents on A1 -- deliberately MORE than MAX_ARROWS (100).
+        let deps = crate::trace::MAX_ARROWS + 20;
+        for r in 1..=deps as u32 {
+            edit_cell(&mut h, r, 1, "=A1");
+        }
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.scroll_body_to(0.0);
+        h.trace_dependents();
+
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, deps, "the TRUE total must survive the cap");
+        assert_eq!(
+            drawn,
+            crate::trace::MAX_ARROWS,
+            "the drawn count must be clamped to the cap, not to the total"
+        );
+        assert!(
+            total > drawn,
+            "test setup: this test is only meaningful when the cap actually bites"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// Off-screen sources are indicated at the viewport edge rather than
     /// drawn at wrong coordinates: when the precedent has scrolled out of
     /// view, an arrow is still counted as drawn (its far end clamped to the
