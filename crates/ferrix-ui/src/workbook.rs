@@ -76,6 +76,52 @@ pub struct CommitReport {
     pub micros: u128,
 }
 
+// ============================================================================
+// Goal Seek (issue #35)
+// ============================================================================
+
+/// Cap on secant iterations. ~100 per the acceptance criteria: enough for a
+/// well-conditioned secant search to converge many times over, small enough
+/// that a genuinely divergent target (see [`GoalSeekReport::converged`])
+/// terminates in well under a second instead of spinning.
+pub const GOAL_SEEK_MAX_ITERS: usize = 100;
+
+/// Convergence tolerance: `|A - target| < GOAL_SEEK_EPSILON` counts as a hit.
+pub const GOAL_SEEK_EPSILON: f64 = 1e-6;
+
+/// Why a Goal Seek request was refused before it wrote anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalSeekError {
+    /// `target` does not transitively depend on `changing` in the dependency
+    /// graph, so no value written to `changing` could ever move `target`.
+    /// Checked with [`ferrix_formula::depgraph::DepGraph::depends_on_at`]
+    /// before a single recalculation runs.
+    NotDependent,
+}
+
+/// Outcome of a completed Goal Seek run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalSeekReport {
+    /// True when the run stopped because `|target - target_value| < ε`,
+    /// rather than because it hit the iteration cap or diverged.
+    pub converged: bool,
+    /// How many candidate values were actually committed to the changing
+    /// cell (bounded by [`GOAL_SEEK_MAX_ITERS`], plus at most one closing
+    /// write that restores the closest candidate found if the run ends on a
+    /// worse one).
+    pub iterations: usize,
+    /// The value the caller asked for.
+    pub target: f64,
+    /// The changing cell's value at the end of the run — the closest
+    /// approach found, whether or not it converged.
+    pub final_b: f64,
+    /// The target cell's value at the end of the run, if it evaluated to a
+    /// number. `None` only when the target formula never produced a number
+    /// for any candidate tried, which leaves the sheet at its original state
+    /// (see [`Workbook::goal_seek`]).
+    pub final_a: Option<f64>,
+}
+
 /// Where the user was last looking in a sheet.
 ///
 /// Kept per sheet so switching tabs restores the position and selection the

@@ -300,6 +300,72 @@ impl DepGraph {
         false
     }
 
+    /// Does `target` transitively depend on `from` — directly, or through any
+    /// chain of intermediate formulas, however many hops and however many
+    /// sheets it crosses?
+    ///
+    /// This is a PRECEDENT walk (what does `target` read), not a dependent
+    /// walk, because Goal Seek is asked the question the other feature graphs
+    /// answer backwards: "if I changed `from`, would `target` move at all?"
+    /// Answering that by first computing `recalc_order_at(from)` and checking
+    /// membership would work too, but it computes the full downstream set of
+    /// `from` — every dependent, however unrelated to `target` — where this
+    /// walk can stop the instant it finds `from`, and does not need `from` to
+    /// be a formula cell (it usually is not: Goal Seek's "changing cell" is
+    /// typically a plain input).
+    ///
+    /// `target == from` is not a dependency: a cell does not transitively
+    /// depend on itself just by existing.
+    pub fn depends_on_at(&self, target: SheetCell, from: SheetCell) -> bool {
+        if target == from {
+            return false;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![target];
+        while let Some(cur) = stack.pop() {
+            // `seen` is what makes this terminate on a cycle rather than
+            // spin — the same guard `is_circular_at` uses.
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(ps) = self.precedents.get(&cur) else {
+                continue;
+            };
+            for (sheet, p) in ps {
+                match p {
+                    Precedent::Cell(c) => {
+                        let refd = SheetCell::new(*sheet, *c);
+                        if refd == from {
+                            return true;
+                        }
+                        if self.precedents.contains_key(&refd) {
+                            stack.push(refd);
+                        }
+                    }
+                    Precedent::Range(_, _) => {
+                        if *sheet == from.sheet && p.contains(from.cell) {
+                            return true;
+                        }
+                        // A range may also cover other formula cells whose
+                        // OWN precedents need walking (a formula inside the
+                        // summed range that itself reads `from` indirectly).
+                        for f in self.precedents.keys() {
+                            if f.sheet == *sheet && p.contains(f.cell) {
+                                stack.push(*f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Single-sheet convenience for [`DepGraph::depends_on_at`].
+    pub fn depends_on(&self, target: CellRef, from: CellRef) -> bool {
+        self.depends_on_at(SheetCell::main(target), SheetCell::main(from))
+    }
+
     /// Every formula affected by a change to `changed`, in an order safe to
     /// evaluate. Spans sheets: editing Sheet1!A1 returns the Sheet2 formulas
     /// that read it, correctly ordered against everything else.
@@ -695,6 +761,65 @@ mod tests {
         ]);
         assert!(g.is_circular_at(sc(S2, 4, 0)));
         assert!(g.full_order_all().is_err());
+    }
+
+    // --- transitive dependency check (Goal Seek, issue #35) --------------
+
+    #[test]
+    fn depends_on_is_true_for_a_direct_precedent() {
+        let g = graph(&[(cr(0, 1), "=A1*2")]);
+        assert!(g.depends_on(cr(0, 1), cr(0, 0)));
+    }
+
+    #[test]
+    fn depends_on_is_true_several_hops_downstream() {
+        // D1 <- C1 <- B1 <- A1. D1 must be seen as depending on A1 even
+        // though it never mentions A1 directly.
+        let g = graph(&[
+            (cr(0, 1), "=A1+1"), // B1 = A1+1
+            (cr(0, 2), "=B1+1"), // C1 = B1+1
+            (cr(0, 3), "=C1+1"), // D1 = C1+1
+        ]);
+        assert!(g.depends_on(cr(0, 3), cr(0, 0)));
+    }
+
+    #[test]
+    fn depends_on_is_false_for_an_unrelated_cell() {
+        let g = graph(&[(cr(0, 1), "=A1*2"), (cr(5, 5), "=Z1*3")]);
+        // D1 (5,5) reads Z1, not A1 — no path exists.
+        assert!(!g.depends_on(cr(5, 5), cr(0, 0)));
+        // And the reverse question is false too: A1 does not depend on B1.
+        assert!(!g.depends_on(cr(0, 0), cr(0, 1)));
+    }
+
+    #[test]
+    fn depends_on_a_cell_is_false_for_itself() {
+        let g = graph(&[(cr(0, 1), "=A1*2")]);
+        assert!(!g.depends_on(cr(0, 1), cr(0, 1)));
+    }
+
+    #[test]
+    fn depends_on_sees_through_a_range_precedent() {
+        // C1 = SUM(A1:A10); B5 is a plain data cell inside that range, so C1
+        // depends on B5 even though the formula names a range, not B5 alone.
+        let g = graph(&[(cr(0, 2), "=SUM(A1:A10)")]);
+        assert!(g.depends_on(cr(0, 2), cr(4, 0))); // A5 is row index 4
+    }
+
+    #[test]
+    fn depends_on_crosses_sheets_and_terminates_on_a_cycle() {
+        // Sheet2!B1 = Sheet1!A1*2; Sheet3!C1 = Sheet2!B1+1.
+        // C1 transitively depends on Sheet1!A1.
+        let g = wb_graph(&[
+            (sc(S2, 0, 1), "=Sheet1!A1*2"),
+            (sc(S3, 0, 2), "=Sheet2!B1+1"),
+        ]);
+        assert!(g.depends_on_at(sc(S3, 0, 2), sc(S1, 0, 0)));
+        assert!(!g.depends_on_at(sc(S3, 0, 2), sc(S1, 5, 5)));
+
+        // A two-sheet cycle must not hang the walk.
+        let cyc = wb_graph(&[(sc(S1, 0, 0), "=Sheet2!A1"), (sc(S2, 0, 0), "=Sheet1!A1")]);
+        assert!(cyc.depends_on_at(sc(S1, 0, 0), sc(S2, 0, 0)));
     }
 
     #[test]
