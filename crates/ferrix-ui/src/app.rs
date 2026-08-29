@@ -67,6 +67,11 @@ struct Loaded {
     /// Defined names read from the source. Only xlsx carries any; CSV yields
     /// an empty table, which costs nothing.
     names: ferrix_formula::NameTable,
+    /// Sheet protection read from the source, by workbook-order sheet index
+    /// (issue #42). Empty for CSV and for any xlsx that has none.
+    protection: Vec<(usize, ferrix_core::SheetProtection)>,
+    /// Workbook-structure protection read from the source.
+    wb_protection: ferrix_core::WorkbookProtection,
 }
 
 type LoadResult = Result<Loaded, String>;
