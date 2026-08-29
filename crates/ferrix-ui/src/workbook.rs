@@ -9,7 +9,7 @@ use ferrix_core::{
 };
 use ferrix_formula::depgraph::DepGraph;
 use ferrix_formula::fill::FillKind;
-use ferrix_formula::{eval_view, parse};
+use ferrix_formula::{eval_view, DefinedName, NameError, NameScope, ParseError};
 
 use crate::grid::ScrollState;
 use crate::sheet_view::{BaseData, SheetView};
@@ -154,6 +154,13 @@ pub struct Workbook {
     pub overlay: EditOverlay,
     /// Workbook-wide dependency graph, spanning every sheet.
     pub graph: DepGraph,
+    /// Defined names, workbook- and sheet-scoped.
+    ///
+    /// Beside the data, never inside it: a name is a handful of small strings
+    /// however many rows it spans, and it is resolved to a plain range in the
+    /// parser, so `=SUM(Sales)` over 200M rows costs exactly what the explicit
+    /// range costs.
+    pub names: ferrix_formula::NameTable,
     /// Tab order and per-sheet identity/view state. Never empty.
     sheets: Vec<SheetMeta>,
     /// Index into `sheets` of the sheet whose data is in `base`/`overlay`.
@@ -213,6 +220,7 @@ impl Workbook {
             base: std::sync::Arc::new(base),
             overlay: EditOverlay::new(),
             graph: DepGraph::new(),
+            names: ferrix_formula::NameTable::new(),
             sheets: vec![SheetMeta {
                 // The first sheet is always MAIN, which is what makes a
                 // single-sheet workbook's graph identical to the pre-sheets one.
@@ -352,9 +360,14 @@ impl Workbook {
     pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<(), SheetError> {
         let name = self.validate_name(name, Some(id))?;
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
-        self.sheets[idx].name = name;
+        let old = std::mem::replace(&mut self.sheets[idx].name, name.clone());
+        // A defined name scoped to this sheet, or pointing into it, must
+        // follow the rename or it would silently address a sheet that no
+        // longer exists.
+        self.names.rename_sheet(&old, &name);
         self.dirty = true;
         self.rebuild_graph_and_recalc();
+        self.dirty = true;
         Ok(())
     }
 
@@ -364,6 +377,9 @@ impl Workbook {
             return Err(SheetError::LastSheet);
         }
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
+        // Captured before the tab goes, so sheet-scoped names can be dropped
+        // by name afterwards.
+        let deleted_name = Some(self.sheets[idx].name.clone());
         if idx == self.active {
             // Park the doomed sheet's storage so `base`/`overlay` can be
             // repointed at a survivor before we drop it.
@@ -385,6 +401,12 @@ impl Workbook {
         // Drop the deleted sheet's formulas, then re-resolve everything that
         // pointed AT it — those references are now #REF!.
         self.graph.remove_sheet(id);
+        // A name scoped to the departed sheet goes with it; a workbook-scoped
+        // name pointing INTO it is left alone, so it becomes a visible #REF!
+        // rather than silently disappearing.
+        if let Some(gone) = deleted_name.as_deref() {
+            self.names.remove_sheet_scope(gone);
+        }
         self.dirty = true;
         self.last_edit = None;
         self.rebuild_graph_and_recalc();
@@ -470,6 +492,187 @@ impl Workbook {
                 .find(|(_, name)| name.eq_ignore_ascii_case(n))
                 .map(|(id, _)| *id)
         }
+    }
+
+    // ---------------------------------------------------------- defined names
+
+    /// Parse a formula living on `home`, resolving defined names.
+    ///
+    /// Every parse in the workbook goes through here so that a name is
+    /// resolved the same way whether the formula was just typed, restored from
+    /// a sidecar, or imported from xlsx. The resolver is built by value rather
+    /// than borrowing `self` so it can be handed to `&mut self` paths.
+    fn parse_on(&self, home: SheetId, src: &str) -> Result<ferrix_formula::Expr, ParseError> {
+        let sheet = self.sheet_name(home).map(str::to_string);
+        let names = self.names.clone();
+        ferrix_formula::parse_with_names(src, &move |ident| names.resolve(ident, sheet.as_deref()))
+    }
+
+    /// Every name visible from the active sheet, sheet-scoped first.
+    pub fn visible_names(&self) -> Vec<&ferrix_formula::DefinedName> {
+        self.names.visible_from(Some(self.active_name()))
+    }
+
+    /// The name, if any, whose target is exactly this selection on the active
+    /// sheet. Drives what the Name Box shows.
+    pub fn name_for_selection(&self, sel: Selection) -> Option<&str> {
+        let (tl, br) = sel.bounds();
+        let want = ferrix_formula::names::refers_to_range(self.active_name(), tl, br);
+        self.visible_names()
+            .into_iter()
+            .find(|d| d.refers_to.eq_ignore_ascii_case(&want))
+            .map(|d| d.name.as_str())
+    }
+
+    /// Where a visible name points, as a selection on the sheet it names.
+    ///
+    /// `None` when the name is unknown, or when it stands for something that
+    /// is not a range on a sheet this workbook has (a constant, say) — there
+    /// is nothing to navigate to in that case.
+    pub fn name_target(&self, ident: &str) -> Option<(SheetId, Selection)> {
+        let d = self.names.get(ident, Some(self.active_name()))?;
+        let expr = d.target().ok()?;
+        let home = self.active_sheet();
+        match expr {
+            ferrix_formula::Expr::Ref(c) => Some((home, Selection::single(c))),
+            ferrix_formula::Expr::Range(a, b) => Some((home, Selection::new(a, b))),
+            ferrix_formula::Expr::XRef(sheet, c) => {
+                Some((self.sheet_id_by_name(&sheet)?, Selection::single(c)))
+            }
+            ferrix_formula::Expr::XRange(sheet, a, b) => {
+                Some((self.sheet_id_by_name(&sheet)?, Selection::new(a, b)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Define a name for a selection on the active sheet.
+    ///
+    /// Formulas that already mention this word were `#NAME?` until now; they
+    /// are re-evaluated so defining a name repairs them immediately.
+    pub fn define_name(
+        &mut self,
+        ident: &str,
+        scope: NameScope,
+        sel: Selection,
+    ) -> Result<(), NameError> {
+        let (tl, br) = sel.bounds();
+        let refers_to = ferrix_formula::names::refers_to_range(self.active_name(), tl, br);
+        self.names
+            .define(ferrix_formula::DefinedName::new(ident, scope, refers_to))?;
+        self.dirty = true;
+        self.refresh_name_dependents(ident);
+        Ok(())
+    }
+
+    /// Define a name pointing at an explicit `refers_to` string. Used by
+    /// import and by the Name Manager's edit field.
+    pub fn define_name_raw(
+        &mut self,
+        ident: &str,
+        scope: NameScope,
+        refers_to: &str,
+    ) -> Result<(), NameError> {
+        self.names
+            .insert(ferrix_formula::DefinedName::new(ident, scope, refers_to))?;
+        self.dirty = true;
+        self.refresh_name_dependents(ident);
+        Ok(())
+    }
+
+    /// Point an existing name somewhere else.
+    pub fn retarget_name(
+        &mut self,
+        ident: &str,
+        scope: &NameScope,
+        refers_to: &str,
+    ) -> Result<(), NameError> {
+        self.names.set_target(ident, scope, refers_to)?;
+        self.dirty = true;
+        self.refresh_name_dependents(ident);
+        Ok(())
+    }
+
+    /// Rename a defined name, REWRITING the source text of every formula that
+    /// uses it.
+    ///
+    /// This is safe in a way a sheet rename is not: a bare word that resolves
+    /// to a name has no other possible meaning in a formula, so replacing it
+    /// cannot change what anything else refers to. The rewrite is textual —
+    /// see [`ferrix_formula::names::rename_in_formula`] — because an AST round
+    /// trip would drop every `$` marker in the formula.
+    ///
+    /// Returns how many formulas were rewritten.
+    pub fn rename_name(
+        &mut self,
+        ident: &str,
+        scope: &NameScope,
+        new: &str,
+    ) -> Result<usize, NameError> {
+        self.names.rename(ident, scope, new)?;
+        // The canonical spelling as it now stands in the table, so rewritten
+        // formulas read the way the Name Manager shows it.
+        let canonical = self
+            .names
+            .get_scoped(new, scope)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| new.to_string());
+
+        let cells = self.graph.cells_using_name(ident);
+        let mut rewritten = 0usize;
+        for at in cells {
+            let Some(src) = self
+                .overlay_of(at.sheet)
+                .and_then(|o| o.get(at.cell))
+                .and_then(|i| i.formula_src())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let new_src = ferrix_formula::names::rename_in_formula(&src, ident, &canonical);
+            if new_src == src {
+                continue;
+            }
+            if let Some(ov) = self.overlay_of_mut(at.sheet) {
+                let cached = ov.value(at.cell).unwrap_or(Value::Empty);
+                ov.set(
+                    at.cell,
+                    CellInput::Formula {
+                        src: new_src,
+                        cached,
+                    },
+                );
+            }
+            rewritten += 1;
+        }
+        self.graph.rename_name_use(ident, &canonical);
+        self.dirty = true;
+        self.rebuild_graph_and_recalc();
+        self.dirty = true;
+        Ok(rewritten)
+    }
+
+    /// Delete a name. Formulas that used it keep their text and become
+    /// `#NAME?` — the parser no longer has an entry for the word, which is
+    /// precisely what `#NAME?` means. Rewriting them to `#REF!` would throw
+    /// away text the user can recover simply by redefining the name.
+    pub fn delete_name(&mut self, ident: &str, scope: &NameScope) -> Option<DefinedName> {
+        let removed = self.names.remove(ident, scope)?;
+        self.dirty = true;
+        self.refresh_name_dependents(ident);
+        Some(removed)
+    }
+
+    /// Re-evaluate every formula whose text mentions `ident`, plus everything
+    /// downstream of them. Called after any change to the name table.
+    fn refresh_name_dependents(&mut self, ident: &str) {
+        if self.graph.cells_using_name(ident).is_empty() {
+            return;
+        }
+        self.rebuild_graph_and_recalc();
+        // `rebuild_graph_and_recalc` clears the dirty flag (it is used for
+        // restore, where the file already matches). A name edit IS a change.
+        self.dirty = true;
     }
 
     // --------------------------------------------------------------- editing
@@ -602,9 +805,13 @@ impl Workbook {
             }
         }
         for (at, src) in &formulas {
-            if let Ok(expr) = parse(src) {
+            if let Ok(expr) = self.parse_on(at.sheet, src) {
                 self.graph.set_formula_at(*at, &expr, &resolve);
             }
+            // Recorded from the TEXT regardless of whether the parse succeeded:
+            // a formula reading `=SUM(Sales)` while `Sales` is undefined is
+            // exactly the one that must be revisited when it is defined.
+            self.graph.set_name_uses(*at, src);
         }
         // Evaluate in dependency order so a formula referencing another
         // formula sees an up-to-date value rather than a stale cache.
@@ -834,35 +1041,43 @@ impl Workbook {
 
         // Update the dependency graph for this cell.
         match &new_input {
-            Some(CellInput::Formula { src, .. }) => match parse(src) {
-                Ok(expr) => {
-                    let resolve = self.name_resolver();
-                    self.graph.set_formula_at(at, &expr, &resolve);
-                    // Sheet-aware: a cycle that leaves this sheet and comes
-                    // back is caught here just like a local one.
-                    if self.graph.is_circular_at(at) {
-                        report.circular = true;
+            Some(CellInput::Formula { src, .. }) => {
+                match self.parse_on(sheet, src) {
+                    Ok(expr) => {
+                        let resolve = self.name_resolver();
+                        self.graph.set_formula_at(at, &expr, &resolve);
+                        // Sheet-aware: a cycle that leaves this sheet and comes
+                        // back is caught here just like a local one.
+                        if self.graph.is_circular_at(at) {
+                            report.circular = true;
+                            self.overlay.set(
+                                cell,
+                                CellInput::Formula {
+                                    src: src.clone(),
+                                    cached: Value::Error(ErrorKind::Circular),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        report.parse_error = Some(e.to_string());
+                        self.graph.remove_at(at);
                         self.overlay.set(
                             cell,
                             CellInput::Formula {
                                 src: src.clone(),
-                                cached: Value::Error(ErrorKind::Circular),
+                                cached: Value::Error(ErrorKind::Name),
                             },
                         );
                     }
                 }
-                Err(e) => {
-                    report.parse_error = Some(e.to_string());
-                    self.graph.remove_at(at);
-                    self.overlay.set(
-                        cell,
-                        CellInput::Formula {
-                            src: src.clone(),
-                            cached: Value::Error(ErrorKind::Name),
-                        },
-                    );
-                }
-            },
+                // Record the names the TEXT mentions, AFTER the match: the
+                // error arm calls `remove_at`, which clears them. A formula
+                // reading `=SUM(Sales)` while `Sales` is undefined is exactly
+                // the one that must be revisited when it is defined, so its
+                // name use has to survive the failed parse.
+                self.graph.set_name_uses(at, src);
+            }
             _ => {
                 // No longer a formula (or cleared): drop its edges.
                 self.graph.remove_at(at);
@@ -981,7 +1196,7 @@ impl Workbook {
             Some(CellInput::Formula { src, .. }) => src.clone(),
             _ => return,
         };
-        let value = match parse(&src) {
+        let value = match self.parse_on(at.sheet, &src) {
             Ok(expr) => {
                 let source = WorkbookSource::new(self, at.sheet);
                 eval_view(&expr, &source)
@@ -1540,16 +1755,22 @@ impl Workbook {
             .and_then(|i| i.formula_src())
             .map(|s| s.to_string());
         match src {
-            Some(src) => match parse(&src) {
-                Ok(expr) => {
-                    // Resolve names against the CURRENT sheet list, so a
-                    // reference to a sheet that no longer exists drops out of
-                    // the graph instead of dangling.
-                    let resolve = self.name_resolver();
-                    self.graph.set_formula_at(at, &expr, &resolve);
+            Some(src) => {
+                match self.parse_on(at.sheet, &src) {
+                    Ok(expr) => {
+                        // Resolve names against the CURRENT sheet list, so a
+                        // reference to a sheet that no longer exists drops out of
+                        // the graph instead of dangling.
+                        let resolve = self.name_resolver();
+                        self.graph.set_formula_at(at, &expr, &resolve);
+                    }
+                    Err(_) => self.graph.remove_at(at),
                 }
-                Err(_) => self.graph.remove_at(at),
-            },
+                // After the match, because the Err arm's `remove_at` clears
+                // them: a formula naming something undefined must still be
+                // findable when that name is later defined.
+                self.graph.set_name_uses(at, &src);
+            }
             None => self.graph.remove_at(at),
         }
     }
@@ -2732,5 +2953,255 @@ mod tests {
             vec![CellRef::new(0, 1)]
         );
         assert!(w.graph.full_order().is_ok());
+    }
+
+    // --- defined names (issue #4) ---
+
+    /// Sheet1 with B2:B1000 filled 1..999, so a named range over it has a
+    /// value worth checking rather than zero.
+    fn named_wb() -> Workbook {
+        let mut s = Sheet::new("Sheet1");
+        for r in 1..1000u32 {
+            s.set(CellRef::new(r, 1), Value::Number(r as f64));
+        }
+        Workbook::new(BaseData::Memory(s))
+    }
+
+    fn nsel(a: (u32, u32), b: (u32, u32)) -> Selection {
+        Selection::new(CellRef::new(a.0, a.1), CellRef::new(b.0, b.1))
+    }
+
+    #[test]
+    fn sum_of_a_named_range_equals_sum_of_the_explicit_range() {
+        // THE acceptance criterion: =SUM(Sales) must equal
+        // =SUM(Sheet1!B2:B1000), to the last float.
+        let mut w = named_wb();
+        w.define_name("Sales", NameScope::Workbook, nsel((1, 1), (999, 1)))
+            .expect("define");
+
+        w.commit_edit(CellRef::new(0, 4), "=SUM(Sales)");
+        w.end_edit_run();
+        w.commit_edit(CellRef::new(1, 4), "=SUM(Sheet1!B2:B1000)");
+
+        let named = val(&w, 0, 4);
+        let explicit = val(&w, 1, 4);
+        assert_eq!(named, explicit);
+        // And it is the real sum, not two matching zeros.
+        assert_eq!(named, Value::Number((1..1000).sum::<u32>() as f64));
+    }
+
+    #[test]
+    fn an_undefined_name_is_a_name_error_and_defining_it_repairs_the_formula() {
+        let mut w = named_wb();
+        w.commit_edit(CellRef::new(0, 4), "=SUM(Sales)");
+        assert_eq!(
+            val(&w, 0, 4),
+            Value::Error(ErrorKind::Name),
+            "a formula naming something undefined is #NAME?"
+        );
+        // Defining the name must fix it without the user retyping anything.
+        w.define_name("Sales", NameScope::Workbook, nsel((1, 1), (999, 1)))
+            .expect("define");
+        assert_eq!(val(&w, 0, 4), Value::Number((1..1000).sum::<u32>() as f64));
+    }
+
+    #[test]
+    fn renaming_a_name_rewrites_the_source_text_of_every_dependent_formula() {
+        let mut w = named_wb();
+        w.define_name("Sales", NameScope::Workbook, nsel((1, 1), (999, 1)))
+            .expect("define");
+        w.commit_edit(CellRef::new(0, 4), "=SUM(Sales)*2");
+        w.end_edit_run();
+        w.commit_edit(CellRef::new(1, 4), "=Sales");
+        let before = val(&w, 0, 4);
+
+        let rewritten = w
+            .rename_name("Sales", &NameScope::Workbook, "Revenue")
+            .expect("rename");
+        assert_eq!(rewritten, 2, "both dependents rewritten");
+
+        // The TEXT changed, not merely the resolution.
+        assert_eq!(w.view().edit_text(CellRef::new(0, 4)), "=SUM(Revenue)*2");
+        assert_eq!(w.view().edit_text(CellRef::new(1, 4)), "=Revenue");
+        // And the value is unchanged, because the name still means the same
+        // range.
+        assert_eq!(val(&w, 0, 4), before);
+        assert!(w.names.get("Sales", None).is_none());
+        assert!(w.names.get("Revenue", None).is_some());
+    }
+
+    #[test]
+    fn a_rename_preserves_absolute_markers_in_the_rewritten_formula() {
+        // The reason the rewrite is textual: an AST round trip would drop
+        // every `$` in the formula while renaming the name.
+        let mut w = named_wb();
+        w.define_name("Sales", NameScope::Workbook, nsel((1, 1), (999, 1)))
+            .expect("define");
+        w.commit_edit(CellRef::new(0, 4), "=SUM($B$2:$B$9)+Sales");
+        w.rename_name("Sales", &NameScope::Workbook, "Revenue")
+            .expect("rename");
+        assert_eq!(
+            w.view().edit_text(CellRef::new(0, 4)),
+            "=SUM($B$2:$B$9)+Revenue",
+            "the $ markers must survive a name rename"
+        );
+    }
+
+    #[test]
+    fn deleting_a_referenced_name_turns_its_dependents_into_name_errors() {
+        let mut w = named_wb();
+        w.define_name("Sales", NameScope::Workbook, nsel((1, 1), (999, 1)))
+            .expect("define");
+        w.commit_edit(CellRef::new(0, 4), "=SUM(Sales)");
+        assert!(matches!(val(&w, 0, 4), Value::Number(_)), "healthy first");
+
+        w.delete_name("Sales", &NameScope::Workbook)
+            .expect("was defined");
+        assert_eq!(val(&w, 0, 4), Value::Error(ErrorKind::Name));
+        // The user's text is kept, so redefining the name restores the value.
+        assert_eq!(w.view().edit_text(CellRef::new(0, 4)), "=SUM(Sales)");
+    }
+
+    #[test]
+    fn a_sheet_scoped_and_a_workbook_scoped_name_resolve_per_sheet() {
+        // Same identifier, two scopes: each sheet must see the right one.
+        let mut s1 = Sheet::new("Sheet1");
+        s1.set(CellRef::new(0, 0), Value::Number(10.0));
+        let mut w = Workbook::new(BaseData::Memory(s1));
+
+        let mut s2data = Sheet::new("Sheet2");
+        s2data.set(CellRef::new(0, 3), Value::Number(99.0));
+        let s2 = w
+            .add_sheet("Sheet2", BaseData::Memory(s2data))
+            .expect("add");
+
+        // Workbook-scoped Total -> Sheet1!$A$1 (10).
+        w.define_name_raw("Total", NameScope::Workbook, "Sheet1!$A$1")
+            .expect("define workbook name");
+        // Sheet-scoped Total on Sheet2 -> Sheet2!$D$1 (99).
+        w.define_name_raw("Total", NameScope::Sheet("Sheet2".into()), "Sheet2!$D$1")
+            .expect("define local name");
+
+        // From Sheet1 the workbook-scoped one is the only one visible.
+        w.commit_edit(CellRef::new(5, 5), "=Total");
+        assert_eq!(
+            val(&w, 5, 5),
+            Value::Number(10.0),
+            "Sheet1 must see the workbook-scoped Total"
+        );
+
+        // From Sheet2 the sheet-scoped one shadows it.
+        w.activate(s2).expect("activate");
+        w.commit_edit(CellRef::new(5, 5), "=Total");
+        assert_eq!(
+            val_in(&w, s2, 5, 5),
+            Value::Number(99.0),
+            "Sheet2 must see its own Total, not the workbook one"
+        );
+
+        // And Sheet1's formula is untouched by any of it.
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(10.0));
+    }
+
+    #[test]
+    fn the_name_box_reports_the_selection_and_navigates_to_a_name() {
+        let mut w = named_wb();
+        let range = nsel((1, 1), (999, 1));
+        assert!(
+            w.name_for_selection(range).is_none(),
+            "an unnamed selection has no name"
+        );
+        w.define_name("Sales", NameScope::Workbook, range)
+            .expect("define");
+        assert_eq!(w.name_for_selection(range), Some("Sales"));
+        // A different selection is still nameless.
+        assert!(w.name_for_selection(nsel((0, 0), (0, 0))).is_none());
+
+        // And the name navigates back to exactly that range.
+        let (sheet, target) = w.name_target("sales").expect("resolvable");
+        assert_eq!(sheet, SheetId::MAIN);
+        assert_eq!(target.bounds(), range.bounds());
+        assert!(w.name_target("Nope").is_none());
+    }
+
+    #[test]
+    fn a_defined_name_never_materialises_the_range_it_spans() {
+        // The scale invariant: a name over a huge range must produce exactly
+        // one rectangular precedent, the same as the explicit range, rather
+        // than an edge per row.
+        let mut w = named_wb();
+        w.define_name_raw("Huge", NameScope::Workbook, "Sheet1!$B$1:$B$1048576")
+            .expect("define");
+        w.commit_edit(CellRef::new(0, 4), "=SUM(Huge)");
+        let at = SheetCell::new(SheetId::MAIN, CellRef::new(0, 4));
+        let precedents = w.graph.precedents_at(at).expect("registered");
+        assert_eq!(
+            precedents.len(),
+            1,
+            "a million-row name must be ONE rectangle, not a million edges"
+        );
+        assert!(matches!(
+            precedents[0].1,
+            ferrix_formula::Precedent::Range(_, _)
+        ));
+    }
+
+    #[test]
+    fn names_that_would_be_ambiguous_with_a_cell_are_refused() {
+        let mut w = named_wb();
+        // Tax1 reads as column TAX row 1, so it could never be reached.
+        assert!(matches!(
+            w.define_name("Tax1", NameScope::Workbook, nsel((0, 0), (0, 0))),
+            Err(NameError::LooksLikeReference(_))
+        ));
+        assert!(w.names.is_empty());
+    }
+
+    #[test]
+    fn renaming_a_sheet_carries_its_local_names_along() {
+        let mut w = named_wb();
+        w.define_name_raw("Local", NameScope::Sheet("Sheet1".into()), "Sheet1!$B$2")
+            .expect("define");
+        w.commit_edit(CellRef::new(0, 4), "=Local");
+        let before = val(&w, 0, 4);
+        assert_eq!(before, Value::Number(1.0), "B2 holds 1");
+
+        w.rename_sheet(SheetId::MAIN, "Revenue Q1").expect("rename");
+        assert_eq!(
+            val(&w, 0, 4),
+            before,
+            "a local name must follow its sheet's rename, not break"
+        );
+        assert_eq!(
+            w.names.get("Local", Some("Revenue Q1")).unwrap().refers_to,
+            "'Revenue Q1'!$B$2"
+        );
+    }
+
+    #[test]
+    fn deleting_a_sheet_drops_its_local_names() {
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).expect("activate");
+        w.define_name_raw("Local", NameScope::Sheet("Sheet2".into()), "Sheet2!$A$1")
+            .expect("define");
+        w.activate(SheetId::MAIN).expect("activate");
+        w.delete_sheet(s2).expect("delete");
+        assert!(
+            w.names.is_empty(),
+            "a name scoped to a deleted sheet must not outlive it"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_name_in_the_same_scope_is_refused() {
+        let mut w = named_wb();
+        let r = nsel((1, 1), (999, 1));
+        w.define_name("Sales", NameScope::Workbook, r)
+            .expect("first");
+        assert!(matches!(
+            w.define_name("SALES", NameScope::Workbook, r),
+            Err(NameError::Duplicate(_))
+        ));
+        assert_eq!(w.names.len(), 1);
     }
 }
