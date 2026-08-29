@@ -17,7 +17,8 @@ use crate::prefs::Prefs;
 /// The menu reads `self` (to label the zoom and enable Unfreeze) while it is
 /// being built, so it cannot also call `&mut self` methods; recording the
 /// choice keeps both borrows legal without duplicating the logic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Not `Copy` since #45: `OpenRecent` carries a `PathBuf`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// A File-menu choice, deferred out of the panel closure.
 ///
 /// The menu's items all need `&mut self`, which the closure already holds
@@ -25,6 +26,10 @@ use crate::prefs::Prefs;
 /// and acted on after the panel ends, exactly as `ViewAction` does.
 enum FileAction {
     Open,
+    /// Open a specific file from the recent list (issue #45).
+    OpenRecent(PathBuf),
+    /// Return to the start screen (issue #45).
+    StartScreen,
     Save,
     Compact,
     ExportCsv,
@@ -420,6 +425,22 @@ pub struct FerrixApp {
 
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
+
+    // ---- recent files / session restore (issue #45) ----
+    //
+    // Three small fields rather than a sub-struct: they are read from the
+    // load path and the menu bar, and an extra level of indirection would buy
+    // nothing.
+    /// The file currently open, and therefore the workbook half of the
+    /// `(workbook path, sheet name)` zoom key. `None` for a workbook that has
+    /// never been saved, which keys against the empty path.
+    source_path: Option<PathBuf>,
+    /// The path a load in flight is for, promoted to `source_path` only when
+    /// that load actually succeeds — a failed open must not rewrite history.
+    pending_path: Option<PathBuf>,
+    /// Show the start screen instead of the grid. True on a cold start with
+    /// no file argument; any choice on that screen turns it off.
+    show_start: bool,
 }
 
 /// The Goal Seek dialog's state: three input fields, a result line, and the
@@ -561,7 +582,9 @@ impl FerrixApp {
             // The first sheet is named before any file is opened, so its
             // remembered zoom is adopted here and re-adopted on every sheet
             // switch — a zoom is a property of the sheet, not of the session.
-            zoom: prefs.zoom_of("Sheet1"),
+            // No file is open yet, so this keys against the empty path — the
+            // same bucket a scratch workbook uses (issue #45).
+            zoom: prefs.zoom_of(std::path::Path::new(""), "Sheet1"),
             name_box_edit: None,
             names_open: false,
             name_edit: None,
@@ -573,9 +596,16 @@ impl FerrixApp {
             cond_warning: None,
             goal_seek: None,
             prefs,
+            source_path: None,
+            pending_path: None,
+            // A file on the command line goes straight to the grid; only a
+            // bare launch has nothing to show yet.
+            show_start: false,
         };
         if let Some(p) = initial {
             app.start_load(p);
+        } else {
+            app.show_start = true;
         }
         app
     }
@@ -590,6 +620,8 @@ impl FerrixApp {
         self.loading = true;
         self.progress = Progress::default();
         self.status = format!("Opening {}…", path.display());
+        // Recorded, not adopted: `source_path` only moves when the load lands.
+        self.pending_path = Some(path.clone());
 
         std::thread::spawn(move || {
             let result = load_any(
@@ -677,12 +709,26 @@ impl FerrixApp {
                 }
                 self.selection.move_to(CellRef::new(0, 0));
                 self.scroll = ScrollState::default();
+                self.panes = crate::grid::Panes::default();
+                // The load succeeded, so this file is now the open one.
+                self.source_path = self.pending_path.take();
                 // The workbook we just built has the FILE's sheet name, which
                 // is only known now — so this is where the sheet's remembered
                 // zoom is adopted. Doing it at construction would read the
                 // placeholder "Sheet1" and silently lose the preference.
-                self.zoom = self.prefs.zoom_of(self.wb.active_name());
-                self.panes = crate::grid::Panes::default();
+                // Keyed on the workbook too since #45, so two files that both
+                // call their first sheet "Sheet1" no longer share one zoom.
+                self.zoom = self.prefs.zoom_of(&self.book_key(), self.wb.active_name());
+                // Recent list + session restore (issue #45). The entry is
+                // touched first so a brand-new file has somewhere to restore
+                // from, then the session it already had is applied.
+                if let Some(p) = self.source_path.clone() {
+                    crate::recent::touch(&mut self.prefs.recent, &p);
+                    let session = crate::recent::session_of(&self.prefs.recent, &p);
+                    self.apply_session(&session);
+                    self.persist_prefs();
+                }
+                self.show_start = false;
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
@@ -690,6 +736,8 @@ impl FerrixApp {
                 self.sync_formula_bar();
             }
             Ok(Err(e)) => {
+                // The open failed, so nothing about the current file changes.
+                self.pending_path = None;
                 // A cancel is a normal outcome the user asked for, not a
                 // failure to apologise for.
                 self.status = if e.contains("cancelled") {
@@ -872,9 +920,204 @@ impl FerrixApp {
     pub fn set_zoom(&mut self, z: f32) {
         self.zoom = crate::grid::clamp_zoom(z);
         let name = self.wb.active_name().to_string();
-        self.prefs.set_zoom(&name, self.zoom);
+        // Keyed on (workbook, sheet) since #45: without the workbook half,
+        // every file whose first sheet is called "Sheet1" shared one zoom.
+        let book = self.book_key();
+        self.prefs.set_zoom(&book, &name, self.zoom);
+        self.remember_session();
         self.persist_prefs();
         self.status = format!("Zoom {}%", (self.zoom * 100.0).round() as i32);
+    }
+
+    // ---- recent files, templates, session restore (issue #45) ----
+
+    /// The workbook half of the zoom key, and the recent-list identity.
+    ///
+    /// An unsaved in-memory workbook has no file, and keys against the empty
+    /// path — one shared bucket for scratch workbooks, which is right: they
+    /// are not distinguishable from each other across a restart either.
+    fn book_key(&self) -> PathBuf {
+        self.source_path.clone().unwrap_or_default()
+    }
+
+    /// The file currently open, if any.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    /// Whether the start screen is showing rather than the grid.
+    pub fn showing_start_screen(&self) -> bool {
+        self.show_start
+    }
+
+    /// The recent-files list as persisted.
+    pub fn recent(&self) -> &[crate::recent::RecentEntry] {
+        &self.prefs.recent
+    }
+
+    /// The body pane's scroll offset, in fractional rows.
+    pub fn scroll_row_offset(&self) -> f64 {
+        self.scroll.row_offset
+    }
+
+    /// The active sheet's name — the sheet half of the zoom key.
+    pub fn active_sheet_name(&self) -> &str {
+        self.wb.active_name()
+    }
+
+    /// Where the user is right now, as a restorable session.
+    pub fn current_session(&self) -> crate::recent::Session {
+        crate::recent::Session {
+            anchor: (self.selection.anchor.row, self.selection.anchor.col),
+            cursor: (self.selection.cursor.row, self.selection.cursor.col),
+            scroll_row: self.scroll.row_offset,
+            scroll_col_px: self.scroll.col_px,
+            frozen_rows: self.panes.rows,
+            frozen_cols: self.panes.cols,
+            frozen: self.panes.frozen,
+        }
+    }
+
+    /// Put the user back where a previous visit to this file left them.
+    ///
+    /// Bounds are NOT clamped here: the row count may still be arriving on the
+    /// load thread, and the grid clamps the scroll offset against the real
+    /// extents every frame anyway. Clamping against a partial row count would
+    /// pin a restored deep scroll to the top.
+    fn apply_session(&mut self, s: &crate::recent::Session) {
+        self.selection = ferrix_core::Selection::new(
+            CellRef::new(s.anchor.0, s.anchor.1),
+            CellRef::new(s.cursor.0, s.cursor.1),
+        );
+        self.scroll.row_offset = s.scroll_row;
+        self.scroll.col_px = s.scroll_col_px;
+        self.panes = crate::grid::Panes {
+            rows: s.frozen_rows,
+            cols: s.frozen_cols,
+            frozen: s.frozen,
+            lead_row: 0.0,
+            lead_col: 0,
+        };
+    }
+
+    /// Record the current session against the open file, in memory.
+    ///
+    /// Cheap and callable often: it writes one fixed-size record into a list
+    /// capped at `recent::MAX_RECENT`. Persisting it to disk is the caller's
+    /// separate `persist_prefs`, so a per-frame caller cannot cause a per-frame
+    /// file write.
+    pub fn remember_session(&mut self) {
+        let Some(p) = self.source_path.clone() else {
+            return;
+        };
+        let s = self.current_session();
+        crate::recent::set_session(&mut self.prefs.recent, &p, s);
+    }
+
+    /// Record the session AND write it out. Called when the app is closing and
+    /// on the interactions worth surviving a crash.
+    pub fn persist_session(&mut self) {
+        self.remember_session();
+        self.persist_prefs();
+    }
+
+    /// Start an empty workbook from the start screen.
+    pub fn new_blank_workbook(&mut self) {
+        self.wb = Workbook::new(BaseData::Memory(Sheet::new("Sheet1")));
+        self.reset_for_new_workbook();
+        self.status = "Blank workbook".into();
+    }
+
+    /// Start a workbook seeded from `templates()[i]`.
+    ///
+    /// Literal cells are written into the base sheet, which is what gives the
+    /// sheet its extent — an overlay entry outside the base's row count reads
+    /// as empty, so committing everything through the overlay would produce a
+    /// workbook that looks blank.
+    ///
+    /// Formulas then go through the SAME `commit_edit` path a user typing them
+    /// would take, so they are parsed, graphed and evaluated by the real
+    /// engine rather than by a second, drifting one.
+    pub fn new_from_template(&mut self, index: usize) {
+        let Some(t) = crate::recent::templates().get(index) else {
+            return;
+        };
+        let mut sheet = Sheet::new(t.name);
+        sheet.set_headers(t.headers.iter().map(|h| h.to_string()).collect());
+        // Pass one: literals into the base, establishing the extent. A cell
+        // that parses as a number is stored as one so the template's sums have
+        // numbers to add rather than text.
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                let cell = CellRef::new(r as u32, c as u32);
+                if text.starts_with('=') {
+                    // Reserved by an empty value so the column exists and the
+                    // row count covers it; the formula lands in pass two.
+                    sheet.set(cell, ferrix_core::Value::Empty);
+                } else if let Ok(n) = text.parse::<f64>() {
+                    sheet.set(cell, ferrix_core::Value::Number(n));
+                } else {
+                    sheet.set_text(cell, text);
+                }
+            }
+        }
+        self.wb = Workbook::new(BaseData::Memory(sheet));
+        self.reset_for_new_workbook();
+        // Pass two: the formulas, through the real commit path.
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                if text.starts_with('=') {
+                    self.wb.commit_edit(CellRef::new(r as u32, c as u32), text);
+                }
+            }
+        }
+        self.stats_rows = t.rows.len();
+        self.stats_cols = t.headers.len();
+        self.status = format!("New workbook from the {} template", t.name);
+    }
+
+    /// Shared reset for the two "start something new" paths.
+    ///
+    /// A new workbook has no file behind it, so it must NOT inherit the
+    /// previous file's sidecar paths — writing this workbook's edits into the
+    /// last file's sidecar would corrupt a file the user is not even looking
+    /// at.
+    fn reset_for_new_workbook(&mut self) {
+        self.source_path = None;
+        self.pending_path = None;
+        self.show_start = false;
+        self.edits_path = None;
+        self.fingerprint = None;
+        self.comments_path = None;
+        self.cache_path = None;
+        self.cache_headers = Vec::new();
+        self.col_widths = Vec::new();
+        self.stats_rows = 0;
+        self.stats_cols = 0;
+        self.selection = ferrix_core::Selection::default();
+        self.scroll = ScrollState::default();
+        self.panes = crate::grid::Panes::default();
+        self.zoom = self.prefs.zoom_of(&PathBuf::new(), self.wb.active_name());
+        self.autosave_last = None;
+        self.autosave_revision = None;
+        self.sync_formula_bar();
+    }
+
+    /// Act on a start-screen choice.
+    pub fn take_start_choice(&mut self, choice: crate::recent::StartChoice) {
+        match choice {
+            crate::recent::StartChoice::Open(p) => self.start_load(p),
+            crate::recent::StartChoice::Blank => self.new_blank_workbook(),
+            crate::recent::StartChoice::Template(i) => self.new_from_template(i),
+            crate::recent::StartChoice::Browse => {
+                self.open_dialog();
+                // The picker is modal and may have been cancelled; only an
+                // actual load leaves the start screen.
+                if self.loading {
+                    self.show_start = false;
+                }
+            }
+        }
     }
 
     pub fn zoom_in(&mut self) {
@@ -1589,6 +1832,9 @@ impl FerrixApp {
     /// by an orderly shutdown would answer yes, and the next launch would
     /// offer to recover edits from a session that ended perfectly normally.
     pub fn on_clean_exit(&mut self) {
+        // Where the user was is part of a clean exit: reopening this file
+        // must land them back here (issue #45).
+        self.persist_session();
         self.clear_autosave();
     }
 
@@ -1729,6 +1975,10 @@ impl FerrixApp {
         self.edits_path = Some(ferrix_io::edits::edits_path_for(cache));
         self.fingerprint =
             ferrix_io::compact::fingerprint_after(cache, rows as u64, cols as u32).ok();
+        // A cache is now open, so the start screen must step aside — it takes
+        // the whole frame and the grid would never run behind it (issue #45).
+        self.source_path = Some(cache.to_path_buf());
+        self.show_start = false;
         Ok(())
     }
 
@@ -3964,7 +4214,7 @@ impl FerrixApp {
         // Zoom and panes belong to the SHEET, not to the session: adopt the
         // new sheet's remembered zoom and drop the old sheet's frozen band,
         // which was defined in that sheet's row and column space.
-        self.zoom = self.prefs.zoom_of(self.wb.active_name());
+        self.zoom = self.prefs.zoom_of(&self.book_key(), self.wb.active_name());
         self.panes = crate::grid::Panes::default();
         // Column widths and search hits belong to the sheet we just left.
         self.col_widths = Vec::new();
@@ -5060,6 +5310,18 @@ impl FerrixApp {
         self.theme.apply(ctx);
         let th = self.theme;
 
+        // --- start screen (issue #45) ---
+        //
+        // Shown INSTEAD of the toolbar/grid on a cold launch with no file, and
+        // returned to by File > Start screen. It owns the whole frame, so it
+        // returns early rather than painting behind the grid.
+        if self.show_start {
+            if let Some(choice) = crate::recent::show_start_screen(ctx, &mut self.prefs, &th) {
+                self.take_start_choice(choice);
+            }
+            return;
+        }
+
         // --- unsaved-changes guard on window close ---
         //
         // egui 0.29 reports a close request as viewport state; cancelling it
@@ -5240,6 +5502,53 @@ impl FerrixApp {
                         }
                         if ui.button("💾 Save edits  (Ctrl+S)").clicked() {
                             file_action = Some(FileAction::Save);
+                            ui.close_menu();
+                        }
+                        // --- recent files (issue #45) ---
+                        //
+                        // A submenu rather than inline items: fifteen entries
+                        // would push Export off the bottom of the File menu.
+                        ui.menu_button("🕘 Open Recent", |ui| {
+                            if self.prefs.recent.is_empty() {
+                                ui.label(
+                                    RichText::new("Nothing opened yet").color(th.text_dim),
+                                );
+                            }
+                            for e in &self.prefs.recent {
+                                let available = e.is_available();
+                                let text = if available {
+                                    RichText::new(e.label())
+                                } else {
+                                    // GREYED, not hidden: an unplugged drive
+                                    // is not a deleted file.
+                                    RichText::new(e.label()).color(th.text_dim).italics()
+                                };
+                                let hover = if available {
+                                    e.full_path()
+                                } else {
+                                    format!(
+                                        "{}\n\nNot reachable right now — it may be on a \
+                                         drive or share that is not connected.",
+                                        e.full_path()
+                                    )
+                                };
+                                if ui
+                                    .add_enabled(available, egui::Button::new(text))
+                                    .on_hover_text(&hover)
+                                    .on_disabled_hover_text(&hover)
+                                    .clicked()
+                                {
+                                    file_action = Some(FileAction::OpenRecent(e.path.clone()));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        if ui
+                            .button("🏠 Start screen…")
+                            .on_hover_text("Recent files, a blank workbook, or a template.")
+                            .clicked()
+                        {
+                            file_action = Some(FileAction::StartScreen);
                             ui.close_menu();
                         }
                         ui.separator();
@@ -5466,6 +5775,16 @@ impl FerrixApp {
         }
         match file_action {
             Some(FileAction::Open) => self.open_dialog(),
+            Some(FileAction::OpenRecent(p)) => {
+                // Leaving a file records where we were in it, so coming back
+                // restores this position rather than the last saved one.
+                self.persist_session();
+                self.start_load(p);
+            }
+            Some(FileAction::StartScreen) => {
+                self.persist_session();
+                self.show_start = true;
+            }
             Some(FileAction::Save) => {
                 let _ = self.save_edits();
             }
