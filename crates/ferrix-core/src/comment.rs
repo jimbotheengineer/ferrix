@@ -283,6 +283,39 @@ impl CommentMap {
         }
     }
 
+    /// Move every comment through an arbitrary cell mapping, in one pass.
+    ///
+    /// `f` returns the comment's new home, or `None` to DELETE it — which is
+    /// what a row removal wants for the rows it removes. Same two-phase
+    /// discipline as [`Self::remap_columns`]: every source is vacated before
+    /// any destination is written, so a permutation cannot clobber a cell it
+    /// is about to read.
+    ///
+    /// Cost is O(comments), never O(rows).
+    pub fn remap_cells(&mut self, f: impl Fn(CellRef) -> Option<CellRef>) {
+        if self.len == 0 {
+            return;
+        }
+        let moved: Vec<(CellRef, Option<CellRef>, Comment)> = self
+            .iter()
+            .filter_map(|(cell, c)| {
+                let dest = f(cell);
+                (dest != Some(cell)).then(|| (cell, dest, c.clone()))
+            })
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        for (cell, _, _) in &moved {
+            self.remove(*cell);
+        }
+        for (_, dest, comment) in moved {
+            if let Some(d) = dest {
+                self.set(d, comment);
+            }
+        }
+    }
+
     /// Rebuild from saved parts. Used by the sidecar loader.
     pub fn from_iter_cells<I: IntoIterator<Item = (CellRef, Comment)>>(items: I) -> Self {
         let mut m = Self::new();

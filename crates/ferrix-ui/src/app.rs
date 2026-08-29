@@ -244,6 +244,18 @@ pub struct FerrixApp {
     /// exactly nothing.
     sort_order: Option<ferrix_core::SortOrder>,
 
+    /// Active subtotal grouping (issue #34). `None` means no subtotals, and
+    /// dropping it is exactly what "Remove Subtotals" does — which is why
+    /// removing them restores the exact original view: there is nothing else
+    /// to undo.
+    ///
+    /// A VIEW TRANSFORM, like `sort_order`: it inserts no data, marks nothing
+    /// dirty, and pushes no undo entry.
+    subtotals: Option<ferrix_core::SubtotalPlan>,
+    /// The grouping spec the plan was built from, kept so the plan can be
+    /// rebuilt when a sort or filter changes the rows underneath it.
+    subtotal_spec: Option<(u32, Vec<u32>, ferrix_core::SubtotalFn)>,
+
     /// Chart panel state: the built scene, its annotations, and the window.
     chart: crate::chart_panel::ChartPanel,
 
@@ -441,6 +453,9 @@ pub struct FerrixApp {
     last_border_segments: usize,
     last_rotated_texts: usize,
     last_wrapped_texts: usize,
+    /// Subtotal rows and aggregate texts the last frame painted (issue #34).
+    last_subtotal_rows: usize,
+    last_subtotal_texts: usize,
 
     /// Active trace-precedents/dependents session (roadmap #39), if any.
     /// `None` means "Remove Arrows" was pressed or nothing has been traced.
@@ -620,6 +635,8 @@ impl FerrixApp {
             row_filter: None,
             sort_keys: Vec::new(),
             sort_order: None,
+            subtotals: None,
+            subtotal_spec: None,
             header_drag: None,
             sizing: ferrix_core::sizing::SheetSizing::new(),
             col_resize: None,
@@ -683,6 +700,8 @@ impl FerrixApp {
             last_border_segments: 0,
             last_rotated_texts: 0,
             last_wrapped_texts: 0,
+            last_subtotal_rows: 0,
+            last_subtotal_texts: 0,
             trace: None,
             last_trace_arrows: 0,
             last_trace_total: 0,
@@ -5750,6 +5769,10 @@ impl FerrixApp {
     fn rebuild_sort_order(&mut self) {
         if self.sort_keys.is_empty() {
             self.sort_order = None;
+            // The subtotal plan is built OVER the rows the sort resolves, so
+            // clearing a sort invalidates it just as changing one does. ONE
+            // call site, right where the mapping underneath it changes.
+            self.rebuild_subtotals();
             return;
         }
         let candidates = self.sort_candidates();
@@ -5759,6 +5782,7 @@ impl FerrixApp {
             &self.sort_keys,
             &view,
         ));
+        self.rebuild_subtotals();
     }
 
     /// A column header was clicked: cycle its sort asc -> desc -> none.
@@ -5802,6 +5826,292 @@ impl FerrixApp {
         // The cursor keeps its underlying row, so it follows its record to
         // wherever the sort put it rather than staying at a screen position.
         self.scroll_to_selection();
+    }
+
+    // ========================================================================
+    // Issue #34: Remove Duplicates, Subtotals, Consolidate
+    // ========================================================================
+
+    /// Cap on rows one Remove Duplicates can drop in a single undo step.
+    ///
+    /// The removed positions are the ONE per-removed-row allocation in the
+    /// whole feature (4 bytes each), and this bounds it. Ten million is 40 MB
+    /// — well inside the budget, far past anything a user reaches by hand,
+    /// and small enough that a mis-keyed dedupe on a 200M-row sheet is refused
+    /// with a sentence instead of an out-of-memory kill.
+    pub const MAX_DEDUPE_REMOVED: usize = 10_000_000;
+
+    /// Remove duplicate rows keyed on the SELECTED COLUMNS.
+    ///
+    /// The selection is the key chooser: selecting B:D and running this
+    /// dedupes on those three columns, matching how the rest of this app
+    /// scopes an action. A single-cell selection means "the whole row",
+    /// which is Excel's default when every checkbox is ticked.
+    pub fn remove_duplicates(&mut self) {
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        let (tl, br) = self.selection.bounds();
+        // A one-column-wide selection is still a deliberate key choice; only a
+        // selection spanning ONE cell falls back to the whole row.
+        let key_cols: Vec<u32> = if self.selection.cell_count() <= 1 {
+            Vec::new()
+        } else {
+            (tl.col..=br.col).collect()
+        };
+        let label = if key_cols.is_empty() {
+            "every column".to_string()
+        } else if key_cols.len() == 1 {
+            format!("column {}", ferrix_core::column_name(key_cols[0]))
+        } else {
+            format!(
+                "columns {}:{}",
+                ferrix_core::column_name(tl.col),
+                ferrix_core::column_name(br.col)
+            )
+        };
+        match self
+            .wb
+            .remove_duplicates(&key_cols, Self::MAX_DEDUPE_REMOVED)
+        {
+            Ok(rep) if rep.duplicates == 0 => {
+                self.status = format!("No duplicate rows found on {label}");
+            }
+            Ok(rep) => {
+                // Every view transform was built over the OLD row count, so
+                // they are stale the moment rows go. Rebuilt through the same
+                // one call site the filters use, so nothing can resolve
+                // through a mapping that outlived its rows.
+                self.rebuild_row_filter();
+                self.rebuild_subtotals();
+                self.status = format!(
+                    "Removed {} duplicate row{} on {label} — {} unique row{} kept, \
+                     one Ctrl+Z restores them all",
+                    rep.duplicates,
+                    if rep.duplicates == 1 { "" } else { "s" },
+                    rep.unique,
+                    if rep.unique == 1 { "" } else { "s" },
+                );
+            }
+            Err(e) => self.status = e,
+        }
+        self.sync_formula_bar();
+    }
+
+    /// Group by the CURSOR's column and show a subtotal at each change of
+    /// value; running it again removes the subtotals.
+    ///
+    /// A VIEW TRANSFORM: nothing is written, nothing is dirtied, and no undo
+    /// entry is pushed. The user removes subtotals by running the command
+    /// again, exactly as they clear a sort by clicking the header again.
+    pub fn toggle_subtotals(&mut self) {
+        if self.subtotals.is_some() {
+            self.subtotals = None;
+            self.subtotal_spec = None;
+            self.status =
+                "Subtotals removed — the original view is back, exactly as it was".to_string();
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        let group_col = self.selection.cursor.col;
+        // Every OTHER column in the selection is aggregated; a single-cell
+        // selection aggregates the column to the right of the group column,
+        // which is the "group by A, total B" shape almost every subtotal has.
+        let (tl, br) = self.selection.bounds();
+        let agg_cols: Vec<u32> = if self.selection.cell_count() <= 1 {
+            vec![group_col + 1]
+        } else {
+            (tl.col..=br.col).filter(|&c| c != group_col).collect()
+        };
+        self.subtotal_spec = Some((group_col, agg_cols, ferrix_core::SubtotalFn::Sum));
+        self.rebuild_subtotals();
+        match &self.subtotals {
+            Some(p) => {
+                self.status = format!(
+                    "Subtotalled by {} — {} group{}; a view only, no rows inserted",
+                    ferrix_core::column_name(group_col),
+                    p.groups().len(),
+                    if p.groups().len() == 1 { "" } else { "s" }
+                )
+            }
+            // `rebuild_subtotals` already put the refusal in the status line.
+            None => self.subtotal_spec = None,
+        }
+    }
+
+    /// Rebuild the subtotal plan over whatever the other transforms resolve.
+    ///
+    /// Called when the spec changes and when the rows underneath it change —
+    /// never from the paint path, which only borrows the finished plan. This
+    /// is the same discipline `rebuild_sort_order` follows, and it is what
+    /// makes subtotals COMPOSE with sort and filter rather than race them.
+    fn rebuild_subtotals(&mut self) {
+        let Some((group_col, agg_cols, func)) = self.subtotal_spec.clone() else {
+            self.subtotals = None;
+            return;
+        };
+        // The rows the stages BELOW this one resolve. Asking the resolver
+        // itself would be circular — it consults this plan — so the count is
+        // taken from the same mapping the resolver would, with the subtotal
+        // stage absent.
+        let below = crate::grid::RowResolver {
+            filter: self.row_filter.as_ref(),
+            sort: self.sort_order.as_ref(),
+            table: None,
+            pad: None,
+            hidden: self.hidden_rows.as_ref(),
+            subtotals: None,
+        };
+        let data_rows = self.wb.view().row_count();
+        let rows = below.resolved_rows(data_rows);
+        let view = self.wb.view();
+        let src = SubtotalRows {
+            view: &view,
+            below: &below,
+            group_col,
+        };
+        match ferrix_core::SubtotalPlan::build(
+            rows,
+            group_col,
+            agg_cols,
+            func,
+            &src,
+            ferrix_core::MAX_GROUPS,
+        ) {
+            Ok(p) => self.subtotals = Some(p),
+            Err(e) => {
+                self.subtotals = None;
+                self.status = format!("Subtotals refused — {e}");
+            }
+        }
+    }
+
+    /// The subtotal plan the grid renders through, for tests.
+    pub fn subtotal_plan(&self) -> Option<&ferrix_core::SubtotalPlan> {
+        self.subtotals.as_ref()
+    }
+
+    /// SUBTOTAL rows and aggregate texts the last frame painted (issue #34).
+    ///
+    /// Real paint output, not model state: a plan that exists but never
+    /// reaches the screen reports zero here, which is the failure mode
+    /// "model-complete and unreachable" actually looks like.
+    pub fn last_subtotal_rows(&self) -> usize {
+        self.last_subtotal_rows
+    }
+
+    pub fn last_subtotal_texts(&self) -> usize {
+        self.last_subtotal_texts
+    }
+
+    /// The first `n` screen rows, resolved through THE resolver.
+    ///
+    /// Exposed for tests so an assertion about row identity goes through the
+    /// same code the painter does, rather than through a mapping the test
+    /// built for itself — which would agree right up until the moment the
+    /// real one was wrong.
+    pub fn screen_rows(&self, n: usize) -> Vec<crate::grid::ScreenRow> {
+        let r = self.row_resolver(None);
+        (0..n).filter_map(|i| r.resolve(i)).collect()
+    }
+
+    /// Consolidate the same range from every sheet in the workbook into a
+    /// labelled block starting at the cursor.
+    ///
+    /// The SELECTION names the source rectangle — its first row is the column
+    /// headers and its first column is the row keys — and every sheet is read
+    /// at those coordinates. Keys missing from a sheet are reported, never
+    /// zeroed; see `consolidate.rs`.
+    pub fn consolidate_sheets(&mut self) {
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        if self.wb.sheet_count() < 2 {
+            self.status =
+                "Consolidate needs at least two sheets — this workbook has one".to_string();
+            return;
+        }
+        let (tl, br) = self.selection.bounds();
+        let sources: Vec<ferrix_core::consolidate::Source> = (0..self.wb.sheet_count())
+            .filter_map(|i| self.wb.sheet_name_at(i))
+            .map(|name| ferrix_core::consolidate::Source {
+                sheet: name,
+                first_row: tl.row,
+                last_row: br.row,
+                first_col: tl.col,
+                last_col: br.col,
+            })
+            .collect();
+        let req = ferrix_core::ConsolidateRequest {
+            sources,
+            func: ferrix_core::SubtotalFn::Sum,
+            max_cells: ferrix_core::MAX_OUTPUT_CELLS,
+        };
+        let src = WorkbookRanges { wb: &self.wb };
+        let out = match ferrix_core::consolidate(&req, &src) {
+            Ok(o) => o,
+            Err(e) => {
+                self.status = format!("Consolidate refused — {e}");
+                return;
+            }
+        };
+        // Written below the source block, so the source the user selected is
+        // never overwritten by its own consolidation.
+        let dest_row = br.row + 2;
+        let mut writes: Vec<(ferrix_core::CellRef, String)> = Vec::new();
+        for (ci, ck) in out.col_keys.iter().enumerate() {
+            writes.push((
+                ferrix_core::CellRef::new(dest_row, tl.col + 1 + ci as u32),
+                ck.clone(),
+            ));
+        }
+        for (ri, rk) in out.row_keys.iter().enumerate() {
+            let r = dest_row + 1 + ri as u32;
+            writes.push((ferrix_core::CellRef::new(r, tl.col), rk.clone()));
+            for ci in 0..out.col_keys.len() {
+                let c = tl.col + 1 + ci as u32;
+                // A cell no source contributed to is left EMPTY rather than
+                // written as 0 — the whole point of the feature is that the
+                // reader can tell the two apart on the sheet, not just in the
+                // status line.
+                if let Some(v) = out.at(ri, ci).and_then(|c| c.value) {
+                    writes.push((
+                        ferrix_core::CellRef::new(r, c),
+                        ferrix_core::format_number(v),
+                    ));
+                }
+            }
+        }
+        let n = writes.len();
+        if let Err(e) = self.wb.write_cells_bulk(writes) {
+            self.status = format!("Consolidate refused — {e}");
+            return;
+        }
+        self.rebuild_row_filter();
+        self.rebuild_subtotals();
+        let partial = out.report.partial_cells;
+        self.status = if partial > 0 {
+            format!(
+                "Consolidated {} sheets into {n} cells — {partial} cell{} came from \
+                 fewer than all of them; {} key/sheet pair{} missing (not zeroed)",
+                out.report.sources,
+                if partial == 1 { "" } else { "s" },
+                out.report.missing.len(),
+                if out.report.missing.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            )
+        } else {
+            format!(
+                "Consolidated {} sheets into {n} cells — every key present on every sheet",
+                out.report.sources
+            )
+        };
+        self.sync_formula_bar();
     }
 
     /// The sort mapping the grid should render through, if any.
@@ -5948,6 +6258,7 @@ impl FerrixApp {
         crate::grid::RowResolver {
             filter: self.row_filter.as_ref(),
             sort: self.sort_order.as_ref(),
+            subtotals: self.subtotals.as_ref(),
             // The table's own decoration is rebuilt per frame inside the
             // paint closure; outside it the mask is only needed when neither
             // of the other two transforms is active, and in that case the
@@ -6999,6 +7310,8 @@ impl FerrixApp {
             editing: self.editing.is_some(),
             zoom: self.zoom,
             selection_label: self.selection.label(),
+            rows: self.wb.view().row_count(),
+            sheets: self.wb.sheet_count(),
         }
     }
 
@@ -7076,6 +7389,12 @@ impl FerrixApp {
             C::FormulaNames => self.names_open = true,
             C::DataGoalSeek => self.goal_seek_open(),
             C::DataChart => self.open_chart(),
+            // Issue #34. These call the SAME methods the harness drives, so a
+            // test that goes through `run_command` exercises the production
+            // dispatch path rather than a parallel entry point.
+            C::DataRemoveDuplicates => self.remove_duplicates(),
+            C::DataSubtotals => self.toggle_subtotals(),
+            C::DataConsolidate => self.consolidate_sheets(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),
             C::DataProtectSheet => self.protect_sheet_open(),
@@ -8196,6 +8515,7 @@ impl FerrixApp {
                         header_dragging: self.header_drag,
                         filter: self.row_filter.as_ref(),
                         sort: self.sort_order.as_ref(),
+                        subtotals: self.subtotals.as_ref(),
                         table: decor.as_ref(),
                         current_match: if self.search_open {
                             self.search_results.wrapped(self.search_index)
@@ -8227,6 +8547,8 @@ impl FerrixApp {
                 self.last_border_segments = resp.border_segments;
                 self.last_rotated_texts = resp.rotated_texts;
                 self.last_wrapped_texts = resp.wrapped_texts;
+                self.last_subtotal_rows = resp.subtotal_rows;
+                self.last_subtotal_texts = resp.subtotal_texts;
 
                 // --- trace precedents / dependents arrows (roadmap #39) ---
                 //
@@ -9496,6 +9818,87 @@ fn width_for(chars: usize) -> f32 {
         w.clamp(64.0, 320.0)
     } else {
         DEFAULT_COL_WIDTH
+    }
+}
+
+/// Reads the group and aggregate columns for a subtotal plan, THROUGH the
+/// resolver stages below subtotals (issue #34).
+///
+/// This is what makes subtotals compose rather than compete: a visible
+/// position is turned into a data row by the SAME `RowResolver` the painter
+/// uses, with only the subtotal stage removed. There is no second mapping
+/// here — that is the whole point.
+struct SubtotalRows<'a> {
+    view: &'a crate::sheet_view::SheetView<'a>,
+    below: &'a crate::grid::RowResolver<'a>,
+    group_col: u32,
+}
+
+impl SubtotalRows<'_> {
+    #[inline]
+    fn data_row(&self, visible: usize) -> Option<u32> {
+        match self.below.resolve(visible)? {
+            crate::grid::ScreenRow::Data(r) => Some(r),
+            // Padding and subtotal rows are not data. The plan is built over
+            // `resolved_rows`, which excludes both, so this is unreachable in
+            // practice and returns None rather than guessing a row.
+            _ => None,
+        }
+    }
+}
+
+impl ferrix_core::GroupSource for SubtotalRows<'_> {
+    fn group_value(&self, visible: usize) -> Value {
+        match self.data_row(visible) {
+            Some(r) => self.view.get(CellRef::new(r, self.group_col)),
+            None => Value::Empty,
+        }
+    }
+
+    fn group_label(&self, visible: usize) -> String {
+        match self.data_row(visible) {
+            Some(r) => self.view.display(CellRef::new(r, self.group_col)),
+            None => String::new(),
+        }
+    }
+
+    fn agg_value(&self, visible: usize, col: u32) -> Value {
+        match self.data_row(visible) {
+            Some(r) => self.view.get(CellRef::new(r, col)),
+            None => Value::Empty,
+        }
+    }
+}
+
+/// Reads labelled ranges out of every sheet in the workbook, for Consolidate.
+///
+/// One call per cell of the SOURCE RECTANGLES the user selected — never a
+/// sheet scan. A sheet the workbook does not have reads as empty, which is
+/// then reported as a missing contribution rather than as a zero.
+struct WorkbookRanges<'a> {
+    wb: &'a Workbook,
+}
+
+impl WorkbookRanges<'_> {
+    fn view_of(&self, sheet: &str) -> Option<crate::sheet_view::SheetView<'_>> {
+        let id = self.wb.sheet_id_by_name(sheet)?;
+        self.wb.sheet_view(id)
+    }
+}
+
+impl ferrix_core::consolidate::RangeSource for WorkbookRanges<'_> {
+    fn label_at(&self, sheet: &str, row: u32, col: u32) -> String {
+        match self.view_of(sheet) {
+            Some(v) => v.display(CellRef::new(row, col)),
+            None => String::new(),
+        }
+    }
+
+    fn number_at(&self, sheet: &str, row: u32, col: u32) -> Option<f64> {
+        // `as_number` and NOT a text parse: a cell holding the WORD "5" is
+        // not a number on this sheet, and quietly coercing it would make a
+        // consolidation disagree with the SUM the user can see.
+        self.view_of(sheet)?.get(CellRef::new(row, col)).as_number()
     }
 }
 

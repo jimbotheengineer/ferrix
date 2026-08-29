@@ -774,6 +774,56 @@ impl Harness {
         self.app.status_text()
     }
 
+    // ---- issue #34: dedupe, subtotals, consolidate ----
+    //
+    // These go through `run_command`, the SAME dispatch the menu bar and the
+    // command palette use, rather than calling the app method directly. A
+    // test that reached past the registry would pass against a feature with
+    // no menu row and no palette entry — which is exactly how six features
+    // in this repo landed model-complete and unreachable.
+
+    /// Run a registry command by id, as the menu and palette both do.
+    pub fn run_command(&mut self, id: crate::command::CommandId) -> &mut Self {
+        self.app.run_command(id);
+        self.steps(2);
+        self
+    }
+
+    /// Remove Duplicates, keyed on the current selection's columns.
+    pub fn remove_duplicates(&mut self) -> &mut Self {
+        self.run_command(crate::command::CommandId::DataRemoveDuplicates)
+    }
+
+    /// Toggle subtotals grouped on the cursor's column.
+    pub fn toggle_subtotals(&mut self) -> &mut Self {
+        self.run_command(crate::command::CommandId::DataSubtotals)
+    }
+
+    /// Consolidate the selected labelled range across every sheet.
+    pub fn consolidate(&mut self) -> &mut Self {
+        self.run_command(crate::command::CommandId::DataConsolidate)
+    }
+
+    /// SUBTOTAL rows the last frame actually painted. Real paint output.
+    pub fn painted_subtotal_rows(&mut self) -> usize {
+        self.step();
+        self.app.last_subtotal_rows()
+    }
+
+    /// Aggregate texts drawn on subtotal rows last frame.
+    pub fn painted_subtotal_texts(&mut self) -> usize {
+        self.step();
+        self.app.last_subtotal_texts()
+    }
+
+    /// The screen rows the resolver produces, as `(screen, ScreenRow)` — the
+    /// single question a test about row identity actually wants answered, and
+    /// answered through THE resolver rather than a test-local mapping.
+    pub fn screen_rows(&mut self, n: usize) -> Vec<crate::grid::ScreenRow> {
+        self.step();
+        self.app.screen_rows(n)
+    }
+
     // ---- goal seek (issue #35) ----
     //
     // Same reasoning as `cond_new_rule`: the Data menu item lives at a pixel

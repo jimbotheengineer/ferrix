@@ -36,6 +36,16 @@ pub struct UndoEntry {
     /// never coalesced into or out of: collapsing a paste into a neighbouring
     /// keystroke would make undo unpredictable.
     bulk: bool,
+    /// The display permutation as it stood BEFORE a structural change, and
+    /// the one it became — `None` for the overwhelming majority of entries,
+    /// which change no structure.
+    ///
+    /// This is how a row removal is undone at scale (issue #34). `order.rs`
+    /// removes rows by ceasing to ADDRESS them rather than by erasing them,
+    /// so undoing is a snapshot of a run list — `O(runs)`, a few kilobytes —
+    /// instead of a copy of every removed row's cells, which on a 10M-row
+    /// dedupe would be the entire sheet.
+    order: Option<(ferrix_core::SheetOrder, ferrix_core::SheetOrder)>,
 }
 
 /// Default cap on the undo stack. A long session would otherwise grow it
@@ -373,6 +383,67 @@ impl Workbook {
             .iter()
             .map(|s| (s.id, s.name.as_str()))
             .collect()
+    }
+
+    /// Sheet name at a tab position, for the consolidate source list.
+    pub fn sheet_name_at(&self, index: usize) -> Option<String> {
+        self.sheets.get(index).map(|s| s.name.clone())
+    }
+
+    /// Write a batch of literal cells as exactly ONE undo step.
+    ///
+    /// Used by Consolidate (issue #34), which writes a small labelled block
+    /// and must be reversible in one Ctrl+Z rather than one per cell. Bounded
+    /// by the batch the caller assembled, which is itself bounded by
+    /// [`ferrix_core::MAX_OUTPUT_CELLS`] — nothing here scales with the row
+    /// count.
+    pub fn write_cells_bulk(
+        &mut self,
+        cells: Vec<(CellRef, String)>,
+    ) -> Result<usize, ferrix_core::Denied> {
+        if cells.is_empty() {
+            return Ok(0);
+        }
+        let sheet = self.active_sheet();
+        // Issue #42: same all-or-nothing protection chokepoint the other bulk
+        // writers use. Checked BEFORE anything is written, so a refusal
+        // leaves the sheet exactly as it was.
+        {
+            let prot = &self.sheets[self.active].protection;
+            if prot.is_enabled() {
+                if let Some(d) = cells.iter().find_map(|(c, _)| prot.deny_edit(*c)) {
+                    self.last_denial = Some(d);
+                    return Err(d);
+                }
+            }
+        }
+        let mut changes = Vec::with_capacity(cells.len());
+        let first = cells[0].0;
+        for (cell, text) in cells {
+            let before = self.overlay.get(cell).cloned();
+            let Some(input) = self.classify(&text) else {
+                continue;
+            };
+            self.overlay.set(cell, input.clone());
+            self.resync_graph_at(SheetCell::new(sheet, cell));
+            changes.push(CellChange {
+                cell,
+                before,
+                after: Some(input),
+            });
+        }
+        let n = changes.len();
+        self.dirty = true;
+        self.push_undo(UndoEntry {
+            sheet,
+            cell: first,
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+            order: None,
+        });
+        self.recalc_all();
+        Ok(n)
     }
 
     /// Used by tests and kept as workbook API; the UI reads the tab list
@@ -1307,10 +1378,189 @@ impl Workbook {
             changes: remapped,
             side_effects: Vec::new(),
             bulk: true,
+            order: None,
         });
         self.dirty = true;
         self.recalc_all();
         Ok(())
+    }
+
+    // ========================================================================
+    // Remove Duplicates (issue #34)
+    // ========================================================================
+
+    /// Remove duplicate rows, keying on `key_cols`, as exactly ONE undo step.
+    ///
+    /// ## Why this can dedupe a sheet larger than memory
+    ///
+    /// Two structures are held, and neither is the data:
+    ///
+    /// * [`ferrix_core::DupeScan`]'s key set — distinct keys x key columns,
+    ///   independent of the row count. See `dedupe.rs`.
+    /// * the removed rows' display positions, which the caller caps through
+    ///   `max_removed`. This is the ONE per-removed-row allocation and it is
+    ///   4 bytes each: the list is consumed immediately by
+    ///   `AxisOrder::remove`, and what SURVIVES into the undo entry is a run
+    ///   list, not a row list.
+    ///
+    /// Removing the rows themselves costs nothing per row: `order.rs` stops
+    /// ADDRESSING them rather than erasing them, so a 10M-row dedupe rewrites
+    /// no base data and the `.ferrix` file on disk is untouched.
+    ///
+    /// ## Why undo is one step that restores every row
+    ///
+    /// The undo entry carries the row permutation as it stood BEFORE and
+    /// AFTER, plus the overlay edits that were relocated. Undo puts the
+    /// permutation back, which re-addresses every removed row's data exactly
+    /// where it was — the values were never destroyed, so there is nothing to
+    /// restore them FROM and nothing to get wrong.
+    ///
+    /// Returns the report, whose `duplicates` is the count to show the user.
+    pub fn remove_duplicates(
+        &mut self,
+        key_cols: &[u32],
+        max_removed: usize,
+    ) -> Result<ferrix_core::DupeReport, String> {
+        // Issue #42: this deletes rows, which is one of the granular
+        // allowances. Gated at the same chokepoint every other structural
+        // change is.
+        if let Some(d) = self
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::DeleteRows)
+        {
+            return Err(format!("Remove Duplicates refused — {d}"));
+        }
+        let rows = self.view().row_count();
+        if rows == 0 {
+            return Ok(ferrix_core::DupeReport::default());
+        }
+        // An empty key column list means "the whole row", resolved HERE
+        // rather than guessed inside the scanner.
+        let cols: Vec<u32> = if key_cols.is_empty() {
+            (0..self.view().col_count() as u32).collect()
+        } else {
+            let mut c = key_cols.to_vec();
+            c.sort_unstable();
+            c.dedup();
+            c
+        };
+
+        // The scan streams. Only the DUPLICATE positions are collected, and
+        // only up to the cap — a sheet that is 99% duplicates is exactly the
+        // case where an uncapped list would be the problem.
+        let mut dupes: Vec<u32> = Vec::new();
+        let mut over_cap = false;
+        let report = {
+            let view = self.view();
+            ferrix_core::scan_duplicates(0..rows as u32, cols, &view, |r| {
+                if dupes.len() < max_removed {
+                    dupes.push(r);
+                } else {
+                    over_cap = true;
+                }
+            })
+        };
+        if over_cap {
+            return Err(format!(
+                "{} duplicate rows is more than one undo step can hold \
+                 (limit {max_removed}) — filter the sheet down first",
+                report.duplicates
+            ));
+        }
+        if dupes.is_empty() {
+            return Ok(report);
+        }
+
+        let before = self.order.clone();
+        // Display position -> its position after the removal, or None when it
+        // is one of the removed rows. Derived from the ascending duplicate
+        // list by a running offset rather than from a second stored mapping:
+        // there is one description of what moved, and both the overlay and
+        // the comments are relocated through it.
+        let removed: std::collections::HashSet<u32> = dupes.iter().copied().collect();
+        let survivor_of = |old: u32| -> Option<u32> {
+            if removed.contains(&old) {
+                return None;
+            }
+            let ahead = dupes.partition_point(|&d| d < old);
+            Some(old - ahead as u32)
+        };
+
+        // Remove from the BOTTOM up so each removal's index is still valid.
+        // `AxisOrder::remove` is O(runs) per call, and a dedupe's duplicates
+        // are typically contiguous runs, so the run count stays small.
+        let axis = self.order.rows_mut(rows as u64);
+        for &r in dupes.iter().rev() {
+            axis.remove(u64::from(r), 1)
+                .map_err(|e| format!("could not remove row {}: {e:?}", r + 1))?;
+        }
+        let after = self.order.clone();
+
+        // The overlay is keyed by DISPLAY position, so it has to move with
+        // the rows — leaving it put would strand every typed value on the
+        // wrong record while the base data slid up underneath it. That is the
+        // side-table failure the guide names, and it is why the comments move
+        // in the same pass.
+        let changes = self.relocate_overlay_rows(&survivor_of);
+        self.comments
+            .remap_cells(|c| survivor_of(c.row).map(|r| CellRef::new(r, c.col)));
+
+        self.push_undo(UndoEntry {
+            sheet: self.active_sheet(),
+            cell: CellRef::new(dupes[0], 0),
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+            order: Some((before, after)),
+        });
+        self.dirty = true;
+        self.recalc_all();
+        Ok(report)
+    }
+
+    /// Move every overlay cell to the row `map` sends it to, dropping the
+    /// ones it sends nowhere. Returns the changes, so a bulk row removal is
+    /// ONE undo entry.
+    ///
+    /// Costs O(edits), never O(rows) — the whole reason edits live in a
+    /// sparse overlay. Two phases, so a cell cannot be clobbered by a cell
+    /// that has not been vacated yet.
+    fn relocate_overlay_rows(&mut self, map: &impl Fn(u32) -> Option<u32>) -> Vec<CellChange> {
+        let existing: Vec<(CellRef, CellInput)> = self
+            .overlay
+            .edited_cells()
+            .map(|(c, i)| (*c, i.clone()))
+            .collect();
+        let sheet = self.active_sheet();
+        let mut changes = Vec::new();
+        let mut moves = Vec::new();
+        for (cell, input) in existing {
+            let dest = map(cell.row).map(|r| CellRef::new(r, cell.col));
+            if dest == Some(cell) {
+                continue;
+            }
+            if let Some(prev) = self.overlay.clear(cell) {
+                changes.push(CellChange {
+                    cell,
+                    before: Some(prev),
+                    after: None,
+                });
+            }
+            self.graph.remove_at(SheetCell::new(sheet, cell));
+            if let Some(d) = dest {
+                moves.push((d, input));
+            }
+        }
+        for (dest, input) in moves {
+            let before = self.overlay.set(dest, input.clone());
+            changes.push(CellChange {
+                cell: dest,
+                before,
+                after: Some(input),
+            });
+            self.resync_graph_at(SheetCell::new(sheet, dest));
+        }
+        changes
     }
 
     /// Rewrite every formula so its references survive an order change.
@@ -1622,6 +1872,7 @@ impl Workbook {
                 }],
                 side_effects,
                 bulk: false,
+                order: None,
             });
         }
         self.last_edit = Some((at, now));
@@ -1910,6 +2161,14 @@ impl Workbook {
         // An undo ends any coalescing run: the next keystroke must not fold
         // into an entry the user has just stepped away from.
         self.last_edit = None;
+        // Structure first: the cell changes below are keyed in the DISPLAY
+        // space the order defines, so restoring them against the wrong
+        // permutation would write them onto other rows — the exact
+        // "data slides out from under the user's edits" failure the guide
+        // warns about for side-tables.
+        if let Some((before, _)) = &entry.order {
+            self.order = before.clone();
+        }
         // Reverse order so overlapping writes unwind exactly as they were made.
         for ch in entry.changes.iter().rev() {
             self.overlay.restore(ch.cell, ch.before.clone());
@@ -1933,6 +2192,9 @@ impl Workbook {
         let entry = self.redo.pop()?;
         self.dirty = true;
         self.last_edit = None;
+        if let Some((_, after)) = &entry.order {
+            self.order = after.clone();
+        }
         for ch in &entry.changes {
             self.overlay.restore(ch.cell, ch.after.clone());
             self.resync_graph_at(SheetCell::new(sheet, ch.cell));
@@ -2241,6 +2503,7 @@ impl Workbook {
             changes,
             side_effects: Vec::new(),
             bulk: true,
+            order: None,
         });
         self.recalc_all();
         Ok(n)
@@ -2435,6 +2698,7 @@ impl Workbook {
             changes,
             side_effects: Vec::new(),
             bulk: true,
+            order: None,
         });
         self.recalc_all();
         Ok(n)
@@ -2570,6 +2834,7 @@ impl Workbook {
                 changes,
                 side_effects: Vec::new(),
                 bulk: true,
+                order: None,
             });
             self.recalc_all();
         }
@@ -2666,6 +2931,7 @@ impl Workbook {
             changes,
             side_effects: Vec::new(),
             bulk: true,
+            order: None,
         });
         self.recalc_all();
         Ok(n)
@@ -2857,6 +3123,7 @@ impl Workbook {
             changes,
             side_effects: Vec::new(),
             bulk: true,
+            order: None,
         });
         self.recalc_all();
         Ok((n, kind))
