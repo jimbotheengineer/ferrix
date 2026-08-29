@@ -30,6 +30,24 @@ pub struct Prefs {
     pub theme: Option<ThemeMode>,
     /// Issue #20: show empty padding rows past the end of the sheet.
     pub show_empty_rows: bool,
+    /// Autosave cadence in seconds. `None` means "not configured", and the
+    /// app uses `DEFAULT_AUTOSAVE_SECS`. Zero disables autosave entirely.
+    pub autosave_secs: Option<u64>,
+}
+
+impl Prefs {
+    /// The cadence actually used, resolving the unset case to the default.
+    pub fn autosave_interval(self) -> std::time::Duration {
+        let secs = self
+            .autosave_secs
+            .unwrap_or(ferrix_io::edits::DEFAULT_AUTOSAVE_SECS);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Autosave is off when the user explicitly set the interval to zero.
+    pub fn autosave_enabled(self) -> bool {
+        self.autosave_secs != Some(0)
+    }
 }
 
 const FILE: &str = "prefs.toml";
@@ -83,6 +101,10 @@ impl Prefs {
                 // falls back to the OS preference rather than to a guess.
                 "theme" => out.theme = ThemeMode::parse(v),
                 "show_empty_rows" => out.show_empty_rows = v == "true",
+                // A malformed number leaves this None, i.e. the default
+                // cadence — never zero, which would silently disable
+                // autosave because of a typo in a config file.
+                "autosave_secs" => out.autosave_secs = v.parse::<u64>().ok(),
                 _ => {}
             }
         }
@@ -95,6 +117,9 @@ impl Prefs {
             s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
         }
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
+        if let Some(secs) = self.autosave_secs {
+            s.push_str(&format!("autosave_secs = {secs}\n"));
+        }
         s
     }
 
@@ -118,11 +143,14 @@ mod tests {
     fn round_trips_through_text() {
         for theme in [None, Some(ThemeMode::Dark), Some(ThemeMode::Light)] {
             for show_empty_rows in [false, true] {
-                let p = Prefs {
-                    theme,
-                    show_empty_rows,
-                };
-                assert_eq!(Prefs::parse(&p.to_text()), p);
+                for autosave_secs in [None, Some(0), Some(15), Some(300)] {
+                    let p = Prefs {
+                        theme,
+                        show_empty_rows,
+                        autosave_secs,
+                    };
+                    assert_eq!(Prefs::parse(&p.to_text()), p);
+                }
             }
         }
     }
@@ -146,10 +174,43 @@ mod tests {
     }
 
     #[test]
+    fn autosave_defaults_to_thirty_seconds_and_stays_on() {
+        let p = Prefs::parse("");
+        assert_eq!(p.autosave_secs, None);
+        assert_eq!(p.autosave_interval().as_secs(), 30);
+        assert!(p.autosave_enabled());
+    }
+
+    #[test]
+    fn autosave_interval_is_configurable() {
+        let p = Prefs::parse("autosave_secs = 5\n");
+        assert_eq!(p.autosave_interval().as_secs(), 5);
+        assert!(p.autosave_enabled());
+    }
+
+    #[test]
+    fn zero_disables_autosave_but_a_typo_does_not() {
+        // Explicit zero is a deliberate opt-out.
+        assert!(!Prefs::parse("autosave_secs = 0\n").autosave_enabled());
+        // A malformed value must fall back to the protective default rather
+        // than silently leaving the user without autosave.
+        for bad in [
+            "autosave_secs = later\n",
+            "autosave_secs = \n",
+            "autosave_secs = -5\n",
+        ] {
+            let p = Prefs::parse(bad);
+            assert!(p.autosave_enabled(), "{bad:?} disabled autosave");
+            assert_eq!(p.autosave_interval().as_secs(), 30);
+        }
+    }
+
+    #[test]
     fn a_truncated_file_still_yields_what_it_can() {
         let full = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            autosave_secs: None,
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -172,6 +233,7 @@ mod tests {
         let want = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            autosave_secs: Some(45),
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

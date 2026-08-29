@@ -41,6 +41,10 @@ struct Loaded {
     /// Set when a sidecar existed but was rejected, so the UI can warn instead
     /// of silently discarding the user's saved work.
     edit_warning: Option<String>,
+    /// An autosave newer than the sidecar — work a crash would otherwise have
+    /// lost. Detected during load (two `stat`s), offered to the user on
+    /// arrival. Nothing is applied until they choose Recover.
+    recovery: Option<ferrix_io::edits::RecoveryCandidate>,
 }
 
 type LoadResult = Result<Loaded, String>;
@@ -173,6 +177,29 @@ pub struct FerrixApp {
     edits_path: Option<PathBuf>,
     fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
 
+    // --- autosave (roadmap #8) ---
+    //
+    // Edits live in a sidecar and undo history is cleared on save, so a crash
+    // between saves loses everything typed since the last one with no undo
+    // left to recover it. The timer below is the safety net.
+    /// When the last autosave tick fired. `None` until the first frame after
+    /// a load, so a freshly opened file does not immediately write.
+    autosave_last: Option<std::time::Instant>,
+    /// The overlay revision captured at the last successful autosave. A tick
+    /// whose revision matches this writes nothing at all — the "no change,
+    /// no write" rule, decided in O(1) rather than by comparing overlays.
+    autosave_revision: Option<u64>,
+    /// A running background autosave, if any. The write happens on a worker
+    /// thread against a cloned overlay so a large edit set never stalls a
+    /// frame; at most one is in flight, since a second would race the first
+    /// onto the same path.
+    autosave_rx: Option<Receiver<Result<(u64, u64), String>>>,
+    /// Recovery offer from a previous session's autosave, awaiting a choice.
+    recovery: Option<ferrix_io::edits::RecoveryCandidate>,
+    /// Set once the user has resolved the recovery prompt, so a redraw does
+    /// not re-offer edits they already accepted or discarded.
+    recovery_resolved: bool,
+
     status: String,
     loading: bool,
     load_rx: Option<Receiver<LoadResult>>,
@@ -283,6 +310,11 @@ impl FerrixApp {
             table_report: ferrix_core::ValidationReport::default(),
             edits_path: None,
             fingerprint: None,
+            autosave_last: None,
+            autosave_revision: None,
+            autosave_rx: None,
+            recovery: None,
+            recovery_resolved: false,
             status: "Ready — open a CSV to begin".into(),
             loading: false,
             load_rx: None,
@@ -376,6 +408,13 @@ impl FerrixApp {
                 self.stats_cols = loaded.cols;
                 self.edits_path = loaded.edits_path;
                 self.fingerprint = loaded.fingerprint;
+                // Offer recovery before anything else touches the overlay.
+                self.recovery = loaded.recovery;
+                self.recovery_resolved = false;
+                // A fresh dataset resets the autosave timer and its
+                // change-tracking baseline.
+                self.autosave_last = None;
+                self.autosave_revision = None;
                 let restored_count = loaded.restored.as_ref().map(|o| o.len());
                 self.wb = build_workbook(
                     loaded.base,
@@ -810,6 +849,10 @@ impl FerrixApp {
                     t.elapsed().as_secs_f64() * 1000.0,
                     history
                 );
+                // The sidecar now holds everything the autosave did, so the
+                // autosave is obsolete. Leaving it would make the next launch
+                // offer to "recover" edits that are already saved.
+                self.clear_autosave();
                 true
             }
             Err(e) => {
@@ -819,13 +862,305 @@ impl FerrixApp {
         }
     }
 
+    // --- autosave and crash recovery (roadmap #8) ---
+
+    /// Drive the autosave timer. Called once per frame.
+    ///
+    /// Writes nothing unless all of: autosave is enabled, a file is open, the
+    /// interval has elapsed, no write is already in flight, and the overlay
+    /// has actually changed since the last successful autosave. That last
+    /// condition is the "skip the write entirely when nothing changed" rule,
+    /// and it is an integer comparison rather than an overlay diff.
+    fn tick_autosave(&mut self) {
+        self.poll_autosave();
+
+        if !self.prefs.autosave_enabled() {
+            return;
+        }
+        let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
+            return;
+        };
+        // Never autosave over an unanswered recovery prompt: the overlay on
+        // screen is the pre-recovery state, and writing it would destroy the
+        // very edits being offered.
+        if self.recovery.is_some() {
+            return;
+        }
+        // One write at a time. Two concurrent writers would race onto the
+        // same path, and the loser's rename could resurrect older edits.
+        if self.autosave_rx.is_some() {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let due = match self.autosave_last {
+            // First tick after a load starts the clock rather than firing;
+            // opening a file should not immediately write one.
+            None => {
+                self.autosave_last = Some(now);
+                false
+            }
+            Some(last) => now.duration_since(last) >= self.prefs.autosave_interval(),
+        };
+        if !due {
+            return;
+        }
+        self.autosave_last = Some(now);
+
+        let revision = self.wb.overlay.revision();
+        // Nothing typed since the last autosave: no write at all. Not a
+        // rewrite of identical bytes — no file touched, no mtime moved.
+        if self.autosave_revision == Some(revision) {
+            return;
+        }
+        // An empty overlay with nothing ever autosaved has nothing to protect.
+        if self.wb.overlay.is_empty() && self.autosave_revision.is_none() {
+            return;
+        }
+
+        self.spawn_autosave(path, fp, revision);
+    }
+
+    /// Clone the overlay and write it on a worker thread.
+    ///
+    /// The clone is what keeps the UI thread free: serializing a large overlay
+    /// inline would stall the frame, and the overlay is `Clone` precisely so
+    /// long-running work can take a snapshot and let editing continue.
+    fn spawn_autosave(
+        &mut self,
+        path: PathBuf,
+        fp: ferrix_io::edits::BaseFingerprint,
+        revision: u64,
+    ) {
+        let snapshot = self.wb.overlay.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ferrix_io::edits::write_autosave(&path, &snapshot, fp)
+                .map(|bytes| (bytes, revision))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.autosave_rx = Some(rx);
+    }
+
+    /// Collect a finished background autosave.
+    ///
+    /// The revision is recorded only on success, so a failed write is retried
+    /// at the next tick rather than being mistaken for "already saved".
+    fn poll_autosave(&mut self) {
+        let Some(rx) = &self.autosave_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((_bytes, revision))) => {
+                self.autosave_revision = Some(revision);
+                self.autosave_rx = None;
+            }
+            Ok(Err(e)) => {
+                // Surfaced, not swallowed: a user who believes autosave is
+                // protecting them when it is not is worse off than one who
+                // knows it is failing.
+                self.status = format!("Autosave failed: {e}");
+                self.autosave_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.autosave_rx = None;
+            }
+        }
+    }
+
+    /// Wait for any in-flight autosave, then delete the autosave file.
+    ///
+    /// Ordering matters. Deleting first would let a still-running write
+    /// recreate the file immediately afterwards, leaving a stale autosave that
+    /// prompts for recovery on the next launch — offering to "restore" edits
+    /// the user already saved.
+    fn clear_autosave(&mut self) {
+        if let Some(rx) = self.autosave_rx.take() {
+            // Bounded: the worker only serializes an overlay, and a lost
+            // sender resolves immediately as Disconnected.
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
+        if let Some(path) = &self.edits_path {
+            if let Err(e) = ferrix_io::edits::discard_autosave(path) {
+                self.status = format!("Could not remove autosave: {e}");
+            }
+        }
+        self.autosave_revision = None;
+    }
+
+    /// The recovery prompt shown when a previous session left an autosave
+    /// newer than the sidecar — i.e. it did not exit cleanly.
+    ///
+    /// Two options, and neither is silent. Recover loads the autosaved overlay
+    /// and leaves the workbook dirty, so the user still owns the decision to
+    /// commit it. Discard deletes the autosave and touches nothing else — the
+    /// official sidecar is not modified either way.
+    fn show_recovery_prompt(&mut self, ctx: &egui::Context) {
+        let Some(candidate) = self.recovery.clone() else {
+            return;
+        };
+        let th = self.theme;
+        let mut recover = false;
+        let mut discard = false;
+
+        egui::Window::new("Recover unsaved edits")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("Recover edits from {} ago?", candidate.age_hhmm()))
+                        .size(13.5),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Ferrix did not shut down cleanly. These edits were saved \
+                         automatically and are not in the saved file yet.",
+                    )
+                    .color(th.text_dim)
+                    .size(11.5),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Recover").clicked() {
+                        recover = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        discard = true;
+                    }
+                });
+            });
+
+        if recover {
+            self.recover_autosave();
+        } else if discard {
+            self.discard_recovery();
+        }
+    }
+
+    /// Load the autosaved overlay into the workbook.
+    ///
+    /// The overlay replaces what is on screen and the workbook is marked
+    /// dirty: recovered edits are unsaved by definition, and the Save button
+    /// must reflect that. The autosave file is left in place until the user
+    /// saves or exits cleanly, so a crash during recovery does not lose it.
+    fn recover_autosave(&mut self) {
+        self.recovery = None;
+        self.recovery_resolved = true;
+        let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
+            return;
+        };
+        match ferrix_io::edits::load_autosave(&path, fp) {
+            Ok(Some(ov)) => {
+                let n = ov.len();
+                self.wb.adopt_overlay(ov);
+                // Formula sources were saved with a cached result computed
+                // against the base at autosave time; re-evaluate so what the
+                // user sees matches the data actually in front of them.
+                self.wb.rebuild_graph_and_recalc();
+                self.wb.mark_dirty();
+                // A recovered overlay is a new starting point for the timer.
+                self.autosave_revision = None;
+                self.autosave_last = Some(std::time::Instant::now());
+                self.sync_formula_bar();
+                self.status = format!("Recovered {} unsaved edit{}", fmt_int(n), plural(n));
+            }
+            Ok(None) => {
+                self.status = "Autosave vanished before it could be recovered".into();
+            }
+            Err(e) => {
+                // Typically a stale base. Say so rather than applying edits by
+                // position onto data that has changed underneath them.
+                self.status = format!("Could not recover autosaved edits — {e}");
+            }
+        }
+    }
+
+    /// Throw the autosave away, leaving the official sidecar untouched.
+    fn discard_recovery(&mut self) {
+        self.recovery = None;
+        self.recovery_resolved = true;
+        if let Some(path) = self.edits_path.clone() {
+            match ferrix_io::edits::discard_autosave(&path) {
+                Ok(()) => self.status = "Discarded autosaved edits".into(),
+                Err(e) => self.status = format!("Could not discard autosave: {e}"),
+            }
+        }
+        self.autosave_revision = None;
+    }
+
+    /// Whether the recovery prompt is currently on screen.
+    pub fn recovery_prompt_open(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    /// The prompt's headline text, for tests and for the status bar.
+    pub fn recovery_prompt_text(&self) -> Option<String> {
+        self.recovery
+            .as_ref()
+            .map(|c| format!("Recover edits from {} ago?", c.age_hhmm()))
+    }
+
+    /// Test/afterlife hook: does an autosave file exist for the open dataset?
+    pub fn autosave_file_exists(&self) -> bool {
+        self.edits_path
+            .as_ref()
+            .map(|p| ferrix_io::edits::autosave_path_for_sidecar(p).exists())
+            .unwrap_or(false)
+    }
+
+    /// Force an autosave tick regardless of the wall clock, for tests.
+    ///
+    /// Waiting 30 real seconds in a test would be intolerable, and shortening
+    /// the interval only to sleep is the same thing with extra steps. This
+    /// drives the SAME path the timer drives — including the no-change skip —
+    /// by moving the deadline into the past rather than bypassing the logic.
+    pub fn autosave_tick_now(&mut self) {
+        if let Some(last) = self.autosave_last.as_mut() {
+            *last -= self.prefs.autosave_interval() + std::time::Duration::from_millis(1);
+        } else {
+            self.autosave_last = Some(
+                std::time::Instant::now()
+                    - self.prefs.autosave_interval()
+                    - std::time::Duration::from_millis(1),
+            );
+        }
+        self.tick_autosave();
+        // Autosave is asynchronous by design; a test wants the outcome.
+        self.wait_for_autosave();
+    }
+
+    /// Block until any in-flight autosave has landed. Test-facing.
+    pub fn wait_for_autosave(&mut self) {
+        if let Some(rx) = self.autosave_rx.take() {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Ok((_bytes, revision))) => self.autosave_revision = Some(revision),
+                Ok(Err(e)) => self.status = format!("Autosave failed: {e}"),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Set the autosave cadence for this session. Test-facing.
+    pub fn set_autosave_secs(&mut self, secs: u64) {
+        self.prefs.autosave_secs = Some(secs);
+    }
+
+    /// Shut down cleanly: no autosave survives a deliberate exit.
+    ///
+    /// The autosave file exists to answer "did we crash?". A file left behind
+    /// by an orderly shutdown would answer yes, and the next launch would
+    /// offer to recover edits from a session that ended perfectly normally.
+    pub fn on_clean_exit(&mut self) {
+        self.clear_autosave();
+    }
+
     /// The unsaved-changes modal shown when the user tries to close the window
     /// with a dirty workbook.
     ///
     /// Three honest options: Save (write the sidecar, then close), Discard
     /// (close and lose the edits — stated plainly), and Cancel (stay put).
-    /// If saving fails, the close is NOT allowed to proceed: the status bar
-    /// carries the error and the user keeps their data.
     fn show_close_prompt(&mut self, ctx: &egui::Context) {
         let th = self.theme;
         let mut save_and_close = false;
@@ -894,6 +1229,10 @@ impl FerrixApp {
         if discard {
             self.close_prompt = false;
             self.allow_close = true;
+            // A deliberate discard is still a clean exit: the user chose to
+            // drop these edits, so leaving an autosave that resurrects them
+            // on the next launch would override that choice.
+            self.clear_autosave();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -2621,6 +2960,14 @@ impl eframe::App for FerrixApp {
         // which cannot be constructed outside eframe.
         self.frame(ctx);
     }
+
+    /// eframe's own shutdown hook — the last point at which the process is
+    /// still alive on a normal quit. Belt and braces alongside the
+    /// close-request path, since a platform quit (Cmd+Q, session logout) can
+    /// reach here without a viewport close request ever being observed.
+    fn on_exit(&mut self) {
+        self.on_clean_exit();
+    }
 }
 
 impl FerrixApp {
@@ -2669,11 +3016,24 @@ impl FerrixApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_prompt = true;
+        } else if ctx.input(|i| i.viewport().close_requested()) {
+            // The close is going through — either nothing is dirty or the
+            // user already answered the prompt. Either way this is a clean
+            // exit, and a clean exit leaves no autosave behind.
+            self.on_clean_exit();
         }
 
         if self.close_prompt {
             self.show_close_prompt(ctx);
         }
+        // Offer to recover a previous session's autosave. Shown after the
+        // close prompt so an in-progress close keeps precedence.
+        if self.recovery.is_some() {
+            self.show_recovery_prompt(ctx);
+        }
+        // The autosave timer. Runs every frame; almost every call returns
+        // immediately without touching the disk.
+        self.tick_autosave();
         self.show_chart_window(ctx);
         {}
 
@@ -3653,6 +4013,15 @@ fn build_workbook(
     wb
 }
 
+/// The plural "s", for status lines that count things.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 /// Thousands separators for readability in the status bar.
 fn fmt_int(n: usize) -> String {
     let s = n.to_string();
@@ -3704,7 +4073,7 @@ where
         );
         let rows = sheet.row_count();
         let cols = sheet.col_count();
-        let (edits_path, fingerprint, restored, edit_warning) =
+        let (edits_path, fingerprint, restored, edit_warning, recovery) =
             restore_edits(path, rows as u64, cols as u32);
         return Ok(Loaded {
             rows,
@@ -3719,6 +4088,7 @@ where
             fingerprint,
             restored,
             edit_warning,
+            recovery,
         });
     }
 
@@ -3762,7 +4132,7 @@ where
     // Edits are keyed to the cache, not the CSV: the cache is what the grid
     // actually reads, and regenerating it is exactly the event that should
     // invalidate saved edits.
-    let (edits_path, fingerprint, restored, edit_warning) =
+    let (edits_path, fingerprint, restored, edit_warning, recovery) =
         restore_edits(&cache, rows as u64, cols as u32);
 
     Ok(Loaded {
@@ -3778,6 +4148,7 @@ where
         fingerprint,
         restored,
         edit_warning,
+        recovery,
     })
 }
 
@@ -3841,6 +4212,7 @@ fn load_xlsx(path: &Path) -> LoadResult {
         fingerprint: None,
         restored: None,
         edit_warning: None,
+        recovery: None,
     })
 }
 
@@ -3857,21 +4229,27 @@ fn restore_edits(
     Option<ferrix_io::edits::BaseFingerprint>,
     Option<ferrix_core::EditOverlay>,
     Option<String>,
+    Option<ferrix_io::edits::RecoveryCandidate>,
 ) {
     use ferrix_io::edits;
     let fp = match edits::BaseFingerprint::of(base, rows, cols) {
         Ok(f) => f,
         // Cannot fingerprint (permissions, vanished file): saving would be
         // unsafe, so report no path rather than risk a mismatched sidecar.
-        Err(_) => return (None, None, None, None),
+        Err(_) => return (None, None, None, None, None),
     };
     let path = edits::edits_path_for(base);
+    // An autosave newer than the sidecar means the last session ended without
+    // a clean exit. Detected here — two `stat`s, no parsing — and offered to
+    // the user rather than applied, because silently resurrecting edits is as
+    // surprising as silently losing them.
+    let recovery = edits::find_recovery(&path);
     match edits::load_edits(&path, fp) {
-        Ok(Some(ov)) => (Some(path), Some(fp), Some(ov), None),
-        Ok(None) => (Some(path), Some(fp), None, None),
+        Ok(Some(ov)) => (Some(path), Some(fp), Some(ov), None, recovery),
+        Ok(None) => (Some(path), Some(fp), None, None, recovery),
         // A rejected sidecar must be surfaced. Silently continuing would look
         // like the user's saved edits simply vanished.
-        Err(e) => (Some(path), Some(fp), None, Some(e.to_string())),
+        Err(e) => (Some(path), Some(fp), None, Some(e.to_string()), recovery),
     }
 }
 
