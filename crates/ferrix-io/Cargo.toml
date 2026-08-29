@@ -8,10 +8,19 @@ repository.workspace = true
 description = "File format ingest/export for Ferrix (CSV now, xlsx next)"
 
 [dependencies]
+# Arrow/Parquet import+export (issue #32). `arrow` is pulled in for the
+# in-memory RecordBatch/array types the parquet reader and writer exchange;
+# `parquet` for the file format itself. Default features are off to avoid
+# dragging in the async/object-store/compute stacks we do not use — we only
+# need the IPC ("arrow" file/stream) reader-writer and the base array kernels.
+arrow = { version = "56", default-features = false, features = ["ipc"] }
 calamine = "0.36"
 ferrix-core.workspace = true
 ferrix-formula.workspace = true
 memmap2 = "0.9"
+# Snappy is the default compression for interoperable Parquet; keeping it
+# means files we write open in pandas/DuckDB/Spark without a codec error.
+parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
 # Reading table/validation/conditional-format parts needs the raw OOXML:
 # calamine surfaces cell values, not the `xl/tables/*.xml` or `dataValidations`
 # elements, and rust_xlsxwriter only writes. So the importer opens the package

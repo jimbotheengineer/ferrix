@@ -10,6 +10,7 @@
 //!   memory-mapped via [`MappedSheet`], so a 10GB dataset is bounded by disk
 //!   rather than RAM and opens instantly on subsequent runs.
 
+pub mod arrow_io;
 pub mod comment_sidecar;
 pub mod compact;
 pub mod convert;
@@ -24,6 +25,11 @@ pub mod safeguard;
 pub mod table_xlsx;
 pub mod xlsx;
 
+pub use arrow_io::{
+    convert_parquet, export_ipc, export_parquet, format_for_path, import_any, import_ipc,
+    import_parquet, ArrowExportStats, ArrowFormat, ArrowIoError, ArrowSource, ArrowStats,
+    ColumnKind, ExportOptions, ExportReport, ImportedArrow, ARROW_EXTENSIONS, ROW_GROUP_ROWS,
+};
 pub use comment_sidecar::{comments_path_for, load_comments, save_comments, CommentSidecarError};
 pub use compact::{compact_cache, CompactError, CompactOutcome, CompactStats};
 pub use convert::{
