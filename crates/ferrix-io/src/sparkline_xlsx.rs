@@ -43,7 +43,6 @@
 //! "the elements Excel reads are present, correctly namespaced and
 //! structurally correct", not "opened in Excel and confirmed".
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use ferrix_core::{CellRef, SparkGroup, SparkKind, SparklineMap, TableRange};
@@ -350,10 +349,6 @@ fn compress(kind: SparkKind, pairs: &[(String, String)]) -> Option<SparkGroup> {
         sc1,
     ))
 }
-
-/// Silence an unused-import warning on a helper the tests use.
-#[allow(dead_code)]
-fn _parts_type_hint(_: &HashMap<String, Vec<u8>>) {}
 
 #[cfg(test)]
 mod tests;
