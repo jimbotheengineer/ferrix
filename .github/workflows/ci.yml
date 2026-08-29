@@ -7,6 +7,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info is the single largest consumer of runner disk here: the
+  # workspace links several large binaries (arrow/parquet, eframe/wgpu) and
+  # the ubuntu runner ran out of space mid-link. CI never opens a debugger,
+  # so the symbols are pure cost. Line tables are kept so panic backtraces
+  # in test failures still name a file and line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Incremental artifacts are never reused inside a one-shot CI job.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check:
@@ -19,6 +28,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # The ubuntu runner ships ~14GB of preinstalled toolchains this build
+      # does not use (Android SDK, .NET, GHC, CodeQL). Reclaiming them is
+      # what keeps the link step from dying with "No space left on device".
+      - name: Free runner disk space
+        if: runner.os == 'Linux'
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/powershell \
+                      /usr/share/swift /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          echo "after:"; df -h /
 
       # eframe/egui needs X11 + wayland + GTK (for rfd file dialogs) headers to
       # build on Linux. Windows runners already ship everything eframe needs.
@@ -59,11 +82,16 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Build
-        run: cargo build --workspace
+      # Clippy first: it builds the same --all-targets graph the tests need,
+      # so running it before `cargo test` reuses those artifacts instead of
+      # building the workspace a third time. The old order built everything
+      # three times over (build, then test, then clippy) and filled the disk.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Disk usage after build
+        if: always()
+        run: df -h .
