@@ -24,7 +24,11 @@ use std::path::PathBuf;
 use crate::theme::ThemeMode;
 
 /// Everything persisted between runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// `PartialEq` but not `Eq`: `zoom` is an f32. Comparisons here are exact by
+/// design — a zoom is only ever one of a fixed set of stops, or a value that
+/// round-tripped through this file's own formatting.
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Prefs {
     /// `None` means "never chosen" — the caller then follows the OS.
     pub theme: Option<ThemeMode>,
@@ -33,11 +37,17 @@ pub struct Prefs {
     /// Autosave cadence in seconds. `None` means "not configured", and the
     /// app uses `DEFAULT_AUTOSAVE_SECS`. Zero disables autosave entirely.
     pub autosave_secs: Option<u64>,
+    /// Zoom level per sheet, keyed by sheet NAME rather than by `SheetId`.
+    ///
+    /// Ids are assigned per run and mean nothing across a restart; the name is
+    /// what the user recognises and what survives reopening the file. Only
+    /// sheets the user actually zoomed appear, so the default costs nothing.
+    pub zoom: Vec<(String, f32)>,
 }
 
 impl Prefs {
     /// The cadence actually used, resolving the unset case to the default.
-    pub fn autosave_interval(self) -> std::time::Duration {
+    pub fn autosave_interval(&self) -> std::time::Duration {
         let secs = self
             .autosave_secs
             .unwrap_or(ferrix_io::edits::DEFAULT_AUTOSAVE_SECS);
@@ -45,8 +55,30 @@ impl Prefs {
     }
 
     /// Autosave is off when the user explicitly set the interval to zero.
-    pub fn autosave_enabled(self) -> bool {
+    pub fn autosave_enabled(&self) -> bool {
         self.autosave_secs != Some(0)
+    }
+}
+
+impl Prefs {
+    /// Zoom remembered for a sheet, or 100% when it was never set.
+    pub fn zoom_of(&self, sheet: &str) -> f32 {
+        self.zoom
+            .iter()
+            .find(|(n, _)| n == sheet)
+            .map(|&(_, z)| crate::grid::clamp_zoom(z))
+            .unwrap_or(1.0)
+    }
+
+    /// Remember a sheet's zoom. 100% is the default, so it is REMOVED rather
+    /// than stored — otherwise the file would accrue an entry for every sheet
+    /// the user ever glanced at.
+    pub fn set_zoom(&mut self, sheet: &str, zoom: f32) {
+        let z = crate::grid::clamp_zoom(zoom);
+        self.zoom.retain(|(n, _)| n != sheet);
+        if (z - 1.0).abs() > 1e-4 {
+            self.zoom.push((sheet.to_string(), z));
+        }
     }
 }
 
@@ -105,13 +137,24 @@ impl Prefs {
                 // cadence — never zero, which would silently disable
                 // autosave because of a typo in a config file.
                 "autosave_secs" => out.autosave_secs = v.parse::<u64>().ok(),
+                // `zoom.<sheet name> = 2` — one line per zoomed sheet. A name
+                // containing '=' still parses: `split_once` takes the FIRST
+                // '=', and the key is everything before it.
+                k2 if k2.starts_with("zoom.") => {
+                    let name = k2.trim_start_matches("zoom.").trim().trim_matches('"');
+                    if let Ok(z) = v.parse::<f32>() {
+                        if !name.is_empty() {
+                            out.set_zoom(name, z);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         out
     }
 
-    pub fn to_text(self) -> String {
+    pub fn to_text(&self) -> String {
         let mut s = String::from("# Ferrix preferences\n");
         if let Some(t) = self.theme {
             s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
@@ -120,13 +163,20 @@ impl Prefs {
         if let Some(secs) = self.autosave_secs {
             s.push_str(&format!("autosave_secs = {secs}\n"));
         }
+        for (name, z) in &self.zoom {
+            // Newlines in a sheet name would forge a second key, so they are
+            // dropped rather than written — a preference file must never be
+            // able to inject a setting the user did not choose.
+            let name = name.replace(['\n', '\r'], " ");
+            s.push_str(&format!("zoom.{name} = {z}\n"));
+        }
         s
     }
 
     /// Best-effort write. A failure to persist a preference is not worth
     /// interrupting the user over, so the error is returned for logging and
     /// otherwise dropped by the caller.
-    pub fn save(self) -> std::io::Result<()> {
+    pub fn save(&self) -> std::io::Result<()> {
         let Some(dir) = config_dir() else {
             return Ok(());
         };
@@ -134,6 +184,16 @@ impl Prefs {
         std::fs::write(dir.join(FILE), self.to_text())
     }
 }
+
+/// Serializes tests that redirect `FERRIX_CONFIG_DIR`.
+///
+/// The environment is per-PROCESS, and every test in this binary runs in the
+/// same one on parallel threads. Two tests each doing set-use-restore will
+/// interleave, and the second `set_var` lands between the first test's set and
+/// its read — which is exactly how a working persistence feature reports
+/// itself broken. Any test that touches this variable must hold this lock.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -148,9 +208,21 @@ mod tests {
                         theme,
                         show_empty_rows,
                         autosave_secs,
+                        zoom: Vec::new(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
+                // Zoom entries alongside every other field: two features wrote
+                // this test independently, each covering only its own field.
+                // A round trip that omits a field cannot catch that field
+                // being dropped by the writer.
+                let p = Prefs {
+                    theme,
+                    show_empty_rows,
+                    autosave_secs: Some(45),
+                    zoom: vec![("Sheet1".into(), 2.0), ("quarterly report".into(), 0.5)],
+                };
+                assert_eq!(Prefs::parse(&p.to_text()), p);
             }
         }
     }
@@ -211,6 +283,7 @@ mod tests {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
             autosave_secs: None,
+            zoom: vec![("Sheet1".into(), 3.0)],
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -223,6 +296,9 @@ mod tests {
     /// the config dir redirected at a temp directory.
     #[test]
     fn theme_preference_survives_a_restart() {
+        // Held for the whole test: the env var is process-wide and shared
+        // with every other test in this binary.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrix-prefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Set-and-restore rather than leaving it set: other tests in this
@@ -234,6 +310,7 @@ mod tests {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
             autosave_secs: Some(45),
+            zoom: vec![("Sheet1".into(), 2.0)],
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

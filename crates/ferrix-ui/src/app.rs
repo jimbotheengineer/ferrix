@@ -11,6 +11,22 @@ use ferrix_io::{load_csv, CsvOptions};
 
 use crate::grid::{Grid, ScrollState, DEFAULT_COL_WIDTH};
 use crate::prefs::Prefs;
+
+/// What the View menu was asked to do, applied after the panel closure ends.
+///
+/// The menu reads `self` (to label the zoom and enable Unfreeze) while it is
+/// being built, so it cannot also call `&mut self` methods; recording the
+/// choice keeps both borrows legal without duplicating the logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewAction {
+    /// (freeze rows, freeze columns) at the cursor.
+    Freeze(bool, bool),
+    Unfreeze,
+    Split,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
 use crate::sheet_view::BaseData;
 use crate::theme::{Theme, ThemeMode};
 use crate::workbook::Workbook;
@@ -151,6 +167,15 @@ pub struct FerrixApp {
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
     header_hitboxes: Vec<(usize, egui::Pos2)>,
+    /// (screen row, underlying row) for every row the LAST FRAME painted,
+    /// frozen band first. Read back by tests as the app's own account of what
+    /// is on screen.
+    last_painted_rows: Vec<(usize, u32)>,
+    /// How many of `last_painted_rows` were in the frozen/split band.
+    last_frozen_rows: usize,
+    /// The grid's outer rect as of the last frame, so cell geometry can be
+    /// asked for outside the paint closure.
+    last_grid_rect: Option<egui::Rect>,
 
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
@@ -254,6 +279,10 @@ pub struct FerrixApp {
     theme_chosen: bool,
     /// Show empty rows past the end of the sheet (issue #20).
     show_empty_rows: bool,
+    /// Frozen / split leading band for the active sheet.
+    panes: crate::grid::Panes,
+    /// Zoom for the active sheet, 0.25..=4.0. Persisted per sheet name.
+    zoom: f32,
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
 }
@@ -302,6 +331,9 @@ impl FerrixApp {
             sort_order: None,
             header_drag: None,
             header_hitboxes: Vec::new(),
+            last_painted_rows: Vec::new(),
+            last_frozen_rows: 0,
+            last_grid_rect: None,
             fill_source: None,
             fill_target: None,
             tables: Vec::new(),
@@ -345,6 +377,11 @@ impl FerrixApp {
             theme: Theme::of(prefs.theme.unwrap_or_default()),
             theme_chosen: prefs.theme.is_some(),
             show_empty_rows: prefs.show_empty_rows,
+            panes: crate::grid::Panes::default(),
+            // The first sheet is named before any file is opened, so its
+            // remembered zoom is adopted here and re-adopted on every sheet
+            // switch — a zoom is a property of the sheet, not of the session.
+            zoom: prefs.zoom_of("Sheet1"),
             prefs,
         };
         if let Some(p) = initial {
@@ -430,6 +467,12 @@ impl FerrixApp {
                 }
                 self.selection.move_to(CellRef::new(0, 0));
                 self.scroll = ScrollState::default();
+                // The workbook we just built has the FILE's sheet name, which
+                // is only known now — so this is where the sheet's remembered
+                // zoom is adopted. Doing it at construction would read the
+                // placeholder "Sheet1" and silently lose the preference.
+                self.zoom = self.prefs.zoom_of(self.wb.active_name());
+                self.panes = crate::grid::Panes::default();
                 self.loading = false;
                 self.load_rx = None;
                 self.progress_rx = None;
@@ -539,6 +582,101 @@ impl FerrixApp {
         self.prefs.theme = Some(mode);
         self.persist_prefs();
         self.status = format!("{} theme", mode.as_str());
+    }
+
+    // ---- freeze panes, split view, zoom (roadmap #6) ----
+
+    /// The frozen / split band the grid should render.
+    pub fn panes(&self) -> crate::grid::Panes {
+        self.panes
+    }
+
+    /// Current zoom factor for the active sheet.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Freeze rows above and/or columns left of the CURSOR.
+    ///
+    /// The cursor's own row is the first SCROLLING row, matching every
+    /// spreadsheet: "freeze at row 5" means rows 1..4 stay put. The cursor's
+    /// row is taken in SCREEN space, through the same resolver the grid paints
+    /// with, so freezing under a sort or filter freezes the rows the user can
+    /// actually see rather than an unrelated slice of the underlying sheet.
+    pub fn freeze_at_cursor(&mut self, rows: bool, cols: bool) {
+        let screen_row = self
+            .row_resolver(self.pad_space())
+            .visible_of(self.selection.cursor.row)
+            .unwrap_or(0);
+        self.panes = crate::grid::Panes::freeze(
+            if rows { screen_row } else { self.panes.rows },
+            if cols {
+                self.selection.cursor.col as usize
+            } else {
+                self.panes.cols
+            },
+        );
+        // The body cannot show rows the band already owns, so park it at the
+        // first scrolling row rather than leaving it above the seam.
+        self.scroll.row_offset = self.scroll.row_offset.max(self.panes.body_min_row());
+        self.status = match (self.panes.rows, self.panes.cols) {
+            (0, 0) => "Nothing to freeze — the cursor is at A1".into(),
+            (r, 0) => format!("Froze {r} row{}", if r == 1 { "" } else { "s" }),
+            (0, c) => format!("Froze {c} column{}", if c == 1 { "" } else { "s" }),
+            (r, c) => format!("Froze {r} rows and {c} columns"),
+        };
+    }
+
+    /// Drop the frozen band / split entirely.
+    pub fn unfreeze(&mut self) {
+        let had = self.panes.is_active();
+        self.panes = crate::grid::Panes::default();
+        self.status = if had {
+            "Unfroze panes".into()
+        } else {
+            "No frozen panes".into()
+        };
+    }
+
+    /// Split at the cursor: same band, but its offset is the user's to move.
+    ///
+    /// Two independent scroll offsets over ONE column layout — the split pane
+    /// and the body index the same widths and the same rows, so they can never
+    /// disagree about what a column is.
+    pub fn split_at_cursor(&mut self) {
+        let screen_row = self
+            .row_resolver(self.pad_space())
+            .visible_of(self.selection.cursor.row)
+            .unwrap_or(0);
+        self.panes = crate::grid::Panes {
+            rows: screen_row,
+            cols: self.selection.cursor.col as usize,
+            frozen: false,
+            lead_row: 0.0,
+            lead_col: 0,
+        };
+        self.status = "Split view — the top pane scrolls on its own".into();
+    }
+
+    /// Set the zoom for the active sheet and remember it.
+    pub fn set_zoom(&mut self, z: f32) {
+        self.zoom = crate::grid::clamp_zoom(z);
+        let name = self.wb.active_name().to_string();
+        self.prefs.set_zoom(&name, self.zoom);
+        self.persist_prefs();
+        self.status = format!("Zoom {}%", (self.zoom * 100.0).round() as i32);
+    }
+
+    pub fn zoom_in(&mut self) {
+        self.set_zoom(crate::grid::zoom_in(self.zoom));
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.set_zoom(crate::grid::zoom_out(self.zoom));
+    }
+
+    pub fn zoom_reset(&mut self) {
+        self.set_zoom(1.0);
     }
 
     fn set_show_empty_rows(&mut self, on: bool) {
@@ -802,7 +940,9 @@ impl FerrixApp {
     fn viewport_rows(&self) -> usize {
         // Recomputed each frame from the real rect; this is a safe default
         // used only before the first paint.
-        ((self.last_viewport_h.max(200.0)) / crate::grid::ROW_HEIGHT) as usize
+        // Zoomed row height: at 200% half as many rows fit, and PageDown /
+        // scroll-to-selection must move by what is actually on screen.
+        ((self.last_viewport_h.max(200.0)) / crate::grid::Metrics::new(self.zoom).row_h) as usize
     }
 
     /// Persist edits to the sidecar beside the base file.
@@ -2008,6 +2148,11 @@ impl FerrixApp {
         let state = self.wb.view_state();
         self.scroll = state.scroll;
         self.selection = state.selection;
+        // Zoom and panes belong to the SHEET, not to the session: adopt the
+        // new sheet's remembered zoom and drop the old sheet's frozen band,
+        // which was defined in that sheet's row and column space.
+        self.zoom = self.prefs.zoom_of(self.wb.active_name());
+        self.panes = crate::grid::Panes::default();
         // Column widths and search hits belong to the sheet we just left.
         self.col_widths = Vec::new();
         self.search_results = ferrix_core::SearchResults::default();
@@ -2324,6 +2469,57 @@ impl FerrixApp {
     /// The sort mapping the grid should render through, if any.
     pub fn sort_order(&self) -> Option<&ferrix_core::SortOrder> {
         self.sort_order.as_ref()
+    }
+
+    /// Scroll the BODY pane to a given screen row. Clamped by the grid on the
+    /// next frame exactly as a wheel or scrollbar drag would be.
+    pub fn scroll_body_to(&mut self, screen_row: f64) {
+        self.scroll.row_offset = screen_row.max(0.0);
+    }
+
+    /// Where the body pane is scrolled to, in screen rows.
+    pub fn body_row_offset(&self) -> f64 {
+        self.scroll.row_offset
+    }
+
+    /// (screen row, underlying row) for every row the last frame painted,
+    /// frozen band FIRST. The app's own account of what is on screen.
+    pub fn painted_rows(&self) -> &[(usize, u32)] {
+        &self.last_painted_rows
+    }
+
+    /// How many painted rows belong to the frozen / split band.
+    pub fn frozen_row_count(&self) -> usize {
+        self.last_frozen_rows
+    }
+
+    /// Underlying rows that were on screen last frame, in paint order.
+    pub fn painted_underlying_rows(&self) -> Vec<u32> {
+        self.last_painted_rows.iter().map(|&(_, r)| r).collect()
+    }
+
+    /// Centre of a CELL as it would be painted right now, or `None` when it
+    /// is off screen.
+    ///
+    /// Read back from the app's own geometry — the same `cell_screen_rect` the
+    /// in-cell editor is positioned with, at the current zoom and pane
+    /// configuration — rather than computed from constants in the test. The
+    /// grid moves whenever a bar opens above it or the zoom changes, so a test
+    /// that hard-codes pixels ends up clicking somewhere else and reporting a
+    /// working feature as broken.
+    pub fn cell_center(&self, cell: CellRef) -> Option<(f32, f32)> {
+        let outer = self.last_grid_rect?;
+        let r = Grid::cell_screen_rect(
+            cell,
+            outer,
+            &self.scroll,
+            &self.col_widths,
+            &self.row_resolver(self.pad_space()),
+            crate::grid::Metrics::new(self.zoom),
+            self.panes,
+        )?;
+        let c = r.center();
+        Some((c.x, c.y))
     }
 
     /// Centre of a display column's header, as painted last frame.
@@ -2675,7 +2871,7 @@ impl FerrixApp {
     /// Centre the viewport on the selection — used when jumping to a match, so
     /// the hit lands mid-screen rather than scraping the edge.
     fn center_on_selection(&mut self) {
-        let visible = (self.last_viewport_h / crate::grid::ROW_HEIGHT) as f64;
+        let visible = (self.last_viewport_h / crate::grid::Metrics::new(self.zoom).row_h) as f64;
         let Some(row) = self.visible_row_of(self.selection.cursor.row) else {
             return;
         };
@@ -2751,6 +2947,32 @@ impl FerrixApp {
         });
         if ctrl_s {
             let _ = self.save_edits();
+            return;
+        }
+
+        // --- zoom shortcuts (roadmap #6) ---
+        //
+        // Both the main-row and numpad keys, and both Plus and Equals: on a US
+        // layout Ctrl+= is what "zoom in" physically is, and matching only
+        // Plus makes the shortcut require Shift for no reason.
+        let (zoom_in_key, zoom_out_key, zoom_reset_key) = ctx.input(|i| {
+            let c = i.modifiers.command;
+            (
+                c && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
+                c && i.key_pressed(Key::Minus),
+                c && i.key_pressed(Key::Num0),
+            )
+        });
+        if zoom_in_key {
+            self.zoom_in();
+            return;
+        }
+        if zoom_out_key {
+            self.zoom_out();
+            return;
+        }
+        if zoom_reset_key {
+            self.zoom_reset();
             return;
         }
         // Clipboard and select-all only apply when the grid owns the keyboard;
@@ -3045,6 +3267,9 @@ impl FerrixApp {
         // closure holds `&mut self` fields, so mutating the theme in place
         // here would conflict with the `th` the same frame is painting with.
         let mut toggle_theme = false;
+        // The View menu borrows `self` immutably to read the current state, so
+        // its choice is recorded and applied after the panel closure ends.
+        let mut view_action: Option<ViewAction> = None;
         let mut toggle_empty = false;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
@@ -3150,6 +3375,57 @@ impl FerrixApp {
                     {
                         toggle_empty = true;
                     }
+                    // --- View menu: freeze panes, split, zoom (roadmap #6) ---
+                    ui.menu_button("View", |ui| {
+                        let frozen = self.panes.is_active();
+                        if ui
+                            .button("❄ Freeze rows above cursor")
+                            .on_hover_text("Rows above the cursor stay put while the rest scrolls.")
+                            .clicked()
+                        {
+                            view_action = Some(ViewAction::Freeze(true, false));
+                            ui.close_menu();
+                        }
+                        if ui.button("❄ Freeze columns left of cursor").clicked() {
+                            view_action = Some(ViewAction::Freeze(false, true));
+                            ui.close_menu();
+                        }
+                        if ui.button("❄ Freeze both at cursor").clicked() {
+                            view_action = Some(ViewAction::Freeze(true, true));
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(frozen, egui::Button::new("✖ Unfreeze"))
+                            .clicked()
+                        {
+                            view_action = Some(ViewAction::Unfreeze);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("⬍ Split at cursor")
+                            .on_hover_text("Two independent scroll offsets over the same columns.")
+                            .clicked()
+                        {
+                            view_action = Some(ViewAction::Split);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.label(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
+                        if ui.button("＋ Zoom in  (Ctrl +)").clicked() {
+                            view_action = Some(ViewAction::ZoomIn);
+                            ui.close_menu();
+                        }
+                        if ui.button("－ Zoom out  (Ctrl -)").clicked() {
+                            view_action = Some(ViewAction::ZoomOut);
+                            ui.close_menu();
+                        }
+                        if ui.button("＝ Reset to 100%  (Ctrl 0)").clicked() {
+                            view_action = Some(ViewAction::ZoomReset);
+                            ui.close_menu();
+                        }
+                    });
+
                     if self.loading {
                         ui.add(egui::Spinner::new().size(14.0));
                         // A 10GB conversion takes minutes, so show real
@@ -3228,6 +3504,15 @@ impl FerrixApp {
 
         if toggle_theme {
             self.set_theme(self.theme.mode.toggled());
+        }
+        match view_action {
+            Some(ViewAction::Freeze(r, c)) => self.freeze_at_cursor(r, c),
+            Some(ViewAction::Unfreeze) => self.unfreeze(),
+            Some(ViewAction::Split) => self.split_at_cursor(),
+            Some(ViewAction::ZoomIn) => self.zoom_in(),
+            Some(ViewAction::ZoomOut) => self.zoom_out(),
+            Some(ViewAction::ZoomReset) => self.zoom_reset(),
+            None => {}
         }
         if toggle_empty {
             self.set_show_empty_rows(!self.show_empty_rows);
@@ -3651,7 +3936,9 @@ impl FerrixApp {
                 }
 
                 let outer = ui.available_rect_before_wrap();
-                self.last_viewport_h = outer.height() - crate::grid::HEADER_HEIGHT;
+                self.last_grid_rect = Some(outer);
+                self.last_viewport_h =
+                    outer.height() - crate::grid::Metrics::new(self.zoom).header_h;
 
                 // Filter mode with nothing to show: say so instead of painting
                 // an empty grid that looks like an empty file.
@@ -3673,8 +3960,11 @@ impl FerrixApp {
                     // many rows the table covers.
                     let decor = self.tables.first().map(|t| {
                         let first = self.scroll.row_offset.floor().max(0.0) as u32;
-                        let count =
-                            (self.last_viewport_h / crate::grid::ROW_HEIGHT).ceil() as u32 + 1;
+                        let count = (self.last_viewport_h
+                            / crate::grid::Metrics::new(self.zoom).row_h)
+                            .ceil() as u32
+                            + 1
+                            + self.panes.rows as u32;
                         crate::table_view::TableDecor::prepare(
                             t,
                             self.table_mask.as_ref(),
@@ -3708,6 +3998,8 @@ impl FerrixApp {
                         } else {
                             0
                         },
+                        metrics: crate::grid::Metrics::new(self.zoom),
+                        panes: &mut self.panes,
                     }
                     .show(ui)
                 };
@@ -3717,6 +4009,12 @@ impl FerrixApp {
                 // click one without guessing at pixels that move whenever a
                 // bar above the grid opens.
                 self.header_hitboxes = resp.header_hitboxes.clone();
+                self.last_painted_rows = resp.painted_rows.clone();
+                self.last_frozen_rows = resp.frozen_row_count;
+                // The grid clamps the zoom (a band taller than the window is
+                // refused), so the app adopts what was ACTUALLY painted rather
+                // than what it asked for.
+                self.zoom = resp.zoom;
 
                 if let Some(cell) = resp.clicked {
                     if self.editing.is_some() && self.editing != Some(cell) {
@@ -3884,6 +4182,8 @@ impl FerrixApp {
                         &self.scroll,
                         &self.col_widths,
                         &resolver,
+                        crate::grid::Metrics::new(self.zoom),
+                        self.panes,
                     ) {
                         let id = egui::Id::new("cell_editor");
                         let mut child = ui.new_child(

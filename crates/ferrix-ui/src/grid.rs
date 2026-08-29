@@ -51,6 +51,186 @@ const SCROLLBAR_W: f32 = 12.0;
 /// what export, SUM and the status bar read — never sees them.
 pub const EMPTY_ROW_PADDING: usize = 200;
 
+/// Base font size for cell text at 100% zoom.
+pub const BASE_FONT: f32 = 12.5;
+
+/// Zoom range. 25% is about the smallest at which a row is still a row rather
+/// than a stripe; 400% is where one cell fills a quarter of the window.
+pub const MIN_ZOOM: f32 = 0.25;
+pub const MAX_ZOOM: f32 = 4.0;
+
+/// The zoom stops the +/- commands walk. Multiplicative rather than linear, so
+/// a step feels the same size at 25% as it does at 400%.
+pub const ZOOM_STOPS: &[f32] = &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+
+#[inline]
+pub fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() {
+        z.clamp(MIN_ZOOM, MAX_ZOOM)
+    } else {
+        1.0
+    }
+}
+
+/// Next zoom stop above `z`, or `z` when already at the top.
+pub fn zoom_in(z: f32) -> f32 {
+    let z = clamp_zoom(z);
+    ZOOM_STOPS
+        .iter()
+        .copied()
+        .find(|&s| s > z + 1e-4)
+        .unwrap_or(MAX_ZOOM)
+}
+
+/// Next zoom stop below `z`, or `z` when already at the bottom.
+pub fn zoom_out(z: f32) -> f32 {
+    let z = clamp_zoom(z);
+    ZOOM_STOPS
+        .iter()
+        .copied()
+        .rev()
+        .find(|&s| s < z - 1e-4)
+        .unwrap_or(MIN_ZOOM)
+}
+
+/// Every length the grid draws with, scaled by the zoom factor.
+///
+/// Zoom is a pure VIEW transform, exactly like sort and filter: it changes how
+/// large a row is on screen and nothing about which row it is. Row heights,
+/// column widths, header bands and the font all scale by the same factor, so
+/// the grid stays geometrically similar to itself and a click at 200% resolves
+/// through the same arithmetic as one at 100%.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    pub zoom: f32,
+    pub row_h: f32,
+    pub header_h: f32,
+    pub row_header_w: f32,
+    pub font: f32,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl Metrics {
+    pub fn new(zoom: f32) -> Self {
+        let z = clamp_zoom(zoom);
+        Self {
+            zoom: z,
+            row_h: ROW_HEIGHT * z,
+            header_h: HEADER_HEIGHT * z,
+            row_header_w: ROW_HEADER_WIDTH * z,
+            font: BASE_FONT * z,
+        }
+    }
+
+    /// A stored column width, on screen.
+    #[inline]
+    pub fn col_width(&self, base: f32) -> f32 {
+        base * self.zoom
+    }
+}
+
+/// The leading band of the viewport: frozen panes and split view are the same
+/// mechanism with one difference.
+///
+/// A band of `rows` rows and/or `cols` columns is painted from its OWN scroll
+/// offset, before the body, and the body scrolls underneath it. When `frozen`
+/// the band's offset is pinned at zero — that is freeze panes. When not frozen
+/// the offset is the user's to move — that is a split view: two independent
+/// scroll offsets, per axis, over ONE column layout.
+///
+/// Column widths and row heights are shared with the body by construction:
+/// both bands index the same `col_widths` and the same [`Metrics`], so there
+/// is no second layout to drift out of step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Panes {
+    /// Rows in the leading band. 0 = no horizontal band.
+    pub rows: usize,
+    /// Columns in the leading band. 0 = no vertical band.
+    pub cols: usize,
+    /// Pinned at offset 0 (freeze) rather than independently scrolled (split).
+    pub frozen: bool,
+    /// First row the band shows when split. Ignored while `frozen`.
+    pub lead_row: f64,
+    /// First column the band shows when split. Ignored while `frozen`.
+    pub lead_col: usize,
+}
+
+impl Default for Panes {
+    fn default() -> Self {
+        Self {
+            rows: 0,
+            cols: 0,
+            frozen: true,
+            lead_row: 0.0,
+            lead_col: 0,
+        }
+    }
+}
+
+impl Panes {
+    pub fn is_active(&self) -> bool {
+        self.rows > 0 || self.cols > 0
+    }
+
+    /// Freeze the first `rows` rows and `cols` columns.
+    pub fn freeze(rows: usize, cols: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            frozen: true,
+            lead_row: 0.0,
+            lead_col: 0,
+        }
+    }
+
+    /// First screen row the leading band paints. Always 0 while frozen — the
+    /// whole point is that it does not move when the body does.
+    #[inline]
+    pub fn lead_first_row(&self) -> usize {
+        if self.frozen {
+            0
+        } else {
+            self.lead_row.max(0.0).floor() as usize
+        }
+    }
+
+    #[inline]
+    pub fn lead_first_col(&self) -> usize {
+        if self.frozen {
+            0
+        } else {
+            self.lead_col
+        }
+    }
+
+    /// Lowest body row offset. Under a freeze the body starts BELOW the frozen
+    /// rows, so a frozen row is never also painted (and scrolled) by the body.
+    /// Under a split both panes may show any row, including the same one.
+    #[inline]
+    pub fn body_min_row(&self) -> f64 {
+        if self.frozen {
+            self.rows as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// First column of body column space, for the same reason.
+    #[inline]
+    pub fn body_first_col(&self) -> usize {
+        if self.frozen {
+            self.cols
+        } else {
+            0
+        }
+    }
+}
+
 /// Where the padding rows start on screen, and which data row the first one
 /// names.
 ///
@@ -215,11 +395,34 @@ pub struct ScrollState {
 
 impl ScrollState {
     /// Clamp to the valid range for the current sheet and viewport.
+    ///
+    /// The no-panes, no-zoom case of [`ScrollState::clamp_body`]. Kept as the
+    /// simple entry point for callers with neither.
+    #[allow(dead_code)]
     pub fn clamp(&mut self, total_rows: usize, total_width: f32, view: Vec2) {
-        let visible_rows = (view.y / ROW_HEIGHT) as f64;
-        let max_row = (total_rows as f64 - visible_rows).max(0.0);
-        self.row_offset = self.row_offset.clamp(0.0, max_row);
-        let max_x = (total_width - view.x).max(0.0);
+        self.clamp_body(total_rows, total_width, view, ROW_HEIGHT, 0.0, 0.0);
+    }
+
+    /// Clamp the BODY pane's offset.
+    ///
+    /// `view` is the body's own rect — the leading frozen/split band is not
+    /// part of it — and `min_row`/`min_x` are where body space starts, which
+    /// under a freeze is just past the frozen band. Without the floor the body
+    /// would scroll up into rows the frozen band is already painting and show
+    /// them twice.
+    pub fn clamp_body(
+        &mut self,
+        total_rows: usize,
+        total_width: f32,
+        view: Vec2,
+        row_h: f32,
+        min_row: f64,
+        min_x: f32,
+    ) {
+        let visible_rows = (view.y / row_h.max(1.0)) as f64;
+        let max_row = (total_rows as f64 - visible_rows).max(min_row);
+        self.row_offset = self.row_offset.clamp(min_row, max_row);
+        let max_x = (total_width - min_x - view.x).max(0.0);
         self.col_px = self.col_px.clamp(0.0, max_x);
     }
 }
@@ -262,6 +465,18 @@ pub struct GridResponse {
     /// does not consume it yet, but it is part of the Grid's public response.
     #[allow(dead_code)]
     pub visible_rows: std::ops::Range<usize>,
+    /// Every screen row painted this frame, frozen band FIRST then body, with
+    /// the underlying row each one resolved to.
+    ///
+    /// This is the answer to "what is actually on screen", and it comes from
+    /// the same list the paint loop walked rather than from a recomputation —
+    /// so a test that asserts row 1 is still visible under a freeze is reading
+    /// the real paint output, not a model of it.
+    pub painted_rows: Vec<(usize, u32)>,
+    /// How many of `painted_rows` belong to the frozen/split band.
+    pub frozen_row_count: usize,
+    /// The zoom actually applied this frame, after clamping.
+    pub zoom: f32,
 }
 
 pub struct Grid<'a> {
@@ -315,6 +530,13 @@ pub struct Grid<'a> {
     /// it permutes which underlying row each screen row shows and never moves
     /// a byte of data. Composed after the filters through [`RowResolver`].
     pub sort: Option<&'a ferrix_core::SortOrder>,
+    /// Zoom-scaled lengths. Everything the grid draws is sized from this, so
+    /// zoom is one multiply at the layout level rather than a special case in
+    /// every paint call.
+    pub metrics: Metrics,
+    /// Frozen / split leading band. Mutable because a SPLIT band scrolls
+    /// independently, and the wheel over the band is what moves it.
+    pub panes: &'a mut Panes,
 }
 
 impl<'a> Grid<'a> {
@@ -330,31 +552,57 @@ impl<'a> Grid<'a> {
         scroll: &ScrollState,
         col_widths: &[f32],
         resolver: &RowResolver<'_>,
+        m: Metrics,
+        panes: Panes,
     ) -> Option<Rect> {
-        let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
+        let body_origin = outer.min + Vec2::new(m.row_header_w, m.header_h);
         // Through THE resolver, so the editor lands on the same screen row the
         // paint loop drew the cell on — under a filter, a sort, or both.
         let visible = resolver.visible_of(cell.row)?;
-        let rel_row = visible as f64 - scroll.row_offset;
-        let y = body_origin.y + (rel_row * ROW_HEIGHT as f64) as f32;
-        if y + ROW_HEIGHT < body_origin.y || y > outer.max.y {
-            return None;
-        }
-        let mut x = body_origin.x - scroll.col_px;
-        for c in 0..cell.col as usize {
-            x += col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH);
-        }
-        let w = col_widths
-            .get(cell.col as usize)
-            .copied()
-            .unwrap_or(DEFAULT_COL_WIDTH);
-        if x + w < body_origin.x || x > outer.max.x {
-            return None;
-        }
-        Some(Rect::from_min_size(
-            egui::pos2(x, y),
-            Vec2::new(w, ROW_HEIGHT),
-        ))
+        let w_of = |c: usize| -> f32 {
+            m.col_width(col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH))
+        };
+
+        // Band extents, mirroring `show`. Widths and heights come from the
+        // SAME metrics and the SAME col_widths the body uses — a frozen column
+        // is the same column, not a copy of it.
+        let band_rows = panes.rows;
+        let band_cols = panes.cols;
+        let band_h = band_rows as f32 * m.row_h;
+        let lead_r = panes.lead_first_row();
+        let lead_c = panes.lead_first_col();
+        let band_w: f32 = (lead_c..lead_c + band_cols).map(w_of).sum();
+
+        // A row inside the leading band is painted from the band's own offset,
+        // which under a freeze never moves — so it has a rect no matter how
+        // far the body has scrolled.
+        let y = if band_rows > 0 && visible >= lead_r && visible < lead_r + band_rows {
+            body_origin.y + (visible - lead_r) as f32 * m.row_h
+        } else {
+            let rel = visible as f64 - scroll.row_offset;
+            let yy = body_origin.y + band_h + (rel * m.row_h as f64) as f32;
+            if yy + m.row_h < body_origin.y + band_h || yy > outer.max.y {
+                return None;
+            }
+            yy
+        };
+
+        let col = cell.col as usize;
+        let w = w_of(col);
+        let x = if band_cols > 0 && col >= lead_c && col < lead_c + band_cols {
+            body_origin.x + (lead_c..col).map(w_of).sum::<f32>()
+        } else {
+            let body_c0 = if panes.frozen { band_cols } else { 0 };
+            if col < body_c0 {
+                return None;
+            }
+            let xx = body_origin.x + band_w + (body_c0..col).map(w_of).sum::<f32>() - scroll.col_px;
+            if xx + w < body_origin.x + band_w || xx > outer.max.x {
+                return None;
+            }
+            xx
+        };
+        Some(Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, m.row_h)))
     }
 
     pub fn show(self, ui: &mut Ui) -> GridResponse {
@@ -403,11 +651,16 @@ impl<'a> Grid<'a> {
         let resolver = RowResolver { pad, ..unpadded };
         let resolve_row = |r: usize| -> Option<ScreenRow> { resolver.resolve(r) };
 
-        let width_of =
-            |c: usize| -> f32 { self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH) };
+        let m = self.metrics;
+        let row_h = m.row_h;
+        let width_of = |c: usize| -> f32 {
+            m.col_width(self.col_widths.get(c).copied().unwrap_or(DEFAULT_COL_WIDTH))
+        };
 
-        // Column x-offsets via prefix sum. Column counts are small, so this is
-        // cheap to rebuild each frame and keeps variable widths trivial.
+        // Column x-offsets via prefix sum, already zoom-scaled. Column counts
+        // are small, so this is cheap to rebuild each frame and keeps variable
+        // widths trivial. ONE prefix sum serves the frozen band and the body
+        // alike: a frozen column is the same column, at the same width.
         let mut col_x = Vec::with_capacity(total_cols + 1);
         let mut acc = 0.0f32;
         for c in 0..total_cols {
@@ -418,9 +671,41 @@ impl<'a> Grid<'a> {
         let total_width = acc;
 
         let outer = ui.available_rect_before_wrap();
-        let body_origin = outer.min + Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT);
-        let body_rect = Rect::from_min_max(body_origin, outer.max - Vec2::splat(SCROLLBAR_W));
+        let body_origin = outer.min + Vec2::new(m.row_header_w, m.header_h);
+        // The whole scrollable area: leading band plus body.
+        let grid_rect = Rect::from_min_max(body_origin, outer.max - Vec2::splat(SCROLLBAR_W));
+
+        // --- band geometry ---
+        //
+        // Clamped against the viewport: a band taller than the window would
+        // leave the body no rows at all, and a freeze the user cannot scroll
+        // out of is worse than no freeze.
+        let max_band_rows = ((grid_rect.height() / row_h) as usize).saturating_sub(2);
+        let max_band_cols = total_cols.saturating_sub(1);
+        let mut panes = *self.panes;
+        panes.rows = panes
+            .rows
+            .min(max_band_rows)
+            .min(total_rows.saturating_sub(1));
+        panes.cols = panes.cols.min(max_band_cols);
+        let band_rows = panes.rows;
+        let band_cols = panes.cols;
+        let lead_r = panes.lead_first_row();
+        let lead_c = panes.lead_first_col();
+        let band_h = band_rows as f32 * row_h;
+        let band_w: f32 = (lead_c..(lead_c + band_cols).min(total_cols))
+            .map(width_of)
+            .sum();
+        // Where the BODY pane lives — under and to the right of the band.
+        let body_rect = Rect::from_min_max(
+            egui::pos2(grid_rect.min.x + band_w, grid_rect.min.y + band_h),
+            grid_rect.max,
+        );
         let body_size = body_rect.size();
+        // First column of body column space. Under a freeze the body starts
+        // past the frozen columns so a frozen column is never painted twice.
+        let body_c0 = panes.body_first_col().min(total_cols);
+        let body_x0 = col_x[body_c0];
 
         // --- input ---
         //
@@ -449,31 +734,96 @@ impl<'a> Grid<'a> {
         let drag_pos = pointer_pos;
 
         let pointer_in_body = pointer_pos.is_some_and(|p| interact_rect.contains(p));
+        // Which pane the wheel drives. A SPLIT band has its own offset, so a
+        // wheel over it scrolls the band and leaves the body where it was —
+        // that is what makes it two independent views of one column layout. A
+        // FROZEN band has no offset to move, so the wheel always reaches the
+        // body underneath.
+        let over_lead_rows = !panes.frozen
+            && band_rows > 0
+            && pointer_pos.is_some_and(|p| p.y < grid_rect.min.y + band_h);
         if pointer_in_body {
             if wheel.y != 0.0 {
                 // Convert pixel wheel delta into row units.
-                self.scroll.row_offset -= (wheel.y / ROW_HEIGHT) as f64;
+                let d = (wheel.y / row_h) as f64;
+                if over_lead_rows {
+                    panes.lead_row = (panes.lead_row - d).clamp(0.0, total_rows as f64 - 1.0);
+                } else {
+                    self.scroll.row_offset -= d;
+                }
             }
             if wheel.x != 0.0 {
                 self.scroll.col_px -= wheel.x;
             }
         }
-        self.scroll.clamp(total_rows, total_width, body_size);
+        self.scroll.clamp_body(
+            total_rows,
+            total_width,
+            body_size,
+            row_h,
+            panes.body_min_row(),
+            body_x0,
+        );
+        // Write the (clamped, possibly split-scrolled) band state back.
+        *self.panes = panes;
 
         let first_row = self.scroll.row_offset.floor().max(0.0) as usize;
         // Sub-row offset in pixels, so scrolling is smooth rather than snapping.
-        let frac_px = ((self.scroll.row_offset - first_row as f64) * ROW_HEIGHT as f64) as f32;
-        let visible_count = (body_size.y / ROW_HEIGHT).ceil() as usize + 1;
+        let frac_px = ((self.scroll.row_offset - first_row as f64) * row_h as f64) as f32;
+        let visible_count = (body_size.y / row_h).ceil() as usize + 1;
         let last_row = (first_row + visible_count).min(total_rows);
         let row_range = first_row..last_row;
 
+        // Body column window, in body column space: `col_px` is measured from
+        // the first body column, not from column 0, so a frozen band does not
+        // shift what "scrolled to the left edge" means.
         let first_col = col_x
-            .partition_point(|&x| x <= self.scroll.col_px)
-            .saturating_sub(1);
+            .partition_point(|&x| x <= self.scroll.col_px + body_x0)
+            .saturating_sub(1)
+            .max(body_c0);
         let last_col = col_x
-            .partition_point(|&x| x < self.scroll.col_px + body_size.x)
-            .min(total_cols);
+            .partition_point(|&x| x < self.scroll.col_px + body_x0 + body_size.x)
+            .min(total_cols)
+            .max(first_col);
         let col_range = first_col..last_col;
+
+        // --- the two bands, in paint order ---
+        //
+        // The frozen/split band is built FIRST and the body second, so the
+        // paint loops below walk the band before the body exactly as the
+        // feature describes. Both lists are viewport-sized: a band is a few
+        // extra painted rows, never a second pass over the sheet.
+        let mut row_bands: Vec<(usize, f32)> = Vec::with_capacity(band_rows + visible_count + 1);
+        for i in 0..band_rows {
+            let r = lead_r + i;
+            if r >= total_rows {
+                break;
+            }
+            row_bands.push((r, grid_rect.min.y + i as f32 * row_h));
+        }
+        let body_row_start = row_bands.len();
+        for r in row_range.clone() {
+            row_bands.push((
+                r,
+                body_rect.min.y + (r - first_row) as f32 * row_h - frac_px,
+            ));
+        }
+
+        let mut col_bands: Vec<(usize, f32)> = Vec::with_capacity(band_cols + total_cols.min(64));
+        for i in 0..band_cols {
+            let c = lead_c + i;
+            if c >= total_cols {
+                break;
+            }
+            col_bands.push((c, grid_rect.min.x + col_x[c] - col_x[lead_c]));
+        }
+        for c in col_range.clone() {
+            col_bands.push((c, body_rect.min.x + col_x[c] - body_x0 - self.scroll.col_px));
+        }
+        // Where a column landed this frame, for merge extents and drop marks.
+        let x_of = |c: usize| -> Option<f32> {
+            col_bands.iter().find(|(cc, _)| *cc == c).map(|&(_, x)| x)
+        };
 
         let mut clicked = None;
         let mut double_clicked = None;
@@ -482,6 +832,8 @@ impl<'a> Grid<'a> {
         let mut fill_to = None;
         let mut fill_released = false;
         let mut painted_cells = 0usize;
+        let mut painted_rows: Vec<(usize, u32)> = Vec::with_capacity(row_bands.len());
+        let mut frozen_row_count = 0usize;
 
         // Narrow the match list to just the visible rows once per frame, so
         // per-cell highlight testing is a small linear probe rather than a
@@ -529,16 +881,30 @@ impl<'a> Grid<'a> {
                 .is_ok()
         };
 
-        // --- paint body ---
-        let painter = ui.painter_at(body_rect);
-        painter.rect_filled(body_rect, 0.0, th.bg);
+        // --- paint ---
+        //
+        // The painter covers the whole grid, band included. Per-band clipping
+        // is applied where it matters (below), so the frozen band cannot bleed
+        // into the body and vice versa.
+        let painter = ui.painter_at(grid_rect);
+        painter.rect_filled(grid_rect, 0.0, th.bg);
+        let band_clip = Rect::from_min_max(
+            grid_rect.min,
+            egui::pos2(grid_rect.max.x, grid_rect.min.y + band_h.max(0.0)),
+        );
 
         // `r` walks VISIBLE rows; `row` is the underlying row it maps to.
         // Everything painted from here on — cell values, highlights, selection
         // tests, the CellRefs handed back to the caller — uses `row`, so a
         // filtered grid addresses exactly the same cells an unfiltered one
         // would.
-        for r in row_range.clone() {
+        //
+        // The FROZEN/SPLIT BAND IS ITERATED FIRST, then the body. Both go
+        // through the SAME `resolve_row`, so a frozen row shows the same
+        // record under a sort or filter that it would show unfrozen — there is
+        // no second row mapping anywhere in this function.
+        for (bi, &(r, y)) in row_bands.iter().enumerate() {
+            let in_lead_rows = bi < body_row_start;
             // Resolve the screen row to a data row through BOTH filters, in
             // the order they narrow: the table first, then search. Resolving
             // them independently would let one silently win.
@@ -547,24 +913,51 @@ impl<'a> Grid<'a> {
             };
             let row = resolved.row();
             let is_pad = resolved.is_pad();
-            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
             let row_rect = Rect::from_min_size(
-                egui::pos2(body_rect.min.x, y),
-                Vec2::new(body_rect.width(), ROW_HEIGHT),
+                egui::pos2(grid_rect.min.x, y),
+                Vec2::new(grid_rect.width(), row_h),
             );
+            let row_clip = if in_lead_rows {
+                band_clip
+            } else {
+                Rect::from_min_max(egui::pos2(grid_rect.min.x, body_rect.min.y), grid_rect.max)
+            };
+            let rp = painter.with_clip_rect(row_clip);
             if is_pad {
                 // Padding gets its own recessed fill and no zebra stripe, so
                 // "there is no row here" is visibly different from "this row
                 // exists and holds empty strings".
-                painter.rect_filled(row_rect, 0.0, th.pad_row);
+                rp.rect_filled(row_rect, 0.0, th.pad_row);
             } else if r % 2 == 1 {
-                painter.rect_filled(row_rect, 0.0, th.row_alt);
+                rp.rect_filled(row_rect, 0.0, th.row_alt);
             }
 
-            for c in col_range.clone() {
-                let x = body_origin.x + col_x[c] - self.scroll.col_px;
+            for (ci, &(c, x)) in col_bands.iter().enumerate() {
+                let in_lead_cols = ci < band_cols;
                 let w = width_of(c);
-                let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, ROW_HEIGHT));
+                let cell_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, row_h));
+                // Clip to the intersection of this cell's row band and column
+                // band, so neither band paints over the other.
+                let clip_rect = {
+                    let left = if in_lead_cols {
+                        grid_rect.min.x
+                    } else {
+                        body_rect.min.x
+                    };
+                    let right = if in_lead_cols {
+                        grid_rect.min.x + band_w
+                    } else {
+                        grid_rect.max.x
+                    };
+                    Rect::from_min_max(
+                        egui::pos2(left, row_clip.min.y),
+                        egui::pos2(right.max(left), row_clip.max.y),
+                    )
+                };
+                if !clip_rect.intersects(cell_rect) {
+                    continue;
+                }
+                let painter = painter.with_clip_rect(clip_rect);
                 let cref = CellRef::new(row, c as u32);
 
                 // Table decoration: number format, conditional styling,
@@ -641,11 +1034,20 @@ impl<'a> Grid<'a> {
                         continue;
                     }
                     // Anchor: widen to the region's full extent so long text
-                    // is not clipped at the first column's edge.
-                    let last = (mr.last_col as usize).min(col_x.len().saturating_sub(1));
-                    let right = body_origin.x + col_x[last] - self.scroll.col_px + width_of(last);
-                    let bottom = y + ROW_HEIGHT * (mr.last_row - mr.first_row + 1) as f32;
-                    cell_rect = Rect::from_min_max(cell_rect.min, egui::pos2(right, bottom));
+                    // is not clipped at the first column's edge. The extent
+                    // uses the SAME per-band x the cells were painted at, so a
+                    // merge that starts in the frozen band stays anchored to
+                    // it rather than sliding with the body.
+                    let last = (mr.last_col as usize).min(total_cols.saturating_sub(1));
+                    let right = match x_of(last) {
+                        Some(lx) => lx + width_of(last),
+                        None => cell_rect.max.x,
+                    };
+                    let bottom = y + row_h * (mr.last_row - mr.first_row + 1) as f32;
+                    cell_rect = Rect::from_min_max(
+                        cell_rect.min,
+                        egui::pos2(right.max(cell_rect.max.x), bottom),
+                    );
                     painter.rect_filled(cell_rect, 0.0, th.bg);
                 }
 
@@ -684,13 +1086,16 @@ impl<'a> Grid<'a> {
                     // distinguishable from a typed-in literal.
                     if view.has_formula(cref) {
                         painter.circle_filled(
-                            egui::pos2(cell_rect.min.x + 3.5, cell_rect.min.y + 4.0),
-                            1.6,
+                            egui::pos2(
+                                cell_rect.min.x + 3.5 * m.zoom,
+                                cell_rect.min.y + 4.0 * m.zoom,
+                            ),
+                            1.6 * m.zoom,
                             th.accent,
                         );
                     }
 
-                    let pad = 6.0;
+                    let pad = 6.0 * m.zoom;
                     let anchor = match align {
                         Align2::RIGHT_CENTER => {
                             egui::pos2(cell_rect.max.x - pad, cell_rect.center().y)
@@ -710,15 +1115,19 @@ impl<'a> Grid<'a> {
                     if let Some(d) = &decor {
                         d.typography.apply_to(&mut ty);
                     }
-                    let ty = ty.resolved(12.5);
+                    // Resolved against the ZOOMED default, so an unstyled cell
+                    // grows with the zoom and a cell with an explicit point
+                    // size grows by the same factor rather than staying put.
+                    let ty = ty.resolved(BASE_FONT);
+                    let size = ty.size * m.zoom;
 
                     let font = match ty.family {
-                        ferrix_core::format::FontFamily::Monospace => FontId::monospace(ty.size),
-                        _ => FontId::proportional(ty.size),
+                        ferrix_core::format::FontFamily::Monospace => FontId::monospace(size),
+                        _ => FontId::proportional(size),
                     };
 
                     let clip = painter.with_clip_rect(
-                        cell_rect.intersect(body_rect).shrink2(Vec2::new(2.0, 0.0)),
+                        cell_rect.intersect(clip_rect).shrink2(Vec2::new(2.0, 0.0)),
                     );
 
                     // Bold is faked by over-painting with a sub-pixel offset.
@@ -750,12 +1159,9 @@ impl<'a> Grid<'a> {
                 if let Some(d) = &decor {
                     if d.violation.is_some() {
                         let tr = egui::pos2(cell_rect.max.x, cell_rect.min.y);
+                        let s = 7.0 * m.zoom;
                         painter.add(egui::Shape::convex_polygon(
-                            vec![
-                                tr,
-                                egui::pos2(tr.x - 7.0, tr.y),
-                                egui::pos2(tr.x, tr.y + 7.0),
-                            ],
+                            vec![tr, egui::pos2(tr.x - s, tr.y), egui::pos2(tr.x, tr.y + s)],
                             th.invalid_flag,
                             Stroke::NONE,
                         ));
@@ -766,14 +1172,42 @@ impl<'a> Grid<'a> {
         }
 
         // --- grid lines ---
+        //
+        // Drawn per band from the same lists the cells came from, so a line
+        // never lands where its row is not.
         let line = Stroke::new(1.0_f32, th.grid_line);
-        for r in row_range.clone() {
-            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
-            painter.hline(body_rect.min.x..=body_rect.max.x, y, line);
+        for (bi, &(_, y)) in row_bands.iter().enumerate() {
+            let lp = painter.with_clip_rect(if bi < body_row_start {
+                band_clip
+            } else {
+                Rect::from_min_max(egui::pos2(grid_rect.min.x, body_rect.min.y), grid_rect.max)
+            });
+            lp.hline(grid_rect.min.x..=grid_rect.max.x, y, line);
         }
-        for c in col_range.start..=col_range.end.min(total_cols) {
-            let x = body_origin.x + col_x[c.min(total_cols)] - self.scroll.col_px;
-            painter.vline(x, body_rect.min.y..=body_rect.max.y, line);
+        for (ci, &(c, x)) in col_bands.iter().enumerate() {
+            let in_lead = ci < band_cols;
+            let lp = painter.with_clip_rect(if in_lead {
+                Rect::from_min_max(
+                    grid_rect.min,
+                    egui::pos2(grid_rect.min.x + band_w, grid_rect.max.y),
+                )
+            } else {
+                Rect::from_min_max(egui::pos2(body_rect.min.x, grid_rect.min.y), grid_rect.max)
+            });
+            lp.vline(x, grid_rect.min.y..=grid_rect.max.y, line);
+            if c + 1 == total_cols {
+                lp.vline(x + width_of(c), grid_rect.min.y..=grid_rect.max.y, line);
+            }
+        }
+        // The seams: where the frozen band ends and the body begins. Drawn
+        // stronger than a grid line so the user can see that the panes are
+        // split rather than wondering why scrolling skips rows.
+        let seam = Stroke::new(2.0_f32, th.accent);
+        if band_rows > 0 {
+            painter.hline(grid_rect.min.x..=grid_rect.max.x, body_rect.min.y, seam);
+        }
+        if band_cols > 0 {
+            painter.vline(body_rect.min.x, grid_rect.min.y..=grid_rect.max.y, seam);
         }
 
         // --- hit testing ---
@@ -781,15 +1215,32 @@ impl<'a> Grid<'a> {
         // Pixels map to a VISIBLE row, which is then translated back through
         // the filter so the CellRef the caller receives — and therefore any
         // click, drag, or edit built from it — names the underlying row.
+        //
+        // ONE hit test for both bands: y above the seam resolves inside the
+        // frozen band, y below it through the body offset. Same for x. Zoom is
+        // already in `row_h` and in the widths, so a click at 200% divides by
+        // a doubled row height and lands on the same data cell it would at
+        // 100% — no separate zoom-aware path to fall out of step.
         let hit = |pos: egui::Pos2| -> Option<CellRef> {
-            if !body_rect.contains(pos) {
+            if !grid_rect.contains(pos) {
                 return None;
             }
-            let dy = pos.y - body_origin.y + frac_px;
-            let r = first_row as f64 + (dy / ROW_HEIGHT) as f64;
-            let local_x = pos.x - body_origin.x + self.scroll.col_px;
-            let c = col_x.partition_point(|&x| x <= local_x) as i64 - 1;
-            if r < 0.0 || c < 0 || r as usize >= total_rows || c as usize >= total_cols {
+            let r = if band_rows > 0 && pos.y < body_rect.min.y {
+                lead_r + ((pos.y - grid_rect.min.y) / row_h) as usize
+            } else {
+                let dy = pos.y - body_rect.min.y + frac_px;
+                if dy < 0.0 {
+                    return None;
+                }
+                first_row + (dy / row_h) as usize
+            };
+            let cx = if band_cols > 0 && pos.x < body_rect.min.x {
+                col_x[lead_c] + (pos.x - grid_rect.min.x)
+            } else {
+                pos.x - body_rect.min.x + body_x0 + self.scroll.col_px
+            };
+            let c = col_x.partition_point(|&x| x <= cx) as i64 - 1;
+            if c < 0 || r >= total_rows || c as usize >= total_cols {
                 return None;
             }
             // Report the DATA row, so a click under a filter selects the cell
@@ -799,7 +1250,7 @@ impl<'a> Grid<'a> {
             // Padding rows are hit-testable — that is the whole point of the
             // toggle: clicking one selects it so the user can type there, and
             // the resulting edit extends the sheet through the overlay.
-            let row = resolve_row(r as usize)?.row();
+            let row = resolve_row(r)?.row();
             Some(CellRef::new(row, c as u32))
         };
         if primary_clicked {
@@ -824,12 +1275,21 @@ impl<'a> Grid<'a> {
                 .filter(|_| self.editing.is_none())
                 .and_then(|sel| {
                     let (_, br) = sel.bounds();
-                    Self::cell_screen_rect(br, outer, self.scroll, self.col_widths, &resolver).map(
-                        |r| Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE)).expand(2.0),
+                    Self::cell_screen_rect(
+                        br,
+                        outer,
+                        self.scroll,
+                        self.col_widths,
+                        &resolver,
+                        m,
+                        panes,
                     )
+                    .map(|r| {
+                        Rect::from_center_size(r.max, Vec2::splat(FILL_HANDLE * m.zoom)).expand(2.0)
+                    })
                 });
         let on_handle = pointer_pos
-            .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && body_rect.contains(p)));
+            .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && grid_rect.contains(p)));
         if dragging
             && !primary_clicked
             && !on_handle
@@ -847,7 +1307,7 @@ impl<'a> Grid<'a> {
         // collapsing the selection.
         if let Some(hr) = handle_rect {
             let hr = hr.shrink(2.0);
-            if body_rect.contains(hr.center()) {
+            if grid_rect.contains(hr.center()) {
                 painter.rect_filled(hr, 1.0, th.accent);
                 painter.rect_stroke(hr, 1.0, Stroke::new(1.0_f32, th.bg));
             }
@@ -867,17 +1327,22 @@ impl<'a> Grid<'a> {
         }
 
         // --- vertical scrollbar (row-indexed, not pixel-indexed) ---
+        //
+        // Spans BODY row space only: the frozen band is not scrollable, so
+        // including it would make the thumb claim reachable rows that are not.
         let vbar = Rect::from_min_max(
-            egui::pos2(outer.max.x - SCROLLBAR_W, body_origin.y),
+            egui::pos2(outer.max.x - SCROLLBAR_W, body_rect.min.y),
             egui::pos2(outer.max.x, outer.max.y - SCROLLBAR_W),
         );
         let vbar_active = dragging && drag_pos.is_some_and(|p| vbar.contains(p));
         let vpainter = ui.painter_at(vbar);
         vpainter.rect_filled(vbar, 0.0, th.panel);
-        let visible_frac = (visible_count as f64 / total_rows as f64).min(1.0);
+        let body_min = panes.body_min_row();
+        let body_rows = (total_rows as f64 - body_min).max(1.0);
+        let visible_frac = (visible_count as f64 / body_rows).min(1.0);
         let thumb_h = (vbar.height() as f64 * visible_frac).max(24.0) as f32;
-        let scroll_span = (total_rows as f64 - visible_count as f64).max(1.0);
-        let pos_frac = (self.scroll.row_offset / scroll_span).clamp(0.0, 1.0);
+        let scroll_span = (body_rows - visible_count as f64).max(1.0);
+        let pos_frac = ((self.scroll.row_offset - body_min) / scroll_span).clamp(0.0, 1.0);
         let thumb_y = vbar.min.y + (vbar.height() - thumb_h) * pos_frac as f32;
         let thumb = Rect::from_min_size(
             egui::pos2(vbar.min.x + 2.0, thumb_y),
@@ -895,22 +1360,23 @@ impl<'a> Grid<'a> {
                 // the bar addresses all 200M rows without precision loss.
                 let t = ((p.y - vbar.min.y - thumb_h / 2.0) / (vbar.height() - thumb_h))
                     .clamp(0.0, 1.0) as f64;
-                self.scroll.row_offset = t * scroll_span;
+                self.scroll.row_offset = body_min + t * scroll_span;
             }
         }
 
         // --- horizontal scrollbar ---
         let hbar = Rect::from_min_max(
-            egui::pos2(body_origin.x, outer.max.y - SCROLLBAR_W),
+            egui::pos2(body_rect.min.x, outer.max.y - SCROLLBAR_W),
             egui::pos2(outer.max.x - SCROLLBAR_W, outer.max.y),
         );
         let hresp = ui.allocate_rect(hbar, Sense::click_and_drag());
         let hpainter = ui.painter_at(hbar);
         hpainter.rect_filled(hbar, 0.0, th.panel);
-        if total_width > body_size.x {
-            let frac = (body_size.x / total_width).min(1.0);
+        let body_width = total_width - body_x0;
+        if body_width > body_size.x {
+            let frac = (body_size.x / body_width).min(1.0);
             let tw = (hbar.width() * frac).max(24.0);
-            let span = (total_width - body_size.x).max(1.0);
+            let span = (body_width - body_size.x).max(1.0);
             let tx = hbar.min.x + (hbar.width() - tw) * (self.scroll.col_px / span).clamp(0.0, 1.0);
             hpainter.rect_filled(
                 Rect::from_min_size(
@@ -936,7 +1402,7 @@ impl<'a> Grid<'a> {
         let hp = ui.painter_at(outer);
         let col_header = Rect::from_min_size(
             egui::pos2(body_origin.x, outer.min.y),
-            Vec2::new(outer.width() - ROW_HEADER_WIDTH, HEADER_HEIGHT),
+            Vec2::new(outer.width() - m.row_header_w, m.header_h),
         );
         hp.rect_filled(col_header, 0.0, th.header_bg);
         let chp = hp.with_clip_rect(col_header);
@@ -944,24 +1410,22 @@ impl<'a> Grid<'a> {
         // --- header reorder gesture ---
         //
         // Which display column is under a given x, or None outside the header.
+        // Walks the SAME band list the cells were painted from, so a frozen
+        // column's header is over its frozen column.
         let col_at_x = |px: f32| -> Option<usize> {
-            for c in col_range.clone() {
-                let x = body_origin.x + col_x[c] - self.scroll.col_px;
-                if px >= x && px < x + width_of(c) {
-                    return Some(c);
-                }
-            }
-            None
+            col_bands
+                .iter()
+                .find(|&&(c, x)| px >= x && px < x + width_of(c))
+                .map(|&(c, _)| c)
         };
         let mut header_press: Option<usize> = None;
         let mut header_drag_to: Option<usize> = None;
         let mut header_released = false;
         let mut header_hitboxes: Vec<(usize, egui::Pos2)> = Vec::new();
-        for c in col_range.clone() {
-            let x = body_origin.x + col_x[c] - self.scroll.col_px;
+        for &(c, x) in &col_bands {
             let r = Rect::from_min_size(
                 egui::pos2(x, outer.min.y),
-                Vec2::new(width_of(c), HEADER_HEIGHT),
+                Vec2::new(width_of(c), m.header_h),
             );
             header_hitboxes.push((c, r.center()));
         }
@@ -988,21 +1452,21 @@ impl<'a> Grid<'a> {
         // can see where the column will land rather than guessing.
         if let (Some(src), Some(pos)) = (self.header_dragging, pointer_pos) {
             if let Some(dst) = col_at_x(pos.x) {
-                let x = body_origin.x + col_x[dst] - self.scroll.col_px;
-                let edge = if dst > src { x + width_of(dst) } else { x };
-                hp.vline(
-                    edge,
-                    outer.min.y..=outer.max.y,
-                    Stroke::new(2.5_f32, th.accent),
-                );
+                if let Some(x) = x_of(dst) {
+                    let edge = if dst > src { x + width_of(dst) } else { x };
+                    hp.vline(
+                        edge,
+                        outer.min.y..=outer.max.y,
+                        Stroke::new(2.5_f32, th.accent),
+                    );
+                }
             }
         }
 
-        for c in col_range.clone() {
-            let x = body_origin.x + col_x[c] - self.scroll.col_px;
+        for &(c, x) in &col_bands {
             let r = Rect::from_min_size(
                 egui::pos2(x, outer.min.y),
-                Vec2::new(width_of(c), HEADER_HEIGHT),
+                Vec2::new(width_of(c), m.header_h),
             );
             let label = view.header_or_letter(c);
             let letter = column_name(c as u32);
@@ -1022,15 +1486,15 @@ impl<'a> Grid<'a> {
                 r.center(),
                 Align2::CENTER_CENTER,
                 shown,
-                FontId::proportional(12.0),
+                FontId::proportional(12.0 * m.zoom),
                 th.text_dim,
             );
-            chp.vline(r.max.x, outer.min.y..=outer.min.y + HEADER_HEIGHT, line);
+            chp.vline(r.max.x, outer.min.y..=outer.min.y + m.header_h, line);
         }
 
         let row_header = Rect::from_min_size(
             egui::pos2(outer.min.x, body_origin.y),
-            Vec2::new(ROW_HEADER_WIDTH, body_rect.height()),
+            Vec2::new(m.row_header_w, grid_rect.height()),
         );
         hp.rect_filled(row_header, 0.0, th.header_bg);
         let rhp = hp.with_clip_rect(row_header);
@@ -1038,19 +1502,26 @@ impl<'a> Grid<'a> {
         // filtered view that renumbered its rows 1..N would be actively
         // misleading: the whole point of finding row 4,912,733 is knowing it
         // is row 4,912,733.
-        for r in row_range.clone() {
+        //
+        // Walks the SAME band list as the cells — frozen band first, then the
+        // body — so the number beside a frozen row is that row's number no
+        // matter where the body has scrolled to.
+        for (bi, &(r, y)) in row_bands.iter().enumerate() {
             let Some(resolved) = resolve_row(r) else {
                 continue;
             };
             let row = resolved.row();
-            let y = body_origin.y + (r - first_row) as f32 * ROW_HEIGHT - frac_px;
+            // Recorded from the SAME walk that paints the row number, so the
+            // reported "what is on screen" cannot disagree with what is.
+            painted_rows.push((r, row));
+            if bi < body_row_start {
+                frozen_row_count += 1;
+            }
             // Row numbers name the DATA row, so a filtered view shows the
             // original 1, 5, 9, ... rather than renumbering to 1, 2, 3 — the
             // user must always be able to tell which rows are hidden.
-            let rect = Rect::from_min_size(
-                egui::pos2(outer.min.x, y),
-                Vec2::new(ROW_HEADER_WIDTH, ROW_HEIGHT),
-            );
+            let rect =
+                Rect::from_min_size(egui::pos2(outer.min.x, y), Vec2::new(m.row_header_w, row_h));
             let selected = self.selection.is_some_and(|s| {
                 let (a, b) = s.row_range();
                 row >= a && row <= b
@@ -1065,10 +1536,10 @@ impl<'a> Grid<'a> {
             // see where they are, but dimmed — it is not a row of the file
             // yet. Typing into it is what makes it one.
             rhp.text(
-                egui::pos2(rect.max.x - 8.0, rect.center().y),
+                egui::pos2(rect.max.x - 8.0 * m.zoom, rect.center().y),
                 Align2::RIGHT_CENTER,
                 (row as u64 + 1).to_string(),
-                FontId::proportional(11.5),
+                FontId::proportional(11.5 * m.zoom),
                 if selected {
                     th.accent
                 } else if resolved.is_pad() {
@@ -1080,7 +1551,7 @@ impl<'a> Grid<'a> {
         }
 
         hp.rect_filled(
-            Rect::from_min_size(outer.min, Vec2::new(ROW_HEADER_WIDTH, HEADER_HEIGHT)),
+            Rect::from_min_size(outer.min, Vec2::new(m.row_header_w, m.header_h)),
             0.0,
             th.header_bg,
         );
@@ -1112,6 +1583,9 @@ impl<'a> Grid<'a> {
             painted_cells,
             header_hitboxes,
             visible_rows: row_range,
+            painted_rows,
+            frozen_row_count,
+            zoom: m.zoom,
         }
     }
 }
@@ -1221,6 +1695,26 @@ mod tests {
         }
     }
 
+    /// `cell_screen_rect` at 100% zoom with no panes — what every pre-existing
+    /// geometry test means, spelled once.
+    fn rect_of(
+        cell: CellRef,
+        outer: Rect,
+        scroll: &ScrollState,
+        widths: &[f32],
+        r: &RowResolver<'_>,
+    ) -> Option<Rect> {
+        Grid::cell_screen_rect(
+            cell,
+            outer,
+            scroll,
+            widths,
+            r,
+            Metrics::default(),
+            Panes::default(),
+        )
+    }
+
     /// Screen row -> underlying row, through THE resolver.
     fn underlying(f: Option<&RowFilter>, visible: usize) -> Option<u32> {
         resolver_of(f, None).resolve(visible).map(|s| s.row())
@@ -1289,7 +1783,7 @@ mod tests {
 
         // Underlying row 1,000,000 is visible row 2, so it sits two rows down
         // — not a million rows off screen.
-        let rect = Grid::cell_screen_rect(
+        let rect = rect_of(
             CellRef::new(1_000_000, 0),
             outer,
             &scroll,
@@ -1302,7 +1796,7 @@ mod tests {
 
         // A row the filter hides has no rect at all, so the cell editor cannot
         // be painted over a row that is not on screen.
-        assert!(Grid::cell_screen_rect(
+        assert!(rect_of(
             CellRef::new(7, 0),
             outer,
             &scroll,
@@ -1312,7 +1806,7 @@ mod tests {
         .is_none());
 
         // Without the filter the same cell is a million rows below the fold.
-        assert!(Grid::cell_screen_rect(
+        assert!(rect_of(
             CellRef::new(1_000_000, 0),
             outer,
             &scroll,
@@ -1459,7 +1953,7 @@ mod tests {
 
         // Without pad space the filter hides row 100 and there is nowhere to
         // draw the editor — the bug this parameter exists to prevent.
-        assert!(Grid::cell_screen_rect(
+        assert!(rect_of(
             CellRef::new(100, 0),
             outer,
             &scroll,
@@ -1468,7 +1962,7 @@ mod tests {
         )
         .is_none());
         // With it, the first padding row sits directly under the last kept row.
-        let rect = Grid::cell_screen_rect(
+        let rect = rect_of(
             CellRef::new(100, 0),
             outer,
             &scroll,
@@ -1479,7 +1973,7 @@ mod tests {
         let expected_y = outer.min.y + HEADER_HEIGHT + 3.0 * ROW_HEIGHT;
         assert!((rect.min.y - expected_y).abs() < 0.5, "got {rect:?}");
         // A real filtered row still resolves through the FILTER, not the pad.
-        let real = Grid::cell_screen_rect(
+        let real = rect_of(
             CellRef::new(6, 0),
             outer,
             &scroll,
