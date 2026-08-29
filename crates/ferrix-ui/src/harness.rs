@@ -432,6 +432,45 @@ impl Harness {
         self
     }
 
+    // ---- cell decoration: borders, alignment, wrap, rotation (issue #28) ----
+    //
+    // These drive the SAME `apply_decor` the toolbar calls, on the CURRENT
+    // selection, so a test proves the production path rather than reaching
+    // into the store. The counters below read the grid's paint output.
+
+    /// Apply decoration to the current selection through the app command.
+    pub fn apply_decor(&mut self, decor: ferrix_core::CellDecor) -> &mut Self {
+        self.app.apply_decor(decor);
+        self.steps(2);
+        self
+    }
+
+    /// Border EDGES the last frame painted, counted once per edge.
+    pub fn painted_border_segments(&mut self) -> usize {
+        self.step();
+        self.app.painted_border_segments()
+    }
+
+    /// Cells whose text the last frame painted ROTATED.
+    pub fn painted_rotated_texts(&mut self) -> usize {
+        self.step();
+        self.app.painted_rotated_texts()
+    }
+
+    /// Cells whose text the last frame laid out WRAPPED.
+    pub fn painted_wrapped_texts(&mut self) -> usize {
+        self.step();
+        self.app.painted_wrapped_texts()
+    }
+
+    /// Height the app currently paints a row at, read back from its own
+    /// geometry rather than recomputed — the same `cell_screen_rect` the
+    /// editor is positioned with.
+    pub fn painted_row_height(&mut self, cell: ferrix_core::CellRef) -> Option<f32> {
+        self.step();
+        self.app.cell_rect(cell).map(|r| r.height())
+    }
+
     pub fn group_rows(&mut self, first: u32, last: u32) -> Result<u8, String> {
         let r = self.app.group_rows(first, last).map_err(|e| e.to_string());
         self.steps(2);

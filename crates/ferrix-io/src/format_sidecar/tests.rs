@@ -74,6 +74,59 @@ fn kitchen_sink() -> SheetFormat {
     );
     f.range_mut(i).unwrap().format = Some(NumberFormat::Thousands { places: 1 });
 
+    // --- decoration on every scope (issue #28) ---
+    //
+    // Every field set to a NON-default value, and every border style used at
+    // least once across the file, so the round trip proves each byte is
+    // actually written and read back rather than defaulting on both sides.
+    // A field left at its default would round-trip through a writer that
+    // dropped it entirely.
+    f.set_column_decor(
+        0,
+        ferrix_core::CellDecor::default()
+            .with_border(
+                ferrix_core::Side::Top,
+                ferrix_core::Border::colored(
+                    ferrix_core::BorderStyle::Thick,
+                    Rgb(0x11, 0x22, 0x33),
+                ),
+            )
+            .with_border(
+                ferrix_core::Side::Bottom,
+                ferrix_core::Border::new(ferrix_core::BorderStyle::Double),
+            )
+            .with_border(
+                ferrix_core::Side::Left,
+                ferrix_core::Border::new(ferrix_core::BorderStyle::Dotted),
+            )
+            .with_border(
+                ferrix_core::Side::Right,
+                ferrix_core::Border::new(ferrix_core::BorderStyle::Dashed),
+            )
+            .with_diagonal(
+                ferrix_core::Border::colored(ferrix_core::BorderStyle::Medium, Rgb(9, 9, 9)),
+                ferrix_core::Diagonal::Both,
+            )
+            .with_h_align(ferrix_core::HAlign::Justify)
+            .with_v_align(ferrix_core::VAlign::Bottom)
+            .with_indent(15)
+            .with_wrap(true)
+            .with_rotation(-90),
+    );
+    f.range_mut(i).unwrap().decor = ferrix_core::CellDecor::default()
+        .with_border(
+            ferrix_core::Side::Left,
+            // The explicit erase, which must stay distinct from "inherit"
+            // across the round trip or "clear this edge" silently becomes
+            // "leave it alone" on every save.
+            ferrix_core::Border::new(ferrix_core::BorderStyle::None),
+        )
+        .with_h_align(ferrix_core::HAlign::General)
+        .with_v_align(ferrix_core::VAlign::Top)
+        .with_indent(0)
+        .with_shrink(false)
+        .with_rotation(0);
+
     f.set_cell_override(
         CellRef::new(42, 7),
         CellOverride {
@@ -93,6 +146,15 @@ fn kitchen_sink() -> SheetFormat {
                 },
             },
             format: Some(NumberFormat::Decimal { places: 4 }),
+            decor: ferrix_core::CellDecor::default()
+                .with_border(
+                    ferrix_core::Side::Right,
+                    ferrix_core::Border::new(ferrix_core::BorderStyle::Thin),
+                )
+                .with_h_align(ferrix_core::HAlign::Center)
+                .with_wrap(false)
+                .with_shrink(true)
+                .with_rotation(37),
         },
     );
     f

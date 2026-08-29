@@ -547,6 +547,13 @@ pub fn wrapped_line_count(text: &str, width_px: f32, indent_px: f32) -> u32 {
 /// sheet.
 pub const MAX_WRAP_LINES: u32 = 12;
 
+/// Largest number of columns the wrapped-row-height scan will consider.
+///
+/// See [`SheetFormat::wrapping_cols`]. This bounds the per-row cost of the
+/// feature so a wrap applied to an enormous range stays a viewport-sized
+/// amount of work rather than a sheet-sized one.
+pub const WRAP_COL_SCAN_CAP: usize = 64;
+
 /// Height a row needs to show `lines` wrapped lines, given the sheet default.
 ///
 /// One line is exactly the default height, so an unwrapped sheet is
@@ -940,6 +947,47 @@ impl SheetFormat {
     /// undecorated sheet one boolean per frame.
     pub fn has_decor(&self) -> bool {
         self.decor_count() > 0
+    }
+
+    /// Every column that any scope has asked to WRAP, ascending and deduped.
+    ///
+    /// The row-height calculation needs this and nothing else, and it must be
+    /// answerable without knowing which columns are on screen — otherwise a
+    /// row's height would change as the user scrolled sideways, and the
+    /// height used by the hit test would differ from the one used to paint.
+    ///
+    /// Bounded by `max_col`, and by `WRAP_COL_SCAN_CAP` overall: a wrap over
+    /// a range spanning the whole sheet must not enumerate 16,384 columns on
+    /// every frame. Past the cap the extra columns simply do not contribute
+    /// to row height, which degrades to "not as tall as it could be" rather
+    /// than to a stall.
+    pub fn wrapping_cols(&self, max_col: u32, out: &mut Vec<u32>) {
+        out.clear();
+        for (&c, cf) in &self.columns {
+            if cf.decor.wraps() && c <= max_col {
+                out.push(c);
+            }
+        }
+        for rf in &self.ranges {
+            if !rf.decor.wraps() {
+                continue;
+            }
+            let last = rf.range.last_col.min(max_col);
+            for c in rf.range.first_col..=last {
+                if out.len() >= WRAP_COL_SCAN_CAP {
+                    break;
+                }
+                out.push(c);
+            }
+        }
+        for ((_, c), ov) in &self.overrides {
+            if ov.decor.wraps() && *c <= max_col {
+                out.push(*c);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.truncate(WRAP_COL_SCAN_CAP);
     }
 
     pub fn override_count(&self) -> usize {

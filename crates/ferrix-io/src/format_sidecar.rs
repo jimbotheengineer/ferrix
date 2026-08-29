@@ -49,8 +49,9 @@ use std::path::{Path, PathBuf};
 use ferrix_core::format::{FontFamily, Typography};
 use ferrix_core::table::ConditionalRule;
 use ferrix_core::{
-    CellOverride, CellRef, CmpOp, ColumnFormat, DateStyle, ManualStyle, NumberFormat, RangeFormat,
-    Rgb, SheetFormat, TableRange,
+    Border, BorderStyle, CellDecor, CellOverride, CellRef, CmpOp, ColumnFormat, DateStyle,
+    Diagonal, HAlign, ManualStyle, NumberFormat, RangeFormat, Rgb, SheetFormat, Side, TableRange,
+    VAlign,
 };
 
 pub const FMT_MAGIC: &[u8; 8] = b"FXFMT001";
@@ -61,7 +62,13 @@ pub const FMT_MAGIC: &[u8; 8] = b"FXFMT001";
 /// nonsense rather than an error. The version check at load rejects it
 /// outright instead — a refused file is recoverable, a silently misread one
 /// is not.
-pub const FMT_VERSION: u32 = 2;
+/// Bumped to 3 when [`CellDecor`] (issue #28) joined every scope.
+///
+/// The same argument as the v1 -> v2 bump: a v2 file has no decoration
+/// bytes, so reading one with the v3 layout would pull the next record's
+/// bytes into a border style and produce plausible nonsense. Refused
+/// outright instead.
+pub const FMT_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub enum FormatSidecarError {
@@ -300,6 +307,7 @@ pub fn save_format(path: &Path, fmt: &SheetFormat) -> Result<u64, FormatSidecarE
             put_u32(&mut w, col)?;
             write_format(&mut w, &cf.format)?;
             write_rules(&mut w, &cf.rules)?;
+            put_decor(&mut w, &cf.decor)?;
         }
         for rf in fmt.ranges() {
             put_u32(&mut w, rf.range.first_row)?;
@@ -308,6 +316,7 @@ pub fn save_format(path: &Path, fmt: &SheetFormat) -> Result<u64, FormatSidecarE
             put_u32(&mut w, rf.range.last_col)?;
             write_opt_format(&mut w, rf.format.as_ref())?;
             write_rules(&mut w, &rf.rules)?;
+            put_decor(&mut w, &rf.decor)?;
         }
         for (cell, ov) in ovs {
             put_u32(&mut w, cell.row)?;
@@ -316,6 +325,7 @@ pub fn save_format(path: &Path, fmt: &SheetFormat) -> Result<u64, FormatSidecarE
             put_opt_rgb(&mut w, ov.manual.text)?;
             put_typography(&mut w, &ov.manual.typography)?;
             write_opt_format(&mut w, ov.format.as_ref())?;
+            put_decor(&mut w, &ov.decor)?;
         }
         w.flush()?;
     }
@@ -399,6 +409,94 @@ impl<'a> Cursor<'a> {
         })
     }
     fn format(&mut self) -> Result<NumberFormat, FormatSidecarError> {
+        self.format_inner()
+    }
+
+    /// Read one border edge written by `put_border`.
+    ///
+    /// An unknown style code is an error rather than a silent `None`: unlike
+    /// the typography family, a border the reader does not understand is a
+    /// line the user WILL notice missing, and losing it quietly is exactly
+    /// what this module exists to avoid.
+    fn border(&mut self) -> Result<Option<Border>, FormatSidecarError> {
+        let style = match self.u8()? {
+            0 => {
+                // Inherit: the presence byte that follows is always zero.
+                let _ = self.u8()?;
+                return Ok(None);
+            }
+            1 => BorderStyle::None,
+            2 => BorderStyle::Thin,
+            3 => BorderStyle::Medium,
+            4 => BorderStyle::Thick,
+            5 => BorderStyle::Double,
+            6 => BorderStyle::Dotted,
+            7 => BorderStyle::Dashed,
+            t => return Err(FormatSidecarError::UnknownTag(t)),
+        };
+        let color = self.opt_rgb()?;
+        Ok(Some(Border { style, color }))
+    }
+
+    /// Read the fixed decoration record written by `put_decor`.
+    fn decor(&mut self) -> Result<CellDecor, FormatSidecarError> {
+        let mut d = CellDecor::default();
+        for s in Side::ALL {
+            d.borders[s.index()] = self.border()?;
+        }
+        let dir = self.u8()?;
+        let diag_border = self.border()?;
+        d.diagonal = match (dir, diag_border) {
+            (1, Some(b)) => Some((b, Diagonal::Up)),
+            (2, Some(b)) => Some((b, Diagonal::Down)),
+            (3, Some(b)) => Some((b, Diagonal::Both)),
+            (0, _) => None,
+            (t, _) => return Err(FormatSidecarError::UnknownTag(t)),
+        };
+        d.h_align = match self.u8()? {
+            0 => None,
+            1 => Some(HAlign::General),
+            2 => Some(HAlign::Left),
+            3 => Some(HAlign::Center),
+            4 => Some(HAlign::Right),
+            5 => Some(HAlign::Justify),
+            t => return Err(FormatSidecarError::UnknownTag(t)),
+        };
+        d.v_align = match self.u8()? {
+            0 => None,
+            1 => Some(VAlign::Top),
+            2 => Some(VAlign::Center),
+            3 => Some(VAlign::Bottom),
+            t => return Err(FormatSidecarError::UnknownTag(t)),
+        };
+        d.indent = match self.u8()? {
+            0 => None,
+            n => Some(ferrix_core::format::clamp_indent(n - 1)),
+        };
+        let mut flag = || -> Result<Option<bool>, FormatSidecarError> {
+            Ok(match self.u8()? {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
+            })
+        };
+        d.wrap = flag()?;
+        d.shrink = flag()?;
+        d.rotation = match self.u8()? {
+            0 => {
+                let _ = self.u8()?;
+                let _ = self.u8()?;
+                None
+            }
+            _ => {
+                let r = i16::from_le_bytes([self.u8()?, self.u8()?]);
+                Some(ferrix_core::format::clamp_rotation(r))
+            }
+        };
+        Ok(d)
+    }
+
+    fn format_inner(&mut self) -> Result<NumberFormat, FormatSidecarError> {
         Ok(match self.u8()? {
             0 => NumberFormat::General,
             1 => NumberFormat::Decimal { places: self.u8()? },
@@ -516,18 +614,22 @@ pub fn load_format(path: &Path) -> Result<Option<SheetFormat>, FormatSidecarErro
         let col = c.u32()?;
         let f = c.format()?;
         let rules = c.rules()?;
+        let decor = c.decor()?;
         let entry = fmt.column_mut(col);
         entry.format = f;
         entry.rules = rules;
+        entry.decor = decor;
     }
     for _ in 0..n_ranges {
         let range = TableRange::new(c.u32()?, c.u32()?, c.u32()?, c.u32()?);
         let format = c.opt_format()?;
         let rules = c.rules()?;
+        let decor = c.decor()?;
         fmt.push_range(RangeFormat {
             range,
             format,
             rules,
+            decor,
         });
     }
     for _ in 0..n_ovs {
@@ -538,9 +640,109 @@ pub fn load_format(path: &Path) -> Result<Option<SheetFormat>, FormatSidecarErro
             typography: c.typography()?,
         };
         let format = c.opt_format()?;
-        fmt.set_cell_override(cell, CellOverride { manual, format });
+        let decor = c.decor()?;
+        fmt.set_cell_override(
+            cell,
+            CellOverride {
+                manual,
+                format,
+                decor,
+            },
+        );
     }
     Ok(Some(fmt))
+}
+
+// ============================================ cell decoration (issue #28) ==
+
+/// A [`CellDecor`] as a fixed 22-byte record.
+///
+/// Fixed width for the same reason [`put_typography`] is: every later record's
+/// offset would otherwise depend on this one, and the reader seeks. An
+/// undecorated scope is 22 zero bytes.
+///
+/// Layout: four border records (2 bytes style + presence, 4 bytes colour) is
+/// too wide, so each border is packed into a style byte and an optional RGB
+/// with a presence byte — see [`put_border`]. Then diagonal, the two
+/// alignments, indent, three tri-state flags and the rotation as i16.
+fn put_decor<W: Write>(w: &mut W, d: &CellDecor) -> io::Result<()> {
+    for s in Side::ALL {
+        put_border(w, d.borders[s.index()])?;
+    }
+    match d.diagonal {
+        None => {
+            w.write_all(&[0])?;
+            put_border(w, None)?;
+        }
+        Some((b, dir)) => {
+            w.write_all(&[match dir {
+                Diagonal::Up => 1,
+                Diagonal::Down => 2,
+                Diagonal::Both => 3,
+            }])?;
+            put_border(w, Some(b))?;
+        }
+    }
+    w.write_all(&[match d.h_align {
+        None => 0,
+        Some(HAlign::General) => 1,
+        Some(HAlign::Left) => 2,
+        Some(HAlign::Center) => 3,
+        Some(HAlign::Right) => 4,
+        Some(HAlign::Justify) => 5,
+    }])?;
+    w.write_all(&[match d.v_align {
+        None => 0,
+        Some(VAlign::Top) => 1,
+        Some(VAlign::Center) => 2,
+        Some(VAlign::Bottom) => 3,
+    }])?;
+    // 0 = inherit, otherwise level + 1, so indent 0 and "unset" stay distinct.
+    w.write_all(&[d.indent.map_or(0, |i| i + 1)])?;
+    for flag in [d.wrap, d.shrink] {
+        w.write_all(&[match flag {
+            None => 0u8,
+            Some(false) => 1,
+            Some(true) => 2,
+        }])?;
+    }
+    // Rotation as a presence byte plus i16, because 0 degrees is a real,
+    // user-chosen value distinct from "inherit".
+    match d.rotation {
+        None => w.write_all(&[0, 0, 0])?,
+        Some(r) => {
+            w.write_all(&[1])?;
+            w.write_all(&r.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// One border edge: a style byte then an optional RGB.
+///
+/// Style byte 0 is "inherit" (`None`), 1 is the explicit `BorderStyle::None`
+/// that ERASES a lower scope. Collapsing those two would silently turn "clear
+/// this edge" back into "leave it alone" on every save.
+fn put_border<W: Write>(w: &mut W, b: Option<Border>) -> io::Result<()> {
+    match b {
+        None => w.write_all(&[0, 0]),
+        Some(b) => {
+            w.write_all(&[border_code(b.style)])?;
+            put_opt_rgb(w, b.color)
+        }
+    }
+}
+
+fn border_code(s: BorderStyle) -> u8 {
+    match s {
+        BorderStyle::None => 1,
+        BorderStyle::Thin => 2,
+        BorderStyle::Medium => 3,
+        BorderStyle::Thick => 4,
+        BorderStyle::Double => 5,
+        BorderStyle::Dotted => 6,
+        BorderStyle::Dashed => 7,
+    }
 }
 
 /// Write a [`Typography`] as a fixed 7-byte record.
