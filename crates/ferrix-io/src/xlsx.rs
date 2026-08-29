@@ -1326,4 +1326,122 @@ mod tests {
             .expect("scope survived quoting");
         assert_eq!(d.refers_to, "'Q1 2024'!$A$1:$A$5");
     }
+
+    // ------------------------------------------------- date round trips ---
+
+    /// Issue #25 acceptance criterion: a date-formatted cell **computed by a
+    /// formula** must export and reimport with the *same serial*.
+    ///
+    /// The failure this guards is not hypothetical: a date is stored as a bare
+    /// `f64`, so a one-day drift or a silently dropped formula would still
+    /// produce a perfectly valid file with a wrong date in it.
+    #[test]
+    fn date_formulas_round_trip_with_the_same_serial() {
+        use ferrix_core::{ColumnType, DateStyle, NumberFormat, Table, TableColumn, TableRange};
+
+        // Row 0 is the table's header row. A2 holds 2023-01-31 (serial
+        // 44957) as a plain number, because a date IS a plain number here --
+        // that is the storage decision under test.
+        let mut sheet = Sheet::new("Dates");
+        sheet.set_text(CellRef::new(0, 0), "start");
+        sheet.set_text(CellRef::new(0, 1), "computed");
+        sheet.set(CellRef::new(1, 0), Value::Number(44_957.0));
+
+        // Formulas whose answers are themselves dates, with the serial each
+        // must produce worked out independently from Excel's calendar.
+        let cases: &[(&str, f64)] = &[
+            ("=EOMONTH(A2,1)", 44_985.0),       // 2023-02-28
+            ("=EDATE(A2,1)", 44_985.0),         // 31 Jan + 1 month clamps
+            ("=DATE(2023,3,15)", 45_000.0),     // 2023-03-15
+            ("=A2+1", 44_958.0),                // plain arithmetic on a date
+            ("=DATE(1900,2,29)", 60.0),         // Excel's phantom day
+            ("=DATE(9999,12,31)", 2_958_465.0), // the top of the range
+        ];
+
+        let mut fx = EditOverlay::new();
+        for (i, (src, want)) in cases.iter().enumerate() {
+            fx.set(
+                CellRef::new(i as u32 + 1, 1),
+                CellInput::Formula {
+                    src: (*src).to_string(),
+                    cached: Value::Number(*want),
+                },
+            );
+        }
+
+        // Column B is declared a date column, so the exported cells really do
+        // carry a date number format rather than being anonymous numbers.
+        let tables = [
+            Table::new("D", TableRange::new(0, 0, cases.len() as u32, 1)).with_columns(vec![
+                TableColumn::new("start").typed(ColumnType::Date),
+                TableColumn::new("computed")
+                    .typed(ColumnType::Date)
+                    .formatted(NumberFormat::Date(DateStyle::Iso)),
+            ]),
+        ];
+
+        let tmp = TempXlsx::new("dateroundtrip");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("Dates", &sheet)
+                .with_formulas(&fx)
+                .with_tables(&tables)],
+        )
+        .expect("export");
+
+        let back = import_xlsx_full(tmp.path()).expect("import");
+        let got = &back[0];
+
+        assert_eq!(
+            got.stats.formulas_kept,
+            cases.len(),
+            "every date formula must come back as a live formula, not be              downgraded to its cached value"
+        );
+
+        for (i, (src, want)) in cases.iter().enumerate() {
+            let cell = CellRef::new(i as u32 + 1, 1);
+
+            // 1. The cached serial survived the file, bit for bit.
+            assert_eq!(
+                got.sheet.get(cell),
+                Value::Number(*want),
+                "{src} reimported with the wrong serial"
+            );
+
+            // 2. The formula came back and still says the same thing.
+            let Some(CellInput::Formula { src: back_src, .. }) = got.formulas.get(cell) else {
+                panic!("{src} did not survive as a formula");
+            };
+            assert_eq!(back_src, src, "formula text drifted");
+
+            // 3. Re-evaluating the reimported formula against the reimported
+            //    sheet reproduces the serial. This is the real round trip:
+            //    the file, the parser and the evaluator all agree.
+            let expr = ferrix_formula::parse(back_src).expect("reparses");
+            assert_eq!(
+                ferrix_formula::eval(&expr, &got.sheet),
+                Value::Number(*want),
+                "{src} re-evaluated to something other than {want}"
+            );
+
+            // 4. And the serial still paints as the date it is meant to be.
+            assert_eq!(
+                ferrix_core::table::render_serial(*want, DateStyle::Iso),
+                ferrix_core::table::render_serial(
+                    got.sheet.get(cell).as_number().unwrap(),
+                    DateStyle::Iso
+                )
+            );
+        }
+
+        // The date column's format survived as a date format, so the cell is
+        // still a *date* cell and not a bare number after the trip.
+        let imported = crate::table_xlsx::import_tables(tmp.path()).expect("tables");
+        let col = &imported[0].table.columns[1];
+        assert!(
+            col.format.is_date(),
+            "computed column lost its date format: {:?}",
+            col.format
+        );
+    }
 }

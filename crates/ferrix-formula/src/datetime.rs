@@ -351,7 +351,7 @@ fn networkdays<S: CellSource + ?Sized>(
     }
 
     if let Some(arg) = holidays {
-        let mut seen = vec![0u8; ((span as usize) + 7) / 8];
+        let mut seen = vec![0u8; (span as usize).div_ceil(8)];
         let mut err = None;
         for_each_serial(arg, src, &mut |v| match v {
             Ok(s) => {
