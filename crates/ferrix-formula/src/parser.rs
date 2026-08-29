@@ -33,6 +33,26 @@ pub enum Token {
         abs_col: bool,
         abs_row: bool,
     },
+    /// A 3-D span across consecutive sheets: `Sheet1:Sheet3!A1`.
+    ///
+    /// Both endpoint names are kept verbatim, in the order written. Which
+    /// sheets lie between them is a question about TAB ORDER, which only the
+    /// workbook can answer — the parser deliberately does not guess.
+    SheetSpan {
+        first: String,
+        last: String,
+        cell: CellRef,
+        abs_col: bool,
+        abs_row: bool,
+    },
+    /// A literal error constant, currently only `#REF!`.
+    ///
+    /// A deleted column, row or SHEET rewrites the formula TEXT to put
+    /// `#REF!` where the reference was (see [`crate::remap`] and
+    /// [`crate::names::break_sheet_in_formula`]). Without a token for it, that
+    /// rewritten text would fail to parse and the cell would show `#NAME?` —
+    /// blaming an unknown name for what is really a broken reference.
+    Error(ferrix_core::ErrorKind),
     Ident(String),
     LParen,
     RParen,
@@ -96,6 +116,23 @@ pub enum Expr {
     XRef(String, CellRef),
     /// `Sheet2!A1:B10` — a range inside another sheet, normalized.
     XRange(String, CellRef, CellRef),
+    /// `Sheet1:Sheet3!A1` / `Sheet1:Sheet3!A1:B10` — a 3-D reference: the same
+    /// rectangle taken from every sheet in a consecutive run of tabs.
+    ///
+    /// The rectangle is stored normalized, exactly as [`Expr::XRange`] stores
+    /// it, and a single-cell 3-D reference is the degenerate 1x1 case. One
+    /// variant rather than two keeps the number of match sites that have to
+    /// learn about 3-D down to what is genuinely unavoidable.
+    ///
+    /// The two sheet NAMES are the endpoints of a tab-order run; which sheets
+    /// lie between them is a question only the workbook can answer, so it is
+    /// resolved at graph-build and evaluation time rather than at parse time.
+    /// Resolving it in the parser would freeze the run against the tab order
+    /// as it stood when the formula was typed, so inserting a sheet between
+    /// the endpoints would silently fail to be included.
+    X3D(String, String, CellRef, CellRef),
+    /// A literal error constant, e.g. the `#REF!` a delete leaves behind.
+    Error(ferrix_core::ErrorKind),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -313,6 +350,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                     .map_err(|_| ParseError::BadChar('.', start))?;
                 out.push(Token::Number(n));
             }
+            b'#' => {
+                // `#REF!` — the only error constant a Ferrix rewrite writes
+                // into formula text. Every other error is stored as a cell
+                // VALUE rather than as formula source, so none of them ever
+                // reach the tokenizer.
+                const REF: &str = "#REF!";
+                if input.len() >= i + REF.len() && input[i..i + REF.len()].eq_ignore_ascii_case(REF)
+                {
+                    out.push(Token::Error(ferrix_core::ErrorKind::Ref));
+                    i += REF.len();
+                } else {
+                    let ch = input[i..].chars().next().unwrap_or('?');
+                    return Err(ParseError::BadChar(ch, i));
+                }
+            }
             b'\'' => {
                 // A quoted sheet name: 'My Sheet'!A1, with '' as an escaped
                 // quote. Only ever valid immediately before `!`.
@@ -353,7 +405,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 let upper = word.to_ascii_uppercase();
                 // `Name!` is a sheet qualifier, and it wins over every other
                 // reading of the word — `TRUE!A1` names a sheet called TRUE.
-                if bytes.get(i) == Some(&b'!') {
+                // `Name:Other!` is the 3-D form of the same thing, and only
+                // counts when a `!` really follows the second name; a plain
+                // `A1:B4` range never reaches here.
+                if bytes.get(i) == Some(&b'!')
+                    || (parse_ref_token(word).is_none()
+                        && sheet_span_ahead(input, bytes, i).is_some())
+                {
                     let (tok, next) = lex_sheet_qualified(input, bytes, i, word.to_string())?;
                     out.push(tok);
                     i = next;
@@ -445,14 +503,20 @@ fn parse_ref_token(word: &str) -> Option<Token> {
 
 /// Finish lexing a sheet-qualified reference.
 ///
-/// `at` points at the byte that should be `!`; `name` is the already-decoded
-/// sheet name. Returns the token plus the index just past the reference.
+/// `at` points at the byte that should be `!` — or at the `:` of a 3-D span
+/// like `Sheet1:Sheet3!A1`. `name` is the already-decoded first sheet name.
+/// Returns the token plus the index just past the reference.
 fn lex_sheet_qualified(
     input: &str,
     bytes: &[u8],
     at: usize,
     name: String,
 ) -> Result<(Token, usize), ParseError> {
+    // `Sheet1:Sheet3!` — the second endpoint of a 3-D span.
+    let (second, at) = match sheet_span_ahead(input, bytes, at) {
+        Some((s, bang)) => (Some(s), bang),
+        None => (None, at),
+    };
     if bytes.get(at) != Some(&b'!') {
         return Err(ParseError::BadSheetRef(name));
     }
@@ -467,17 +531,79 @@ fn lex_sheet_qualified(
             cell,
             abs_col,
             abs_row,
-        }) => Ok((
-            Token::SheetRef {
-                sheet: name,
-                cell,
-                abs_col,
-                abs_row,
-            },
-            i,
-        )),
+        }) => {
+            let tok = match second {
+                Some(last) => Token::SheetSpan {
+                    first: name,
+                    last,
+                    cell,
+                    abs_col,
+                    abs_row,
+                },
+                None => Token::SheetRef {
+                    sheet: name,
+                    cell,
+                    abs_col,
+                    abs_row,
+                },
+            };
+            Ok((tok, i))
+        }
         _ => Err(ParseError::BadSheetRef(name)),
     }
+}
+
+/// At `at`, read the `:Sheet3` half of a 3-D span, returning the decoded
+/// second sheet name and the index of the `!` that must follow it.
+///
+/// `None` unless the text really is `:<name>!`, so `A1:B4` and
+/// `Sheet1!A1:Sheet1!B4` are left entirely alone — the caller only reaches
+/// here for a word that is not itself a cell reference.
+fn sheet_span_ahead(input: &str, bytes: &[u8], at: usize) -> Option<(String, usize)> {
+    if bytes.get(at) != Some(&b':') {
+        return None;
+    }
+    let mut i = at + 1;
+    let name = if bytes.get(i) == Some(&b'\'') {
+        let mut name = String::new();
+        i += 1;
+        loop {
+            if i >= bytes.len() {
+                return None;
+            }
+            if bytes[i] == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    name.push('\'');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                break;
+            }
+            let ch_len = utf8_len(bytes[i]);
+            name.push_str(&input[i..i + ch_len]);
+            i += ch_len;
+        }
+        name
+    } else {
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'$'
+                || bytes[i] == b'_'
+                || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        input[start..i].to_string()
+    };
+    if bytes.get(i) != Some(&b'!') {
+        return None;
+    }
+    Some((name, i))
 }
 
 /// Parse a formula. Accepts an optional leading `=`.
@@ -602,6 +728,7 @@ impl Parser<'_> {
             Token::Number(n) => Expr::Number(n),
             Token::Text(s) => Expr::Text(s),
             Token::Bool(b) => Expr::Bool(b),
+            Token::Error(e) => Expr::Error(e),
             Token::Ref { cell, .. } => {
                 // A colon here means this is a range.
                 if matches!(self.peek(), Some(Token::Colon)) {
@@ -647,6 +774,29 @@ impl Parser<'_> {
                     }
                 } else {
                     Expr::XRef(sheet, cell)
+                }
+            }
+            Token::SheetSpan {
+                first, last, cell, ..
+            } => {
+                // `Sheet1:Sheet3!A1:B4` — the rectangle may be a range, the
+                // same way `Sheet2!A1:B4` may. The far corner is bare: a
+                // second qualifier inside a 3-D rectangle is not a thing.
+                if matches!(self.peek(), Some(Token::Colon)) {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::Ref { cell: end, .. }) => {
+                            let (a, b) = normalize_range(cell, end);
+                            Expr::X3D(first, last, a, b)
+                        }
+                        Some(t) => {
+                            return Err(ParseError::Expected("cell reference", format!("{t:?}")))
+                        }
+                        None => return Err(ParseError::UnexpectedEnd),
+                    }
+                } else {
+                    // A single-cell 3-D reference is the 1x1 rectangle.
+                    Expr::X3D(first, last, cell, cell)
                 }
             }
             Token::Ident(name) => {
@@ -1240,6 +1390,161 @@ mod tests {
                 "SUM".into(),
                 vec![Expr::Range(CellRef::new(0, 0), CellRef::new(9, 0))]
             )
+        );
+    }
+
+    // --- 3-D references across a sheet run (issue #43) ---
+
+    fn cr(row: u32, col: u32) -> CellRef {
+        CellRef::new(row, col)
+    }
+
+    #[test]
+    fn parses_a_three_d_single_cell_reference() {
+        // THE acceptance criterion at the parser level.
+        assert_eq!(
+            parse("=Sheet1:Sheet3!A1").unwrap(),
+            Expr::X3D("Sheet1".into(), "Sheet3".into(), cr(0, 0), cr(0, 0)),
+            "a single-cell 3-D reference is the degenerate 1x1 rectangle"
+        );
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet1".into(),
+                    "Sheet3".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn parses_a_three_d_range() {
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!A1:B10)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet1".into(),
+                    "Sheet3".into(),
+                    cr(0, 0),
+                    cr(9, 1)
+                )]
+            )
+        );
+        // Corners are normalised, exactly as a 2-D range's are.
+        assert_eq!(
+            parse("=SUM(Sheet1:Sheet3!B10:A1)").unwrap(),
+            parse("=SUM(Sheet1:Sheet3!A1:B10)").unwrap()
+        );
+    }
+
+    #[test]
+    fn three_d_endpoints_may_be_quoted() {
+        assert_eq!(
+            parse("=SUM('Q1 2024':'Q4 2024'!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Q1 2024".into(),
+                    "Q4 2024".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+        // Mixed quoting, and `''` as an escaped quote in the second name.
+        assert_eq!(
+            parse("=SUM(Start:'Bob''s Data'!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Start".into(),
+                    "Bob's Data".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn a_three_d_run_written_backwards_keeps_the_names_as_written() {
+        // The parser does NOT reorder the endpoints: which way round the run
+        // goes is a tab-order question, and only the workbook knows the tab
+        // order. Reordering here would be a guess.
+        assert_eq!(
+            parse("=SUM(Sheet3:Sheet1!A1)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::X3D(
+                    "Sheet3".into(),
+                    "Sheet1".into(),
+                    cr(0, 0),
+                    cr(0, 0)
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn a_plain_range_is_never_mistaken_for_a_three_d_span() {
+        // THE regression the `:` lookahead could easily cause. If `A1:B4`
+        // were read as the span `A1`..`B4`, every ordinary range in the
+        // workbook would stop being a range.
+        assert_eq!(
+            parse("=SUM(A1:B4)").unwrap(),
+            Expr::Call("SUM".into(), vec![Expr::Range(cr(0, 0), cr(3, 1))])
+        );
+        // A requalified same-sheet range stays a 2-D XRange, not a span.
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:Sheet2!B4)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::XRange("Sheet2".into(), cr(0, 0), cr(3, 1))]
+            )
+        );
+        // And a bare cross-sheet range is unaffected.
+        assert_eq!(
+            parse("=SUM(Sheet2!A1:B4)").unwrap(),
+            Expr::Call(
+                "SUM".into(),
+                vec![Expr::XRange("Sheet2".into(), cr(0, 0), cr(3, 1))]
+            )
+        );
+    }
+
+    #[test]
+    fn a_colon_without_a_following_bang_is_not_a_span() {
+        // `Total:B4` is a name-to-cell range the parser must not silently
+        // reinterpret as a sheet run. Without the `!` requirement the
+        // qualifier scanner would eat `Total:B4` whole.
+        assert!(
+            !matches!(parse("=SUM(Total:B4)"), Ok(Expr::Call(_, _))),
+            "a bare name is not a sheet qualifier"
+        );
+        // The tokenizer must not have produced a SheetSpan for it either.
+        assert!(!tokenize("Total:B4")
+            .unwrap()
+            .iter()
+            .any(|t| matches!(t, Token::SheetSpan { .. })));
+    }
+
+    #[test]
+    fn tokenizes_a_three_d_span_with_absolute_markers() {
+        assert_eq!(
+            tokenize("Sheet1:Sheet3!$B$2").unwrap(),
+            vec![Token::SheetSpan {
+                first: "Sheet1".into(),
+                last: "Sheet3".into(),
+                cell: cr(1, 1),
+                abs_col: true,
+                abs_row: true
+            }],
+            "the tokenizer still records the $ markers a rewrite needs"
         );
     }
 

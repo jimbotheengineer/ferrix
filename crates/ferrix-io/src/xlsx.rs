@@ -98,8 +98,35 @@ pub const XLSX_MAX_COLS: usize = 16_384;
 /// Excel's correct cached answer. So imports check the names too, and this
 /// list must track the `eval_call` match arms in `ferrix-formula/src/eval.rs`.
 pub const SUPPORTED_FUNCTIONS: &[&str] = &[
-    "SUM", "COUNT", "AVERAGE", "MIN", "MAX", "ABS", "SQRT", "ROUND", "FLOOR", "CEILING", "INT",
-    "LN", "LOG10", "EXP", "IF", "AND", "OR", "NOT",
+    "SUM",
+    "COUNT",
+    "AVERAGE",
+    "MIN",
+    "MAX",
+    "ABS",
+    "SQRT",
+    "ROUND",
+    "FLOOR",
+    "CEILING",
+    "INT",
+    "LN",
+    "LOG10",
+    "EXP",
+    "IF",
+    "AND",
+    "OR",
+    "NOT",
+    // The conditional-aggregate family. These have `eval_call` arms and are
+    // reachable from a cross-sheet criteria range (issue #43), so a workbook
+    // using one must not lose it on load — which is what omitting them here
+    // did: the formula was silently downgraded to its cached value and never
+    // recalculated again.
+    "SUMIF",
+    "SUMIFS",
+    "COUNTIF",
+    "COUNTIFS",
+    "AVERAGEIF",
+    "AVERAGEIFS",
 ];
 
 /// Does every function call in this expression have an implementation?
@@ -118,11 +145,19 @@ fn calls_are_supported(e: &Expr) -> bool {
         }
         Expr::Unary(_, a) => calls_are_supported(a),
         Expr::Binary(_, a, b) => calls_are_supported(a) && calls_are_supported(b),
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::Range(_, _) => true,
+        Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_)
+        | Expr::Ref(_)
+        | Expr::Range(_, _)
+        // A `#REF!` constant is a real thing a broken formula holds; it must
+        // survive the round trip rather than being dropped as unsupported.
+        | Expr::Error(_) => true,
         // Cross-sheet references are supported now that workbooks hold every
         // sheet; whether the named sheet actually exists is resolved when the
-        // workbook builds its dependency graph, not here.
-        Expr::XRef(_, _) | Expr::XRange(_, _, _) => true,
+        // workbook builds its dependency graph, not here. The same is true of
+        // a 3-D span, whose run is a question about tab order.
+        Expr::XRef(_, _) | Expr::XRange(_, _, _) | Expr::X3D(_, _, _, _) => true,
     }
 }
 
@@ -1318,6 +1353,179 @@ mod tests {
         second.set(CellRef::new(2, 0), Value::Bool(true));
 
         (data, fx, second)
+    }
+
+    // --- multi-sheet references and 3-D ranges (issue #43) ---
+
+    /// The formula SOURCE at `cell` in an imported sheet.
+    fn imported_src(got: &ImportedSheet, cell: CellRef) -> Option<&str> {
+        match got.formulas.get(cell) {
+            Some(CellInput::Formula { src, .. }) => Some(src.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn cross_sheet_and_three_d_formulas_survive_the_xlsx_round_trip() {
+        // THE acceptance criterion: every shape issue #43 adds must come back
+        // as a LIVE formula, not be silently downgraded to its cached value.
+        // A dropped formula looks perfect until the data underneath changes.
+        let mut one = Sheet::new("Sheet1");
+        one.set(CellRef::new(0, 1), Value::Number(1.0));
+        let mut two = Sheet::new("Sheet2");
+        two.set(CellRef::new(0, 1), Value::Number(20.0));
+        two.set_text(CellRef::new(0, 0), "North");
+        two.set_text(CellRef::new(1, 0), "South");
+        two.set(CellRef::new(1, 1), Value::Number(5.0));
+        let mut three = Sheet::new("Sheet3");
+        three.set(CellRef::new(0, 1), Value::Number(300.0));
+
+        // One formula per shape, each with a distinct cached result so a
+        // round trip that mixed them up could not pass.
+        let cases: &[(&str, Value)] = &[
+            ("=Sheet2!B1*2", Value::Number(40.0)),
+            ("=SUM(Sheet2!B1:B2)", Value::Number(25.0)),
+            ("=SUM(Sheet1:Sheet3!B1)", Value::Number(321.0)),
+            ("=SUM(Sheet1:Sheet3!B1:B2)", Value::Number(326.0)),
+            (
+                "=SUMIF(Sheet2!A1:A2,\"North\",Sheet2!B1:B2)",
+                Value::Number(20.0),
+            ),
+            ("=COUNTIFS(Sheet2!A1:A2,\"North\")", Value::Number(1.0)),
+            // Absolute markers, which an AST round trip would silently drop.
+            ("=SUM(Sheet2!$B$1:$B$2)", Value::Number(25.0)),
+        ];
+        let mut fx = EditOverlay::new();
+        for (i, (src, cached)) in cases.iter().enumerate() {
+            fx.set(
+                CellRef::new(i as u32, 5),
+                CellInput::Formula {
+                    src: (*src).to_string(),
+                    cached: *cached,
+                },
+            );
+        }
+
+        let tmp = TempXlsx::new("xsheet-roundtrip");
+        export_workbook(
+            tmp.path(),
+            &[
+                SheetExport::new("Sheet1", &one).with_formulas(&fx),
+                SheetExport::new("Sheet2", &two),
+                SheetExport::new("Sheet3", &three),
+            ],
+        )
+        .expect("export");
+
+        let sheets = import_xlsx_full(tmp.path()).expect("import");
+        assert_eq!(sheets.len(), 3, "every sheet must come back");
+        let got = &sheets[0];
+        assert_eq!(
+            got.stats.formulas_dropped, 0,
+            "no cross-sheet or 3-D formula may be downgraded to its value"
+        );
+        assert_eq!(got.stats.formulas_kept, cases.len());
+
+        for (i, (src, cached)) in cases.iter().enumerate() {
+            let cell = CellRef::new(i as u32, 5);
+            assert_eq!(
+                imported_src(got, cell),
+                Some(*src),
+                "formula text must survive byte for byte"
+            );
+            // The cached RESULT has to come back too, or the sheet shows
+            // blanks until something triggers a recalculation.
+            assert_eq!(
+                got.sheet.get(cell),
+                *cached,
+                "cached result for {src} was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_sheet_name_survives_the_round_trip_in_both_ref_and_3d_form() {
+        let mut one = Sheet::new("Sheet1");
+        one.set(CellRef::new(0, 0), Value::Number(2.0));
+        let mut mid = Sheet::new("My Sheet");
+        mid.set(CellRef::new(0, 0), Value::Number(3.0));
+        let mut last = Sheet::new("Q1 2024");
+        last.set(CellRef::new(0, 0), Value::Number(4.0));
+
+        let mut fx = EditOverlay::new();
+        fx.set(
+            CellRef::new(0, 5),
+            CellInput::Formula {
+                src: "='My Sheet'!A1+1".into(),
+                cached: Value::Number(4.0),
+            },
+        );
+        fx.set(
+            CellRef::new(1, 5),
+            CellInput::Formula {
+                src: "=SUM(Sheet1:'Q1 2024'!A1)".into(),
+                cached: Value::Number(9.0),
+            },
+        );
+
+        let tmp = TempXlsx::new("xsheet-quoted");
+        export_workbook(
+            tmp.path(),
+            &[
+                SheetExport::new("Sheet1", &one).with_formulas(&fx),
+                SheetExport::new("My Sheet", &mid),
+                SheetExport::new("Q1 2024", &last),
+            ],
+        )
+        .expect("export");
+
+        let sheets = import_xlsx_full(tmp.path()).expect("import");
+        let got = &sheets[0];
+        assert_eq!(got.stats.formulas_dropped, 0);
+        assert_eq!(
+            imported_src(got, CellRef::new(0, 5)),
+            Some("='My Sheet'!A1+1"),
+            "the quotes a name with a space needs must survive"
+        );
+        assert_eq!(
+            imported_src(got, CellRef::new(1, 5)),
+            Some("=SUM(Sheet1:'Q1 2024'!A1)")
+        );
+    }
+
+    #[test]
+    fn a_broken_ref_formula_survives_the_round_trip_as_a_formula() {
+        // After a sheet delete a formula's TEXT holds `#REF!`. If the import
+        // could not parse that, the workbook would come back showing #NAME?
+        // — blaming an unknown name for a reference the user deleted.
+        let sheet = Sheet::new("Sheet1");
+        let mut fx = EditOverlay::new();
+        fx.set(
+            CellRef::new(0, 0),
+            CellInput::Formula {
+                src: "=#REF!*2".into(),
+                cached: Value::Error(ErrorKind::Ref),
+            },
+        );
+        let tmp = TempXlsx::new("xsheet-refbreak");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("Sheet1", &sheet).with_formulas(&fx)],
+        )
+        .expect("export");
+
+        let sheets = import_xlsx_full(tmp.path()).expect("import");
+        let got = &sheets[0];
+        assert_eq!(
+            imported_src(got, CellRef::new(0, 0)),
+            Some("=#REF!*2"),
+            "a broken reference must stay a broken reference, visibly"
+        );
+        assert_eq!(
+            got.sheet.get(CellRef::new(0, 0)),
+            Value::Error(ErrorKind::Ref),
+            "and keep its #REF! value rather than becoming #NAME?"
+        );
     }
 
     #[test]

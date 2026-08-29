@@ -5500,7 +5500,7 @@ impl FerrixApp {
     fn delete_sheet(&mut self, id: ferrix_core::SheetId) {
         let name = self.wb.sheet_name(id).unwrap_or("").to_string();
         match self.wb.delete_sheet(id) {
-            Ok(()) => {
+            Ok(broken) => {
                 // Deleting may have changed which sheet is active.
                 let state = self.wb.view_state();
                 self.scroll = state.scroll;
@@ -5509,7 +5509,14 @@ impl FerrixApp {
                 let view = self.wb.view();
                 self.stats_rows = view.row_count();
                 self.stats_cols = view.col_count();
-                self.status = format!("Deleted sheet {name}");
+                // Say out loud how many formulas the delete broke. A silent
+                // sheet full of fresh #REF! is exactly the surprise the
+                // "report lossy operations" rule exists to prevent.
+                self.status = match broken {
+                    0 => format!("Deleted sheet {name}"),
+                    1 => format!("Deleted sheet {name}; 1 formula now #REF!"),
+                    n => format!("Deleted sheet {name}; {n} formulas now #REF!"),
+                };
                 self.sync_formula_bar();
             }
             Err(e) => self.status = e.to_string(),
@@ -5522,8 +5529,14 @@ impl FerrixApp {
         };
         let name = std::mem::take(&mut self.rename_buffer);
         match self.wb.rename_sheet(id, &name) {
-            Ok(()) => {
-                self.status = format!("Renamed sheet to {}", name.trim());
+            Ok(rewritten) => {
+                // Say how many formulas followed the rename. Silence would
+                // leave the user unable to tell a rewrite from a no-op.
+                self.status = match rewritten {
+                    0 => format!("Renamed sheet to {}", name.trim()),
+                    1 => format!("Renamed sheet to {}; 1 formula updated", name.trim()),
+                    n => format!("Renamed sheet to {}; {n} formulas updated", name.trim()),
+                };
                 self.sync_formula_bar();
             }
             // Refused (blank or duplicate): say why and keep the old name.

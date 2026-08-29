@@ -655,31 +655,93 @@ impl Workbook {
         Ok(id)
     }
 
-    /// Rename a sheet. Refuses blank names and duplicates.
+    /// Rename a sheet, REWRITING the source text of every formula that names
+    /// it. Refuses blank names and duplicates.
     ///
-    /// Formula SOURCES that name the old sheet are deliberately NOT rewritten;
-    /// `sheet_id_by_name` resolves through the current name list, so a formula
-    /// pointing at a renamed sheet becomes a `#REF!` on next recalc rather
-    /// than silently rebinding to whatever later takes that name. Rewriting
-    /// sources is a bigger change than this issue asks for, and getting it
-    /// half-right is worse than being explicit.
-    pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<(), SheetError> {
+    /// ## Why the text is rewritten, and where it deliberately is not
+    ///
+    /// Leaving formulas alone would turn every reference into `#REF!` the
+    /// moment a tab was renamed, which is not what any spreadsheet does and
+    /// not what the user asked for — they renamed a tab, not their formulas.
+    ///
+    /// The rewrite is TEXTUAL, through
+    /// [`ferrix_formula::names::rename_sheet_in_formula`], never an AST round
+    /// trip: the parser discards the `$` markers the tokenizer recorded, so
+    /// re-rendering would silently unpin every absolute reference in the
+    /// workbook.
+    ///
+    /// And it is deliberately narrower than a defined-name rename. A sheet
+    /// name can also appear inside a STRING LITERAL, where it is the user's
+    /// data — `=Sheet2!A1&" from Sheet2"` must become `=Q1!A1&" from Sheet2"`,
+    /// with the literal untouched. The scanner skips literals for exactly this
+    /// reason.
+    ///
+    /// Returns how many formulas were rewritten.
+    pub fn rename_sheet(&mut self, id: SheetId, name: &str) -> Result<usize, SheetError> {
         self.check_structure(ferrix_core::StructureOp::RenameSheet)?;
         let name = self.validate_name(name, Some(id))?;
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
         let old = std::mem::replace(&mut self.sheets[idx].name, name.clone());
+        if old == name {
+            return Ok(0);
+        }
         // A defined name scoped to this sheet, or pointing into it, must
         // follow the rename or it would silently address a sheet that no
         // longer exists.
         self.names.rename_sheet(&old, &name);
+
+        // Only formulas whose TEXT names the old sheet — found through the
+        // graph's recorded sheet uses rather than by rescanning the workbook,
+        // which would be O(workbook) on every rename.
+        let cells = self.graph.cells_using_sheet(&old);
+        let mut rewritten = 0usize;
+        for at in cells {
+            let Some(src) = self
+                .overlay_of(at.sheet)
+                .and_then(|o| o.get(at.cell))
+                .and_then(|i| i.formula_src())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let new_src = ferrix_formula::names::rename_sheet_in_formula(&src, &old, &name);
+            if new_src == src {
+                continue;
+            }
+            if let Some(ov) = self.overlay_of_mut(at.sheet) {
+                let cached = ov.value(at.cell).unwrap_or(Value::Empty);
+                ov.set(
+                    at.cell,
+                    CellInput::Formula {
+                        src: new_src,
+                        cached,
+                    },
+                );
+            }
+            rewritten += 1;
+        }
+
         self.dirty = true;
         self.rebuild_graph_and_recalc();
         self.dirty = true;
-        Ok(())
+        Ok(rewritten)
     }
 
     /// Delete a sheet and everything it stored. The last sheet cannot go.
-    pub fn delete_sheet(&mut self, id: SheetId) -> Result<(), SheetError> {
+    ///
+    /// Formulas elsewhere that named the departed sheet have their SOURCE
+    /// TEXT rewritten so the qualifier becomes `#REF!` — `=Sheet2!A1*2`
+    /// becomes `=#REF!*2`, which parses to nothing and evaluates to `#REF!`.
+    ///
+    /// Rewriting the text rather than leaving it and relying on name
+    /// resolution failing is the difference between a broken reference the
+    /// user can SEE and one that silently rebinds: without it, creating a new
+    /// sheet that happens to reuse the old name would quietly repoint every
+    /// orphaned formula at unrelated data. Excel breaks the text for the same
+    /// reason.
+    ///
+    /// Returns how many formulas were broken.
+    pub fn delete_sheet(&mut self, id: SheetId) -> Result<usize, SheetError> {
         self.check_structure(ferrix_core::StructureOp::DeleteSheet)?;
         if self.sheets.len() == 1 {
             return Err(SheetError::LastSheet);
@@ -687,7 +749,7 @@ impl Workbook {
         let idx = self.index_of(id).ok_or(SheetError::NoSuchSheet)?;
         // Captured before the tab goes, so sheet-scoped names can be dropped
         // by name afterwards.
-        let deleted_name = Some(self.sheets[idx].name.clone());
+        let deleted_name = self.sheets[idx].name.clone();
         if idx == self.active {
             // Park the doomed sheet's storage so `base`/`overlay` can be
             // repointed at a survivor before we drop it.
@@ -706,19 +768,53 @@ impl Workbook {
         if idx < self.active {
             self.active -= 1;
         }
+        // Break every surviving formula that named it. Found through the
+        // graph's recorded sheet USES rather than its edges, because those
+        // edges are about to be — or already are — gone.
+        let cells: Vec<SheetCell> = self
+            .graph
+            .cells_using_sheet(&deleted_name)
+            .into_iter()
+            .filter(|at| at.sheet != id)
+            .collect();
+        let mut broken = 0usize;
+        for at in cells {
+            let Some(src) = self
+                .overlay_of(at.sheet)
+                .and_then(|o| o.get(at.cell))
+                .and_then(|i| i.formula_src())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let new_src = ferrix_formula::names::break_sheet_in_formula(&src, &deleted_name);
+            if new_src == src {
+                continue;
+            }
+            if let Some(ov) = self.overlay_of_mut(at.sheet) {
+                ov.set(
+                    at.cell,
+                    CellInput::Formula {
+                        src: new_src,
+                        cached: Value::Error(ErrorKind::Ref),
+                    },
+                );
+            }
+            broken += 1;
+        }
+
         // Drop the deleted sheet's formulas, then re-resolve everything that
         // pointed AT it — those references are now #REF!.
         self.graph.remove_sheet(id);
         // A name scoped to the departed sheet goes with it; a workbook-scoped
         // name pointing INTO it is left alone, so it becomes a visible #REF!
         // rather than silently disappearing.
-        if let Some(gone) = deleted_name.as_deref() {
-            self.names.remove_sheet_scope(gone);
-        }
+        self.names.remove_sheet_scope(&deleted_name);
         self.dirty = true;
         self.last_edit = None;
         self.rebuild_graph_and_recalc();
-        Ok(())
+        self.dirty = true;
+        Ok(broken)
     }
 
     /// Move a sheet to a new position in the tab strip.
@@ -788,19 +884,15 @@ impl Workbook {
         self.parked.get(&id).map(|(b, o)| SheetView::new(b, o))
     }
 
-    /// A resolver for the dependency graph, bound to the current name list.
+    /// A sheet index for the dependency graph, bound to the current tab strip.
     ///
     /// Returned by value (not borrowing `self`) so it can be handed to
-    /// `&mut self` graph calls without fighting the borrow checker.
-    fn name_resolver(&self) -> impl Fn(&str) -> Option<SheetId> + use<> {
-        let names: Vec<(SheetId, String)> =
-            self.sheets.iter().map(|s| (s.id, s.name.clone())).collect();
-        move |n: &str| {
-            names
-                .iter()
-                .find(|(_, name)| name.eq_ignore_ascii_case(n))
-                .map(|(id, _)| *id)
-        }
+    /// `&mut self` graph calls without fighting the borrow checker. Tab ORDER
+    /// is preserved, because a 3-D span (`Sheet1:Sheet3!A1`) is defined by it.
+    fn name_resolver(&self) -> ferrix_formula::depgraph::SheetIndex {
+        ferrix_formula::depgraph::SheetIndex::new(
+            self.sheets.iter().map(|s| (s.id, s.name.clone())).collect(),
+        )
     }
 
     // ---------------------------------------------------------- defined names
@@ -1146,6 +1238,10 @@ impl Workbook {
             // a formula reading `=SUM(Sales)` while `Sales` is undefined is
             // exactly the one that must be revisited when it is defined.
             self.graph.set_name_uses(*at, src);
+            // Sheet qualifiers, for the same reason: a formula naming a sheet
+            // that does not exist has NO edges, so the edge list could never
+            // find it for a later rename or delete.
+            self.graph.set_sheet_uses(*at, src);
         }
         // Evaluate in dependency order so a formula referencing another
         // formula sees an up-to-date value rather than a stale cache.
@@ -1439,6 +1535,7 @@ impl Workbook {
                 // the one that must be revisited when it is defined, so its
                 // name use has to survive the failed parse.
                 self.graph.set_name_uses(at, src);
+                self.graph.set_sheet_uses(at, src);
             }
             _ => {
                 // No longer a formula (or cleared): drop its edges.
@@ -2793,6 +2890,7 @@ impl Workbook {
                 // them: a formula naming something undefined must still be
                 // findable when that name is later defined.
                 self.graph.set_name_uses(at, &src);
+                self.graph.set_sheet_uses(at, &src);
             }
             None => self.graph.remove_at(at),
         }
@@ -2887,6 +2985,46 @@ impl ferrix_formula::CellSource for WorkbookSource<'_> {
 
     fn has_sheet(&self, sheet: &str) -> bool {
         self.wb.sheet_id_by_name(sheet).is_some()
+    }
+
+    /// Resolve a string id against the arena of the sheet it came from.
+    ///
+    /// Each sheet has its OWN string arena, so a `StrId` read out of Sheet2
+    /// means nothing in Sheet1's. Resolving it in the home sheet returns
+    /// whatever string happens to sit at that index — which is why a
+    /// cross-sheet text criterion matched nothing at all.
+    fn resolve_in(&self, sheet: &str, id: ferrix_core::StrId) -> &str {
+        let Some(target) = self.wb.sheet_id_by_name(sheet) else {
+            return "";
+        };
+        let Some(overlay) = self.wb.overlay_of(target) else {
+            return "";
+        };
+        match overlay.resolve(id) {
+            Some(s) => s,
+            None => {
+                if target == self.wb.sheets[self.wb.active].id {
+                    self.wb.base.resolve(id)
+                } else {
+                    self.wb.parked[&target].0.resolve(id)
+                }
+            }
+        }
+    }
+
+    /// The tab-order run `first..=last`, as sheet NAMES.
+    ///
+    /// Answered from the tab strip rather than from a stored list on the
+    /// formula, so inserting a sheet between the endpoints puts it in the run
+    /// on the very next recalculation — which is what a 3-D reference means.
+    fn sheet_span(&self, first: &str, last: &str) -> Vec<String> {
+        let names: Vec<&str> = self.wb.sheets.iter().map(|s| s.name.as_str()).collect();
+        let pos = |want: &str| names.iter().position(|n| n.eq_ignore_ascii_case(want));
+        let (Some(a), Some(b)) = (pos(first), pos(last)) else {
+            return Vec::new();
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        names[lo..=hi].iter().map(|s| s.to_string()).collect()
     }
 
     fn sum_rect_in(&self, sheet: &str, start: CellRef, end: CellRef) -> Option<f64> {
@@ -3848,6 +3986,563 @@ mod tests {
             val_in(&w, SheetId::MAIN, 0, 1),
             Value::Error(ErrorKind::Ref),
             "the formula must not keep showing a value from a deleted sheet"
+        );
+    }
+
+    // --- multi-sheet references and 3-D ranges (issue #43) ---
+
+    /// Sheet1 (base A1:A10 = 1..10) plus empty Sheet2 and Sheet3, in that
+    /// tab order — which is what a 3-D run is defined against.
+    fn three_sheet_wb() -> (Workbook, SheetId, SheetId) {
+        let mut w = wb();
+        let s2 = w
+            .add_sheet("Sheet2", BaseData::Memory(Sheet::new("Sheet2")))
+            .expect("add");
+        // `add_sheet` inserts after the ACTIVE tab, so activate Sheet2 first
+        // to get Sheet1, Sheet2, Sheet3 left to right.
+        w.activate(s2).unwrap();
+        let s3 = w
+            .add_sheet("Sheet3", BaseData::Memory(Sheet::new("Sheet3")))
+            .expect("add");
+        w.activate(SheetId::MAIN).unwrap();
+        assert_eq!(
+            w.sheet_names()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![SheetId::MAIN, s2, s3],
+            "these tests depend on the tab order"
+        );
+        (w, s2, s3)
+    }
+
+    /// A cell's formula SOURCE TEXT, or `None` if it is not a formula.
+    fn src_at(w: &Workbook, sheet: SheetId, r: u32, c: u32) -> Option<String> {
+        w.overlay_of(sheet)
+            .and_then(|o| o.get(CellRef::new(r, c)))
+            .and_then(|i| i.formula_src())
+            .map(str::to_string)
+    }
+
+    /// Put `value` in B1 of every sheet of a three-sheet workbook.
+    fn seed_b1(w: &mut Workbook, sheets: &[SheetId], values: &[f64]) {
+        for (id, v) in sheets.iter().zip(values) {
+            w.activate(*id).unwrap();
+            w.commit_edit(CellRef::new(0, 1), &v.to_string());
+            w.end_edit_run();
+        }
+    }
+
+    #[test]
+    fn a_three_d_sum_spans_every_sheet_in_the_run() {
+        // THE acceptance criterion: =SUM(Sheet1:Sheet3!B1) over consecutive
+        // sheets. 1 + 20 + 300 = 321, a total no pair of the three produces,
+        // so a run that dropped or doubled a sheet cannot pass by luck.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+    }
+
+    #[test]
+    fn a_three_d_run_covers_only_the_sheets_between_its_endpoints() {
+        // The control for the test above. If the run were ignored and every
+        // sheet summed regardless, this would also read 321.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet2!B1)");
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Number(21.0),
+            "Sheet3 is outside the run and must not contribute"
+        );
+        w.commit_edit(CellRef::new(6, 5), "=SUM(Sheet2:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 6, 5), Value::Number(320.0));
+    }
+
+    #[test]
+    fn a_three_d_range_and_the_other_aggregates_work() {
+        let (mut w, s2, s3) = three_sheet_wb();
+        for (id, base) in [(SheetId::MAIN, 1.0), (s2, 10.0), (s3, 100.0)] {
+            w.activate(id).unwrap();
+            for r in 0..3u32 {
+                w.commit_edit(CellRef::new(r, 1), &(base * (r + 1) as f64).to_string());
+                w.end_edit_run();
+            }
+        }
+        w.activate(SheetId::MAIN).unwrap();
+        // Each sheet holds base*1, base*2, base*3 => 6 + 60 + 600 = 666.
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1:B3)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(666.0));
+        w.commit_edit(CellRef::new(6, 5), "=COUNT(Sheet1:Sheet3!B1:B3)");
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 6, 5),
+            Value::Number(9.0),
+            "three cells on each of three sheets"
+        );
+        w.commit_edit(CellRef::new(7, 5), "=AVERAGE(Sheet1:Sheet3!B1:B3)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 7, 5), Value::Number(666.0 / 9.0));
+    }
+
+    #[test]
+    fn editing_a_middle_sheet_recalculates_a_three_d_total() {
+        // Sheet2 is not NAMED in the formula at all — it is only in the run
+        // by tab order. If the graph resolved endpoints and nothing between,
+        // this edit would leave a stale total on screen.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+
+        w.activate(s2).unwrap();
+        let rep = w.commit_edit(CellRef::new(0, 1), "20000");
+        assert_eq!(
+            rep.recalculated, 1,
+            "the Sheet1 3-D total is a dependent of this edit"
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(20301.0));
+    }
+
+    #[test]
+    fn a_three_d_run_with_a_missing_endpoint_is_a_ref_error() {
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Nowhere!B1)");
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Error(ErrorKind::Ref),
+            "half a run is a wrong number that looks right; #REF! is honest"
+        );
+    }
+
+    #[test]
+    fn a_bare_three_d_reference_is_an_error_not_a_scalar() {
+        // `=Sheet1:Sheet3!B1` names that cell on THREE sheets, so there is no
+        // single value to show. Excel refuses it too.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=Sheet1:Sheet3!B1");
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Error(ErrorKind::Value),
+            "a 3-D reference must not silently collapse to one sheet's value"
+        );
+    }
+
+    // --- cross-sheet criteria ranges: the SUMIF-family coverage gap ---
+
+    /// Sheet2 holds a region/amount table; Sheet1 does the criteria maths.
+    fn criteria_wb() -> (Workbook, SheetId) {
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        let rows = [
+            ("North", 10.0),
+            ("South", 20.0),
+            ("North", 30.0),
+            ("East", 40.0),
+        ];
+        for (r, (region, amount)) in rows.iter().enumerate() {
+            w.commit_edit(CellRef::new(r as u32, 0), region);
+            w.end_edit_run();
+            w.commit_edit(CellRef::new(r as u32, 1), &amount.to_string());
+            w.end_edit_run();
+        }
+        w.activate(SheetId::MAIN).unwrap();
+        (w, s2)
+    }
+
+    #[test]
+    fn sumif_over_a_cross_sheet_criteria_range() {
+        // THE coverage gap issue #43 calls out: the SUMIF family landed with
+        // same-sheet criteria ranges only. North is rows 1 and 3 => 10 + 30.
+        let (mut w, _s2) = criteria_wb();
+        w.commit_edit(
+            CellRef::new(0, 4),
+            "=SUMIF(Sheet2!A1:A4,\"North\",Sheet2!B1:B4)",
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 4),
+            Value::Number(40.0),
+            "only the two North rows may contribute"
+        );
+        // A criterion matching nothing is 0, not the whole column.
+        w.commit_edit(
+            CellRef::new(1, 4),
+            "=SUMIF(Sheet2!A1:A4,\"West\",Sheet2!B1:B4)",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 1, 4), Value::Number(0.0));
+        // And a different criterion picks a different subset — so the first
+        // assertion cannot be passing because everything is summed.
+        w.commit_edit(
+            CellRef::new(2, 4),
+            "=SUMIF(Sheet2!A1:A4,\"South\",Sheet2!B1:B4)",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 2, 4), Value::Number(20.0));
+    }
+
+    #[test]
+    fn countif_and_averageif_over_a_cross_sheet_criteria_range() {
+        let (mut w, _s2) = criteria_wb();
+        w.commit_edit(CellRef::new(0, 4), "=COUNTIF(Sheet2!A1:A4,\"North\")");
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 4), Value::Number(2.0));
+        w.commit_edit(CellRef::new(1, 4), "=COUNTIF(Sheet2!A1:A4,\"East\")");
+        assert_eq!(val_in(&w, SheetId::MAIN, 1, 4), Value::Number(1.0));
+        w.commit_edit(
+            CellRef::new(2, 4),
+            "=AVERAGEIF(Sheet2!A1:A4,\"North\",Sheet2!B1:B4)",
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 2, 4),
+            Value::Number(20.0),
+            "mean of 10 and 30"
+        );
+    }
+
+    #[test]
+    fn countifs_and_sumifs_over_cross_sheet_criteria_ranges() {
+        let (mut w, _s2) = criteria_wb();
+        // Two criteria, both cross-sheet: North AND amount > 15 => row 3 only.
+        w.commit_edit(
+            CellRef::new(0, 4),
+            "=SUMIFS(Sheet2!B1:B4,Sheet2!A1:A4,\"North\",Sheet2!B1:B4,\">15\")",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 4), Value::Number(30.0));
+        w.commit_edit(
+            CellRef::new(1, 4),
+            "=COUNTIFS(Sheet2!A1:A4,\"North\",Sheet2!B1:B4,\">15\")",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 1, 4), Value::Number(1.0));
+        // Relaxing the second criterion must let the other North row back in,
+        // proving the criteria really are being applied per row.
+        w.commit_edit(
+            CellRef::new(2, 4),
+            "=COUNTIFS(Sheet2!A1:A4,\"North\",Sheet2!B1:B4,\">5\")",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 2, 4), Value::Number(2.0));
+    }
+
+    #[test]
+    fn a_cross_sheet_criteria_range_recalculates_when_its_sheet_changes() {
+        // The dependency-graph half: the criteria range is on another sheet,
+        // so the edge must cross sheets or the total goes stale.
+        let (mut w, s2) = criteria_wb();
+        w.commit_edit(
+            CellRef::new(0, 4),
+            "=SUMIF(Sheet2!A1:A4,\"North\",Sheet2!B1:B4)",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 4), Value::Number(40.0));
+
+        // Flip row 2 from South to North: it now matches, adding 20.
+        w.activate(s2).unwrap();
+        let rep = w.commit_edit(CellRef::new(1, 0), "North");
+        assert_eq!(rep.recalculated, 1, "the Sheet1 SUMIF must be a dependent");
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 4), Value::Number(60.0));
+    }
+
+    #[test]
+    fn a_criteria_range_on_a_deleted_sheet_is_a_ref_error() {
+        let (mut w, s2) = criteria_wb();
+        w.commit_edit(
+            CellRef::new(0, 4),
+            "=SUMIF(Sheet2!A1:A4,\"North\",Sheet2!B1:B4)",
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 4), Value::Number(40.0));
+        w.delete_sheet(s2).unwrap();
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 4),
+            Value::Error(ErrorKind::Ref),
+            "a SUMIF must not keep reporting a total from a deleted sheet"
+        );
+    }
+
+    // --- renaming a sheet rewrites formula TEXT ---
+
+    #[test]
+    fn renaming_a_sheet_rewrites_referencing_formulas_and_keeps_them_working() {
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "7");
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=Sheet2!A1*2");
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 1), Value::Number(14.0));
+
+        let rewritten = w.rename_sheet(s2, "Summary").expect("rename");
+        assert_eq!(rewritten, 1, "one formula named the old sheet");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=Summary!A1*2"),
+            "the TEXT must follow the rename"
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 1),
+            Value::Number(14.0),
+            "and it must still evaluate, not become #REF!"
+        );
+    }
+
+    #[test]
+    fn renaming_a_sheet_does_not_touch_its_name_inside_a_string_literal() {
+        // THE ASYMMETRY vs a defined-name rename, end to end. One formula,
+        // the sheet name in BOTH positions: a reference and a quoted string.
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "7");
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=Sheet2!A1&\" (from Sheet2)\"");
+
+        w.rename_sheet(s2, "Q1").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=Q1!A1&\" (from Sheet2)\""),
+            "the reference moves; the string literal is the user's data"
+        );
+
+        // A formula naming the sheet ONLY in text is untouched and is not
+        // even counted as a dependent.
+        w.commit_edit(CellRef::new(1, 1), "=\"Sheet2 total\"");
+        let rewritten = w.rename_sheet(s2, "Q2").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 1, 1).as_deref(),
+            Some("=\"Sheet2 total\"")
+        );
+        assert_eq!(
+            rewritten, 1,
+            "only the real reference counts as a rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn renaming_a_sheet_quotes_a_name_that_needs_it() {
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "5");
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=Sheet2!A1+1");
+
+        w.rename_sheet(s2, "My Sheet").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("='My Sheet'!A1+1"),
+            "a name with a space must be quoted or the formula stops parsing"
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 1), Value::Number(6.0));
+
+        // And back to a plain name: the quotes must go.
+        w.rename_sheet(s2, "Data").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=Data!A1+1")
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 1), Value::Number(6.0));
+    }
+
+    #[test]
+    fn renaming_a_sheet_keeps_absolute_markers() {
+        // The regression an AST round trip would cause: every `$` silently
+        // dropped across the workbook.
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "3");
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=SUM(Sheet2!$A$1:$A$9)+Sheet2!$A1");
+        w.rename_sheet(s2, "Q1").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=SUM(Q1!$A$1:$A$9)+Q1!$A1"),
+            "every $ the user typed must survive the rename"
+        );
+    }
+
+    #[test]
+    fn renaming_a_sheet_follows_a_three_d_run_endpoint() {
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+
+        w.rename_sheet(s3, "Last").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 5, 5).as_deref(),
+            Some("=SUM(Sheet1:Last!B1)")
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Number(321.0),
+            "the run still covers the same three sheets"
+        );
+
+        // Renaming the sheet in the MIDDLE changes no text, and the total
+        // must be unchanged — it is in the run by position, not by name.
+        w.rename_sheet(s2, "Middle").expect("rename");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 5, 5).as_deref(),
+            Some("=SUM(Sheet1:Last!B1)")
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+    }
+
+    // --- deleting a sheet breaks its referents visibly ---
+
+    #[test]
+    fn deleting_a_sheet_rewrites_referents_to_ref_in_the_formula_text() {
+        // Not merely "did not panic": the TEXT must say #REF! so the user can
+        // see what broke, and so a new sheet reusing the name cannot silently
+        // rebind the formula to unrelated data.
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "8");
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=Sheet2!A1*2");
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 1), Value::Number(16.0));
+
+        let broken = w.delete_sheet(s2).expect("delete");
+        assert_eq!(broken, 1);
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=#REF!*2"),
+            "the formula text must record the broken reference"
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 1),
+            Value::Error(ErrorKind::Ref)
+        );
+
+        // THE point of breaking the text: a new sheet with the old name must
+        // NOT resurrect the formula pointing at different data.
+        let fresh = w
+            .add_sheet("Sheet2", BaseData::Memory(Sheet::new("Sheet2")))
+            .expect("add");
+        w.activate(fresh).unwrap();
+        w.commit_edit(CellRef::new(0, 0), "999");
+        w.activate(SheetId::MAIN).unwrap();
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 1),
+            Value::Error(ErrorKind::Ref),
+            "a reused sheet name must not silently rebind a broken formula"
+        );
+    }
+
+    #[test]
+    fn deleting_a_sheet_collapses_a_whole_range_reference() {
+        let (mut w, s2) = two_sheet_wb();
+        w.activate(s2).unwrap();
+        for r in 0..3u32 {
+            w.commit_edit(CellRef::new(r, 0), "1");
+            w.end_edit_run();
+        }
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "=SUM(Sheet2!A1:A3)+1");
+        assert_eq!(val_in(&w, SheetId::MAIN, 0, 1), Value::Number(4.0));
+
+        w.delete_sheet(s2).expect("delete");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 0, 1).as_deref(),
+            Some("=SUM(#REF!)+1"),
+            "a broken range collapses to one #REF!, not #REF!:A3"
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 1),
+            Value::Error(ErrorKind::Ref)
+        );
+    }
+
+    #[test]
+    fn deleting_a_sheet_leaves_unrelated_formulas_alone() {
+        // The control. Without it, a delete that broke EVERY formula would
+        // pass the tests above.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=Sheet3!B1");
+        w.commit_edit(CellRef::new(6, 5), "=A1+A2");
+        w.commit_edit(CellRef::new(7, 5), "=\"Sheet3 total\"");
+
+        let broken = w.delete_sheet(s3).expect("delete");
+        assert_eq!(broken, 1, "only the real reference breaks");
+        assert_eq!(src_at(&w, SheetId::MAIN, 5, 5).as_deref(), Some("=#REF!"));
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 6, 5).as_deref(),
+            Some("=A1+A2"),
+            "a same-sheet formula is untouched"
+        );
+        assert_eq!(val_in(&w, SheetId::MAIN, 6, 5), Value::Number(3.0));
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 7, 5).as_deref(),
+            Some("=\"Sheet3 total\""),
+            "a sheet name inside a string literal is not a reference"
+        );
+    }
+
+    #[test]
+    fn deleting_an_endpoint_of_a_three_d_run_breaks_the_whole_reference() {
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+
+        w.delete_sheet(s3).expect("delete");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 5, 5).as_deref(),
+            Some("=SUM(#REF!)"),
+            "half a run would be a wrong total that looks right"
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Error(ErrorKind::Ref)
+        );
+    }
+
+    #[test]
+    fn deleting_a_sheet_in_the_middle_of_a_run_shrinks_the_total() {
+        // The middle sheet is not named in the text, so nothing is rewritten
+        // — but the run is one sheet shorter and the total must say so.
+        let (mut w, s2, s3) = three_sheet_wb();
+        seed_b1(&mut w, &[SheetId::MAIN, s2, s3], &[1.0, 20.0, 300.0]);
+        w.activate(SheetId::MAIN).unwrap();
+        w.commit_edit(CellRef::new(5, 5), "=SUM(Sheet1:Sheet3!B1)");
+        assert_eq!(val_in(&w, SheetId::MAIN, 5, 5), Value::Number(321.0));
+
+        let broken = w.delete_sheet(s2).expect("delete");
+        assert_eq!(broken, 0, "neither endpoint was named Sheet2");
+        assert_eq!(
+            src_at(&w, SheetId::MAIN, 5, 5).as_deref(),
+            Some("=SUM(Sheet1:Sheet3!B1)"),
+            "the text still names two live sheets"
+        );
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 5, 5),
+            Value::Number(301.0),
+            "the run is now Sheet1..Sheet3 with nothing between them"
+        );
+    }
+
+    #[test]
+    fn a_cross_sheet_cycle_through_a_three_d_run_is_detected() {
+        // Same criterion as the two-sheet cycle test, but the loop closes
+        // through a RUN: Sheet1!B1 is inside Sheet1:Sheet3!B1:B9.
+        let (mut w, s2, s3) = three_sheet_wb();
+        w.activate(s3).unwrap();
+        w.commit_edit(CellRef::new(0, 5), "=SUM(Sheet1:Sheet3!B1:B9)");
+        w.activate(SheetId::MAIN).unwrap();
+        let rep = w.commit_edit(CellRef::new(0, 1), "=Sheet3!F1");
+        assert!(rep.circular, "the run reaches back into this very cell");
+        assert_eq!(
+            val_in(&w, SheetId::MAIN, 0, 1),
+            Value::Error(ErrorKind::Circular)
+        );
+        // A full recalc over the same graph must terminate, not spin.
+        w.recalc_all();
+        assert_eq!(
+            val_in(&w, s2, 0, 0),
+            Value::Empty,
+            "the recalc completed rather than hanging"
         );
     }
 

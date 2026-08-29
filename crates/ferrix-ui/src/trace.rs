@@ -135,7 +135,7 @@ mod tests {
         let mut g = DepGraph::new();
         for &(at, src) in formulas {
             let expr = parse(src).unwrap();
-            g.set_formula_at(at, &expr, &|_| None);
+            g.set_formula_at(at, &expr, &ferrix_formula::depgraph::SheetIndex::default());
         }
         g
     }
