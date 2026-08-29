@@ -529,6 +529,76 @@ impl Harness {
         self.app.status_text()
     }
 
+    // ---- goal seek (issue #35) ----
+    //
+    // Same reasoning as `cond_new_rule`: the Data menu item lives at a pixel
+    // that moves with the theme and window width, so opening goes through the
+    // exact entry point the menu item calls. Everything AFTER that — filling
+    // the fields, pressing Solve, pressing Cancel — goes through the real
+    // dialog and its real, painted buttons.
+
+    /// Open the Goal Seek dialog, as the Data menu item does.
+    pub fn goal_seek_open(&mut self) -> &mut Self {
+        self.app.goal_seek_open();
+        self.steps(2);
+        self
+    }
+
+    /// Fill the dialog's three fields the way the text widgets would.
+    pub fn goal_seek_fill(
+        &mut self,
+        set_cell: &str,
+        to_value: &str,
+        by_changing: &str,
+    ) -> &mut Self {
+        let st = self
+            .app
+            .goal_seek_state_mut()
+            .expect("the Goal Seek dialog is not open");
+        st.set_cell = set_cell.to_string();
+        st.to_value = to_value.to_string();
+        st.by_changing = by_changing.to_string();
+        self.steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL Solve button, at wherever it was painted.
+    ///
+    /// Not a call to `goal_seek_solve`: this is a genuine move-then-click at
+    /// the button's reported rect, so a dialog whose Solve never draws fails
+    /// the test instead of passing it.
+    pub fn goal_seek_click_solve(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .goal_seek_state()
+            .and_then(|s| s.solve_rect)
+            .expect("the Goal Seek dialog's Solve button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
+    /// Press the dialog's REAL Cancel button.
+    pub fn goal_seek_click_cancel(&mut self) -> &mut Self {
+        self.step();
+        let r = self
+            .app
+            .goal_seek_state()
+            .and_then(|s| s.cancel_rect)
+            .expect("the Goal Seek dialog's Cancel button was never painted");
+        self.click_at(r.center().x, r.center().y).steps(2);
+        self
+    }
+
+    /// The dialog's own result line, which is where a Goal Seek run reports.
+    pub fn goal_seek_message(&self) -> Option<&str> {
+        self.app.goal_seek_message()
+    }
+
+    pub fn goal_seek_is_open(&self) -> bool {
+        self.app.goal_seek_is_open()
+    }
+
     /// Frames run so far.
     pub fn frames(&self) -> u64 {
         self.frame
@@ -4279,6 +4349,245 @@ xxx,yyy,zzz
             drawn, 1,
             "an off-screen precedent must still produce an arrow to the \
              viewport edge, not be silently dropped"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- Goal Seek (issue #35) ----
+    //
+    // These drive the REAL dialog: the fields the widgets bind to, and the
+    // Solve/Cancel buttons at the rects they were actually painted at. What
+    // each asserts if the gesture were dead: every one reads a NUMBER back out
+    // of the grid, or an undo depth, so a dialog that opens and does nothing
+    // fails. Deliberately NOT asserting "the status line is non-empty" — the
+    // file-load message already satisfies that, and this repo has been burned
+    // by exactly that assertion before.
+
+    /// Seed a sheet where D1 = C1*2, C1 = B1+5, B1 = 2 — so D1 is two hops
+    /// downstream of B1 and equals 14 at rest.
+    fn goal_seek_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(name, "a,b,c,d\n1,2,0,0\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        // C1 = B1 + 5
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.step();
+        h.type_text("=B1+5").step();
+        h.press_key(Key::Enter).steps(3);
+        // D1 = C1 * 2
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(0, 3), CellRef::new(0, 3));
+        h.step();
+        h.type_text("=C1*2").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "14",
+            "setup: D1 = (B1+5)*2 = 14"
+        );
+        (p, h)
+    }
+
+    #[test]
+    fn goal_seek_solves_through_the_real_dialog_two_hops_downstream() {
+        let (p, mut h) = goal_seek_fixture("goalseek_solve.csv");
+
+        h.goal_seek_open();
+        assert!(
+            h.goal_seek_is_open(),
+            "the Data menu item must open a dialog"
+        );
+        // D1 = 30 => C1 = 15 => B1 = 10. B1 is TWO hops upstream of D1.
+        h.goal_seek_fill("D1", "30", "B1");
+        h.goal_seek_click_solve();
+
+        // The grid, not the report: this is what the user sees.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "10",
+            "B1 must have been solved to 10"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "30",
+            "the target cell must actually read 30"
+        );
+        // The intermediate hop must have recalculated too.
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "15", "C1 = B1+5");
+        // And the dialog said so, in its own message rather than only in the
+        // status bar.
+        let msg = h.goal_seek_message().expect("a run must report something");
+        assert!(
+            msg.contains("D1") && msg.contains("B1"),
+            "the result must name both cells: {msg:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn goal_seek_refuses_a_cell_the_target_does_not_depend_on() {
+        let (p, mut h) = goal_seek_fixture("goalseek_refuse.csv");
+        let before_d1 = h.app().display(CellRef::new(0, 3));
+        let before_a1 = h.app().display(CellRef::new(0, 0));
+        let depth_before = h.app().undo_depth();
+
+        h.goal_seek_open();
+        // A1 is a plain data cell that nothing in the D1 chain reads.
+        h.goal_seek_fill("D1", "999", "A1");
+        h.goal_seek_click_solve();
+
+        let msg = h.goal_seek_message().expect("a refusal must be reported");
+        assert!(
+            msg.contains("does not depend"),
+            "the refusal must explain WHY, not just say it failed: {msg:?}"
+        );
+        // Refusal is total: no value moved and no history was written.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 0)),
+            before_a1,
+            "the changing cell must not have been touched"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            before_d1,
+            "the target must not have moved"
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before,
+            "a refusal must push no undo entry"
+        );
+        assert!(
+            h.goal_seek_is_open(),
+            "the dialog stays open to be corrected"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_goal_seek_run_is_one_undo_step_and_cancel_restores_the_changing_cell() {
+        let (p, mut h) = goal_seek_fixture("goalseek_cancel.csv");
+        let depth_before = h.app().undo_depth();
+
+        h.goal_seek_open();
+        h.goal_seek_fill("D1", "30", "B1");
+        h.goal_seek_click_solve();
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "10", "setup: solved");
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before + 1,
+            "however many iterations it took, the run is ONE undo step"
+        );
+
+        // Cancel, at the button's real painted rect.
+        h.goal_seek_click_cancel();
+
+        assert!(!h.goal_seek_is_open(), "Cancel closes the dialog");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "2",
+            "Cancel must restore B1 to its original 2"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "14",
+            "and the dependents must go back with it"
+        );
+        assert_eq!(
+            h.app().undo_depth(),
+            depth_before,
+            "Cancel consumed exactly the one entry the run created"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn cancelling_a_goal_seek_that_never_ran_does_not_undo_the_previous_edit() {
+        // The trap this pins: Cancel is "undo the run". With no run, undoing
+        // anyway silently rewinds whatever the user did BEFORE opening the
+        // dialog.
+        let (p, mut h) = goal_seek_fixture("goalseek_cancel_noop.csv");
+        // A distinctive edit that must survive.
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.step();
+        h.type_text("77").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 1)), "77", "setup");
+        let depth = h.app().undo_depth();
+
+        h.goal_seek_open();
+        h.goal_seek_click_cancel(); // no Solve at all
+
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "77",
+            "Cancel with nothing applied must not eat the user's own edit"
+        );
+        assert_eq!(h.app().undo_depth(), depth, "and must not pop history");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_non_convergent_goal_seek_reports_the_closest_value_not_success() {
+        let p = write_csv("goalseek_diverge.csv", "a,b,c\n1,3,0\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        // C1 = B1*B1 + 5, whose minimum is 5 — a target of 1 is unreachable.
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.step();
+        h.type_text("=B1*B1+5").step();
+        h.press_key(Key::Enter).steps(3);
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "14", "setup: 3*3+5");
+
+        h.goal_seek_open();
+        h.goal_seek_fill("C1", "1", "B1");
+        h.goal_seek_click_solve();
+
+        let msg = h.goal_seek_message().expect("a run must report something");
+        assert!(
+            msg.contains("No solution") && msg.contains("Closest"),
+            "an unreachable target must be reported as a near miss, not a \
+             success: {msg:?}"
+        );
+        // The reported value must be one the model can actually produce, and
+        // the grid must agree with it.
+        let c1: f64 = h
+            .app()
+            .display(CellRef::new(0, 2))
+            .parse()
+            .expect("C1 is a number");
+        assert!(
+            c1 >= 5.0,
+            "C1 = B1*B1+5 can never be below 5, grid shows {c1}"
+        );
+        assert!(
+            (c1 - 1.0).abs() > 1.0,
+            "it must not claim to have reached 1: {c1}"
+        );
+        assert!(
+            c1 < 14.0,
+            "but it must still have got closer than the starting 14: {c1}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn goal_seek_seeds_set_cell_from_the_cursor_and_leaves_changing_blank() {
+        let (p, mut h) = goal_seek_fixture("goalseek_seed.csv");
+        h.app_mut()
+            .set_selection_for_test(CellRef::new(0, 3), CellRef::new(0, 3));
+        h.step();
+
+        h.goal_seek_open();
+        let st = h.app().goal_seek_state().expect("open");
+        assert_eq!(st.set_cell, "D1", "Set cell seeds from the cursor");
+        assert!(
+            st.by_changing.is_empty(),
+            "By changing must NOT be guessed, got {:?}",
+            st.by_changing
         );
         let _ = std::fs::remove_file(&p);
     }
