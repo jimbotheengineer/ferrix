@@ -955,6 +955,16 @@ impl FerrixApp {
         &self.prefs.recent
     }
 
+    /// The body pane's scroll offset, in fractional rows.
+    pub fn scroll_row_offset(&self) -> f64 {
+        self.scroll.row_offset
+    }
+
+    /// The active sheet's name — the sheet half of the zoom key.
+    pub fn active_sheet_name(&self) -> &str {
+        self.wb.active_name()
+    }
+
     /// Where the user is right now, as a restorable session.
     pub fn current_session(&self) -> crate::recent::Session {
         crate::recent::Session {
@@ -1020,20 +1030,43 @@ impl FerrixApp {
 
     /// Start a workbook seeded from `templates()[i]`.
     ///
-    /// The seed rows are committed through the SAME `commit_edit` path a user
-    /// typing them would take, so a template's formulas are parsed and
-    /// evaluated by the real engine rather than by a second, drifting one.
+    /// Literal cells are written into the base sheet, which is what gives the
+    /// sheet its extent — an overlay entry outside the base's row count reads
+    /// as empty, so committing everything through the overlay would produce a
+    /// workbook that looks blank.
+    ///
+    /// Formulas then go through the SAME `commit_edit` path a user typing them
+    /// would take, so they are parsed, graphed and evaluated by the real
+    /// engine rather than by a second, drifting one.
     pub fn new_from_template(&mut self, index: usize) {
         let Some(t) = crate::recent::templates().get(index) else {
             return;
         };
         let mut sheet = Sheet::new(t.name);
         sheet.set_headers(t.headers.iter().map(|h| h.to_string()).collect());
-        self.wb = Workbook::new(BaseData::Memory(sheet));
-        self.reset_for_new_workbook();
+        // Pass one: literals into the base, establishing the extent. A cell
+        // that parses as a number is stored as one so the template's sums have
+        // numbers to add rather than text.
         for (r, row) in t.rows.iter().enumerate() {
             for (c, text) in row.iter().enumerate() {
-                if !text.is_empty() {
+                let cell = CellRef::new(r as u32, c as u32);
+                if text.starts_with('=') {
+                    // Reserved by an empty value so the column exists and the
+                    // row count covers it; the formula lands in pass two.
+                    sheet.set(cell, ferrix_core::Value::Empty);
+                } else if let Ok(n) = text.parse::<f64>() {
+                    sheet.set(cell, ferrix_core::Value::Number(n));
+                } else {
+                    sheet.set_text(cell, text);
+                }
+            }
+        }
+        self.wb = Workbook::new(BaseData::Memory(sheet));
+        self.reset_for_new_workbook();
+        // Pass two: the formulas, through the real commit path.
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                if text.starts_with('=') {
                     self.wb.commit_edit(CellRef::new(r as u32, c as u32), text);
                 }
             }
@@ -1942,6 +1975,10 @@ impl FerrixApp {
         self.edits_path = Some(ferrix_io::edits::edits_path_for(cache));
         self.fingerprint =
             ferrix_io::compact::fingerprint_after(cache, rows as u64, cols as u32).ok();
+        // A cache is now open, so the start screen must step aside — it takes
+        // the whole frame and the grid would never run behind it (issue #45).
+        self.source_path = Some(cache.to_path_buf());
+        self.show_start = false;
         Ok(())
     }
 

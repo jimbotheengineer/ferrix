@@ -112,7 +112,7 @@ pub fn remove(list: &mut Vec<RecentEntry>, path: &Path) {
 }
 
 /// Record where the user was in `path`.
-pub fn set_session(list: &mut Vec<RecentEntry>, path: &Path, session: Session) {
+pub fn set_session(list: &mut [RecentEntry], path: &Path, session: Session) {
     if let Some(e) = list.iter_mut().find(|e| e.path == path) {
         e.session = session;
     }
@@ -292,6 +292,12 @@ pub struct Template {
 /// template that can go missing. Three is a deliberate floor, not a roadmap —
 /// the point of the criterion is that the start screen offers templates at
 /// all.
+///
+/// The formulas use A1 rows starting at 1 for the FIRST SEED ROW: headers
+/// live in their own band rather than in data row 0, so `rows[0]` is A1 row 1.
+/// Getting this off by one is silent — the formula still evaluates, just over
+/// the wrong cells — so `a_template_opens_a_workbook_whose_formulas_actually_
+/// evaluate` pins the arithmetic rather than merely that a number appeared.
 pub fn templates() -> &'static [Template] {
     &[
         Template {
@@ -299,10 +305,10 @@ pub fn templates() -> &'static [Template] {
             description: "Monthly income and outgoings with a running total.",
             headers: &["Category", "Planned", "Actual", "Difference"],
             rows: &[
-                &["Rent", "1200", "1200", "=C2-B2"],
-                &["Groceries", "400", "0", "=C3-B3"],
-                &["Transport", "120", "0", "=C4-B4"],
-                &["Total", "=SUM(B2:B4)", "=SUM(C2:C4)", "=SUM(D2:D4)"],
+                &["Rent", "1200", "1200", "=C1-B1"],
+                &["Groceries", "400", "0", "=C2-B2"],
+                &["Transport", "120", "0", "=C3-B3"],
+                &["Total", "=SUM(B1:B3)", "=SUM(C1:C3)", "=SUM(D1:D3)"],
             ],
         },
         Template {
@@ -319,9 +325,9 @@ pub fn templates() -> &'static [Template] {
             description: "Line items with quantity, unit price and a total.",
             headers: &["Item", "Qty", "Unit price", "Amount"],
             rows: &[
+                &["", "1", "0", "=B1*C1"],
                 &["", "1", "0", "=B2*C2"],
-                &["", "1", "0", "=B3*C3"],
-                &["Total", "", "", "=SUM(D2:D3)"],
+                &["Total", "", "", "=SUM(D1:D2)"],
             ],
         },
     ]
