@@ -4073,8 +4073,7 @@ where
         );
         let rows = sheet.row_count();
         let cols = sheet.col_count();
-        let (edits_path, fingerprint, restored, edit_warning, recovery) =
-            restore_edits(path, rows as u64, cols as u32);
+        let restored_edits = restore_edits(path, rows as u64, cols as u32);
         return Ok(Loaded {
             rows,
             cols,
@@ -4084,11 +4083,11 @@ where
             sheet_name: stem,
             extra_sheets: Vec::new(),
             first_formulas: None,
-            edits_path,
-            fingerprint,
-            restored,
-            edit_warning,
-            recovery,
+            edits_path: restored_edits.path,
+            fingerprint: restored_edits.fingerprint,
+            restored: restored_edits.overlay,
+            edit_warning: restored_edits.warning,
+            recovery: restored_edits.recovery,
         });
     }
 
@@ -4132,8 +4131,7 @@ where
     // Edits are keyed to the cache, not the CSV: the cache is what the grid
     // actually reads, and regenerating it is exactly the event that should
     // invalidate saved edits.
-    let (edits_path, fingerprint, restored, edit_warning, recovery) =
-        restore_edits(&cache, rows as u64, cols as u32);
+    let restored_edits = restore_edits(&cache, rows as u64, cols as u32);
 
     Ok(Loaded {
         rows,
@@ -4144,11 +4142,11 @@ where
         sheet_name: stem,
         extra_sheets: Vec::new(),
         first_formulas: None,
-        edits_path,
-        fingerprint,
-        restored,
-        edit_warning,
-        recovery,
+        edits_path: restored_edits.path,
+        fingerprint: restored_edits.fingerprint,
+        restored: restored_edits.overlay,
+        edit_warning: restored_edits.warning,
+        recovery: restored_edits.recovery,
     })
 }
 
@@ -4220,23 +4218,23 @@ fn load_xlsx(path: &Path) -> LoadResult {
 ///
 /// Returns the sidecar path and fingerprint regardless, so a later save knows
 /// where to write even when nothing was restored.
-fn restore_edits(
-    base: &Path,
-    rows: u64,
-    cols: u32,
-) -> (
-    Option<PathBuf>,
-    Option<ferrix_io::edits::BaseFingerprint>,
-    Option<ferrix_core::EditOverlay>,
-    Option<String>,
-    Option<ferrix_io::edits::RecoveryCandidate>,
-) {
+/// What a sidecar lookup found next to a base file.
+#[derive(Default)]
+struct RestoredEdits {
+    path: Option<PathBuf>,
+    fingerprint: Option<ferrix_io::edits::BaseFingerprint>,
+    overlay: Option<ferrix_core::EditOverlay>,
+    warning: Option<String>,
+    recovery: Option<ferrix_io::edits::RecoveryCandidate>,
+}
+
+fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
     use ferrix_io::edits;
     let fp = match edits::BaseFingerprint::of(base, rows, cols) {
         Ok(f) => f,
         // Cannot fingerprint (permissions, vanished file): saving would be
         // unsafe, so report no path rather than risk a mismatched sidecar.
-        Err(_) => return (None, None, None, None, None),
+        Err(_) => return RestoredEdits::default(),
     };
     let path = edits::edits_path_for(base);
     // An autosave newer than the sidecar means the last session ended without
@@ -4244,12 +4242,19 @@ fn restore_edits(
     // the user rather than applied, because silently resurrecting edits is as
     // surprising as silently losing them.
     let recovery = edits::find_recovery(&path);
-    match edits::load_edits(&path, fp) {
-        Ok(Some(ov)) => (Some(path), Some(fp), Some(ov), None, recovery),
-        Ok(None) => (Some(path), Some(fp), None, None, recovery),
+    let (overlay, warning) = match edits::load_edits(&path, fp) {
+        Ok(Some(ov)) => (Some(ov), None),
+        Ok(None) => (None, None),
         // A rejected sidecar must be surfaced. Silently continuing would look
         // like the user's saved edits simply vanished.
-        Err(e) => (Some(path), Some(fp), None, Some(e.to_string()), recovery),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    RestoredEdits {
+        path: Some(path),
+        fingerprint: Some(fp),
+        overlay,
+        warning,
+        recovery,
     }
 }
 
