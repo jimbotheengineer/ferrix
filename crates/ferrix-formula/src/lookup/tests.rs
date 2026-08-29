@@ -614,6 +614,81 @@ fn indirect_recursion_budget_yields_ref_instead_of_hanging() {
     );
 }
 
+// --- INDIRECT and the dependency graph ------------------------------------
+
+/// The documented gap, asserted rather than merely described.
+///
+/// The module docs claim `INDIRECT`'s edges cannot be collected statically.
+/// This test PINS that claim, so it cannot quietly become false (or quietly
+/// stay false after someone "fixes" it in a way that produces a stale edge).
+/// If a future change did make `collect_precedents` see through `INDIRECT`,
+/// this test fails and forces the module docs — and the staleness argument in
+/// them — to be revisited deliberately.
+#[test]
+fn indirect_contributes_no_static_precedent_edge_for_its_target() {
+    use crate::depgraph::{collect_precedents, Precedent};
+
+    // A direct reference to A3 produces an edge to A3.
+    let mut direct = Vec::new();
+    collect_precedents(&parse("=A3").unwrap(), &mut direct);
+    assert_eq!(direct, vec![Precedent::Cell(CellRef::new(2, 0))]);
+
+    // The SAME target reached through INDIRECT produces NO edge at all: the
+    // parse tree holds a string literal, not a reference.
+    let mut via_indirect = Vec::new();
+    collect_precedents(&parse("=INDIRECT(\"A3\")").unwrap(), &mut via_indirect);
+    assert!(
+        via_indirect.is_empty(),
+        "INDIRECT(\"A3\") contributed {via_indirect:?}; the dependency graph \
+         walks the parse tree, where the target is a string. If this ever \
+         becomes non-empty, the staleness argument in the module docs needs \
+         rewriting, not silently ignoring"
+    );
+
+    // And the ARGUMENT's own references ARE collected — INDIRECT does not
+    // hide the cells that compute its target, only the cell it lands on. This
+    // is what makes `=INDIRECT(E1)` recalculate when E1 changes even though
+    // it does not recalculate when the cell E1 NAMES changes.
+    let mut computed = Vec::new();
+    collect_precedents(&parse("=INDIRECT(E1)").unwrap(), &mut computed);
+    assert_eq!(
+        computed,
+        vec![Precedent::Cell(CellRef::new(0, 4))],
+        "the driving cell E1 must still be an edge; only the resolved target \
+         is invisible"
+    );
+}
+
+/// The consequence, stated as a test: an `INDIRECT` cycle is invisible to the
+/// graph's cycle detector, which is precisely why the runtime budget exists.
+///
+/// Written as a positive assertion about what the detector DOES see, so it
+/// documents the limitation instead of pretending it is not there.
+#[test]
+fn the_dep_graph_cannot_see_an_indirect_cycle() {
+    use crate::depgraph::DepGraph;
+    use ferrix_core::CellRef as CR;
+
+    let mut g = DepGraph::new();
+    // A1 = INDIRECT("A1") is a genuine self-cycle at runtime.
+    g.set_formula(CR::new(0, 0), &parse("=INDIRECT(\"A1\")").unwrap());
+    assert!(
+        !g.is_circular(CR::new(0, 0)),
+        "the static graph reported an INDIRECT cycle; if it has learned to \
+         see through INDIRECT then MAX_INDIRECT_DEPTH is no longer the only \
+         defence and the module docs must say so"
+    );
+
+    // A direct self-reference, by contrast, IS caught — so the detector is
+    // working and the line above is a real limitation, not a dead assertion.
+    g.set_formula(CR::new(1, 0), &parse("=A2+1").unwrap());
+    assert!(
+        g.is_circular(CR::new(1, 0)),
+        "the cycle detector failed on a direct self-reference, so the \
+         INDIRECT assertion above proves nothing"
+    );
+}
+
 #[test]
 fn indirect_nesting_just_inside_the_budget_still_resolves() {
     // The complement of the test above: the budget must not be so tight that
