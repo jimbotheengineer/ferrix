@@ -352,6 +352,17 @@ pub struct FerrixApp {
     /// Comment markers painted by the last frame.
     last_comment_markers: usize,
 
+    /// Active trace-precedents/dependents session (roadmap #39), if any.
+    /// `None` means "Remove Arrows" was pressed or nothing has been traced.
+    trace: Option<crate::trace::TraceState>,
+    /// Arrows actually painted by the last frame, for the "showing N of M"
+    /// status note and for tests asserting on real paint output rather than
+    /// on the model.
+    last_trace_arrows: usize,
+    /// Total arrows the current trace level would draw before the cap —
+    /// what the "showing N of M" note reports alongside `last_trace_arrows`.
+    last_trace_total: usize,
+
     /// Sheet currently being renamed inline, and the buffer being typed into.
     renaming: Option<ferrix_core::SheetId>,
     rename_buffer: String,
@@ -495,6 +506,9 @@ impl FerrixApp {
             allow_close: false,
             comments_path: None,
             last_comment_markers: 0,
+            trace: None,
+            last_trace_arrows: 0,
+            last_trace_total: 0,
             comment_editing: None,
             comment_buffer: String::new(),
             comment_author_buffer: String::new(),
@@ -840,6 +854,79 @@ impl FerrixApp {
 
     pub fn zoom_reset(&mut self) {
         self.set_zoom(1.0);
+    }
+
+    // ---- trace precedents / dependents (roadmap #39) ----
+
+    /// The active trace session, for the caller to paint arrows for.
+    pub fn trace(&self) -> Option<crate::trace::TraceState> {
+        self.trace
+    }
+
+    /// The workbook-wide dependency graph, for callers that want to ask
+    /// questions about it directly (tests, and future trace UI).
+    pub fn graph_snapshot(&self) -> &ferrix_formula::depgraph::DepGraph {
+        &self.wb.graph
+    }
+
+    /// The active sheet's id, for tests that need to build a `SheetCell`.
+    pub fn active_sheet_id(&self) -> ferrix_core::SheetId {
+        self.wb.active_sheet()
+    }
+
+    /// Arrows painted by the last frame, and how many the current trace
+    /// level covers before the cap — the "showing N of M" note.
+    pub fn trace_counts(&self) -> (usize, usize) {
+        (self.last_trace_arrows, self.last_trace_total)
+    }
+
+    fn origin_cell(&self) -> ferrix_core::SheetCell {
+        ferrix_core::SheetCell::new(self.wb.active_sheet(), self.selection.cursor)
+    }
+
+    /// Trace Precedents on the cursor cell. A second press on the SAME
+    /// origin+direction walks one level further out, matching Excel; a press
+    /// on a different cell (or the other direction) starts a fresh trace.
+    pub fn trace_precedents(&mut self) {
+        self.trace_step(crate::trace::TraceKind::Precedents);
+    }
+
+    /// Trace Dependents on the cursor cell. Same one-level-further-out
+    /// behaviour as `trace_precedents`.
+    pub fn trace_dependents(&mut self) {
+        self.trace_step(crate::trace::TraceKind::Dependents);
+    }
+
+    fn trace_step(&mut self, kind: crate::trace::TraceKind) {
+        let origin = self.origin_cell();
+        match &mut self.trace {
+            Some(t) if t.origin == origin && t.kind == kind => {
+                t.depth += 1;
+            }
+            _ => {
+                self.trace = Some(crate::trace::TraceState::new(origin, kind));
+            }
+        }
+        let label = match kind {
+            crate::trace::TraceKind::Precedents => "Precedents",
+            crate::trace::TraceKind::Dependents => "Dependents",
+        };
+        let depth = self.trace.map(|t| t.depth).unwrap_or(1);
+        self.status = format!(
+            "Tracing {label} of {} ({depth} level{})",
+            cell_label(origin.cell),
+            if depth == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Remove Arrows: clears the active trace. Changing the selection does
+    /// NOT do this implicitly — arrows must not strand themselves silently,
+    /// but they also must not vanish just because the user glanced at
+    /// another cell, so an explicit clear is the only way out.
+    pub fn clear_trace(&mut self) {
+        if self.trace.take().is_some() {
+            self.status = "Removed trace arrows".into();
+        }
     }
 
     fn set_show_empty_rows(&mut self, on: bool) {
@@ -4370,6 +4457,22 @@ impl FerrixApp {
             self.zoom_reset();
             return;
         }
+        // --- trace precedents/dependents shortcuts (roadmap #39) ---
+        let (trace_prec_key, trace_dep_key) = ctx.input(|i| {
+            let c = i.modifiers.command;
+            (
+                c && i.key_pressed(Key::OpenBracket),
+                c && i.key_pressed(Key::CloseBracket),
+            )
+        });
+        if self.editing.is_none() && trace_prec_key {
+            self.trace_precedents();
+            return;
+        }
+        if self.editing.is_none() && trace_dep_key {
+            self.trace_dependents();
+            return;
+        }
         // Clipboard and select-all only apply when the grid owns the keyboard;
         // inside a text field the widget's own handling must win.
         let grid_has_keys = ctx.memory(|m| m.focused()).is_none() && self.focus == Focus::Grid;
@@ -4847,6 +4950,38 @@ impl FerrixApp {
                             .clicked()
                         {
                             cond_action = Some(true);
+                            ui.close_menu();
+                        }
+                    });
+
+                    // --- Formula menu: trace precedents/dependents (roadmap #39) ---
+                    ui.menu_button("Formula", |ui| {
+                        let has_trace = self.trace.is_some();
+                        if ui
+                            .button("↖ Trace Precedents  (Ctrl+[)")
+                            .on_hover_text(
+                                "Draw arrows from what this cell reads. Press again to walk one level further out.",
+                            )
+                            .clicked()
+                        {
+                            self.trace_precedents();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("↘ Trace Dependents  (Ctrl+])")
+                            .on_hover_text(
+                                "Draw arrows to what reads this cell. Press again to walk one level further out.",
+                            )
+                            .clicked()
+                        {
+                            self.trace_dependents();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_trace, egui::Button::new("✖ Remove Arrows"))
+                            .clicked()
+                        {
+                            self.clear_trace();
                             ui.close_menu();
                         }
                     });
@@ -5536,6 +5671,79 @@ impl FerrixApp {
                 self.last_painted = resp.painted_cells;
                 self.last_comment_markers = resp.comment_markers;
 
+                // --- trace precedents / dependents arrows (roadmap #39) ---
+                //
+                // Painted straight onto the grid's own Painter, like the
+                // in-cell editor is positioned below: the grid owns no
+                // widget per cell to hang an overlay off, so this reads the
+                // same geometry (`cell_screen_rect`) rather than keeping a
+                // second copy of it.
+                if let Some(trace) = self.trace {
+                    let pad = self.pad_space();
+                    let resolver = self.row_resolver(pad);
+                    let metrics = crate::grid::Metrics::new(self.zoom);
+                    let (edges, total) = crate::trace::edges_for(&self.wb.graph, trace);
+                    let active_sheet = self.wb.active_sheet();
+                    let painter = ui.painter().with_clip_rect(outer);
+                    let mut drawn = 0usize;
+                    for edge in &edges {
+                        // Only the active sheet's endpoints are on screen at
+                        // all; a cross-sheet edge is real in the model but
+                        // has nowhere to be painted here.
+                        if edge.from.sheet != active_sheet || edge.to.sheet != active_sheet {
+                            continue;
+                        }
+                        let from_rect = Grid::cell_screen_rect(
+                            edge.from.cell,
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        );
+                        let to_rect = Grid::cell_screen_rect(
+                            edge.to.cell,
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        );
+                        // A cell in a cycle is drawn with a distinct dashed
+                        // stroke — the existing cycle detection already
+                        // finds these, so this is purely a paint choice.
+                        let cyclic = self.wb.graph.is_circular_at(edge.from)
+                            || self.wb.graph.is_circular_at(edge.to);
+                        let color = if cyclic { th.error } else { th.accent };
+                        match (from_rect, to_rect) {
+                            (Some(fr), Some(tr)) => {
+                                draw_trace_arrow(&painter, fr.center(), tr.center(), color, cyclic);
+                            }
+                            // One (or both) endpoints are off screen. Point
+                            // an arrow at the viewport edge nearest the
+                            // hidden endpoint, rather than at wrong
+                            // coordinates or not drawing anything at all.
+                            (Some(fr), None) => {
+                                let edge_pt = clamp_to_rect_edge(outer, fr.center());
+                                draw_trace_arrow(&painter, fr.center(), edge_pt, color, cyclic);
+                            }
+                            (None, Some(tr)) => {
+                                let edge_pt = clamp_to_rect_edge(outer, tr.center());
+                                draw_trace_arrow(&painter, edge_pt, tr.center(), color, cyclic);
+                            }
+                            (None, None) => continue,
+                        }
+                        drawn += 1;
+                    }
+                    self.last_trace_arrows = drawn;
+                    self.last_trace_total = total;
+                } else {
+                    self.last_trace_arrows = 0;
+                    self.last_trace_total = 0;
+                }
+
                 // Right-click opens the cell menu. Anchored at the click
                 // point and remembered across frames, because the click event
                 // is gone by the frame the menu is first drawn.
@@ -6204,6 +6412,66 @@ fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
 /// A1-style label for a cell, for status messages.
 fn cell_label(cell: CellRef) -> String {
     format!("{}{}", ferrix_core::column_name(cell.col), cell.row + 1)
+}
+
+/// Draw one trace arrow from `from` to `to`. A cyclic edge is dashed so it
+/// reads as distinct from an ordinary precedent/dependent arrow at a glance,
+/// per the acceptance criteria — the underlying cycle detection already
+/// exists in `DepGraph::is_circular_at`.
+fn draw_trace_arrow(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    color: egui::Color32,
+    dashed: bool,
+) {
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    if dashed {
+        // egui has no built-in dashed line; approximate with short segments
+        // along the vector so a cycle arrow is visually distinct without
+        // pulling in a new dependency for one stroke style.
+        let delta = to - from;
+        let len = delta.length();
+        if len < 1.0 {
+            return;
+        }
+        let dir = delta / len;
+        let dash = 6.0_f32;
+        let gap = 4.0_f32;
+        let mut t = 0.0_f32;
+        while t < len {
+            let seg_end = (t + dash).min(len);
+            painter.line_segment([from + dir * t, from + dir * seg_end], stroke);
+            t += dash + gap;
+        }
+    } else {
+        painter.line_segment([from, to], stroke);
+    }
+    // Arrowhead at `to`: a small filled triangle pointing along the segment.
+    let delta = to - from;
+    if delta.length() > 1.0 {
+        let dir = delta.normalized();
+        let perp = egui::Vec2::new(-dir.y, dir.x);
+        let head = 6.0_f32;
+        let p1 = to;
+        let p2 = to - dir * head + perp * (head * 0.5);
+        let p3 = to - dir * head - perp * (head * 0.5);
+        painter.add(egui::Shape::convex_polygon(
+            vec![p1, p2, p3],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+/// The point on `rect`'s border nearest `target`, for pointing an arrow at
+/// the viewport edge when the real endpoint has scrolled off screen — rather
+/// than drawing at wrong coordinates or dropping the arrow.
+fn clamp_to_rect_edge(rect: egui::Rect, target: egui::Pos2) -> egui::Pos2 {
+    egui::Pos2::new(
+        target.x.clamp(rect.min.x, rect.max.x),
+        target.y.clamp(rect.min.y, rect.max.y),
+    )
 }
 
 /// Who a new comment is attributed to.

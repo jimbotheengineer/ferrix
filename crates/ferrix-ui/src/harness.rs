@@ -398,6 +398,37 @@ impl Harness {
         self
     }
 
+    // ---- trace precedents / dependents (roadmap #39) ----
+
+    /// Trace Precedents on the cursor cell, same entry point the Formula
+    /// menu item and Ctrl+[ call.
+    pub fn trace_precedents(&mut self) -> &mut Self {
+        self.app.trace_precedents();
+        self.steps(2);
+        self
+    }
+
+    /// Trace Dependents on the cursor cell, same entry point the Formula
+    /// menu item and Ctrl+] call.
+    pub fn trace_dependents(&mut self) -> &mut Self {
+        self.app.trace_dependents();
+        self.steps(2);
+        self
+    }
+
+    /// Remove Arrows.
+    pub fn clear_trace(&mut self) -> &mut Self {
+        self.app.clear_trace();
+        self.steps(2);
+        self
+    }
+
+    /// Arrows painted by the last frame, and how many the current trace
+    /// level covers before the cap.
+    pub fn trace_counts(&self) -> (usize, usize) {
+        self.app.trace_counts()
+    }
+
     /// Scroll the body pane to a screen row and let the frame settle.
     pub fn scroll_body_to(&mut self, screen_row: f64) -> &mut Self {
         self.app.scroll_body_to(screen_row);
@@ -3938,6 +3969,276 @@ xxx,yyy,zzz
             st.target.rules(&h.app().format_snapshot()).len(),
             1,
             "and it must list the rule that is actually there"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- trace precedents / dependents (roadmap #39) ----
+
+    fn small_numeric_app(name: &str) -> (Harness, std::path::PathBuf) {
+        let p = write_csv(name, NUMS);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+        (h, p)
+    }
+
+    /// The AGENT_GUIDE question, applied at the UI layer: tracing a cell
+    /// with no formula at all -- what a dead gesture would report if the
+    /// feature did nothing -- must draw ZERO arrows, not some placeholder.
+    #[test]
+    fn tracing_a_plain_data_cell_draws_no_arrows() {
+        let (mut h, p) = small_numeric_app("trace_dead.csv");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        let before = h.paint_shape_count();
+        h.trace_precedents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(drawn, 0, "a plain data cell has no precedents to draw");
+        assert_eq!(total, 0);
+        // The shape count must not have grown from tracing nothing -- the
+        // exact failure mode AGENT_GUIDE.md calls out: a status line (or
+        // here, a shape count) that looks non-trivial for a dead gesture.
+        let after = h.paint_shape_count();
+        assert!(
+            after <= before + 2,
+            "tracing an empty precedent set must not paint phantom arrows \
+             (before={before}, after={after})"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Trace Precedents on a real formula draws one arrow per precedent, and
+    /// the count is the REAL PAINT OUTPUT (`paint_shape_count`), not a model
+    /// value that could be wrong while nothing reaches the screen.
+    #[test]
+    fn trace_precedents_draws_one_arrow_per_precedent() {
+        let (mut h, p) = small_numeric_app("trace_prec.csv");
+        // C1 = A1 + B1 -- two precedents, both on screen at the default view.
+        edit_cell(&mut h, 0, 2, "=A1+B1");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        let shapes_before = h.paint_shape_count();
+        h.trace_precedents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, 2, "C1 reads exactly A1 and B1");
+        assert_eq!(drawn, 2, "both precedents are on screen and must be drawn");
+        let shapes_after = h.paint_shape_count();
+        assert!(
+            shapes_after > shapes_before,
+            "tracing a real formula must paint MORE shapes than before it \
+             (before={shapes_before}, after={shapes_after})"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Trace Dependents is the mirror direction: arrows point AT the cells
+    /// that read the traced one.
+    #[test]
+    fn trace_dependents_finds_every_direct_reader() {
+        let (mut h, p) = small_numeric_app("trace_dep.csv");
+        edit_cell(&mut h, 0, 2, "=A1*2");
+        edit_cell(&mut h, 0, 3, "=A1+1");
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.trace_dependents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, 2, "A1 has exactly two direct dependents");
+        assert_eq!(drawn, 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Repeated invocations walk one level further out, as Excel does --
+    /// the acceptance criterion checked directly against real paint output.
+    #[test]
+    fn repeated_trace_precedents_walks_further_out_each_time() {
+        let (mut h, p) = small_numeric_app("trace_depth.csv");
+        // C1 = A1, D1 = C1: a two-hop chain.
+        edit_cell(&mut h, 0, 2, "=A1");
+        edit_cell(&mut h, 0, 3, "=C1");
+        h.select(CellRef::new(0, 3), CellRef::new(0, 3));
+
+        h.trace_precedents();
+        let (drawn1, total1) = h.trace_counts();
+        assert_eq!(total1, 1, "first press reaches only C1");
+        assert_eq!(drawn1, 1);
+
+        h.trace_precedents();
+        let (drawn2, total2) = h.trace_counts();
+        assert_eq!(
+            total2, 2,
+            "second press on the SAME cell must walk one level further, to A1"
+        );
+        assert_eq!(drawn2, 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Remove Arrows actually clears the paint output, not just a flag --
+    /// asserted against `paint_shape_count`, matching AGENT_GUIDE.md's rule
+    /// that a UI test must read the screen, not the model.
+    #[test]
+    fn remove_arrows_stops_painting_them() {
+        let (mut h, p) = small_numeric_app("trace_remove.csv");
+        edit_cell(&mut h, 0, 2, "=A1+B1");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.trace_precedents();
+        let (drawn_before, _) = h.trace_counts();
+        assert_eq!(drawn_before, 2);
+
+        let shapes_with_arrows = h.paint_shape_count();
+        h.clear_trace();
+        let shapes_without = h.paint_shape_count();
+        let (drawn_after, total_after) = h.trace_counts();
+        assert_eq!(drawn_after, 0, "Remove Arrows must stop drawing them");
+        assert_eq!(total_after, 0);
+        assert!(
+            shapes_without < shapes_with_arrows,
+            "removing arrows must reduce the real paint output \
+             (with={shapes_with_arrows}, without={shapes_without})"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Changing the selection does NOT silently strand the arrows -- they
+    /// keep tracing their original origin cell until explicitly removed.
+    #[test]
+    fn changing_selection_does_not_clear_the_trace() {
+        let (mut h, p) = small_numeric_app("trace_stranded.csv");
+        edit_cell(&mut h, 0, 2, "=A1+B1");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.trace_precedents();
+        let (drawn_before, _) = h.trace_counts();
+        assert_eq!(drawn_before, 2);
+
+        // Move the selection elsewhere -- a plain move, not a menu action.
+        h.select(CellRef::new(3, 0), CellRef::new(3, 0));
+        h.step();
+        let (drawn_after, total_after) = h.trace_counts();
+        assert_eq!(
+            drawn_after, drawn_before,
+            "arrows must survive a selection change until Remove Arrows is pressed"
+        );
+        assert_eq!(total_after, 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A cell in a cycle is traceable without hanging, and the underlying
+    /// cycle detection the paint code consults agrees that it IS a cycle --
+    /// the property that decides the distinct (dashed/red) styling.
+    #[test]
+    fn a_cyclic_cell_traces_without_hanging_and_is_flagged_circular() {
+        let (mut h, p) = small_numeric_app("trace_cycle.csv");
+        // C1 = D1, D1 = C1: a direct two-cell cycle, deliberately not A1/B1
+        // so it does not disturb the plain data columns other assertions
+        // might rely on.
+        edit_cell(&mut h, 0, 2, "=D1");
+        edit_cell(&mut h, 0, 3, "=C1");
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.trace_precedents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, 1, "one edge exists to walk even inside a cycle");
+        assert_eq!(drawn, 1, "the cycle must still be painted, not dropped");
+        let sheet = h.app().active_sheet_id();
+        let c1 = ferrix_core::SheetCell::new(sheet, CellRef::new(0, 2));
+        assert!(
+            h.app().graph_snapshot().is_circular_at(c1),
+            "the cell the arrow starts from must be recognised as circular"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The scale invariant at the UI layer: a cell with many dependents
+    /// must still paint in bounded time and never attempt more than
+    /// MAX_ARROWS arrows, while `trace_counts().1` still reports the true
+    /// total -- "showing N of M", not a silently truncated lie. The
+    /// 500k-scale claim itself is pinned directly in trace.rs against the
+    /// graph, with no UI frame cost.
+    #[test]
+    fn a_cell_with_many_dependents_is_capped_in_the_real_paint_output() {
+        // A purpose-built 60-row fixture: writing formulas up to row 41
+        // must land on REAL rows, not past `row_count` into empty-row
+        // padding territory, which would fail for reasons unrelated to the
+        // cap this test is pinning.
+        let mut body = String::from("id,qty\n");
+        for i in 1..=60u32 {
+            body.push_str(&format!("{i},{i}\n"));
+        }
+        let p = write_csv("trace_cap.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+
+        for r in 1..41u32 {
+            edit_cell(&mut h, r, 1, "=A1");
+        }
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        // Park the body at the top so the ORIGIN cell (A1) is on screen.
+        // Editing row 41 scrolled the view down, and with A1 off screen too
+        // an edge with NEITHER endpoint visible has nothing to point at and
+        // is legitimately skipped — which would make this test's number an
+        // accident of scroll position rather than a statement about the cap.
+        h.scroll_body_to(0.0);
+        assert!(
+            h.app().cell_center(CellRef::new(0, 0)).is_some(),
+            "test setup: the origin cell must be on screen"
+        );
+        h.trace_dependents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, 40, "the real total must be reported honestly");
+        assert!(
+            drawn <= crate::trace::MAX_ARROWS,
+            "must never exceed the cap"
+        );
+        assert_eq!(
+            drawn, 40,
+            "with the origin on screen, every edge has something to point at \
+             — the off-screen ones clamp to the viewport edge rather than \
+             being dropped"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Off-screen sources are indicated at the viewport edge rather than
+    /// drawn at wrong coordinates: when the precedent has scrolled out of
+    /// view, an arrow is still counted as drawn (its far end clamped to the
+    /// grid rect), and the ORIGIN cell's own on-screen rect is unaffected.
+    #[test]
+    fn an_offscreen_precedent_still_draws_an_arrow_at_the_viewport_edge() {
+        let big = {
+            let mut s = String::from("id,qty\n");
+            for i in 1..=3000u32 {
+                s.push_str(&format!("{i},{i}\n"));
+            }
+            s
+        };
+        let p = write_csv("trace_offscreen.csv", &big);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(400, |a| a.row_count() > 0));
+
+        // A far-down formula cell referencing A1, which will be scrolled out
+        // of view once the body is parked near the bottom.
+        edit_cell(&mut h, 2000, 2, "=A1");
+        h.select(CellRef::new(2000, 2), CellRef::new(2000, 2));
+        h.scroll_body_to(1990.0);
+
+        // Precondition: A1 really is off screen from here.
+        assert!(
+            h.app().cell_center(CellRef::new(0, 0)).is_none(),
+            "test setup: A1 must be off screen for this to check anything"
+        );
+        assert!(
+            h.app().cell_center(CellRef::new(2000, 2)).is_some(),
+            "test setup: the origin cell must be on screen"
+        );
+
+        h.trace_precedents();
+        let (drawn, total) = h.trace_counts();
+        assert_eq!(total, 1);
+        assert_eq!(
+            drawn, 1,
+            "an off-screen precedent must still produce an arrow to the \
+             viewport edge, not be silently dropped"
         );
         let _ = std::fs::remove_file(&p);
     }

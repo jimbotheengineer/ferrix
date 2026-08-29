@@ -10,6 +10,7 @@ mod prefs;
 mod sheet_view;
 mod table_view;
 mod theme;
+mod trace;
 mod workbook;
 
 use app::FerrixApp;
