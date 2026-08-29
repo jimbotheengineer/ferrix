@@ -62,6 +62,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+use ferrix_core::merge::MergeMap;
 use ferrix_core::{
     CmpOp, ColumnType, ConditionalRule, NumberFormat, Predicate, Rgb, Table, TableColumn,
     TableRange, Validation, ValidationRule,
@@ -594,6 +595,101 @@ fn totals_function_from_name(name: &str) -> rust_xlsxwriter::TableFunction {
 }
 
 // ===================================================================== read ==
+
+/// A merged region found in a worksheet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedMerge {
+    /// Index of the owning worksheet, in workbook order.
+    pub sheet_index: usize,
+    pub range: TableRange,
+}
+
+/// Read every `<mergeCell>` out of an `.xlsx`.
+///
+/// Ferrix previously dropped these entirely. A merged title row then came back
+/// as a value in the first column with blanks beside it, which reads as data
+/// loss to the user even though every byte survived.
+///
+/// Opens the package directly for the same reason table import does: calamine
+/// surfaces cell values, not the worksheet's structural parts.
+pub fn import_merges(path: impl AsRef<Path>) -> Result<Vec<ImportedMerge>, XlsxError> {
+    let path = path.as_ref();
+    let disp = path.display().to_string();
+    let io_err = |e: std::io::Error| XlsxError::Read {
+        path: disp.clone(),
+        source: Box::new(calamine::XlsxError::Io(e)),
+    };
+    let zip_err = |msg: String| XlsxError::TableParse {
+        path: disp.clone(),
+        detail: msg,
+    };
+
+    let file = std::fs::File::open(path).map_err(io_err)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
+
+    let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| zip_err(e.to_string()))?;
+        if !f.is_file() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut buf).map_err(io_err)?;
+        parts.insert(name, buf);
+    }
+
+    let sheet_paths = worksheet_paths(&parts);
+    let mut out = Vec::new();
+    for (sheet_index, sp) in sheet_paths.iter().enumerate() {
+        let Some(xml) = parts.get(sp) else { continue };
+        let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
+        let mut buf = Vec::new();
+        loop {
+            match rd.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Empty(ref e))
+                | Ok(quick_xml::events::Event::Start(ref e)) => {
+                    if e.local_name().as_ref() == b"mergeCell" {
+                        if let Some(r) = attr(e, b"ref").and_then(|r| TableRange::from_a1(&r)) {
+                            out.push(ImportedMerge {
+                                sheet_index,
+                                range: r,
+                            });
+                        }
+                    }
+                }
+                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+    Ok(out)
+}
+
+/// Write `<mergeCells>` for a sheet's merged regions.
+///
+/// Excel requires the count attribute to match the number of children; an
+/// inconsistent pair makes the whole workbook unopenable, so it is derived
+/// here rather than passed in.
+pub fn write_merges(
+    ws: &mut Worksheet,
+    merges: &MergeMap,
+) -> Result<(), rust_xlsxwriter::XlsxError> {
+    for r in merges.regions() {
+        // rust_xlsxwriter writes the merge and its anchor format together; a
+        // default format keeps the cell's existing appearance.
+        ws.merge_range(
+            r.first_row,
+            r.first_col as u16,
+            r.last_row,
+            r.last_col as u16,
+            "",
+            &Format::new(),
+        )?;
+    }
+    Ok(())
+}
 
 /// Every table found in a workbook, with the worksheet it belongs to.
 #[derive(Debug, Clone, PartialEq)]

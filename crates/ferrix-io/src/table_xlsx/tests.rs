@@ -369,6 +369,59 @@ fn a_ferrix_table_reimports_with_every_rule_intact() {
 }
 
 #[test]
+fn merged_regions_reach_the_package_and_come_back() {
+    // The full loop: build merges, export, assert the OOXML part exists, then
+    // re-import and compare. Asserting only on the written XML would not prove
+    // the reader works, and asserting only on the reader would not prove Excel
+    // gets a part it can open.
+    use ferrix_core::merge::MergeMap;
+
+    let mut m = MergeMap::new();
+    m.merge(TableRange::new(0, 0, 0, 2)).expect("title row");
+    m.merge(TableRange::new(2, 1, 4, 1)).expect("tall label");
+
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("merge");
+    crate::xlsx::export_workbook(
+        t.path(),
+        &[crate::xlsx::SheetExport::new("Data", &sheet).with_merges(&m)],
+    )
+    .expect("export");
+
+    // The part Excel actually reads.
+    let xml = part(t.path(), "xl/worksheets/sheet1.xml").expect("sheet part");
+    assert!(
+        xml.contains("<mergeCells"),
+        "the worksheet must carry a mergeCells element, got:\n{}",
+        &xml[..xml.len().min(400)]
+    );
+    assert!(xml.contains("A1:C1"), "the title-row merge must be present");
+    assert!(xml.contains("B3:B5"), "the tall merge must be present");
+
+    // And back in.
+    let got = super::import_merges(t.path()).expect("import");
+    let mut ranges: Vec<TableRange> = got.iter().map(|g| g.range).collect();
+    ranges.sort_by_key(|r| (r.first_row, r.first_col));
+    assert_eq!(
+        ranges,
+        vec![TableRange::new(0, 0, 0, 2), TableRange::new(2, 1, 4, 1)],
+        "every merged region must survive the round trip"
+    );
+    assert!(got.iter().all(|g| g.sheet_index == 0));
+}
+
+#[test]
+fn a_workbook_with_no_merges_imports_as_none() {
+    // The common case must not invent regions, and must not fail on a package
+    // that has no mergeCells element at all.
+    let sheet = demo_sheet();
+    let t = TempXlsx::new("nomerge");
+    crate::xlsx::export_xlsx(t.path(), &sheet, "Data").expect("export");
+    let got = super::import_merges(t.path()).expect("import");
+    assert!(got.is_empty(), "no merges were written, none may be read");
+}
+
+#[test]
 fn every_validation_shape_survives_a_round_trip() {
     let rules = [
         (

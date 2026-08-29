@@ -340,6 +340,8 @@ pub struct SheetExport<'a> {
     /// `xl/tables/tableN.xml` part plus its validation/conditional-format
     /// elements — see [`crate::table_xlsx`].
     pub tables: &'a [ferrix_core::Table],
+    /// Merged regions, written as `<mergeCells>`.
+    pub merges: Option<&'a ferrix_core::merge::MergeMap>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -349,11 +351,18 @@ impl<'a> SheetExport<'a> {
             sheet,
             formulas: None,
             tables: &[],
+            merges: None,
         }
     }
 
     pub fn with_formulas(mut self, overlay: &'a EditOverlay) -> Self {
         self.formulas = Some(overlay);
+        self
+    }
+
+    /// Attach merged regions, written as `<mergeCells>`.
+    pub fn with_merges(mut self, merges: &'a ferrix_core::merge::MergeMap) -> Self {
+        self.merges = Some(merges);
         self
     }
 
@@ -416,7 +425,10 @@ pub fn export_workbook(path: impl AsRef<Path>, sheets: &[SheetExport]) -> Result
         // go worksheet cannot support. Tables are capped by Excel's own row
         // limit anyway, and `check_limits` has already refused anything above
         // it, so the memory exposure is bounded.
-        let ws = if s.tables.is_empty() {
+        // Merges, like tables, need the buffering writer: a merge is applied
+        // to a range after its cells are written, which the constant-memory
+        // writer cannot revisit.
+        let ws = if s.tables.is_empty() && s.merges.is_none_or(|m| m.is_empty()) {
             wb.add_worksheet_with_constant_memory()
         } else {
             wb.add_worksheet()
@@ -425,6 +437,9 @@ pub fn export_workbook(path: impl AsRef<Path>, sheets: &[SheetExport]) -> Result
         write_sheet(ws, s).map_err(write_err)?;
         for table in s.tables {
             crate::table_xlsx::write_table(ws, table).map_err(write_err)?;
+        }
+        if let Some(m) = s.merges {
+            crate::table_xlsx::write_merges(ws, m).map_err(write_err)?;
         }
     }
     wb.save(path).map_err(write_err)?;
