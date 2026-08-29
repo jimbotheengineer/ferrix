@@ -4167,7 +4167,10 @@ impl FerrixApp {
         let caret = self.edit_caret.min(text.len());
         // Byte offsets from egui are always on a char boundary, but a caret
         // restored from a stale frame need not be — clamp rather than panic.
-        let caret = (0..=caret).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+        let caret = (0..=caret)
+            .rev()
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(0);
         let Some((next, span)) = ferrix_formula::refedit::cycle_at(&text, caret) else {
             self.status = "F4: no cell reference under the cursor".into();
             return false;
@@ -4218,7 +4221,10 @@ impl FerrixApp {
             self.status = "That would move the reference off the sheet".into();
             return false;
         };
-        let label = next[span.start..].split(['+', '-', '*', '/', ')', ',']).next().unwrap_or("");
+        let label = next[span.start..]
+            .split(['+', '-', '*', '/', ')', ','])
+            .next()
+            .unwrap_or("");
         self.status = format!("Reference moved to {}", label.trim());
         self.set_live_edit_text(is_cell, next);
         true
@@ -6040,7 +6046,9 @@ impl FerrixApp {
                     // --- empty rows toggle (issue #20) ---
                     if ui
                         .selectable_label(self.showing_formulas(), "ƒ Formulas")
-                        .on_hover_text("Ctrl+` — show formula source instead of values, for this sheet")
+                        .on_hover_text(
+                            "Ctrl+` — show formula source instead of values, for this sheet",
+                        )
                         .clicked()
                     {
                         chosen_command = Some(crate::command::CommandId::ViewShowFormulas);
@@ -6272,9 +6280,9 @@ impl FerrixApp {
                         if let Some(mut st) = egui::TextEdit::load_state(ctx, fid) {
                             if let Some(want) = self.pending_caret.take() {
                                 let ch = byte_to_char(&self.formula_input, want);
-                                st.cursor.set_char_range(Some(
-                                    egui::text::CCursorRange::one(egui::text::CCursor::new(ch)),
-                                ));
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(ch),
+                                )));
                                 st.clone().store(ctx, fid);
                                 self.edit_caret = want;
                             } else if let Some(r) = st.cursor.char_range() {
@@ -6332,23 +6340,19 @@ impl FerrixApp {
                 // from the pointer's CURRENT distance from the bar's top
                 // rather than accumulated per frame, so a fast drag cannot
                 // drift out of step with the pointer.
-                let handle = ui.allocate_response(
-                    egui::vec2(ui.available_width(), 6.0),
-                    egui::Sense::drag(),
-                );
+                let handle = ui
+                    .allocate_response(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
                 let bright = handle.hovered() || handle.dragged();
                 ui.painter().hline(
                     handle.rect.x_range(),
                     handle.rect.center().y,
-                    egui::Stroke::new(if bright { 2.0_f32 } else { 1.0_f32 }, if bright {
-                        th.accent
-                    } else {
-                        th.grid_line
-                    }),
+                    egui::Stroke::new(
+                        if bright { 2.0_f32 } else { 1.0_f32 },
+                        if bright { th.accent } else { th.grid_line },
+                    ),
                 );
                 if handle.hovered() || handle.dragged() {
-                    ui.ctx()
-                        .set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 }
                 if handle.dragged() {
                     if let Some(p) = ui.ctx().pointer_interact_pos() {
@@ -6986,7 +6990,10 @@ impl FerrixApp {
                     if pressed {
                         if let (Some(i), Some(p)) = (hit, ptr) {
                             if let Some(cell) = self.cell_at_point(p, outer) {
-                                self.ref_drag = Some(RefDrag { span: i, from: cell });
+                                self.ref_drag = Some(RefDrag {
+                                    span: i,
+                                    from: cell,
+                                });
                             }
                         }
                     } else if !down {
@@ -7239,14 +7246,13 @@ impl FerrixApp {
                         if let Some(mut st) = egui::TextEdit::load_state(ctx, id) {
                             if let Some(want) = self.pending_caret.take() {
                                 let ch = byte_to_char(&self.edit_buffer, want);
-                                st.cursor.set_char_range(Some(
-                                    egui::text::CCursorRange::one(egui::text::CCursor::new(ch)),
-                                ));
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(ch),
+                                )));
                                 st.clone().store(ctx, id);
                                 self.edit_caret = want;
                             } else if let Some(r) = st.cursor.char_range() {
-                                self.edit_caret =
-                                    char_to_byte(&self.edit_buffer, r.primary.index);
+                                self.edit_caret = char_to_byte(&self.edit_buffer, r.primary.index);
                             }
                         }
                         // The bar mirrors the cell editor while an edit is

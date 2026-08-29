@@ -237,7 +237,12 @@ impl Theme {
                 Color32::from_rgb(0x1a, 0x7f, 0x45),
                 Color32::from_rgb(0xa5, 0x54, 0x00),
                 Color32::from_rgb(0x7b, 0x3f, 0xb8),
-                Color32::from_rgb(0x0a, 0x71, 0x7a),
+                // Pulled bluer than the obvious teal: at #0a717a this sat only
+                // 83 away from the green above, so two different references
+                // outlined in "green-ish" were indistinguishable on a light
+                // grid. Kept clear of the #1460c8 selection accent too, so it
+                // still does not read as "selected".
+                Color32::from_rgb(0x06, 0x80, 0x8f),
                 Color32::from_rgb(0xb0, 0x2c, 0x6e),
             ],
         }

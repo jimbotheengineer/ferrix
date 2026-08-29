@@ -5088,7 +5088,10 @@ xxx,yyy,zzz
     fn fbar_fixture(name: &str) -> (std::path::PathBuf, Harness) {
         let p = write_csv(name, SAMPLE);
         let mut h = Harness::new(Some(&p));
-        assert!(h.step_until(200, |a| a.row_count() > 0), "file never loaded");
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "file never loaded"
+        );
         // C1 = SUM(C2:C4). The values column is 10/20/30/40, so the computed
         // value (90) and the source text are unmistakably different.
         h.select(CellRef::new(0, 2), CellRef::new(0, 2));
@@ -5107,7 +5110,8 @@ xxx,yyy,zzz
     fn f4_cycles_the_reference_under_the_caret_through_the_real_app() {
         let (p, mut h) = fbar_fixture("fbar_f4.csv");
         h.select(CellRef::new(0, 0), CellRef::new(0, 0));
-        h.app_mut().begin_edit_for_test(CellRef::new(0, 0), Some("=A2+$B$3"));
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(0, 0), Some("=A2+$B$3"));
         h.steps(2);
 
         // Caret parked just after A2 — the reference the user is on.
@@ -5117,7 +5121,8 @@ xxx,yyy,zzz
             h.f4_at(if i == 0 { 3 } else { caret });
             let (_, text) = h.app().editing_for_test().expect("still editing");
             assert_eq!(
-                &text, expect,
+                &text,
+                expect,
                 "press {} of the F4 cycle; status: {}",
                 i + 1,
                 h.status()
@@ -5158,6 +5163,15 @@ xxx,yyy,zzz
     #[test]
     fn ctrl_backtick_paints_formula_source_instead_of_the_value() {
         let (p, mut h) = fbar_fixture("fbar_show.csv");
+        // Move the cursor AWAY from C1 using the REAL arrow-key path, which
+        // resyncs the formula bar. `painted_texts` reads the whole frame and
+        // the formula bar always shows the selected cell's source, so with C1
+        // selected the source is legitimately on screen before any toggle and
+        // the precondition below would fail against a working app. Note
+        // `set_selection_for_test` is NOT enough here: it assigns the
+        // selection directly and never resyncs the bar, so the stale
+        // `=SUM(C2:C4)` stays painted.
+        h.press_key(Key::ArrowDown).steps(2);
 
         let before = h.painted_texts();
         assert!(
@@ -5320,7 +5334,8 @@ xxx,yyy,zzz
 
         let (_, text) = h.app().editing_for_test().expect("still editing");
         assert_eq!(
-            text, "=A2+$C$1",
+            text,
+            "=A2+$C$1",
             "dragging the first outline down one row must rewrite only that \
              reference; status: {}",
             h.status()
@@ -5344,7 +5359,10 @@ xxx,yyy,zzz
         // TYPING over the cell: the seed is the character typed, so the old
         // source now exists only in the pre-edit snapshot.
         h.type_text("9").steps(2);
-        let (_, buf) = h.app().editing_for_test().expect("typing must start an edit");
+        let (_, buf) = h
+            .app()
+            .editing_for_test()
+            .expect("typing must start an edit");
         assert_eq!(buf, "9", "typing must replace the cell, as Excel does");
 
         h.press_key(Key::Escape).steps(2);
