@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
 use eframe::egui;
 use egui::{Align, Key, Layout, RichText};
 use ferrix_core::{CellRef, Selection, Sheet, Value};
-use ferrix_formula::{eval_view, parse};
+use ferrix_formula::eval_view;
 use ferrix_io::{load_csv, CsvOptions};
 
 use crate::grid::{Grid, ScrollState, DEFAULT_COL_WIDTH};
@@ -61,6 +61,9 @@ struct Loaded {
     /// lost. Detected during load (two `stat`s), offered to the user on
     /// arrival. Nothing is applied until they choose Recover.
     recovery: Option<ferrix_io::edits::RecoveryCandidate>,
+    /// Defined names read from the source. Only xlsx carries any; CSV yields
+    /// an empty table, which costs nothing.
+    names: ferrix_formula::NameTable,
 }
 
 type LoadResult = Result<Loaded, String>;
@@ -283,6 +286,27 @@ pub struct FerrixApp {
     panes: crate::grid::Panes,
     /// Zoom for the active sheet, 0.25..=4.0. Persisted per sheet name.
     zoom: f32,
+
+    /// Name Box buffer: what the user is typing above the row headers.
+    ///
+    /// `None` whenever the box is not being edited, which is what lets it
+    /// display the live selection (a name, or the A1 label) rather than a
+    /// stale string. It only becomes `Some` when the user starts typing.
+    name_box_edit: Option<String>,
+    /// Name Manager window state.
+    names_open: bool,
+    /// The name currently being edited in the manager, and the buffers it is
+    /// being edited into. Held as (original identifier, scope) so an edit that
+    /// changes the identifier still knows which entry it started from.
+    name_edit: Option<(String, ferrix_formula::NameScope)>,
+    name_edit_ident: String,
+    name_edit_target: String,
+    /// Last error from a name operation, shown in the manager. Kept separate
+    /// from `status` so it stays visible while the modal is open.
+    name_error: Option<String>,
+    /// Whether a new name typed in the Name Box is scoped to the active sheet.
+    name_box_sheet_scope: bool,
+
     /// Persisted preferences, written back whenever a toggle flips.
     prefs: Prefs,
 }
@@ -382,6 +406,13 @@ impl FerrixApp {
             // remembered zoom is adopted here and re-adopted on every sheet
             // switch — a zoom is a property of the sheet, not of the session.
             zoom: prefs.zoom_of("Sheet1"),
+            name_box_edit: None,
+            names_open: false,
+            name_edit: None,
+            name_edit_ident: String::new(),
+            name_edit_target: String::new(),
+            name_error: None,
+            name_box_sheet_scope: false,
             prefs,
         };
         if let Some(p) = initial {
@@ -459,6 +490,7 @@ impl FerrixApp {
                     loaded.first_formulas,
                     loaded.restored,
                     loaded.extra_sheets,
+                    loaded.names,
                 );
                 if let Some(w) = loaded.edit_warning {
                     self.status = format!("Saved edits not applied — {w}");
@@ -1971,11 +2003,17 @@ impl FerrixApp {
                     .into();
             return;
         };
-        self.status = match ferrix_io::export_xlsx_with_tables(&path, sheet, "Sheet1", &self.tables)
-        {
+        self.status = match ferrix_io::export_workbook_with_names(
+            &path,
+            &[ferrix_io::SheetExport::new("Sheet1", sheet)
+                .with_formulas(&self.wb.overlay)
+                .with_tables(&self.tables)],
+            &self.wb.names,
+        ) {
             Ok(()) => format!(
-                "Exported {} table(s) → {}",
+                "Exported {} table(s), {} name(s) → {}",
                 self.tables.len(),
+                self.wb.names.len(),
                 path.file_name().unwrap_or_default().to_string_lossy()
             ),
             Err(e) => format!("Export failed: {e}"),
@@ -2033,6 +2071,92 @@ impl FerrixApp {
     /// The status line, the app's own account of what it last did.
     pub fn status_text(&self) -> &str {
         &self.status
+    }
+
+    // --- Name Box / Name Manager seams ---
+    //
+    // The Name Box is a TextEdit whose pixel position depends on theme text
+    // metrics; synthesising a click on it would test layout rather than the
+    // feature. These drive the SAME state the widget writes and the SAME
+    // entry point Enter calls, so a test asserts on real behaviour.
+
+    /// Type into the Name Box, as the widget's `changed()` branch does.
+    pub fn type_in_name_box(&mut self, text: &str) {
+        self.name_box_edit = Some(text.to_string());
+    }
+
+    /// Scope newly-defined names to the active sheet rather than the workbook.
+    pub fn set_name_box_sheet_scope(&mut self, on: bool) {
+        self.name_box_sheet_scope = on;
+    }
+
+    /// Is the Name Manager window on screen?
+    pub fn names_manager_open(&self) -> bool {
+        self.names_open
+    }
+
+    pub fn open_name_manager(&mut self) {
+        self.names_open = true;
+    }
+
+    /// Begin editing a name in the manager, as its Edit button does.
+    pub fn begin_name_edit(&mut self, ident: &str, scope: ferrix_formula::NameScope) {
+        let refers_to = self
+            .wb
+            .names
+            .get_scoped(ident, &scope)
+            .map(|d| d.refers_to.clone())
+            .unwrap_or_default();
+        self.name_edit_ident = ident.to_string();
+        self.name_edit_target = refers_to;
+        self.name_edit = Some((ident.to_string(), scope));
+        self.name_error = None;
+    }
+
+    /// Set the manager's identifier buffer, as typing into it does.
+    pub fn set_name_edit_ident(&mut self, ident: &str) {
+        self.name_edit_ident = ident.to_string();
+    }
+
+    /// Set the manager's "refers to" buffer.
+    pub fn set_name_edit_target(&mut self, target: &str) {
+        self.name_edit_target = target.to_string();
+    }
+
+    /// The manager's Apply button.
+    pub fn apply_name_edit_now(&mut self) {
+        self.apply_name_edit();
+    }
+
+    /// The manager's Delete button.
+    pub fn delete_name_now(&mut self, ident: &str, scope: &ferrix_formula::NameScope) {
+        self.delete_name_ui(ident, scope);
+    }
+
+    /// The manager's last reported error, if any.
+    pub fn name_error_text(&self) -> Option<&str> {
+        self.name_error.as_deref()
+    }
+
+    /// Read-only access to the workbook, for tests that assert on names.
+    pub fn workbook(&self) -> &Workbook {
+        &self.wb
+    }
+
+    /// The active selection, so a navigation can be checked.
+    pub fn selection(&self) -> Selection {
+        self.selection
+    }
+
+    /// Type into the formula bar, as the TextEdit's `changed()` branch does.
+    pub fn set_formula_input(&mut self, text: &str) {
+        self.formula_input = text.to_string();
+        self.recompute_formula();
+    }
+
+    /// The formula bar's live preview of what the typed formula evaluates to.
+    pub fn formula_preview(&self) -> Option<&str> {
+        self.formula_result.as_deref()
     }
 
     /// Whether the search bar is open.
@@ -2121,6 +2245,271 @@ impl FerrixApp {
     fn sync_formula_bar(&mut self) {
         self.formula_input = self.wb.view().edit_text(self.selection.cursor);
         self.recompute_formula();
+    }
+
+    // ------------------------------------------------------------ Name Box
+
+    /// What the Name Box shows: the selection's defined name if it has one,
+    /// otherwise its A1 label.
+    ///
+    /// Read live from the workbook rather than cached, so defining, renaming
+    /// or deleting a name is reflected without any explicit refresh.
+    pub fn name_box_text(&self) -> String {
+        if let Some(buf) = &self.name_box_edit {
+            return buf.clone();
+        }
+        match self.wb.name_for_selection(self.selection) {
+            Some(n) => n.to_string(),
+            None => self.selection.label(),
+        }
+    }
+
+    /// Commit whatever is typed in the Name Box.
+    ///
+    /// An EXISTING name navigates to it (switching sheets when it lives
+    /// elsewhere); an A1 reference or range navigates there; anything else
+    /// valid DEFINES a new name for the current selection. Excel's Name Box
+    /// behaves the same way, and it is what makes naming a range a one-gesture
+    /// operation rather than a trip through a dialog.
+    pub fn commit_name_box(&mut self) {
+        let Some(text) = self.name_box_edit.take() else {
+            return;
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        // 1. An existing name: navigate.
+        if let Some((sheet, target)) = self.wb.name_target(&text) {
+            if sheet != self.wb.active_sheet() {
+                self.switch_sheet(sheet);
+            }
+            self.set_selection(target);
+            self.status = format!("Went to {text}");
+            return;
+        }
+
+        // 2. A literal address: navigate there too, so the box doubles as
+        //    "go to cell" the way every spreadsheet's does.
+        if let Some(sel) = parse_a1_selection(&text) {
+            self.set_selection(sel);
+            self.status = format!("Went to {}", sel.label());
+            return;
+        }
+
+        // 3. Otherwise define it for the current selection.
+        let scope = if self.name_box_sheet_scope {
+            ferrix_formula::NameScope::Sheet(self.wb.active_name().to_string())
+        } else {
+            ferrix_formula::NameScope::Workbook
+        };
+        let sel = self.selection;
+        self.status = match self.wb.define_name(&text, scope, sel) {
+            Ok(()) => format!("Defined {text} = {}", sel.label()),
+            Err(e) => format!("Cannot define {text:?}: {e}"),
+        };
+    }
+
+    /// Move the cursor and scroll to a target selection.
+    fn set_selection(&mut self, sel: Selection) {
+        self.selection = sel;
+        self.center_on_selection();
+        self.sync_formula_bar();
+    }
+
+    /// Delete a name through the manager, reporting what happened.
+    fn delete_name_ui(&mut self, ident: &str, scope: &ferrix_formula::NameScope) {
+        let affected = self.wb.graph.cells_using_name(ident).len();
+        if self.wb.delete_name(ident, scope).is_some() {
+            self.status = if affected > 0 {
+                format!("Deleted {ident} — {affected} formula(s) now #NAME?")
+            } else {
+                format!("Deleted {ident}")
+            };
+        }
+    }
+
+    /// Apply the Name Manager's edit buffers to the entry being edited.
+    fn apply_name_edit(&mut self) {
+        let Some((orig, scope)) = self.name_edit.clone() else {
+            return;
+        };
+        self.name_error = None;
+
+        // Retarget first: if the identifier also changed, the rename below
+        // finds the entry by its ORIGINAL name, which is still in place.
+        let target = self.name_edit_target.trim().to_string();
+        if !target.is_empty() {
+            if let Err(e) = self.wb.retarget_name(&orig, &scope, &target) {
+                self.name_error = Some(e.to_string());
+                return;
+            }
+        }
+
+        let ident = self.name_edit_ident.trim().to_string();
+        if !ident.is_empty() && !ident.eq_ignore_ascii_case(&orig) {
+            match self.wb.rename_name(&orig, &scope, &ident) {
+                Ok(n) => {
+                    self.status = format!("Renamed {orig} → {ident} · {n} formula(s) rewritten");
+                }
+                Err(e) => {
+                    self.name_error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+        self.name_edit = None;
+    }
+
+    /// The Name Manager: list every defined name, edit or delete each one.
+    ///
+    /// A modal window rather than a panel, because editing a name can rewrite
+    /// formulas across the whole workbook and that should be a deliberate act,
+    /// not something reachable by a stray click while typing in a cell.
+    fn show_name_manager(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        let mut open = self.names_open;
+        // Actions are collected and applied after the closure, so the list is
+        // never mutated while it is being iterated.
+        let mut to_delete: Option<(String, ferrix_formula::NameScope)> = None;
+        let mut to_edit: Option<(String, ferrix_formula::NameScope, String)> = None;
+        let mut to_goto: Option<String> = None;
+        let mut apply = false;
+
+        egui::Window::new("Name Manager")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let names: Vec<(String, ferrix_formula::NameScope, String)> = self
+                    .wb
+                    .names
+                    .iter()
+                    .map(|d| (d.name.clone(), d.scope.clone(), d.refers_to.clone()))
+                    .collect();
+
+                if names.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No defined names yet. Select a range and type a name into the \
+                             Name Box to create one.",
+                        )
+                        .color(th.text_dim),
+                    );
+                    return;
+                }
+
+                egui::Grid::new("names_grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Name").strong());
+                        ui.label(RichText::new("Scope").strong());
+                        ui.label(RichText::new("Refers to").strong());
+                        ui.label("");
+                        ui.end_row();
+
+                        for (name, scope, refers_to) in &names {
+                            let editing = self
+                                .name_edit
+                                .as_ref()
+                                .is_some_and(|(n, s)| n == name && s == scope);
+                            if editing {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.name_edit_ident)
+                                        .desired_width(120.0),
+                                );
+                            } else {
+                                ui.label(RichText::new(name).monospace().color(th.accent));
+                            }
+
+                            ui.label(
+                                RichText::new(scope.sheet().unwrap_or("Workbook"))
+                                    .color(th.text_dim),
+                            );
+
+                            if editing {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.name_edit_target)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(220.0),
+                                );
+                            } else {
+                                ui.label(RichText::new(refers_to).monospace());
+                            }
+
+                            ui.horizontal(|ui| {
+                                if editing {
+                                    if ui.button("Apply").clicked() {
+                                        apply = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.name_edit = None;
+                                        self.name_error = None;
+                                    }
+                                } else {
+                                    if ui.button("Edit").clicked() {
+                                        to_edit =
+                                            Some((name.clone(), scope.clone(), refers_to.clone()));
+                                    }
+                                    if ui.button("Go to").clicked() {
+                                        to_goto = Some(name.clone());
+                                    }
+                                    // How many formulas a delete would break,
+                                    // shown BEFORE the click rather than after.
+                                    let uses = self.wb.graph.cells_using_name(name).len();
+                                    let label = if uses > 0 {
+                                        format!("Delete ({uses})")
+                                    } else {
+                                        "Delete".to_string()
+                                    };
+                                    let btn = ui.button(label);
+                                    let btn = if uses > 0 {
+                                        btn.on_hover_text(format!(
+                                            "{uses} formula(s) will become #NAME?"
+                                        ))
+                                    } else {
+                                        btn
+                                    };
+                                    if btn.clicked() {
+                                        to_delete = Some((name.clone(), scope.clone()));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+
+                if let Some(e) = &self.name_error {
+                    ui.separator();
+                    ui.label(RichText::new(e).color(th.error));
+                }
+            });
+
+        if apply {
+            self.apply_name_edit();
+        }
+        if let Some((name, scope, refers_to)) = to_edit {
+            self.name_edit_ident = name.clone();
+            self.name_edit_target = refers_to;
+            self.name_edit = Some((name, scope));
+            self.name_error = None;
+        }
+        if let Some(name) = to_goto {
+            if let Some((sheet, target)) = self.wb.name_target(&name) {
+                if sheet != self.wb.active_sheet() {
+                    self.switch_sheet(sheet);
+                }
+                self.set_selection(target);
+            }
+        }
+        if let Some((name, scope)) = to_delete {
+            self.delete_name_ui(&name, &scope);
+            self.name_edit = None;
+        }
+        self.names_open = open;
     }
 
     /// Save where the user is looking on the current sheet.
@@ -2885,7 +3274,7 @@ impl FerrixApp {
             self.formula_result = None;
             return;
         }
-        self.formula_result = Some(match parse(&text) {
+        self.formula_result = Some(match self.wb.parse_active(&text) {
             Ok(expr) => {
                 let t = std::time::Instant::now();
                 // Evaluate through the WORKBOOK, not just this sheet, so the
@@ -3527,12 +3916,41 @@ impl FerrixApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(self.selection.label())
-                            .color(th.accent)
-                            .monospace()
-                            .size(13.0),
+                    // --- Name Box ---
+                    //
+                    // Sits at the top-left, above the row headers, and is
+                    // width-matched to them so it reads as their heading. It
+                    // shows the selection's name or its A1 label, navigates to
+                    // an existing name or address, and defines a new name for
+                    // the selection otherwise.
+                    let mut buf = self.name_box_text();
+                    let resp = ui.add_sized(
+                        [crate::grid::ROW_HEADER_WIDTH, 22.0],
+                        egui::TextEdit::singleline(&mut buf)
+                            .font(egui::TextStyle::Monospace)
+                            .text_color(th.accent),
                     );
+                    if resp.changed() {
+                        self.name_box_edit = Some(buf);
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        self.commit_name_box();
+                        self.focus = Focus::Grid;
+                    } else if resp.lost_focus() {
+                        // Abandoned without Enter: drop the buffer so the box
+                        // snaps back to showing the live selection.
+                        self.name_box_edit = None;
+                    }
+                    if resp.gained_focus() {
+                        self.focus = Focus::FormulaBar;
+                    }
+                    resp.on_hover_text(
+                        "Name Box — type a name to go to it, or a new name to define it \
+                         for the selection",
+                    );
+                    if ui.small_button("▾").on_hover_text("Name Manager").clicked() {
+                        self.names_open = true;
+                    }
                     ui.separator();
                     ui.label(RichText::new("fx").color(th.text_dim).italics());
 
@@ -3579,6 +3997,11 @@ impl FerrixApp {
                     }
                 });
             });
+
+        // --- Name Manager ---
+        if self.names_open {
+            self.show_name_manager(ctx);
+        }
 
         // --- search bar ---
         if self.search_open {
@@ -4274,6 +4697,7 @@ fn build_workbook(
     first_formulas: Option<ferrix_core::EditOverlay>,
     restored: Option<ferrix_core::EditOverlay>,
     extras: Vec<(String, BaseData, ferrix_core::EditOverlay)>,
+    names: ferrix_formula::NameTable,
 ) -> Workbook {
     let had_formulas = first_formulas.as_ref().is_some_and(|o| !o.is_empty());
     let restored_any = restored.is_some();
@@ -4303,11 +4727,16 @@ fn build_workbook(
         }
     }
     let _ = wb.activate_index(0);
+    // Names must be in place BEFORE the recalc below: a formula reading
+    // `=SUM(Sales)` only resolves once the table knows what Sales is, and a
+    // recalc without it would cache #NAME? into every one of them.
+    let has_names = !names.is_empty();
+    wb.names = names;
     // Formula cells arrive with their source and a cached value computed
     // elsewhere; rebuild the graph and recompute so nothing drifts. This is
     // also what wires up cross-sheet references between the sheets just
     // loaded — until every sheet exists, `Sheet2!A1` has nothing to resolve to.
-    if restored_any || had_formulas || added > 0 {
+    if restored_any || had_formulas || added > 0 || has_names {
         wb.rebuild_graph_and_recalc();
     }
     wb
@@ -4319,6 +4748,23 @@ fn plural(n: usize) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+/// Parse `A1` or `A1:B10` as a selection. `None` for anything else.
+///
+/// Lets the Name Box double as a "go to" box, which is how every spreadsheet's
+/// Name Box works — and it must be tried BEFORE defining a name, or typing
+/// `B7` would create a name that the tokenizer could never resolve anyway.
+fn parse_a1_selection(text: &str) -> Option<Selection> {
+    let text = text.trim().replace('$', "");
+    match text.split_once(':') {
+        Some((a, b)) => {
+            let a = CellRef::from_a1(a.trim())?;
+            let b = CellRef::from_a1(b.trim())?;
+            Some(Selection::new(a, b))
+        }
+        None => Some(Selection::single(CellRef::from_a1(&text)?)),
     }
 }
 
@@ -4388,6 +4834,7 @@ where
             restored: restored_edits.overlay,
             edit_warning: restored_edits.warning,
             recovery: restored_edits.recovery,
+            names: ferrix_formula::NameTable::new(),
         });
     }
 
@@ -4447,6 +4894,7 @@ where
         restored: restored_edits.overlay,
         edit_warning: restored_edits.warning,
         recovery: restored_edits.recovery,
+        names: ferrix_formula::NameTable::new(),
     })
 }
 
@@ -4459,6 +4907,10 @@ where
 fn load_xlsx(path: &Path) -> LoadResult {
     let t = std::time::Instant::now();
     let imported = ferrix_io::import_xlsx_full(path).map_err(|e| e.to_string())?;
+    // Read in a second pass: `<definedName>` lives in xl/workbook.xml, which
+    // the per-sheet import never opens. A file with no names yields an empty
+    // table rather than an error.
+    let names = ferrix_io::import_defined_names(path).unwrap_or_default();
     let sheet_count = imported.len();
     let total_cells: usize = imported.iter().map(|s| s.stats.cells).sum();
     let kept: usize = imported.iter().map(|s| s.stats.formulas_kept).sum();
@@ -4511,6 +4963,10 @@ fn load_xlsx(path: &Path) -> LoadResult {
         restored: None,
         edit_warning: None,
         recovery: None,
+        // Defined names live in xl/workbook.xml, not in any worksheet, so
+        // they are read in their own pass beside the sheet import. A file
+        // with none costs one small XML scan.
+        names,
     })
 }
 
@@ -4734,6 +5190,7 @@ mod tests {
             loaded.first_formulas,
             loaded.restored,
             loaded.extra_sheets,
+            loaded.names,
         );
 
         // Every sheet is present, in the workbook's own order.
@@ -4784,6 +5241,7 @@ mod tests {
             loaded.first_formulas,
             loaded.restored,
             loaded.extra_sheets,
+            loaded.names,
         );
         let gamma = wb.sheet_id_by_name("Gamma").unwrap();
 
@@ -4802,7 +5260,14 @@ mod tests {
         // Regression guard: the CSV path must not sprout phantom sheets.
         let mut s = Sheet::new("t");
         s.set(CellRef::new(0, 0), Value::Number(5.0));
-        let wb = build_workbook(BaseData::Memory(s), "data".into(), None, None, Vec::new());
+        let wb = build_workbook(
+            BaseData::Memory(s),
+            "data".into(),
+            None,
+            None,
+            Vec::new(),
+            ferrix_formula::NameTable::new(),
+        );
         assert_eq!(wb.sheet_count(), 1);
         assert_eq!(wb.active_name(), "data");
         assert_eq!(wb.view().get(CellRef::new(0, 0)), Value::Number(5.0));

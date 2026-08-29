@@ -75,11 +75,12 @@
 //! single sheet rather than the whole workbook. Given the xlsx row cap, the
 //! worst case is bounded and modest compared to the datasets Ferrix targets.
 
+use std::io::Read;
 use std::path::Path;
 
 use calamine::{Data, Reader, Xlsx};
 use ferrix_core::{CellInput, CellRef, EditOverlay, ErrorKind, Sheet, Value};
-use ferrix_formula::Expr;
+use ferrix_formula::{DefinedName, Expr, NameScope, NameTable};
 use rust_xlsxwriter::{Formula, Workbook};
 
 /// Excel's hard worksheet row limit.
@@ -158,6 +159,10 @@ pub enum XlsxError {
     /// A table part existed but could not be understood.
     #[error("reading table parts of {path}: {detail}")]
     TableParse { path: String, detail: String },
+
+    /// Excel refused a defined name — it breaks one of its naming rules.
+    #[error("cannot write defined name {name:?}: {detail}")]
+    DefinedName { name: String, detail: String },
 }
 
 /// A worksheet as it came out of a workbook.
@@ -328,6 +333,158 @@ fn cell_error_to_kind(e: &calamine::CellErrorType) -> ErrorKind {
     }
 }
 
+// ------------------------------------------------------- defined names ---
+
+/// Read `<definedName>` entries out of `xl/workbook.xml`.
+///
+/// Done by opening the package directly rather than through calamine, which
+/// exposes `defined_names()` as bare `(name, formula)` pairs and drops the
+/// `localSheetId` attribute — the only thing in the file that distinguishes a
+/// sheet-scoped name from a workbook-scoped one. Losing it would silently
+/// promote every local name to workbook scope on import, so two sheets with
+/// their own `Total` would collide.
+///
+/// `localSheetId` is an index into the `<sheets>` order, which is the same
+/// order [`import_xlsx_full`] returns, so the scope is resolved to a sheet
+/// NAME here and the caller never has to think about indices.
+///
+/// Built-in names (`_xlnm.Print_Area` and friends) are skipped: they are
+/// Excel print settings, not user ranges, and Ferrix has no equivalent.
+pub fn import_defined_names(path: impl AsRef<Path>) -> Result<NameTable, XlsxError> {
+    let path = path.as_ref();
+    let disp = path.display().to_string();
+    let io_err = |e: std::io::Error| XlsxError::Read {
+        path: disp.clone(),
+        source: Box::new(calamine::XlsxError::Io(e)),
+    };
+    let zip_err = |msg: String| XlsxError::TableParse {
+        path: disp.clone(),
+        detail: msg,
+    };
+
+    let file = std::fs::File::open(path).map_err(io_err)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(e.to_string()))?;
+    let mut xml = Vec::new();
+    {
+        let mut f = zip
+            .by_name("xl/workbook.xml")
+            .map_err(|e| zip_err(e.to_string()))?;
+        f.read_to_end(&mut xml).map_err(io_err)?;
+    }
+
+    let sheet_order = workbook_sheet_names(&xml);
+    let mut table = NameTable::new();
+    let mut rd = quick_xml::Reader::from_reader(xml.as_slice());
+    let mut buf = Vec::new();
+    let mut pending: Option<(String, Option<usize>)> = None;
+    let mut text = String::new();
+
+    loop {
+        match rd.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(ref e))
+                if e.local_name().as_ref() == b"definedName" =>
+            {
+                let Some(name) = xattr(e, b"name") else {
+                    continue;
+                };
+                let local = xattr(e, b"localSheetId").and_then(|v| v.parse::<usize>().ok());
+                pending = Some((name, local));
+                text.clear();
+            }
+            Ok(quick_xml::events::Event::Text(t)) if pending.is_some() => {
+                if let Ok(s) = t.xml10_content() {
+                    text.push_str(&s);
+                }
+            }
+            Ok(quick_xml::events::Event::End(ref e))
+                if e.local_name().as_ref() == b"definedName" =>
+            {
+                if let Some((name, local)) = pending.take() {
+                    // `_xlnm.*` are Excel's own print/filter settings.
+                    if !name.starts_with("_xlnm") {
+                        let scope = match local.and_then(|i| sheet_order.get(i)) {
+                            Some(s) => NameScope::Sheet(s.clone()),
+                            None => NameScope::Workbook,
+                        };
+                        // A target Ferrix cannot parse (a 3-D reference, an
+                        // Excel-only function) is dropped rather than stored
+                        // as something that would evaluate to nonsense.
+                        let _ = table.insert(DefinedName::new(name, scope, text.trim()));
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(table)
+}
+
+/// Sheet names in `xl/workbook.xml` order — what `localSheetId` indexes.
+fn workbook_sheet_names(xml: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rd = quick_xml::Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        match rd.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Empty(ref e))
+            | Ok(quick_xml::events::Event::Start(ref e))
+                if e.local_name().as_ref() == b"sheet" =>
+            {
+                if let Some(n) = xattr(e, b"name") {
+                    out.push(n);
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// Read an attribute by local name, resolving XML entities.
+fn xattr(e: &quick_xml::events::BytesStart, name: &[u8]) -> Option<String> {
+    e.attributes().flatten().find_map(|a| {
+        if a.key.as_ref() != name && a.key.local_name().as_ref() != name {
+            return None;
+        }
+        Some(
+            match a.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
+                Ok(v) => v.into_owned(),
+                Err(_) => String::from_utf8_lossy(a.value.as_ref()).into_owned(),
+            },
+        )
+    })
+}
+
+/// Write a name table as `<definedName>` entries.
+///
+/// `rust_xlsxwriter` addresses a sheet-scoped name through the `Sheet!Name`
+/// spelling and emits the correct `localSheetId` itself, which is why the
+/// scope is re-encoded into the name here rather than written by hand.
+fn write_defined_names(wb: &mut Workbook, names: &NameTable) -> Result<(), XlsxError> {
+    for d in names.iter() {
+        // Excel wants a leading '=' on the formula.
+        let formula = if d.refers_to.starts_with('=') {
+            d.refers_to.clone()
+        } else {
+            format!("={}", d.refers_to)
+        };
+        let key = match d.scope.sheet() {
+            Some(s) => format!("{}!{}", ferrix_formula::quote_sheet_name(s), d.name),
+            None => d.name.clone(),
+        };
+        wb.define_name(&key, &formula)
+            .map_err(|e| XlsxError::DefinedName {
+                name: d.name.clone(),
+                detail: e.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- export ---
 
 /// One worksheet to write.
@@ -400,6 +557,19 @@ pub fn export_xlsx_with_formulas(
 /// writing happens, so an oversized sheet fails without leaving a partial
 /// file behind.
 pub fn export_workbook(path: impl AsRef<Path>, sheets: &[SheetExport]) -> Result<(), XlsxError> {
+    export_workbook_with_names(path, sheets, &NameTable::new())
+}
+
+/// Export a multi-sheet workbook together with its defined names.
+///
+/// Names are written as OOXML `<definedName>` elements, workbook-scoped ones
+/// bare and sheet-scoped ones carrying the `localSheetId` that binds them to
+/// one sheet — the only thing in the format that distinguishes the two scopes.
+pub fn export_workbook_with_names(
+    path: impl AsRef<Path>,
+    sheets: &[SheetExport],
+    names: &NameTable,
+) -> Result<(), XlsxError> {
     if sheets.is_empty() {
         return Err(XlsxError::NoSheets);
     }
@@ -442,6 +612,7 @@ pub fn export_workbook(path: impl AsRef<Path>, sheets: &[SheetExport]) -> Result
             crate::table_xlsx::write_merges(ws, m).map_err(write_err)?;
         }
     }
+    write_defined_names(&mut wb, names)?;
     wb.save(path).map_err(write_err)?;
     Ok(())
 }
@@ -963,5 +1134,172 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists(), "TempXlsx must remove its file on drop");
+    }
+
+    // --- defined names ---------------------------------------------------
+
+    /// Two sheets, so a sheet-scoped name has somewhere to be scoped TO and
+    /// its `localSheetId` has to point at the right index.
+    fn two_sheets() -> (Sheet, Sheet) {
+        let mut a = Sheet::new("Sheet1");
+        for r in 0..10u32 {
+            a.set(CellRef::new(r, 1), Value::Number((r + 1) as f64));
+        }
+        let mut b = Sheet::new("Sheet2");
+        b.set(CellRef::new(0, 3), Value::Number(99.0));
+        (a, b)
+    }
+
+    #[test]
+    fn a_round_trip_preserves_both_workbook_and_sheet_scope() {
+        // THE acceptance criterion for xlsx: two names sharing an identifier
+        // must come back distinct, because only `localSheetId` tells them
+        // apart in the file.
+        let tmp = TempXlsx::new("names-scope");
+        let (a, b) = two_sheets();
+        let mut names = NameTable::new();
+        names
+            .define(DefinedName::new(
+                "Sales",
+                NameScope::Workbook,
+                "Sheet1!$B$1:$B$10",
+            ))
+            .expect("workbook name");
+        names
+            .define(DefinedName::new(
+                "Sales",
+                NameScope::Sheet("Sheet2".into()),
+                "Sheet2!$D$1",
+            ))
+            .expect("local name");
+
+        export_workbook_with_names(
+            tmp.path(),
+            &[
+                SheetExport::new("Sheet1", &a),
+                SheetExport::new("Sheet2", &b),
+            ],
+            &names,
+        )
+        .expect("export");
+
+        let back = import_defined_names(tmp.path()).expect("import names");
+        assert_eq!(back.len(), 2, "both scopes must survive");
+
+        let wb_scoped = back
+            .get_scoped("Sales", &NameScope::Workbook)
+            .expect("workbook-scoped Sales survived");
+        assert_eq!(wb_scoped.refers_to, "Sheet1!$B$1:$B$10");
+
+        let local = back
+            .get_scoped("Sales", &NameScope::Sheet("Sheet2".into()))
+            .expect("sheet-scoped Sales survived");
+        assert_eq!(local.refers_to, "Sheet2!$D$1");
+        assert_eq!(local.scope, NameScope::Sheet("Sheet2".into()));
+
+        // And resolution from each sheet still picks the right one.
+        assert_eq!(
+            back.get("Sales", Some("Sheet2")).unwrap().refers_to,
+            "Sheet2!$D$1"
+        );
+        assert_eq!(
+            back.get("Sales", Some("Sheet1")).unwrap().refers_to,
+            "Sheet1!$B$1:$B$10"
+        );
+    }
+
+    #[test]
+    fn exported_names_appear_as_real_defined_name_elements() {
+        // Proves the OOXML Excel reads is actually there, not just that
+        // Ferrix agrees with itself.
+        use std::io::Read as _;
+        let tmp = TempXlsx::new("names-xml");
+        let (a, b) = two_sheets();
+        let mut names = NameTable::new();
+        names
+            .define(DefinedName::new("Rate", NameScope::Workbook, "Sheet1!$B$1"))
+            .unwrap();
+        names
+            .define(DefinedName::new(
+                "Local",
+                NameScope::Sheet("Sheet2".into()),
+                "Sheet2!$D$1",
+            ))
+            .unwrap();
+        export_workbook_with_names(
+            tmp.path(),
+            &[
+                SheetExport::new("Sheet1", &a),
+                SheetExport::new("Sheet2", &b),
+            ],
+            &names,
+        )
+        .expect("export");
+
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut xml = String::new();
+        zip.by_name("xl/workbook.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+
+        assert!(xml.contains("<definedNames>"), "no definedNames block");
+        assert!(xml.contains("name=\"Rate\""), "workbook name missing");
+        assert!(xml.contains("name=\"Local\""), "local name missing");
+        // Sheet2 is index 1 in the <sheets> order, and only the local name
+        // carries a localSheetId at all.
+        assert!(
+            xml.contains("localSheetId=\"1\""),
+            "sheet scope must be encoded as localSheetId, got: {xml}"
+        );
+    }
+
+    #[test]
+    fn a_workbook_without_names_writes_no_defined_names_block() {
+        // A file that gained an empty element would churn every save and
+        // could confuse stricter readers.
+        use std::io::Read as _;
+        let tmp = TempXlsx::new("names-none");
+        let (a, _) = two_sheets();
+        export_workbook(tmp.path(), &[SheetExport::new("Sheet1", &a)]).expect("export");
+        let f = std::fs::File::open(tmp.path()).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut xml = String::new();
+        zip.by_name("xl/workbook.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(!xml.contains("definedName"));
+        assert!(import_defined_names(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_quoted_sheet_name_survives_the_scope_round_trip() {
+        let tmp = TempXlsx::new("names-quoted");
+        let (a, b) = two_sheets();
+        let mut names = NameTable::new();
+        names
+            .define(DefinedName::new(
+                "Local",
+                NameScope::Sheet("Q1 2024".into()),
+                "'Q1 2024'!$A$1:$A$5",
+            ))
+            .unwrap();
+        export_workbook_with_names(
+            tmp.path(),
+            &[
+                SheetExport::new("Sheet1", &a),
+                SheetExport::new("Q1 2024", &b),
+            ],
+            &names,
+        )
+        .expect("export");
+
+        let back = import_defined_names(tmp.path()).expect("import");
+        let d = back
+            .get_scoped("Local", &NameScope::Sheet("Q1 2024".into()))
+            .expect("scope survived quoting");
+        assert_eq!(d.refers_to, "'Q1 2024'!$A$1:$A$5");
     }
 }

@@ -122,6 +122,19 @@ fn scoped_contains(p: &ScopedPrecedent, target: SheetCell) -> bool {
 pub struct DepGraph {
     /// formula cell -> what it reads
     precedents: HashMap<SheetCell, Vec<ScopedPrecedent>>,
+    /// formula cell -> the defined names its SOURCE TEXT mentions, upper-cased.
+    ///
+    /// Names resolve to plain ranges in the parser, so by the time `precedents`
+    /// is built the name has vanished — which is exactly what makes a named
+    /// range cost the same as an explicit one. But a rename or a delete has to
+    /// find the formulas that mention a name, and rescanning every formula's
+    /// text on each edit would be O(workbook). Recording the (tiny) list of
+    /// words alongside the edges makes that a lookup instead.
+    ///
+    /// Entries are kept even when the name is not defined: a formula reading
+    /// `=SUM(Sales)` while `Sales` is undefined is exactly the formula that
+    /// must be revisited when `Sales` is later defined.
+    name_uses: HashMap<SheetCell, Vec<String>>,
 }
 
 impl DepGraph {
@@ -154,12 +167,64 @@ impl DepGraph {
 
     pub fn remove_at(&mut self, at: SheetCell) {
         self.precedents.remove(&at);
+        self.name_uses.remove(&at);
     }
 
     /// Forget every formula belonging to `sheet` — used when a sheet is
     /// deleted, so its nodes cannot keep participating in recalculation.
     pub fn remove_sheet(&mut self, sheet: SheetId) {
         self.precedents.retain(|k, _| k.sheet != sheet);
+        self.name_uses.retain(|k, _| k.sheet != sheet);
+    }
+
+    // --- defined names ----------------------------------------------------
+
+    /// Record which defined names a formula's SOURCE TEXT mentions.
+    ///
+    /// Called with the raw text rather than the parsed tree because the parser
+    /// has already replaced every name with the range it stands for — the name
+    /// only exists in the text.
+    pub fn set_name_uses(&mut self, at: SheetCell, src: &str) {
+        let names = crate::names::names_in(src);
+        if names.is_empty() {
+            self.name_uses.remove(&at);
+        } else {
+            self.name_uses.insert(at, names);
+        }
+    }
+
+    /// The defined names a formula mentions, upper-cased.
+    pub fn name_uses_at(&self, at: SheetCell) -> &[String] {
+        self.name_uses.get(&at).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Every formula in the workbook whose text mentions `ident`.
+    ///
+    /// This is what a rename rewrites and what a delete invalidates. Sorted so
+    /// a rename produces a deterministic sequence of edits.
+    pub fn cells_using_name(&self, ident: &str) -> Vec<SheetCell> {
+        let want = ident.to_ascii_uppercase();
+        let mut v: Vec<SheetCell> = self
+            .name_uses
+            .iter()
+            .filter(|(_, names)| names.contains(&want))
+            .map(|(at, _)| *at)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Rewrite a recorded name use after a rename, so the graph keeps agreeing
+    /// with the formula text the caller just rewrote.
+    pub fn rename_name_use(&mut self, old: &str, new: &str) {
+        let (old_u, new_u) = (old.to_ascii_uppercase(), new.to_ascii_uppercase());
+        for names in self.name_uses.values_mut() {
+            for n in names.iter_mut() {
+                if *n == old_u {
+                    *n = new_u.clone();
+                }
+            }
+        }
     }
 
     /// Every formula cell registered for `sheet`.
@@ -381,7 +446,7 @@ fn strip_main(cells: Vec<SheetCell>) -> Vec<CellRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::{parse, parse_with_names};
 
     fn cr(row: u32, col: u32) -> CellRef {
         CellRef::new(row, col)
@@ -665,5 +730,83 @@ mod tests {
         let mut p = Vec::new();
         collect_precedents(&parse("=A1+Sheet2!B2").unwrap(), &mut p);
         assert_eq!(p, vec![Precedent::Cell(cr(0, 0))]);
+    }
+
+    // --- defined names ----------------------------------------------------
+
+    #[test]
+    fn a_named_range_produces_the_same_edges_as_the_explicit_range() {
+        // The scale invariant, at the graph level: the name is gone by the
+        // time edges are built, so the graph cannot tell the two apart — and
+        // a 200M-row name is one rectangle, not 200M edges.
+        let named = parse_with_names("=SUM(Sales)", &|w| {
+            (w == "SALES").then(|| parse("=B2:B1000").unwrap())
+        })
+        .unwrap();
+        let explicit = parse("=SUM(B2:B1000)").unwrap();
+
+        let mut a = DepGraph::new();
+        a.set_formula(cr(0, 0), &named);
+        let mut b = DepGraph::new();
+        b.set_formula(cr(0, 0), &explicit);
+        assert_eq!(
+            a.precedents_of(cr(0, 0)),
+            b.precedents_of(cr(0, 0)),
+            "a name must leave no trace in the edge set"
+        );
+        assert_eq!(
+            a.precedents_of(cr(0, 0)).unwrap(),
+            vec![Precedent::Range(cr(1, 1), cr(999, 1))]
+        );
+    }
+
+    #[test]
+    fn name_uses_are_recorded_from_the_text_and_found_again() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 2);
+        g.set_formula_at(at, &parse("=A1").unwrap(), &|_| None);
+        g.set_name_uses(at, "=SUM(Sales)+A1");
+        assert_eq!(g.name_uses_at(at), ["SALES"]);
+        assert_eq!(g.cells_using_name("sales"), vec![at]);
+        assert!(g.cells_using_name("Revenue").is_empty());
+    }
+
+    #[test]
+    fn name_uses_skip_references_literals_and_calls() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 0);
+        // A1 is a reference, "Sales" is text, Sheet1! is a qualifier, SUM( is
+        // a call, TRUE is a literal. Only Costs is a name.
+        g.set_name_uses(at, "=SUM(A1:A9)+Sheet1!B1+\"Sales\"+Costs*TRUE");
+        assert_eq!(g.name_uses_at(at), ["COSTS"]);
+    }
+
+    #[test]
+    fn a_renamed_name_use_follows_the_rewrite() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 0);
+        g.set_name_uses(at, "=SUM(Sales)");
+        g.rename_name_use("Sales", "Revenue");
+        assert!(g.cells_using_name("Sales").is_empty());
+        assert_eq!(g.cells_using_name("Revenue"), vec![at]);
+    }
+
+    #[test]
+    fn dropping_a_formula_drops_its_name_uses_too() {
+        let mut g = DepGraph::new();
+        let at = sc(S1, 0, 0);
+        g.set_formula_at(at, &parse("=1").unwrap(), &|_| None);
+        g.set_name_uses(at, "=Sales");
+        g.remove_at(at);
+        assert!(
+            g.cells_using_name("Sales").is_empty(),
+            "a deleted formula must not stay a name dependent"
+        );
+
+        // And the same when a whole sheet goes.
+        let other = sc(S1, 5, 5);
+        g.set_name_uses(other, "=Sales");
+        g.remove_sheet(S1);
+        assert!(g.cells_using_name("Sales").is_empty());
     }
 }

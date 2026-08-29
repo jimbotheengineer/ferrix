@@ -31,9 +31,9 @@ pub use format_sidecar::{format_path_for, load_format, save_format, FormatSideca
 pub use mapped::MappedSheet;
 pub use table_xlsx::{import_tables, write_table, FerrixTag, ImportedTable};
 pub use xlsx::{
-    export_workbook, export_xlsx, export_xlsx_with_formulas, export_xlsx_with_tables, import_xlsx,
-    import_xlsx_full, ImportStats, ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS,
-    XLSX_MAX_ROWS,
+    export_workbook, export_workbook_with_names, export_xlsx, export_xlsx_with_formulas,
+    export_xlsx_with_tables, import_defined_names, import_xlsx, import_xlsx_full, ImportStats,
+    ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS, XLSX_MAX_ROWS,
 };
 
 /// Files at or above this size are converted and memory-mapped rather than
