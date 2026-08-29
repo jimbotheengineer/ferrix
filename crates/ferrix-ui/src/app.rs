@@ -101,6 +101,9 @@ pub struct FerrixApp {
     /// Chart panel state: the built scene, its annotations, and the window.
     chart: crate::chart_panel::ChartPanel,
 
+    /// Display column being dragged by its header, between press and release.
+    header_drag: Option<usize>,
+
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
     fill_target: Option<Selection>,
@@ -215,6 +218,7 @@ impl FerrixApp {
             chart: crate::chart_panel::ChartPanel::default(),
             search_filter_mode: false,
             row_filter: None,
+            header_drag: None,
             fill_source: None,
             fill_target: None,
             tables: Vec::new(),
@@ -2587,6 +2591,7 @@ impl FerrixApp {
                         editing: self.editing,
                         matches: &self.search_results.matches,
                         filling: self.fill_source.is_some(),
+                        header_dragging: self.header_drag,
                         filter: self.row_filter.as_ref(),
                         table: decor.as_ref(),
                         current_match: if self.search_open {
@@ -2632,6 +2637,47 @@ impl FerrixApp {
                             fmt_int(self.selection.cell_count() as usize)
                         );
                     }
+                }
+                // --- header reorder ---
+                //
+                // Press starts the drag and selects the whole column, so the
+                // user sees what they grabbed. Release commits the move.
+                if let Some(c) = resp.header_press {
+                    self.header_drag = Some(c);
+                    let last = self.stats_rows.saturating_sub(1) as u32;
+                    self.selection =
+                        Selection::new(CellRef::new(0, c as u32), CellRef::new(last, c as u32));
+                    self.status = format!("Column {} selected", ferrix_core::column_name(c as u32));
+                }
+                if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
+                    if src != dst {
+                        self.status = format!(
+                            "Move {} → before {}",
+                            ferrix_core::column_name(src as u32),
+                            ferrix_core::column_name(dst as u32)
+                        );
+                    }
+                }
+                if resp.header_released {
+                    if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
+                        if src != dst {
+                            // `to` is an insertion point in the ORIGINAL
+                            // indexing: dropping onto a column to the right
+                            // means landing after it, hence dst + 1.
+                            let to = if dst > src { dst + 1 } else { dst };
+                            match self.move_columns(src as u64, 1, to as u64) {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "Moved column {} to position {}",
+                                        ferrix_core::column_name(src as u32),
+                                        ferrix_core::column_name(dst as u32)
+                                    );
+                                }
+                                Err(e) => self.status = format!("Move failed: {e}"),
+                            }
+                        }
+                    }
+                    self.header_drag = None;
                 }
                 // --- fill handle ---
                 if resp.fill_started {

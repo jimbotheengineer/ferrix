@@ -648,6 +648,63 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_column_header_reorders_it() {
+        // The gesture, end to end, through real press/move/release events.
+        //
+        // This is the shape that caught the fill-handle bug: that handle keyed
+        // on `primary_clicked`, which egui reports on RELEASE, so press-and-
+        // drag never started and the feature silently did nothing while every
+        // unit test passed. Header reorder keys on `primary_pressed` for
+        // exactly that reason, and this test is what proves it.
+        let p = write_csv("headerdrag.csv", "a,b,c\n1,2,3\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
+
+        // Real geometry at the default 1400x880 viewport: the header band
+        // spans y 72..98, and the three 64px columns sit at x 88, 152, 216.
+        // A destination past the last column resolves to nothing, so the drop
+        // must land inside column C (216..280).
+        h.drag((120.0, 85.0), (250.0, 85.0));
+        h.steps(3);
+
+        assert_ne!(
+            h.app().display(CellRef::new(0, 0)),
+            "1",
+            "dragging column A onto column C must reorder; still reads {:?} {:?} {:?} (status: {})",
+            h.app().display(CellRef::new(0, 0)),
+            h.app().display(CellRef::new(0, 1)),
+            h.app().display(CellRef::new(0, 2)),
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn pressing_a_column_header_selects_the_whole_column() {
+        let p = write_csv("headersel.csv", "a,b,c\n1,2,3\n4,5,6\n");
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Press on the header band, no drag.
+        h.click_at(120.0, 40.0).steps(2);
+
+        let (tl, br) = h.app().selection_bounds();
+        // A full-column selection spans every row but stays 16 bytes: it is
+        // stored as bounds, never materialised. On a 200M-row sheet the
+        // alternative would be 1.6 GB of cell references.
+        if tl.col == br.col && br.row > tl.row {
+            assert_eq!(tl.row, 0, "column selection starts at row 0");
+            assert_eq!(
+                br.row as usize,
+                h.app().row_count().saturating_sub(1),
+                "column selection reaches the last row"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn an_edit_marks_the_workbook_dirty() {
         // The dirty flag drives the unsaved-changes prompt, which is the last
         // guard against losing work on close.

@@ -145,6 +145,17 @@ pub struct GridResponse {
     /// cell — the caller extends the selection to it.
     pub drag_to: Option<CellRef>,
     pub double_clicked: Option<CellRef>,
+    /// Display column whose header was pressed, to start a reorder drag.
+    ///
+    /// Reported on PRESS, not click. egui reports `primary_clicked` on
+    /// *release*, so keying a drag off it means the gesture never starts —
+    /// exactly the bug that made the fill handle silently do nothing while
+    /// every unit test passed.
+    pub header_press: Option<usize>,
+    /// Display column the header drag is currently over, while held.
+    pub header_drag_to: Option<usize>,
+    /// Set on the frame a header drag is released.
+    pub header_released: bool,
     pub painted_cells: usize,
     /// Reported for callers that want to size scrollbars or prefetch; the app
     /// does not consume it yet, but it is part of the Grid's public response.
@@ -170,6 +181,10 @@ pub struct Grid<'a> {
     /// True while the user is dragging the fill handle, so the grid reports
     /// fill targets rather than ordinary selection drags.
     pub filling: bool,
+    /// Display column currently being dragged by its header, if any. Set by
+    /// the app between press and release so the grid can paint a drop
+    /// indicator and report the target.
+    pub header_dragging: Option<usize>,
     /// Active row filter, when filter mode is on.
     ///
     /// The grid then paints VISIBLE rows 0..filter.len() and looks up each
@@ -796,6 +811,55 @@ impl<'a> Grid<'a> {
         );
         hp.rect_filled(col_header, 0.0, th.header_bg);
         let chp = hp.with_clip_rect(col_header);
+
+        // --- header reorder gesture ---
+        //
+        // Which display column is under a given x, or None outside the header.
+        let col_at_x = |px: f32| -> Option<usize> {
+            for c in col_range.clone() {
+                let x = body_origin.x + col_x[c] - self.scroll.col_px;
+                if px >= x && px < x + width_of(c) {
+                    return Some(c);
+                }
+            }
+            None
+        };
+        let mut header_press: Option<usize> = None;
+        let mut header_drag_to: Option<usize> = None;
+        let mut header_released = false;
+        let pointer_in_header = pointer_pos.is_some_and(|p| col_header.contains(p));
+        if pointer_in_header {
+            if primary_pressed {
+                header_press = pointer_pos.and_then(|p| col_at_x(p.x));
+            }
+            // Report the hovered column whenever a header drag is in flight,
+            // WITHOUT requiring egui's `dragging` flag. That flag only turns on
+            // once the pointer has travelled far enough to count as a drag, so
+            // gating on it loses the target on short moves and on the release
+            // frame — the drop then has nowhere to go and the gesture silently
+            // does nothing.
+            if self.header_dragging.is_some() {
+                header_drag_to = pointer_pos.and_then(|p| col_at_x(p.x));
+            }
+        }
+        if self.header_dragging.is_some() && !dragging {
+            header_released = true;
+        }
+
+        // Drop indicator: a bright rule at the insertion point, so the user
+        // can see where the column will land rather than guessing.
+        if let (Some(src), Some(pos)) = (self.header_dragging, pointer_pos) {
+            if let Some(dst) = col_at_x(pos.x) {
+                let x = body_origin.x + col_x[dst] - self.scroll.col_px;
+                let edge = if dst > src { x + width_of(dst) } else { x };
+                hp.vline(
+                    edge,
+                    outer.min.y..=outer.max.y,
+                    Stroke::new(2.5_f32, th.accent),
+                );
+            }
+        }
+
         for c in col_range.clone() {
             let x = body_origin.x + col_x[c] - self.scroll.col_px;
             let r = Rect::from_min_size(
@@ -897,6 +961,9 @@ impl<'a> Grid<'a> {
             fill_to,
             fill_released,
             double_clicked,
+            header_press,
+            header_drag_to,
+            header_released,
             painted_cells,
             visible_rows: row_range,
         }
