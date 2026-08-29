@@ -689,6 +689,29 @@ impl ferrix_io::export::ExportSource for OwnedSheet {
     }
 }
 
+/// The same snapshot, exported with TYPES rather than display strings.
+///
+/// Parquet needs the typed value: rendering a number to text first would throw
+/// away exactly the type information the format exists to carry, and the file
+/// would come back into pandas as a column of strings.
+impl ferrix_io::ArrowSource for OwnedSheet {
+    fn row_count(&self) -> usize {
+        self.view().row_count()
+    }
+    fn col_count(&self) -> usize {
+        self.view().col_count()
+    }
+    fn header(&self, col: usize) -> String {
+        self.view().header_or_letter(col)
+    }
+    fn value(&self, cell: CellRef) -> Value {
+        self.view().get(cell)
+    }
+    fn text(&self, id: StrId) -> String {
+        self.view().resolve(id).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

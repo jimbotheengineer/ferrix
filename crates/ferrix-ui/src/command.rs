@@ -161,6 +161,8 @@ registry! {
         "Write this sheet, including edits, to a CSV file." }
     FileExportXlsx { "file.export_xlsx", Some(Menu::File), "⬈ Export xlsx…", None, false, None,
         "Write this sheet and its table as a real Excel Table, with validation, conditional formatting and autoFilter." }
+    FileExportParquet { "file.export_parquet", Some(Menu::File), "⬈ Export Parquet…", None, false, None,
+        "Write this sheet, including edits, as a Parquet file. Columns keep their type, and the write streams one column stripe at a time." }
 
     // ---- Format ----
     FormatCondNew { "format.cond_new", Some(Menu::Format), "🎨 Conditional Formatting — New Rule…", None, false, Some(Note::Selection),
@@ -259,7 +261,9 @@ impl Command {
         }
         use CommandId::*;
         match self.id {
-            FileOpen | FileOpenXlsx | FileExportCsv | FileExportXlsx if st.busy => {
+            FileOpen | FileOpenXlsx | FileExportCsv | FileExportXlsx | FileExportParquet
+                if st.busy =>
+            {
                 say(&st.busy_hint, "Wait for the current operation to finish")
             }
             FileCompact if !st.can_compact => {

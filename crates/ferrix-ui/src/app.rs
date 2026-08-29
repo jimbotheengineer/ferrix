@@ -751,9 +751,17 @@ impl FerrixApp {
 
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Spreadsheets", &["csv", "tsv", "txt", "xlsx"])
+            .add_filter(
+                "Spreadsheets",
+                &[
+                    "csv", "tsv", "txt", "xlsx", "parquet", "pq", "arrow", "feather",
+                ],
+            )
             .add_filter("CSV", &["csv", "tsv", "txt"])
             .add_filter("Excel", &["xlsx"])
+            // Same list `ferrix_io::format_for_path` routes on, so the dialog
+            // cannot offer a file the open path then refuses.
+            .add_filter("Parquet / Arrow", ferrix_io::ARROW_EXTENSIONS)
             .pick_file()
         {
             self.start_load(path);
@@ -3636,6 +3644,93 @@ impl FerrixApp {
         self.sync_formula_bar();
     }
 
+    /// Write this sheet as a Parquet file.
+    ///
+    /// Runs on the calling thread rather than the background export machinery
+    /// the CSV path uses. That is a deliberate limitation, not an oversight:
+    /// the progress/cancel plumbing is built around `ExportStats`, and wiring
+    /// a second stats type through it is a bigger change than this issue.
+    /// The write itself is still streaming — `export_parquet` holds one
+    /// column stripe — so the memory bound holds; only the UI's
+    /// responsiveness during a very large export does not.
+    fn export_parquet_dialog(&mut self) {
+        if self.exporting {
+            self.status = "An export is already running — cancel it first".into();
+            return;
+        }
+        let cost = crate::sheet_view::OwnedSheet::snapshot_cost_bytes(&self.wb.overlay);
+        if let Err(msg) = ferrix_core::Budget::sample().admit(cost, "Exporting this sheet's edits")
+        {
+            self.status = msg;
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Parquet", &["parquet"])
+            .set_file_name("export.parquet")
+            .save_file()
+        else {
+            return;
+        };
+
+        let snapshot = crate::sheet_view::OwnedSheet::new(
+            std::sync::Arc::clone(&self.wb.base),
+            &self.wb.overlay,
+        );
+        // Columns the user has formatted as dates are written as timestamps;
+        // everything else keeps its inferred type. Guessing from the magnitude
+        // of the number instead would silently turn a price column into 2023.
+        let date_columns: Vec<usize> = (0..snapshot.view().col_count())
+            .filter(|c| self.column_is_date_formatted(*c))
+            .collect();
+        let opts = ferrix_io::ExportOptions {
+            date_columns,
+            use_headers: true,
+        };
+
+        self.status = match ferrix_io::export_parquet(&snapshot, &path, &opts) {
+            Ok((stats, report)) => {
+                // Report the lossy case rather than letting the user discover
+                // it in pandas — the `rule_survives_xlsx` convention.
+                let note = if report.is_lossless() {
+                    String::new()
+                } else {
+                    format!(
+                        " · {} mixed-type column(s) written as text: {}",
+                        report.mixed_columns.len(),
+                        report
+                            .mixed_columns
+                            .iter()
+                            .map(|c| ferrix_core::column_name(*c as u32))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "Exported {} rows × {} cols to Parquet ({} row group(s), {:.1} MB){}",
+                    fmt_int(stats.rows),
+                    stats.cols,
+                    stats.row_groups,
+                    stats.bytes as f64 / 1e6,
+                    note
+                )
+            }
+            Err(e) => format!("Parquet export failed: {e}"),
+        };
+    }
+
+    /// Does this column's number format render as a date?
+    ///
+    /// The only signal available: `Value` has no date type, so a date is an
+    /// f64 serial and the column's *number format* is what says it is a date.
+    /// Stored per column, so asking this costs one map lookup regardless of
+    /// how many rows the column has.
+    fn column_is_date_formatted(&self, col: usize) -> bool {
+        self.wb
+            .format
+            .column(col as u32)
+            .is_some_and(|f| matches!(f.format, ferrix_core::NumberFormat::Date(_)))
+    }
+
     /// Write this sheet and its tables as a real Excel workbook.
     fn export_xlsx_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
@@ -5307,6 +5402,7 @@ impl FerrixApp {
             }
             C::FileExportCsv => self.export_dialog(),
             C::FileExportXlsx => self.export_xlsx_dialog(),
+            C::FileExportParquet => self.export_parquet_dialog(),
             C::FormatCondNew => self.cond_new_rule(),
             C::FormatCondManage => self.cond_manage(),
             C::FormatBold => {
@@ -6802,6 +6898,14 @@ where
         return load_xlsx(path);
     }
 
+    // Parquet and Arrow IPC route through the SAME dispatch as csv/xlsx —
+    // extending this match rather than adding a second open path is what
+    // keeps `File > Open`, drag-and-drop, and the recent-files list all
+    // agreeing about what a `.parquet` is.
+    if let Some(fmt) = ferrix_io::format_for_path(path) {
+        return load_arrow(path, fmt, &mut progress);
+    }
+
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -6904,6 +7008,118 @@ where
         restored: restored_edits.overlay,
         edit_warning: restored_edits.warning,
         recovery: restored_edits.recovery,
+        names: ferrix_formula::NameTable::new(),
+    })
+}
+
+/// Open a Parquet or Arrow IPC file.
+///
+/// Storage is chosen the same way a CSV's is, and for the same reason: a
+/// Parquet file that would not fit in RAM is streamed into the columnar
+/// `.ferrix` cache and memory-mapped, so what bounds the open is disk rather
+/// than memory. The difference from CSV is only *which* streaming converter
+/// runs — `ferrix_io::convert_parquet` instead of `convert_csv` — because the
+/// scale rule is a property of the app, not of the CSV parser.
+///
+/// Arrow IPC always takes the in-RAM path: the format is designed to be
+/// mapped whole and there is no partial-read story worth the complexity until
+/// someone shows up with an `.arrow` file that needs one.
+fn load_arrow<F>(path: &Path, fmt: ferrix_io::ArrowFormat, progress: &mut F) -> LoadResult
+where
+    F: FnMut(u64, u64),
+{
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Sheet1".to_string());
+
+    // Large Parquet: stream into the columnar cache and map it, exactly as a
+    // large CSV does.
+    if fmt == ferrix_io::ArrowFormat::Parquet && ferrix_io::should_use_mmap(path) {
+        let cache = ferrix_io::cache_path_for(path);
+        let reused = ferrix_io::cache_is_fresh(path, &cache);
+        let mut note = String::new();
+        if !reused {
+            let stats = ferrix_io::convert_parquet(path, &cache, &mut *progress)
+                .map_err(|e| e.to_string())?;
+            note = format!(
+                "converted {} rows in {:.0}s · ",
+                fmt_int(stats.rows as usize),
+                stats.millis as f64 / 1000.0,
+            );
+        }
+        let mapped = ferrix_io::MappedSheet::open(&cache).map_err(|e| e.to_string())?;
+        let widths = compute_col_widths_mapped(&mapped);
+        let rows = mapped.row_count();
+        let cols = mapped.col_count();
+        let summary = format!(
+            "{}{} rows × {} cols · {:.1} GB mapped from disk{}",
+            note,
+            fmt_int(rows),
+            cols,
+            mapped.mapped_bytes() as f64 / 1e9,
+            if reused { " (cached)" } else { "" }
+        );
+        let restored = restore_edits(&cache, rows as u64, cols as u32);
+        return Ok(Loaded {
+            rows,
+            cols,
+            col_widths: widths,
+            summary,
+            base: BaseData::Mapped(Box::new(mapped)),
+            sheet_name: stem,
+            extra_sheets: Vec::new(),
+            first_formulas: None,
+            edits_path: restored.path,
+            fingerprint: restored.fingerprint,
+            comments_path: restored.comments_path,
+            comments: restored.comments,
+            cache_path: Some(cache),
+            restored: restored.overlay,
+            edit_warning: restored.warning,
+            recovery: restored.recovery,
+            names: ferrix_formula::NameTable::new(),
+        });
+    }
+
+    let imported = ferrix_io::import_any(path).map_err(|e| e.to_string())?;
+    let sheet = imported.sheet;
+    let st = imported.stats;
+    let widths = compute_col_widths_mem(&sheet);
+    let rows = sheet.row_count();
+    let cols = sheet.col_count();
+    let summary = format!(
+        "Loaded {} rows × {} cols from {} in {} ms · {} distinct string{}",
+        fmt_int(rows),
+        cols,
+        if fmt == ferrix_io::ArrowFormat::Parquet {
+            "Parquet"
+        } else {
+            "Arrow"
+        },
+        st.millis,
+        fmt_int(st.distinct_strings),
+        if st.distinct_strings == 1 { "" } else { "s" },
+    );
+    let restored = restore_edits(path, rows as u64, cols as u32);
+    Ok(Loaded {
+        rows,
+        cols,
+        col_widths: widths,
+        summary,
+        base: BaseData::Memory(sheet),
+        sheet_name: stem,
+        extra_sheets: Vec::new(),
+        first_formulas: None,
+        edits_path: restored.path,
+        fingerprint: restored.fingerprint,
+        comments_path: restored.comments_path,
+        comments: restored.comments,
+        cache_path: None,
+        restored: restored.overlay,
+        edit_warning: restored.warning,
+        recovery: restored.recovery,
         names: ferrix_formula::NameTable::new(),
     })
 }
@@ -7295,6 +7511,173 @@ mod tests {
             ],
         )
         .expect("export fixture");
+    }
+
+    /// `.parquet` must reach the grid through the SAME `load_any` dispatch
+    /// csv and xlsx use — not a parallel path bolted on beside it.
+    ///
+    /// What would this assert if the feature did nothing? `load_any` would
+    /// fall through to the CSV loader, which on Parquet's binary header
+    /// produces either an error or one garbage row. So the assertions are on
+    /// the decoded VALUES at specific coordinates, with their types intact.
+    #[test]
+    fn a_parquet_file_opens_through_the_normal_load_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix-ui-parquet-open-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sales.parquet");
+
+        // Build the fixture through the public exporter, so this test also
+        // pins that what Ferrix writes, Ferrix reads.
+        let mut src = ferrix_core::Sheet::new("sales");
+        src.set_headers(vec!["region".into(), "units".into(), "active".into()]);
+        for r in 0..250u32 {
+            src.set_text(
+                CellRef::new(r, 0),
+                ["north", "south", "east"][r as usize % 3],
+            );
+            src.set(CellRef::new(r, 1), Value::Number(r as f64 * 2.0));
+            src.set(CellRef::new(r, 2), Value::Bool(r % 2 == 0));
+        }
+        ferrix_io::export_parquet(
+            &src,
+            &path,
+            &ferrix_io::ExportOptions {
+                use_headers: true,
+                ..Default::default()
+            },
+        )
+        .expect("write parquet fixture");
+
+        let loaded = load_any(&path, |_, _| {}, &mut || false).expect("parquet must open");
+        assert_eq!(loaded.rows, 250, "every row must arrive");
+        assert_eq!(loaded.cols, 3);
+        // The sheet is named from the file, as csv's is.
+        assert_eq!(loaded.sheet_name, "sales");
+
+        let wb = build_workbook(
+            loaded.base,
+            loaded.sheet_name,
+            loaded.first_formulas,
+            loaded.restored,
+            loaded.extra_sheets,
+            loaded.names,
+        );
+        let view = wb.view();
+        // Per-row identity through the real open path, at both ends and the
+        // middle — not "the status line is non-empty".
+        for r in [0u32, 1, 2, 137, 249] {
+            assert_eq!(
+                view.display(CellRef::new(r, 0)),
+                ["north", "south", "east"][r as usize % 3],
+                "row {r} region"
+            );
+            assert_eq!(
+                view.get(CellRef::new(r, 1)),
+                Value::Number(r as f64 * 2.0),
+                "row {r} units"
+            );
+            assert_eq!(
+                view.get(CellRef::new(r, 2)),
+                Value::Bool(r % 2 == 0),
+                "row {r} active must stay a Bool, not become a number"
+            );
+        }
+        // Headers came from the Parquet field names, not A/B/C.
+        assert_eq!(view.header_or_letter(0), "region");
+        assert_eq!(view.header_or_letter(1), "units");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same, for `.arrow`. Separate test because the two extensions reach
+    /// different readers and a dispatch that only handled one would otherwise
+    /// pass.
+    #[test]
+    fn an_arrow_ipc_file_opens_through_the_normal_load_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix-ui-arrow-open-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed.arrow");
+
+        let mut src = ferrix_core::Sheet::new("feed");
+        src.set_headers(vec!["k".into(), "v".into()]);
+        for r in 0..64u32 {
+            src.set_text(CellRef::new(r, 0), &format!("k{r}"));
+            src.set(CellRef::new(r, 1), Value::Number(r as f64 / 8.0));
+        }
+        ferrix_io::export_ipc(
+            &src,
+            &path,
+            &ferrix_io::ExportOptions {
+                use_headers: true,
+                ..Default::default()
+            },
+        )
+        .expect("write arrow fixture");
+
+        let loaded = load_any(&path, |_, _| {}, &mut || false).expect(".arrow must open");
+        assert_eq!(loaded.rows, 64);
+        assert_eq!(loaded.cols, 2);
+
+        let wb = build_workbook(
+            loaded.base,
+            loaded.sheet_name,
+            loaded.first_formulas,
+            loaded.restored,
+            loaded.extra_sheets,
+            loaded.names,
+        );
+        let view = wb.view();
+        for r in [0u32, 7, 63] {
+            assert_eq!(view.display(CellRef::new(r, 0)), format!("k{r}"));
+            assert_eq!(view.get(CellRef::new(r, 1)), Value::Number(r as f64 / 8.0));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.parquet` whose contents are not Parquet must REPORT, not panic and
+    /// not silently open as an empty sheet.
+    #[test]
+    fn a_corrupt_parquet_file_reports_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix-ui-badparquet-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("junk.parquet");
+        std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
+
+        let err = match load_any(&path, |_, _| {}, &mut || false) {
+            Ok(loaded) => panic!(
+                "a non-Parquet .parquet must not open; got {} rows x {} cols",
+                loaded.rows, loaded.cols
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            !err.trim().is_empty(),
+            "the failure must carry a message the status bar can show"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

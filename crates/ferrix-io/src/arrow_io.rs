@@ -324,7 +324,7 @@ fn decode_array(
             prim!(Date64Type, |v: i64| serial_from_unix_ms(v))
         }
         (ColumnKind::DateSerial, DataType::Timestamp(unit, _)) => {
-            let unit = unit.clone();
+            let unit = *unit;
             let vals: Vec<i64> = match unit {
                 TimeUnit::Second => ts_raw::<TimestampSecondType>(array),
                 TimeUnit::Millisecond => ts_raw::<TimestampMillisecondType>(array),

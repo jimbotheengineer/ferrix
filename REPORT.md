@@ -1,102 +1,118 @@
-# Issue #40 — Command palette
+# Issue #32 — Parquet and Arrow import/export
 
-Branch `feat/cmdpal` in `C:\Users\Error\projects\ferrix-cmdpal`. Not pushed; the
-orchestrator merges.
+Clone: `C:/Users/Error/projects/ferrix-parquet`, branch `feat/parquet`, forked
+from `main` @ `571c510`.
+
+## Gate results
+
+Run bare (never piped), from the clone root:
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | **PASS** — 1279 passed, 0 failed |
+| `cargo fmt --all --check` | **PASS** — exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** — exit 0 |
+
+Baseline on `main` was 1255. 1279 − 1255 = **24 new tests**, all passing:
+21 in `ferrix-io/src/arrow_io/tests.rs`, 3 in `ferrix-ui/src/app.rs`.
 
 ## What landed
 
-New module `crates/ferrix-ui/src/command.rs` (+ `command/tests.rs`), plus a
-refactor of the menu bar in `app.rs` and one new key in `prefs.rs`.
+**`crates/ferrix-io/src/arrow_io.rs`** (new, plus `arrow_io/tests.rs`)
 
-The issue is not really "add a search box" — it is "make it impossible for a
-command to exist in a menu and not in the palette". So the registry came first:
+* `import_parquet` / `import_ipc` / `import_any` → in-RAM `Sheet`. Batched at
+  `ROW_GROUP_ROWS` (64K), so transient peak is one batch.
+* `convert_parquet` → streams a Parquet file into the `.ferrix` columnar cache
+  via `convert.rs`'s `Spill` writer (the same encoder `convert.rs` and
+  `compact.rs` use — deliberately not a fourth one), then the caller mmaps it.
+  Holds one row-group batch plus the arena, nothing else.
+* `export_parquet` → written through the **low-level `SerializedFileWriter`**,
+  not `ArrowWriter`. That is the load-bearing choice: `ArrowWriter` takes a
+  whole `RecordBatch` (every column of the row group at once), which would
+  multiply peak by the column count. The low-level writer lets us materialise
+  and drop **one column stripe** at a time.
+* `export_ipc` → Arrow IPC file, batched. Honest caveat in the module docs:
+  IPC genuinely needs every column of a batch live at once (that is what a
+  `RecordBatch` is), so its bound is `ROW_GROUP_ROWS × cols` — still
+  independent of row count, but not one stripe.
+* `ExportReport` reports mixed-type columns written as text, rather than
+  silently coercing (the `rule_survives_xlsx` convention).
 
-* `command.rs` declares `CommandId` and `REGISTRY` from ONE macro table, so a
-  variant cannot exist without a row and vice versa. `menu_items()` draws every
-  menu from it; `CommandPalette::matches()` searches it.
-* The five hand-written menu closures in `app.rs` (~150 lines, ~15 `close_menu`
-  sites) are now a 6-line loop over `Menu::ALL`. The `FileAction` / `ViewAction`
-  deferral enums are gone, replaced by one `Option<CommandId>`.
-* `FerrixApp::run_command` is the single dispatcher, exhaustive over
-  `CommandId` — adding a registry row without behaviour is a compile error.
-  Toolbar buttons route through it too, so a toolbar click ranks in the palette.
+**Dependencies added** to `crates/ferrix-io/Cargo.toml`: `arrow = "56"`
+(default-features off, `ipc`) and `parquet = "56"` (default-features off,
+`arrow` + `snap`). Resolved to 56.2.1. Fetched from crates.io successfully.
 
-### Acceptance criteria
+**`crates/ferrix-ui/src/app.rs`**
 
-| criterion | state |
-|---|---|
-| Ctrl+Shift+P and Ctrl+/ open a fuzzy list of every command | met — `ctrl_shift_p_opens_the_palette_and_ctrl_slash_does_too`, `the_palette_lists_every_command_and_filters_to_the_typed_one` |
-| One registry the menus also read | met — `menu_commands_and_palette_commands_come_from_one_registry` walks the real `for_menu()` construction the menu bar calls and requires every item in the palette's list; `menus_are_drawn_only_from_the_registry` equivalent in `command/tests.rs` |
-| Shows each command's keyboard shortcut | met — `shortcuts_are_shown_for_the_commands_that_have_them` |
-| Recently used rank first, persists across restart | met — `running_a_command_reorders_recency_and_it_survives_a_restart` builds a SECOND `Harness` (= a fresh process's `Prefs::load`) and asserts the restored order reaches the visible list |
-| Enter runs; Escape closes and restores selection | met — `enter_runs_the_highlighted_command`, `escape_closes_and_leaves_the_selection_exactly_as_it_was` (multi-cell selection, and a following arrow key proves the grid really got the keyboard back) |
-| Unavailable shown DISABLED WITH REASON, not hidden | met — `unavailable_commands_are_listed_with_their_reason_not_hidden` asserts Unfreeze is still listed *and* that the reason clears once panes are actually frozen |
-| Opening does not disturb the current edit | met — `opening_the_palette_does_not_disturb_an_edit_in_progress` |
+* `load_any` — the existing csv/xlsx dispatch — gained one arm calling
+  `ferrix_io::format_for_path`. Extended, not duplicated.
+* `load_arrow` chooses storage the same way a CSV does: a Parquet file that
+  fails `should_use_mmap` streams into the cache and is memory-mapped; smaller
+  files and all `.arrow` load in RAM.
+* `export_parquet_dialog` + `CommandId::FileExportParquet` in the registry.
+  Date columns are taken from each column's `NumberFormat::Date(_)`, never
+  guessed from magnitude.
+* Open dialog filters extended from `ferrix_io::ARROW_EXTENSIONS` (one list,
+  shared with the router, so the dialog cannot offer a file the loader
+  refuses).
 
-## Notable design points
+**`crates/ferrix-ui/src/sheet_view.rs`** — `ArrowSource for OwnedSheet`, so the
+export writes typed values from the base+overlay composite view rather than
+display strings.
 
-* Named `CommandPalette` / `command_palette` throughout. `palette` alone already
-  means the COLOUR palette here (`theme`, issue #19).
-* `CommandPalette::keys` **consumes** keys via `input_mut`. Everything else in
-  this app reads without consuming, but the in-cell editor checks Escape in the
-  *paint* path later in the same frame — a merely-observed Escape closed the
-  palette AND cancelled the user's edit. A failing test caught this.
-* Ctrl+Shift+P is consumed before Ctrl+/ because `Modifiers::matches_logically`
-  ignores an extra Shift.
-* `CommandState` is a snapshot of scalars, not a borrow: the panel closure
-  already holds `&mut self`.
-* `disabled_reason` falls back to a sentence when the app hands it an empty
-  hint string — a grey row with no explanation is the failure the criterion
-  exists to prevent, and `every_disabled_reason_is_a_sentence_not_a_flag`
-  caught exactly that against `file.save`.
-* Scale invariant untouched: the registry is a `const` slice, recency is capped
-  at 40 slugs. Nothing here is per row or per cell.
+## Acceptance criteria
 
-## Conflict minimisation
+| Criterion | Status | Evidence |
+|---|---|---|
+| `.parquet`/`.arrow` open through the normal File > Open path | **Done** | `a_parquet_file_opens_through_the_normal_load_path`, `an_arrow_ipc_file_opens_through_the_normal_load_path` — both call the real `load_any`, then build a real `Workbook` and assert decoded values at coordinates. |
+| Export streams column by column, bounded peak | **Done** | `export_peak_is_one_stripe_not_the_file` exports the same sheet at 2 and 20 row groups and asserts `peak_stripe_bytes` is **identical**, while asserting the output file did grow 4x+. |
+| Type mapping tested both directions | **Done** | `type_mapping_import_covers_every_supported_arrow_type` (9 Arrow types incl. an all-null row); `type_mapping_export_writes_the_declared_parquet_types` reads the **Parquet schema** back, so a write-everything-as-text implementation fails even though its values would round trip. |
+| Dictionary Utf8 onto the arena, not expanded | **Done** | `dictionary_column_does_not_expand_to_per_row_strings`: 100k rows / 3 distinct → asserts `arena.len() == 3` **and** `arena.data_bytes() == 14`. Plus `..._with_many_distinct_values...` (5000 distinct over 50k rows → 5000) and `streaming_import_keeps_dictionary_bounded` (200k rows through the out-of-core path → 3). |
+| Round trip preserves per-row identity AND order | **Done** | `parquet_round_trip_preserves_per_row_identity_and_order` — 64K+777 rows (crosses a row-group boundary, asserted), scattered holes, verified **per row at every index**, no checksum. Plus `round_trip_survives_a_shuffled_source_order`, where the source is a deliberate non-monotonic bijection so any internal sort/dedup is caught (a SUM would be identical either way). |
+| Larger-than-RAM Parquet opens without materialising | **Partial — see below** | `large_parquet_streams_without_materialising` |
+| Unsupported logical types reported, not coerced | **Done** | `unsupported_types_are_reported_not_coerced` (List/Struct/Decimal/Binary/Interval/non-Utf8-dictionary rejected, **and** the 8 supported types asserted to classify — otherwise the test would pass against a `classify` that rejects everything). `an_unsupported_column_fails_the_whole_import_before_reading_rows` checks the error names the column. |
 
-A concurrent agent is editing `app.rs` and `prefs.rs` for issue #45.
+## What I did NOT verify — read this part
 
-* `prefs.rs`: one new field, one parse arm, one serialise block. The existing
-  zoom handling and formatting are untouched.
-* `app.rs`: one struct field, one initialiser, one call in the frame path, the
-  new `run_command` / `command_state` / `command_palette_frame` block, and the
-  menu-bar refactor. The menu refactor is a large deletion in a region issue #45
-  is unlikely to touch (the toolbar's five menu closures).
-* `harness.rs`: additive only — new helpers at the end of the impl and new
-  tests at the end of the test module.
+1. **No file larger than actual RAM was ever opened.** The "larger than RAM"
+   criterion is tested by *bound*, not by scale: a 400k-row × 4-col Parquet
+   file is streamed and the reported `peak_block_bytes` is asserted to be
+   ≤ 2 stripes and an order of magnitude below the ~25MB a materialising
+   import would need. That proves the converter *holds* only a row group. It
+   does **not** prove a 10GB file opens on an 8GB machine — nobody tried one.
+2. **`peak_block_bytes` / `peak_stripe_bytes` are computed by the code under
+   test**, from its own buffer capacities. They are not RSS measurements. A
+   bug that allocated elsewhere (inside the parquet reader, say) would not
+   show up in them. The invariance-across-row-counts assertion is the real
+   signal; the absolute number is self-reported.
+3. **No throughput measurement.** `convert.rs` does 245 MB/s; I did not
+   benchmark `convert_parquet` against that or anything else. Performance is
+   unknown beyond "the tests finish quickly".
+4. **No interop check with pandas / DuckDB / Spark.** Files are written with
+   Snappy and standard logical types, and they round trip through
+   *Ferrix's own reader*. That proves self-consistency, not that pandas
+   accepts them. Nobody opened one outside this process.
+5. **`export_parquet_dialog` runs on the UI thread**, unlike the CSV export
+   which has background progress/cancel plumbing. The write is still streaming
+   so memory is bounded, but a very large Parquet export will freeze the UI.
+   Documented in the function's doc comment. Reusing the background machinery
+   needs it generalised past `ExportStats`, which is bigger than this issue.
+6. **The export dialog and menu item were never clicked.** They are wired
+   through the command registry and compile, and `export_parquet` itself is
+   tested directly, but no headless-harness test drives the menu.
+7. **Int64 → f64 precision.** Integers above 2^53 lose precision in a
+   `Value::Number` cell. Inherent to the f64 cell type; documented in
+   `classify`, not rejected (rejecting Int64 would make the importer useless),
+   and **not** tested.
+8. **Arrow IPC never takes the out-of-core path** — `.arrow` always loads in
+   RAM. Deliberate, noted in `load_arrow`'s docs, but it means a huge
+   `.arrow` file has no graceful degradation.
+9. **`ScratchDir` cleanup on hard kill.** Spill files are removed via `Drop`;
+   a SIGKILL mid-convert leaves a `ferrix-parquet-spill-*` directory beside
+   the cache.
 
-## Gates (all bare, not piped)
+## Fixtures
 
-```
-cargo test --workspace                                  312 passed; 0 failed
-cargo fmt --all --check                                 exit 0
-cargo clippy --workspace --all-targets -- -D warnings   exit 0, clean
-```
-
-## What I did NOT verify
-
-* **The GUI was never launched.** Every check is the headless harness driving
-  the real `FerrixApp` through `RawInput`. That proves the model, the key
-  routing and the paint call path; it does NOT prove the palette window looks
-  right, is legible against either theme, or is positioned sensibly on a real
-  monitor. The disabled-reason text, the shortcut column and the selection
-  highlight are asserted as *data*, not as pixels.
-* **No click-through test on a menu item.** `a_menu_click_records_recency_too`
-  drives `run_command` — the shared dispatcher the menu closure calls — not a
-  synthesised pointer click at a menu's pixel. Menu geometry moves with the
-  theme and window width; per AGENT_GUIDE that is a layout test, not a registry
-  test. So "the menus read the registry" is proven at the construction level
-  (`for_menu`), not by clicking a real menu item and observing the effect.
-* **Palette row clicks are untested.** `show()` returns a clicked id, but no
-  test synthesises a click on a palette row; only Enter is exercised.
-* **`FileOpen` / `FileExportCsv` / `FileOpenXlsx` / `FileExportXlsx` /
-  `FileCompact` are dispatched but not exercised end to end** — they open native
-  file dialogs or start worker threads. Their registry rows, availability
-  reasons and dispatch arms are covered; the resulting dialogs are not.
-* **Recency ties.** Ranking is score, then recency, then registry order (stable
-  sort). Two commands with equal score and neither ever run keep registry order;
-  that is asserted only indirectly.
-* **No multi-process test of the prefs file.** Persistence is proven by a second
-  `Harness` in the same process with `FERRIX_CONFIG_DIR` redirected, which is
-  what the existing `theme_preference_survives_a_restart` does. A genuine
-  second process was never spawned.
+All test fixtures are written to `std::env::temp_dir()` under self-deleting
+guard structs and are removed on drop. No `benchdata/` was created, and
+nothing was committed beyond source. Nothing outside this clone was touched.
