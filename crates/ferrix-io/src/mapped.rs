@@ -169,6 +169,12 @@ impl MappedSheet {
     /// Resolve an interned string out of the mapped arena.
     #[inline]
     pub fn resolve(&self, id: StrId) -> &str {
+        // Formula-produced text lives in the process-wide interner, not in the
+        // mapped file's arena. Route it there so a mapped sheet displays
+        // `=UPPER(A1)` exactly like an in-memory one.
+        if let Some(s) = ferrix_core::arena::resolve_formula_text(id) {
+            return s;
+        }
         let Some(&(start, len)) = self.spans.get(id.0 as usize) else {
             return "";
         };

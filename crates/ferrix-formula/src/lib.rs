@@ -13,6 +13,10 @@ pub mod parser;
 pub mod refscan;
 pub mod remap;
 pub mod stats;
+pub mod text;
+
+#[cfg(test)]
+mod compose_tests;
 
 pub use criteria::{Criterion, Pattern, Scalar};
 pub use depgraph::{DepGraph, Precedent};

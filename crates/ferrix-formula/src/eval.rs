@@ -470,6 +470,10 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
         // Date and time functions live in their own module — see
         // `crate::datetime` for the calendar rules and the injectable clock.
         name if crate::datetime::is_date_fn(name) => crate::datetime::call(name, args, src),
+        // Text functions live entirely in `crate::text`. Kept to ONE arm here
+        // on purpose: the whole library is one module file, so it can grow
+        // without touching this match again.
+        name if crate::text::is_text_fn(name) => crate::text::call(name, args, src),
         _ => Value::Error(ErrorKind::Name),
     }
 }
