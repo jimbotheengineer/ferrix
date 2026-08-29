@@ -121,8 +121,9 @@ fn calls_are_supported(e: &Expr) -> bool {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Ref(_) | Expr::Range(_, _) => true,
         // Cross-sheet references are supported now that workbooks hold every
         // sheet; whether the named sheet actually exists is resolved when the
-        // workbook builds its dependency graph, not here.
-        Expr::XRef(_, _) | Expr::XRange(_, _, _) => true,
+        // workbook builds its dependency graph, not here. The same is true of
+        // a 3-D span, whose run is a question about tab order.
+        Expr::XRef(_, _) | Expr::XRange(_, _, _) | Expr::X3D(_, _, _, _) => true,
     }
 }
 

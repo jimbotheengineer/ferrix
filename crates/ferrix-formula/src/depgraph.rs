@@ -46,6 +46,62 @@ impl Precedent {
 /// 200M edges. Sheet identity is checked first and costs one `u32` compare.
 pub type ScopedPrecedent = (SheetId, Precedent);
 
+/// The workbook's sheets, in TAB ORDER, as the graph needs to see them.
+///
+/// Two questions are asked of it, and they are different questions:
+///
+/// * `id` — what sheet does this NAME mean? (`Sheet2!A1`)
+/// * `span` — which sheets lie in this RUN? (`Sheet1:Sheet3!A1`)
+///
+/// The second cannot be answered by a name lookup, which is why the graph
+/// takes this rather than the bare `Fn(&str) -> Option<SheetId>` closure it
+/// used to: a closure could only ever answer the first, so a 3-D reference
+/// would silently contribute no edges and its formula would never recalculate.
+///
+/// Cost is one small entry per SHEET — a workbook quantity, never a row one.
+#[derive(Debug, Default, Clone)]
+pub struct SheetIndex {
+    /// (id, name) in tab order.
+    order: Vec<(SheetId, String)>,
+}
+
+impl SheetIndex {
+    /// Build from the tab strip, left to right.
+    pub fn new(order: Vec<(SheetId, String)>) -> Self {
+        Self { order }
+    }
+
+    /// Resolve a sheet name, case-insensitively — Excel's rule, and the one
+    /// `sheet2!A1` needs to find `Sheet2`.
+    pub fn id(&self, name: &str) -> Option<SheetId> {
+        self.order
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|(id, _)| *id)
+    }
+
+    fn position(&self, name: &str) -> Option<usize> {
+        self.order
+            .iter()
+            .position(|(_, n)| n.eq_ignore_ascii_case(name))
+    }
+
+    /// Every sheet in the inclusive tab-order run `first..=last`.
+    ///
+    /// Written backwards (`Sheet3:Sheet1`) is the same run, as in Excel. An
+    /// endpoint that does not exist yields nothing at all rather than a
+    /// half-open run: a 3-D reference with a broken endpoint is `#REF!`, and
+    /// quietly summing "as much of it as still resolves" would be a wrong
+    /// number that looks right.
+    pub fn span(&self, first: &str, last: &str) -> Vec<SheetId> {
+        let (Some(a), Some(b)) = (self.position(first), self.position(last)) else {
+            return Vec::new();
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        self.order[lo..=hi].iter().map(|(id, _)| *id).collect()
+    }
+}
+
 /// Walk an expression and collect everything it reads *within its own sheet*.
 ///
 /// Cross-sheet references (`Sheet2!A1`) are deliberately skipped here: this
@@ -55,7 +111,7 @@ pub fn collect_precedents(expr: &Expr, out: &mut Vec<Precedent>) {
     match expr {
         Expr::Ref(c) => out.push(Precedent::Cell(*c)),
         Expr::Range(a, b) => out.push(Precedent::Range(*a, *b)),
-        Expr::XRef(_, _) | Expr::XRange(_, _, _) => {}
+        Expr::XRef(_, _) | Expr::XRange(_, _, _) | Expr::X3D(_, _, _, _) => {}
         Expr::Unary(_, inner) => collect_precedents(inner, out),
         Expr::Binary(_, l, r) => {
             collect_precedents(l, out);
@@ -70,38 +126,45 @@ pub fn collect_precedents(expr: &Expr, out: &mut Vec<Precedent>) {
     }
 }
 
-/// Walk an expression, resolving sheet-qualified references through `resolve`.
+/// Walk an expression, resolving sheet-qualified references through `sheets`.
 ///
-/// Unqualified references belong to `home`. A name `resolve` cannot place is
+/// Unqualified references belong to `home`. A name `sheets` cannot place is
 /// dropped from the graph — the formula will evaluate to `#REF!`, and a
 /// dangling edge to a sheet that does not exist would only corrupt ordering.
 pub fn collect_precedents_scoped(
     expr: &Expr,
     home: SheetId,
-    resolve: &dyn Fn(&str) -> Option<SheetId>,
+    sheets: &SheetIndex,
     out: &mut Vec<ScopedPrecedent>,
 ) {
     match expr {
         Expr::Ref(c) => out.push((home, Precedent::Cell(*c))),
         Expr::Range(a, b) => out.push((home, Precedent::Range(*a, *b))),
         Expr::XRef(name, c) => {
-            if let Some(id) = resolve(name) {
+            if let Some(id) = sheets.id(name) {
                 out.push((id, Precedent::Cell(*c)));
             }
         }
         Expr::XRange(name, a, b) => {
-            if let Some(id) = resolve(name) {
+            if let Some(id) = sheets.id(name) {
                 out.push((id, Precedent::Range(*a, *b)));
             }
         }
-        Expr::Unary(_, inner) => collect_precedents_scoped(inner, home, resolve, out),
+        // One rectangle PER SHEET in the run, not per cell: a 3-D SUM over
+        // three 200M-row columns is three entries.
+        Expr::X3D(first, last, a, b) => {
+            for id in sheets.span(first, last) {
+                out.push((id, Precedent::Range(*a, *b)));
+            }
+        }
+        Expr::Unary(_, inner) => collect_precedents_scoped(inner, home, sheets, out),
         Expr::Binary(_, l, r) => {
-            collect_precedents_scoped(l, home, resolve, out);
-            collect_precedents_scoped(r, home, resolve, out);
+            collect_precedents_scoped(l, home, sheets, out);
+            collect_precedents_scoped(r, home, sheets, out);
         }
         Expr::Call(_, args) => {
             for a in args {
-                collect_precedents_scoped(a, home, resolve, out);
+                collect_precedents_scoped(a, home, sheets, out);
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
@@ -153,15 +216,10 @@ impl DepGraph {
     // --- sheet-aware API -------------------------------------------------
 
     /// Register (or replace) a formula's dependencies, resolving any
-    /// sheet-qualified references through `resolve`.
-    pub fn set_formula_at(
-        &mut self,
-        at: SheetCell,
-        expr: &Expr,
-        resolve: &dyn Fn(&str) -> Option<SheetId>,
-    ) {
+    /// sheet-qualified references through `sheets`.
+    pub fn set_formula_at(&mut self, at: SheetCell, expr: &Expr, sheets: &SheetIndex) {
         let mut p = Vec::new();
-        collect_precedents_scoped(expr, at.sheet, resolve, &mut p);
+        collect_precedents_scoped(expr, at.sheet, sheets, &mut p);
         self.precedents.insert(at, p);
     }
 
@@ -458,7 +516,7 @@ impl DepGraph {
 
     /// Register (or replace) a formula's dependencies in the main sheet.
     pub fn set_formula(&mut self, cell: CellRef, expr: &Expr) {
-        self.set_formula_at(SheetCell::main(cell), expr, &|_| None);
+        self.set_formula_at(SheetCell::main(cell), expr, &SheetIndex::default());
     }
 
     pub fn remove(&mut self, cell: CellRef) {
@@ -671,18 +729,18 @@ mod tests {
         SheetCell::new(sheet, CellRef::new(row, col))
     }
 
-    /// Resolver for a fixed two/three-sheet workbook.
-    fn names(n: &str) -> Option<SheetId> {
-        match n.to_ascii_uppercase().as_str() {
-            "SHEET1" => Some(S1),
-            "SHEET2" => Some(S2),
-            "SHEET3" => Some(S3),
-            _ => None,
-        }
+    /// Sheet index for a fixed three-sheet workbook, in tab order.
+    fn names() -> SheetIndex {
+        SheetIndex::new(vec![
+            (S1, "Sheet1".into()),
+            (S2, "Sheet2".into()),
+            (S3, "Sheet3".into()),
+        ])
     }
 
     fn wb_graph(entries: &[(SheetCell, &str)]) -> DepGraph {
         let mut g = DepGraph::new();
+        let names = names();
         for (at, src) in entries {
             g.set_formula_at(*at, &parse(src).unwrap(), &names);
         }
@@ -889,7 +947,7 @@ mod tests {
     fn name_uses_are_recorded_from_the_text_and_found_again() {
         let mut g = DepGraph::new();
         let at = sc(S1, 0, 2);
-        g.set_formula_at(at, &parse("=A1").unwrap(), &|_| None);
+        g.set_formula_at(at, &parse("=A1").unwrap(), &SheetIndex::default());
         g.set_name_uses(at, "=SUM(Sales)+A1");
         assert_eq!(g.name_uses_at(at), ["SALES"]);
         assert_eq!(g.cells_using_name("sales"), vec![at]);
@@ -920,7 +978,7 @@ mod tests {
     fn dropping_a_formula_drops_its_name_uses_too() {
         let mut g = DepGraph::new();
         let at = sc(S1, 0, 0);
-        g.set_formula_at(at, &parse("=1").unwrap(), &|_| None);
+        g.set_formula_at(at, &parse("=1").unwrap(), &SheetIndex::default());
         g.set_name_uses(at, "=Sales");
         g.remove_at(at);
         assert!(

@@ -33,6 +33,18 @@ pub enum Token {
         abs_col: bool,
         abs_row: bool,
     },
+    /// A 3-D span across consecutive sheets: `Sheet1:Sheet3!A1`.
+    ///
+    /// Both endpoint names are kept verbatim, in the order written. Which
+    /// sheets lie between them is a question about TAB ORDER, which only the
+    /// workbook can answer — the parser deliberately does not guess.
+    SheetSpan {
+        first: String,
+        last: String,
+        cell: CellRef,
+        abs_col: bool,
+        abs_row: bool,
+    },
     Ident(String),
     LParen,
     RParen,
@@ -96,6 +108,21 @@ pub enum Expr {
     XRef(String, CellRef),
     /// `Sheet2!A1:B10` — a range inside another sheet, normalized.
     XRange(String, CellRef, CellRef),
+    /// `Sheet1:Sheet3!A1` / `Sheet1:Sheet3!A1:B10` — a 3-D reference: the same
+    /// rectangle taken from every sheet in a consecutive run of tabs.
+    ///
+    /// The rectangle is stored normalized, exactly as [`Expr::XRange`] stores
+    /// it, and a single-cell 3-D reference is the degenerate 1x1 case. One
+    /// variant rather than two keeps the number of match sites that have to
+    /// learn about 3-D down to what is genuinely unavoidable.
+    ///
+    /// The two sheet NAMES are the endpoints of a tab-order run; which sheets
+    /// lie between them is a question only the workbook can answer, so it is
+    /// resolved at graph-build and evaluation time rather than at parse time.
+    /// Resolving it in the parser would freeze the run against the tab order
+    /// as it stood when the formula was typed, so inserting a sheet between
+    /// the endpoints would silently fail to be included.
+    X3D(String, String, CellRef, CellRef),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -353,7 +380,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 let upper = word.to_ascii_uppercase();
                 // `Name!` is a sheet qualifier, and it wins over every other
                 // reading of the word — `TRUE!A1` names a sheet called TRUE.
-                if bytes.get(i) == Some(&b'!') {
+                // `Name:Other!` is the 3-D form of the same thing, and only
+                // counts when a `!` really follows the second name; a plain
+                // `A1:B4` range never reaches here.
+                if bytes.get(i) == Some(&b'!')
+                    || (parse_ref_token(word).is_none()
+                        && sheet_span_ahead(input, bytes, i).is_some())
+                {
                     let (tok, next) = lex_sheet_qualified(input, bytes, i, word.to_string())?;
                     out.push(tok);
                     i = next;
@@ -445,14 +478,20 @@ fn parse_ref_token(word: &str) -> Option<Token> {
 
 /// Finish lexing a sheet-qualified reference.
 ///
-/// `at` points at the byte that should be `!`; `name` is the already-decoded
-/// sheet name. Returns the token plus the index just past the reference.
+/// `at` points at the byte that should be `!` — or at the `:` of a 3-D span
+/// like `Sheet1:Sheet3!A1`. `name` is the already-decoded first sheet name.
+/// Returns the token plus the index just past the reference.
 fn lex_sheet_qualified(
     input: &str,
     bytes: &[u8],
     at: usize,
     name: String,
 ) -> Result<(Token, usize), ParseError> {
+    // `Sheet1:Sheet3!` — the second endpoint of a 3-D span.
+    let (second, at) = match sheet_span_ahead(input, bytes, at) {
+        Some((s, bang)) => (Some(s), bang),
+        None => (None, at),
+    };
     if bytes.get(at) != Some(&b'!') {
         return Err(ParseError::BadSheetRef(name));
     }
@@ -467,17 +506,79 @@ fn lex_sheet_qualified(
             cell,
             abs_col,
             abs_row,
-        }) => Ok((
-            Token::SheetRef {
-                sheet: name,
-                cell,
-                abs_col,
-                abs_row,
-            },
-            i,
-        )),
+        }) => {
+            let tok = match second {
+                Some(last) => Token::SheetSpan {
+                    first: name,
+                    last,
+                    cell,
+                    abs_col,
+                    abs_row,
+                },
+                None => Token::SheetRef {
+                    sheet: name,
+                    cell,
+                    abs_col,
+                    abs_row,
+                },
+            };
+            Ok((tok, i))
+        }
         _ => Err(ParseError::BadSheetRef(name)),
     }
+}
+
+/// At `at`, read the `:Sheet3` half of a 3-D span, returning the decoded
+/// second sheet name and the index of the `!` that must follow it.
+///
+/// `None` unless the text really is `:<name>!`, so `A1:B4` and
+/// `Sheet1!A1:Sheet1!B4` are left entirely alone — the caller only reaches
+/// here for a word that is not itself a cell reference.
+fn sheet_span_ahead(input: &str, bytes: &[u8], at: usize) -> Option<(String, usize)> {
+    if bytes.get(at) != Some(&b':') {
+        return None;
+    }
+    let mut i = at + 1;
+    let name = if bytes.get(i) == Some(&b'\'') {
+        let mut name = String::new();
+        i += 1;
+        loop {
+            if i >= bytes.len() {
+                return None;
+            }
+            if bytes[i] == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    name.push('\'');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                break;
+            }
+            let ch_len = utf8_len(bytes[i]);
+            name.push_str(&input[i..i + ch_len]);
+            i += ch_len;
+        }
+        name
+    } else {
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'$'
+                || bytes[i] == b'_'
+                || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        input[start..i].to_string()
+    };
+    if bytes.get(i) != Some(&b'!') {
+        return None;
+    }
+    Some((name, i))
 }
 
 /// Parse a formula. Accepts an optional leading `=`.
@@ -647,6 +748,29 @@ impl Parser<'_> {
                     }
                 } else {
                     Expr::XRef(sheet, cell)
+                }
+            }
+            Token::SheetSpan {
+                first, last, cell, ..
+            } => {
+                // `Sheet1:Sheet3!A1:B4` — the rectangle may be a range, the
+                // same way `Sheet2!A1:B4` may. The far corner is bare: a
+                // second qualifier inside a 3-D rectangle is not a thing.
+                if matches!(self.peek(), Some(Token::Colon)) {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::Ref { cell: end, .. }) => {
+                            let (a, b) = normalize_range(cell, end);
+                            Expr::X3D(first, last, a, b)
+                        }
+                        Some(t) => {
+                            return Err(ParseError::Expected("cell reference", format!("{t:?}")))
+                        }
+                        None => return Err(ParseError::UnexpectedEnd),
+                    }
+                } else {
+                    // A single-cell 3-D reference is the 1x1 rectangle.
+                    Expr::X3D(first, last, cell, cell)
                 }
             }
             Token::Ident(name) => {

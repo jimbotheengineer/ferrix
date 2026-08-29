@@ -56,6 +56,19 @@ pub trait CellSource {
     fn row_count_in(&self, _sheet: &str) -> Option<usize> {
         None
     }
+
+    /// The sheet NAMES in the inclusive tab-order run `first..=last`, which is
+    /// what `Sheet1:Sheet3!A1` spans.
+    ///
+    /// Returned as names rather than ids because the rest of `CellSource`
+    /// speaks names — that is what keeps the evaluator ignorant of what a
+    /// workbook is. An empty result means the run does not resolve, and a 3-D
+    /// reference over it is `#REF!` rather than an empty sum.
+    ///
+    /// Bounded by the SHEET count, never the row count.
+    fn sheet_span(&self, _first: &str, _last: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl CellSource for Sheet {
@@ -102,6 +115,19 @@ pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
                 Value::Error(ErrorKind::Value)
             } else {
                 Value::Error(ErrorKind::Ref)
+            }
+        }
+        // A 3-D reference is not a scalar even when it is one cell wide: it
+        // stands for that cell on SEVERAL sheets, so there is no single value
+        // to return. Only an aggregate can consume it — as in Excel, where
+        // `=Sheet1:Sheet3!A1` alone is an error and `=SUM(Sheet1:Sheet3!A1)`
+        // is the point of the feature. A broken run still says #REF! first,
+        // which is the more useful of the two diagnoses.
+        Expr::X3D(first, last, _, _) => {
+            if src.sheet_span(first, last).is_empty() {
+                Value::Error(ErrorKind::Ref)
+            } else {
+                Value::Error(ErrorKind::Value)
             }
         }
         Expr::Unary(op, inner) => {
@@ -224,6 +250,21 @@ where
                 }
             }
         }
+        // The same rectangle on every sheet of the run. `arg_error` has
+        // already reported an unresolvable run as #REF!, so a failure here is
+        // simply nothing to add.
+        Expr::X3D(first, last, start, end) => {
+            let _ = for_each_3d(first, last, *start, *end, src, |spec| {
+                for dc in 0..spec.cols {
+                    for dr in 0..spec.rows {
+                        if let Value::Number(n) = spec_get(spec, src, dr, dc) {
+                            f(n);
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
         other => {
             if let Some(n) = eval_view(other, src).as_number() {
                 f(n);
@@ -255,6 +296,19 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                     None => Value::Error(ErrorKind::Ref),
                 };
             }
+            // And for a 3-D run: each sheet's own columnar sum, so summing
+            // the same 200M-row column across three sheets is three slice
+            // walks rather than 600M reads.
+            if let [Expr::X3D(first, last, s, e)] = args {
+                if let Some(err) = arg_error(&args[0], src) {
+                    return Value::Error(err);
+                }
+                let mut acc = 0.0;
+                return match sum_3d(first, last, *s, *e, src, &mut acc) {
+                    Ok(()) => Value::Number(acc),
+                    Err(e) => Value::Error(e),
+                };
+            }
             let mut acc = 0.0;
             for a in args {
                 if let Some(err) = arg_error(a, src) {
@@ -272,6 +326,13 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                 return match src.count_rect_in(sh, *s, *e) {
                     Some(n) => Value::Number(n as f64),
                     None => Value::Error(ErrorKind::Ref),
+                };
+            }
+            if let [Expr::X3D(first, last, s, e)] = args {
+                let mut n = 0usize;
+                return match count_3d(first, last, *s, *e, src, &mut n) {
+                    Ok(()) => Value::Number(n as f64),
+                    Err(e) => Value::Error(e),
                 };
             }
             let mut n = 0usize;
@@ -302,6 +363,22 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                 else {
                     return Value::Error(ErrorKind::Ref);
                 };
+                if count == 0 {
+                    return Value::Error(ErrorKind::DivZero);
+                }
+                return Value::Number(total / count as f64);
+            }
+            if let [Expr::X3D(first, last, s, e)] = args {
+                if let Some(err) = arg_error(&args[0], src) {
+                    return Value::Error(err);
+                }
+                let (mut total, mut count) = (0.0, 0usize);
+                if let Err(e) = sum_3d(first, last, *s, *e, src, &mut total) {
+                    return Value::Error(e);
+                }
+                if let Err(e) = count_3d(first, last, *s, *e, src, &mut count) {
+                    return Value::Error(e);
+                }
                 if count == 0 {
                     return Value::Error(ErrorKind::DivZero);
                 }
@@ -537,10 +614,25 @@ pub(crate) fn range_spec<'a, S: CellSource + ?Sized>(
         Expr::XRange(sh, s, e) => (Some(sh.as_str()), *s, *e),
         Expr::Ref(c) => (None, *c, *c),
         Expr::XRef(sh, c) => (Some(sh.as_str()), *c, *c),
+        // A 3-D reference is deliberately NOT a range: it is one rectangle
+        // per sheet, so it has no single origin to resize a SUMIF value range
+        // against. Excel refuses it in the *IF family too. Callers that CAN
+        // consume several rectangles use `for_each_3d`.
         _ => return None,
     };
-    // Clamp the open-ended bottom edge to the sheet's real extent so
-    // `A:A` costs the populated rows, not 2^20 of them.
+    spec_for(sheet, start, end, src)
+}
+
+/// One rectangle, clamped to the sheet it lives on.
+///
+/// Clamping the open-ended bottom edge to the sheet's real extent is what
+/// makes `A:A` cost the populated rows rather than 2^20 of them.
+fn spec_for<'a, S: CellSource + ?Sized>(
+    sheet: Option<&'a str>,
+    start: CellRef,
+    end: CellRef,
+    src: &S,
+) -> Option<RangeSpec<'a>> {
     let extent = match sheet {
         None => src.row_count(),
         Some(sh) => src.row_count_in(sh)?,
@@ -554,6 +646,39 @@ pub(crate) fn range_spec<'a, S: CellSource + ?Sized>(
         rows,
         cols: end.col - start.col + 1,
     })
+}
+
+/// Run `f` once per sheet in a 3-D run, handing it that sheet's rectangle.
+///
+/// SCALE: one `RangeSpec` is live at a time and the run is bounded by the
+/// SHEET count, so `SUM(Sheet1:Sheet3!A:A)` over three 200M-row columns holds
+/// three stack words, not 600M cells.
+///
+/// `Err(Ref)` when the run does not resolve — a 3-D reference whose endpoint
+/// sheet is gone must be `#REF!`, never a quietly smaller sum.
+pub(crate) fn for_each_3d<S, F>(
+    first: &str,
+    last: &str,
+    start: CellRef,
+    end: CellRef,
+    src: &S,
+    mut f: F,
+) -> Result<(), ErrorKind>
+where
+    S: CellSource + ?Sized,
+    F: FnMut(&RangeSpec<'_>) -> Result<(), ErrorKind>,
+{
+    let names = src.sheet_span(first, last);
+    if names.is_empty() {
+        return Err(ErrorKind::Ref);
+    }
+    for name in &names {
+        let Some(spec) = spec_for(Some(name.as_str()), start, end, src) else {
+            return Err(ErrorKind::Ref);
+        };
+        f(&spec)?;
+    }
+    Ok(())
 }
 
 /// Read the cell at `(dr, dc)` inside a spec. Offsets past the sheet read as
@@ -749,6 +874,54 @@ fn eval_ifs<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Value
     finish(name, t)
 }
 
+/// Columnar sum over every sheet of a 3-D run, accumulated into `acc`.
+///
+/// Delegates to each sheet's own `sum_rect_in`, so the fast path that makes
+/// `SUM(Sheet2!A1:A200000000)` a slice walk fires once per sheet instead of
+/// being lost the moment a formula becomes 3-D.
+fn sum_3d<S: CellSource + ?Sized>(
+    first: &str,
+    last: &str,
+    start: CellRef,
+    end: CellRef,
+    src: &S,
+    acc: &mut f64,
+) -> Result<(), ErrorKind> {
+    let names = src.sheet_span(first, last);
+    if names.is_empty() {
+        return Err(ErrorKind::Ref);
+    }
+    for name in &names {
+        match src.sum_rect_in(name, start, end) {
+            Some(v) => *acc += v,
+            None => return Err(ErrorKind::Ref),
+        }
+    }
+    Ok(())
+}
+
+/// Columnar numeric count over every sheet of a 3-D run.
+fn count_3d<S: CellSource + ?Sized>(
+    first: &str,
+    last: &str,
+    start: CellRef,
+    end: CellRef,
+    src: &S,
+    acc: &mut usize,
+) -> Result<(), ErrorKind> {
+    let names = src.sheet_span(first, last);
+    if names.is_empty() {
+        return Err(ErrorKind::Ref);
+    }
+    for name in &names {
+        match src.count_rect_in(name, start, end) {
+            Some(n) => *acc += n,
+            None => return Err(ErrorKind::Ref),
+        }
+    }
+    Ok(())
+}
+
 /// Propagate the first error found inside a range argument.
 ///
 /// Scanning a whole range would defeat the columnar fast path on huge ranges,
@@ -791,6 +964,30 @@ fn arg_error<S: CellSource + ?Sized>(arg: &Expr, src: &S) -> Option<ErrorKind> {
                 }
             }
             None
+        }
+        // An unresolvable RUN is #REF!, for the same reason an unresolvable
+        // sheet name is: the alternative is an aggregate that quietly omits
+        // the sheets it could not find and returns a plausible wrong number.
+        Expr::X3D(first, last, start, end) => {
+            let mut found = None;
+            let walked = for_each_3d(first, last, *start, *end, src, |spec| {
+                if spec.rows as usize > MAX_SCAN {
+                    return Ok(());
+                }
+                for dc in 0..spec.cols {
+                    for dr in 0..spec.rows {
+                        if let Value::Error(e) = spec_get(spec, src, dr, dc) {
+                            found = Some(e);
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            });
+            match walked {
+                Err(e) => Some(e),
+                Ok(()) => found,
+            }
         }
         _ => None,
     }

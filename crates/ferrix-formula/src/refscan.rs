@@ -118,6 +118,150 @@ pub fn parse_ref(word: &str) -> Option<ParsedRef> {
     })
 }
 
+/// A sheet qualifier in formula TEXT: `Sheet1!`, `'My Sheet'!`, or the 3-D
+/// form `Sheet1:Sheet3!`.
+///
+/// Byte spans are reported for each name **as written**, quotes included, so a
+/// caller can splice a new (re-quoted) name over exactly those bytes and leave
+/// the rest of the formula byte-identical. That is what a sheet rename needs
+/// and what an AST round trip cannot give it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Qualifier {
+    /// Byte offset of the first character of the qualifier.
+    pub start: usize,
+    /// Byte offset one past the `!`.
+    pub end: usize,
+    /// First (or only) sheet name, unquoted, with `''` unescaped.
+    pub first: String,
+    /// Byte range of the first name as written.
+    pub first_span: (usize, usize),
+    /// The second endpoint of a 3-D span, if this is one.
+    pub last: Option<String>,
+    /// Byte range of the second name as written.
+    pub last_span: Option<(usize, usize)>,
+}
+
+/// Index one past the closing `'` of a quoted run starting at `at`.
+fn skip_quoted(b: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            // A doubled quote is an escaped quote, not the end.
+            if b.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Read one sheet name at `at`: a quoted run, or a bare word.
+///
+/// Returns the decoded name and the index just past it (past the closing
+/// quote, for a quoted name).
+fn read_name(src: &str, at: usize) -> Option<(String, usize)> {
+    let b = src.as_bytes();
+    if b.get(at) == Some(&b'\'') {
+        let end = skip_quoted(b, at)?;
+        let inner = &src[at + 1..end - 1];
+        return Some((inner.replace("''", "'"), end));
+    }
+    let mut i = at;
+    while i < b.len()
+        && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] == b'.')
+    {
+        i += 1;
+    }
+    if i == at {
+        return None;
+    }
+    Some((src[at..i].to_string(), i))
+}
+
+/// Parse a sheet qualifier starting exactly at `at`. `None` when there is not
+/// one there.
+pub fn qualifier_at(src: &str, at: usize) -> Option<(Qualifier, usize)> {
+    let b = src.as_bytes();
+    let (first, mut j) = read_name(src, at)?;
+    let first_span = (at, j);
+    let mut last = None;
+    let mut last_span = None;
+
+    // `Sheet1:Sheet3!` — but ONLY when the left name is not itself a cell
+    // reference. `Sheet1!A1:Sheet1!B4` is a requalified 2-D range, and
+    // reading `A1:Sheet1!` out of it as a 3-D span would hide the `A1` from
+    // every reference rewriter. A sheet whose name is spelled exactly like a
+    // cell reference cannot open a 3-D span here; Excel refuses such sheet
+    // names outright, so nothing valid is lost.
+    if b.get(j) == Some(&b':') && parse_ref(&first).is_none() {
+        if let Some((second, k)) = read_name(src, j + 1) {
+            if b.get(k) == Some(&b'!') {
+                last = Some(second);
+                last_span = Some((j + 1, k));
+                j = k;
+            }
+        }
+    }
+
+    if b.get(j) != Some(&b'!') {
+        return None;
+    }
+    Some((
+        Qualifier {
+            start: at,
+            end: j + 1,
+            first,
+            first_span,
+            last,
+            last_span,
+        },
+        j + 1,
+    ))
+}
+
+/// Every sheet qualifier in `src`, in order.
+///
+/// String literals are skipped, which is the asymmetry a sheet rename lives
+/// or dies by: a sheet name may legitimately appear inside `"Sheet2 total"`,
+/// and rewriting there would corrupt the user's text rather than repoint a
+/// reference.
+pub fn qualifiers(src: &str) -> Vec<Qualifier> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if let Some((q, past)) = qualifier_at(src, i) {
+            out.push(q);
+            i = past;
+            continue;
+        }
+        if b[i] == b'\'' {
+            i = skip_quoted(b, i).unwrap_or(b.len());
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Find every reference-candidate word in `src`, in order.
 ///
 /// Skips, in the same way and for the same reasons the tokenizer does:
@@ -127,6 +271,8 @@ pub fn parse_ref(word: &str) -> Option<ParsedRef> {
 ///   reference, which would otherwise be rewritten and silently rename the
 ///   sheet the formula points at;
 /// - **sheet qualifiers** — in `Sheet1!A1` only `A1` is a reference;
+/// - **3-D sheet spans** — in `Sheet1:Sheet3!A1` neither endpoint name is a
+///   reference, even though the `:` looks like a range operator;
 /// - **function names** — `SUM(` is a call, never cell `SUM`. Note that a bare
 ///   `LOG10` with no paren IS a valid reference (column LOG, row 10), and
 ///   Excel agrees; only the paren disambiguates.
@@ -156,20 +302,18 @@ pub fn scan(src: &str) -> Vec<RefWord> {
             continue;
         }
 
-        // Skip quoted sheet names wholesale.
+        // Skip a sheet qualifier — `Sheet1!`, `'Q1 2024'!`, or the two names
+        // of a 3-D span `Sheet1:Sheet3!` — wholesale, INCLUDING the `!`. The
+        // cell reference after it is left for the loop to pick up normally.
+        if let Some((_, past)) = qualifier_at(src, i) {
+            i = past;
+            continue;
+        }
+
+        // A lone quoted run that is not a sheet qualifier is still not
+        // reference text; skip it rather than reading `Q1` out of it.
         if ch == b'\'' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\'' {
-                    if b.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+            i = skip_quoted(b, i).unwrap_or(b.len());
             continue;
         }
 
@@ -180,11 +324,6 @@ pub fn scan(src: &str) -> Vec<RefWord> {
                 && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] == b'.')
             {
                 i += 1;
-            }
-
-            // A bare word followed by `!` is a sheet qualifier, not a cell.
-            if b.get(i) == Some(&b'!') {
-                continue;
             }
 
             // A word immediately followed by '(' is a function call.

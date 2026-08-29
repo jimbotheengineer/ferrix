@@ -756,19 +756,15 @@ impl Workbook {
         self.parked.get(&id).map(|(b, o)| SheetView::new(b, o))
     }
 
-    /// A resolver for the dependency graph, bound to the current name list.
+    /// A sheet index for the dependency graph, bound to the current tab strip.
     ///
     /// Returned by value (not borrowing `self`) so it can be handed to
-    /// `&mut self` graph calls without fighting the borrow checker.
-    fn name_resolver(&self) -> impl Fn(&str) -> Option<SheetId> + use<> {
-        let names: Vec<(SheetId, String)> =
-            self.sheets.iter().map(|s| (s.id, s.name.clone())).collect();
-        move |n: &str| {
-            names
-                .iter()
-                .find(|(_, name)| name.eq_ignore_ascii_case(n))
-                .map(|(id, _)| *id)
-        }
+    /// `&mut self` graph calls without fighting the borrow checker. Tab ORDER
+    /// is preserved, because a 3-D span (`Sheet1:Sheet3!A1`) is defined by it.
+    fn name_resolver(&self) -> ferrix_formula::depgraph::SheetIndex {
+        ferrix_formula::depgraph::SheetIndex::new(
+            self.sheets.iter().map(|s| (s.id, s.name.clone())).collect(),
+        )
     }
 
     // ---------------------------------------------------------- defined names
@@ -2433,6 +2429,21 @@ impl ferrix_formula::CellSource for WorkbookSource<'_> {
 
     fn has_sheet(&self, sheet: &str) -> bool {
         self.wb.sheet_id_by_name(sheet).is_some()
+    }
+
+    /// The tab-order run `first..=last`, as sheet NAMES.
+    ///
+    /// Answered from the tab strip rather than from a stored list on the
+    /// formula, so inserting a sheet between the endpoints puts it in the run
+    /// on the very next recalculation — which is what a 3-D reference means.
+    fn sheet_span(&self, first: &str, last: &str) -> Vec<String> {
+        let names: Vec<&str> = self.wb.sheets.iter().map(|s| s.name.as_str()).collect();
+        let pos = |want: &str| names.iter().position(|n| n.eq_ignore_ascii_case(want));
+        let (Some(a), Some(b)) = (pos(first), pos(last)) else {
+            return Vec::new();
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        names[lo..=hi].iter().map(|s| s.to_string()).collect()
     }
 
     fn sum_rect_in(&self, sheet: &str, start: CellRef, end: CellRef) -> Option<f64> {
