@@ -30,6 +30,7 @@ pub mod selection;
 pub mod sheet;
 pub mod sizing;
 pub mod sort;
+pub mod sparkline;
 pub mod table;
 pub mod tsv;
 pub mod value;
@@ -61,6 +62,7 @@ pub use sizing::{
     MAX_OUTLINE_LEVEL,
 };
 pub use sort::{cycle_click, CellKeys, SortCell, SortDir, SortKey, SortOrder};
+pub use sparkline::{sparkline_shape, SparkBar, SparkGroup, SparkKind, SparkShape, SparklineMap};
 pub use table::{
     CellStyle, CmpOp, ColumnType, CompiledPredicate, ConditionalRule, DateStyle, NumberFormat,
     Predicate, Rgb, RowMask, Table, TableColumn, TableRange, UniquenessIndex, Validation,

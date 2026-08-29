@@ -372,6 +372,14 @@ pub struct Workbook {
     /// 200M-row selection is one small entry, so styling costs nothing per
     /// row and appending rows inherits it for free.
     pub format: ferrix_core::SheetFormat,
+    /// Sparkline groups for the ACTIVE sheet (issue #36).
+    ///
+    /// Beside `format` and stored on exactly the same terms: a group is a
+    /// RECTANGLE plus a source column span, so sparklining a 200M-row column
+    /// is one 24-byte entry and appending rows inherits it for free. There is
+    /// no per-cell entry and no chart object -- the picture is produced by the
+    /// grid's paint loop for visible rows only.
+    pub sparklines: ferrix_core::SparklineMap,
     /// Display-order permutation for the ACTIVE sheet.
     ///
     /// Reordering a column must not move data: on a 200M-row sheet that would
@@ -438,6 +446,7 @@ impl Workbook {
             active: 0,
             order: ferrix_core::SheetOrder::new(),
             format: ferrix_core::SheetFormat::new(),
+            sparklines: ferrix_core::SparklineMap::new(),
             merges: ferrix_core::merge::MergeMap::new(),
             comments: ferrix_core::CommentMap::new(),
             parked: std::collections::HashMap::new(),

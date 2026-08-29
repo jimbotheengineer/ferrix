@@ -199,6 +199,23 @@ registry! {
     FormatAlignRight { "format.align_right", Some(Menu::Format), "⯈ Align right", None, false, None,
         "Align the selection's text to the right of its cells." }
 
+    // ---- Format: sparklines (issue #36) ----
+    //
+    // In the Format menu rather than Data: a sparkline is a way of DRAWING
+    // cells the user already has, not a transformation of the data. It is
+    // stored exactly like a conditional format -- one entry per range -- and
+    // is drawn by the grid's paint loop rather than by a chart object, which
+    // is why it belongs beside the other per-range formatting rather than
+    // beside "Chart...".
+    FormatSparkLine { "format.spark_line", Some(Menu::Format), "\u{2197} Sparkline: line", None, true, Some(Note::Selection),
+        "Draw a tiny line chart of each selected row in the column to its right. Painted per visible row, so it costs the same on a 200M-row sheet." }
+    FormatSparkColumn { "format.spark_column", Some(Menu::Format), "\u{2588} Sparkline: column", None, false, None,
+        "Draw a tiny bar chart of each selected row in the column to its right." }
+    FormatSparkWinLoss { "format.spark_winloss", Some(Menu::Format), "\u{00b1} Sparkline: win/loss", None, false, None,
+        "Draw one equal-height bar per value, up for positive and down for negative. Magnitude is deliberately ignored." }
+    FormatSparkClear { "format.spark_clear", Some(Menu::Format), "\u{2716} Remove sparklines", None, false, None,
+        "Remove the sparkline groups drawing inside the selection." }
+
     // ---- Data: protection (issue #42) ----
     //
     // In the Data menu rather than Format: locking a cell is a statement

@@ -463,6 +463,11 @@ pub struct FerrixApp {
     last_border_segments: usize,
     last_rotated_texts: usize,
     last_wrapped_texts: usize,
+    /// Sparkline primitives, and covered-but-blank cells, the grid painted
+    /// last frame (issue #36). Same discipline: the count of the SPECIFIC
+    /// shape kind this feature emits, not a slice of the frame total.
+    last_sparkline_shapes: usize,
+    last_sparkline_blanks: usize,
 
     /// Active trace-precedents/dependents session (roadmap #39), if any.
     /// `None` means "Remove Arrows" was pressed or nothing has been traced.
@@ -707,6 +712,8 @@ impl FerrixApp {
             last_border_segments: 0,
             last_rotated_texts: 0,
             last_wrapped_texts: 0,
+            last_sparkline_shapes: 0,
+            last_sparkline_blanks: 0,
             trace: None,
             last_trace_arrows: 0,
             last_trace_total: 0,
@@ -3568,6 +3575,22 @@ impl FerrixApp {
         self.last_wrapped_texts
     }
 
+    /// Sparkline primitives painted last frame (issue #36).
+    ///
+    /// Zero on every sheet with no sparkline group. This is the number a test
+    /// asserts on rather than `paint_shape_count()`: a frame total moves when
+    /// a selection rectangle appears or a grid line leaves, so it can rise
+    /// while the feature draws nothing and fall while it draws plenty.
+    pub fn painted_sparklines(&self) -> usize {
+        self.last_sparkline_shapes
+    }
+
+    /// Cells a sparkline group covers that deliberately drew NOTHING last
+    /// frame, because their source was empty or held no numbers.
+    pub fn blank_sparklines(&self) -> usize {
+        self.last_sparkline_blanks
+    }
+
     /// Persist comments beside the base file.
     ///
     /// Independent of `save_edits`: a session that only added a note has
@@ -3825,6 +3848,105 @@ impl FerrixApp {
         }
         self.wb.mark_dirty();
         self.status = "Cell formatting applied".into();
+    }
+
+    // ---- sparklines (issue #36) ----
+
+    /// Add a sparkline group over the selection, drawing into the column
+    /// immediately to its RIGHT.
+    ///
+    /// The selection is the SOURCE, and the destination is derived rather than
+    /// asked for. That follows the precedent the border commands set: a
+    /// command that needs a value waits for a dialog, and one that has an
+    /// unambiguous answer just does it. "Beside the numbers" is where a
+    /// sparkline column goes in every spreadsheet anyone has used.
+    ///
+    /// ONE entry is written however many rows the selection spans -- see
+    /// `ferrix_core::sparkline`. `sparkline_over_a_100k_row_selection_stores_one_group`
+    /// asserts it.
+    pub fn add_sparkline(&mut self, kind: ferrix_core::SparkKind) {
+        // A sparkline is formatting, so it answers to the same granular
+        // allowance the other format commands do.
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::FormatCells)
+        {
+            self.status = format!("Sparkline refused -- {d}");
+            return;
+        }
+        let (a, b) = self.selection.bounds();
+        if a.col == b.col {
+            // One source column is one point per row, which draws a dot and
+            // says nothing. Refusing with a sentence beats painting a column
+            // of specks the user cannot interpret.
+            self.status =
+                "Select at least two columns of numbers -- a sparkline plots a row of them".into();
+            return;
+        }
+        let target_col = b.col + 1;
+        let group = ferrix_core::SparkGroup::new(
+            kind,
+            ferrix_core::TableRange::new(a.row, target_col, b.row, target_col),
+            a.col,
+            b.col,
+        );
+        self.wb.sparklines.add(group);
+        self.wb.mark_dirty();
+        let rows = (b.row - a.row + 1) as u64;
+        self.status = format!(
+            "{} sparklines in column {} over {rows} row{}",
+            kind.label(),
+            ferrix_core::column_name(target_col),
+            if rows == 1 { "" } else { "s" }
+        );
+    }
+
+    /// Remove every sparkline group drawing inside the selection.
+    pub fn clear_sparklines(&mut self) {
+        let (a, b) = self.selection.bounds();
+        let range = ferrix_core::TableRange::new(a.row, a.col, b.row, b.col);
+        let n = self.wb.sparklines.clear_in(range);
+        if n == 0 {
+            self.status = "No sparklines in the selection".into();
+            return;
+        }
+        self.wb.mark_dirty();
+        self.status = format!(
+            "Removed {n} sparkline group{}",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+
+    /// How many sparkline GROUPS are configured. A function of how many the
+    /// user made, never of how many rows they cover.
+    pub fn sparkline_group_count(&self) -> usize {
+        self.wb.sparklines.len()
+    }
+
+    /// Widen the single configured sparkline group down to `last_row`.
+    ///
+    /// For the scale test only. There is no gesture that selects 200M rows,
+    /// and materialising them to build one is precisely what the invariant
+    /// forbids -- so the group is widened here and the assertion is still made
+    /// on what the PAINT LOOP does with it.
+    #[cfg(test)]
+    pub fn widen_sparkline_for_test(&mut self, last_row: u32) {
+        let Some(g) = self.wb.sparklines.iter().next().copied() else {
+            panic!("a group must already be configured");
+        };
+        self.wb.sparklines.clear_in(g.target);
+        self.wb.sparklines.add(ferrix_core::SparkGroup::new(
+            g.kind,
+            ferrix_core::TableRange::new(
+                g.target.first_row,
+                g.target.first_col,
+                last_row,
+                g.target.last_col,
+            ),
+            g.src_first_col,
+            g.src_last_col,
+        ));
     }
 
     /// The decoration a cell resolves to right now, through the same
@@ -4698,6 +4820,10 @@ impl FerrixApp {
                 // the same reason protection does: a sheet the user bordered
                 // and re-exported must still have its borders.
                 .with_format(&self.wb.format)
+                // Sparklines (issue #36) survive as `<extLst>` groups. A group
+                // Excel cannot express is reported below rather than silently
+                // dropped.
+                .with_sparklines(&self.wb.sparklines)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
@@ -4748,6 +4874,14 @@ impl FerrixApp {
         }
         for (_, ov) in self.wb.format.overrides() {
             push(&ov.decor, &mut out);
+        }
+        // Sparklines (issue #36), same contract: a group Excel cannot express
+        // is reported HERE, in the editor, rather than discovered after the
+        // file is opened.
+        for m in ferrix_io::sparkline_xlsx_loss(&self.wb.sparklines) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
         }
         out
     }
@@ -7349,6 +7483,13 @@ impl FerrixApp {
             C::FormatAlignRight => self.apply_decor(
                 ferrix_core::CellDecor::default().with_h_align(ferrix_core::HAlign::Right),
             ),
+            // Issue #36. Dispatch through `add_sparkline`, which is the same
+            // method the harness drives -- so a test asserts through the
+            // registry and the paint loop rather than around them.
+            C::FormatSparkLine => self.add_sparkline(ferrix_core::SparkKind::Line),
+            C::FormatSparkColumn => self.add_sparkline(ferrix_core::SparkKind::Column),
+            C::FormatSparkWinLoss => self.add_sparkline(ferrix_core::SparkKind::WinLoss),
+            C::FormatSparkClear => self.clear_sparklines(),
             C::FormulaTracePrecedents => self.trace_precedents(),
             C::FormulaTraceDependents => self.trace_dependents(),
             C::FormulaTraceClear => self.clear_trace(),
@@ -8505,6 +8646,7 @@ impl FerrixApp {
                         row_outline: Some(&self.sizing.row_outline),
                         col_resizing: self.col_resize,
                         show_formulas: show_formulas_now,
+                        sparklines: Some(&self.wb.sparklines),
                     }
                     .show(ui)
                 };
@@ -8514,6 +8656,8 @@ impl FerrixApp {
                 self.last_border_segments = resp.border_segments;
                 self.last_rotated_texts = resp.rotated_texts;
                 self.last_wrapped_texts = resp.wrapped_texts;
+                self.last_sparkline_shapes = resp.sparkline_shapes;
+                self.last_sparkline_blanks = resp.sparkline_blanks;
 
                 // --- trace precedents / dependents arrows (roadmap #39) ---
                 //
@@ -9889,6 +10033,57 @@ mod tests {
         assert!(
             wbp.structure_locked(),
             "workbook structure protection was stripped by export"
+        );
+    }
+
+    /// Issue #36: the EXPORT the menu item runs must carry sparklines.
+    ///
+    /// Asserts through `export_xlsx_to` -- the production path -- for exactly
+    /// the reason the protection test above gives. `sparkline_xlsx`'s own
+    /// tests would keep passing if `export_xlsx_to` never called
+    /// `.with_sparklines(..)`, and the file would come back with none.
+    /// Re-importing is what proves the bytes carry it.
+    #[test]
+    fn exporting_preserves_sparkline_groups() {
+        let mut app = FerrixApp::new(None);
+        // Four numeric source columns over two rows.
+        for r in 0..2u32 {
+            for c in 0..4u32 {
+                app.wb
+                    .commit_edit(CellRef::new(r, c), &format!("{}", r * 4 + c + 1));
+            }
+        }
+        app.set_selection_for_test(CellRef::new(0, 0), CellRef::new(1, 3));
+        // Through the REGISTRY dispatch, not `add_sparkline`.
+        app.run_command(crate::command::CommandId::FormatSparkColumn);
+        assert_eq!(app.sparkline_group_count(), 1, "status: {}", app.status);
+
+        let tmp = TempXlsx::new("spark-roundtrip");
+        app.export_xlsx_to(tmp.path());
+        assert!(
+            tmp.path().exists(),
+            "export did not write a file; status: {}",
+            app.status
+        );
+
+        let back = ferrix_io::import_sparklines(tmp.path()).expect("re-import sparklines");
+        assert_eq!(
+            back.len(),
+            1,
+            "the re-imported workbook has no sparkline group -- export stripped it"
+        );
+        assert_eq!(
+            back[0].group.kind,
+            ferrix_core::SparkKind::Column,
+            "the TYPE must survive, not just the geometry"
+        );
+        assert_eq!(
+            back[0].group.target,
+            ferrix_core::TableRange::new(0, 4, 1, 4)
+        );
+        assert_eq!(
+            (back[0].group.src_first_col, back[0].group.src_last_col),
+            (0, 3)
         );
     }
 
