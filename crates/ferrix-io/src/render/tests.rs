@@ -695,6 +695,114 @@ fn cancelling_leaves_no_partial_file() {
     );
 }
 
+#[test]
+fn a_cancelled_re_export_preserves_the_previous_file() {
+    // Re-exporting to a path that already holds a good PDF, then cancelling,
+    // must NOT destroy the good file. The temp-sibling + rename discipline is
+    // the whole point: writing straight to the destination and deleting it on
+    // cancel would silently lose the export the user was replacing.
+    let (rows, cols) = (RowSizes::default(), ColSizes::default());
+    let path = tmp("preserved.pdf");
+
+    // First, a small successful export leaves a valid PDF at `path`.
+    let good = Grid::new(3, 2);
+    render_pdf(
+        &path,
+        &good,
+        &letter(),
+        &RenderOptions::default(),
+        &rows,
+        &cols,
+        true,
+        |_, _| {},
+        || false,
+    )
+    .expect("the first export should succeed");
+    let original = std::fs::read(&path).expect("first export must exist");
+    assert!(
+        original.starts_with(b"%PDF"),
+        "sanity: first export is a PDF"
+    );
+
+    // Now a big re-export to the SAME path, cancelled partway.
+    let big = Grid::new(50_000, 4);
+    let mut calls = 0;
+    let err = render_pdf(
+        &path,
+        &big,
+        &letter(),
+        &RenderOptions::default(),
+        &rows,
+        &cols,
+        true,
+        |_, _| {},
+        || {
+            calls += 1;
+            calls > 2
+        },
+    )
+    .expect_err("the re-export should have been cancelled");
+    assert!(matches!(err, RenderError::Cancelled));
+
+    // The original file must still be there, byte-for-byte.
+    let after = std::fs::read(&path).expect("the previous file must survive a cancel");
+    assert_eq!(
+        original, after,
+        "a cancelled re-export corrupted or replaced the previous file"
+    );
+}
+
+#[test]
+fn a_refused_large_re_export_preserves_the_previous_file() {
+    // The large-job refusal returns before writing anything; a pre-existing
+    // file at the path must be untouched.
+    let (rows, cols) = (RowSizes::default(), ColSizes::default());
+    let path = tmp("preserved-refuse.pdf");
+
+    let good = Grid::new(3, 2);
+    render_pdf(
+        &path,
+        &good,
+        &letter(),
+        &RenderOptions::default(),
+        &rows,
+        &cols,
+        true,
+        |_, _| {},
+        || false,
+    )
+    .expect("the first export should succeed");
+    let original = std::fs::read(&path).unwrap();
+
+    // A job over the large threshold, WITHOUT confirm_large, must refuse.
+    // Give it enough real rows plus a break before each so every row is its
+    // own page — comfortably past LARGE_JOB_PAGES.
+    let huge = Grid::new(2000, 2);
+    let mut setup = letter();
+    for r in 1..2000u32 {
+        setup.add_row_break(r);
+    }
+    let err = render_pdf(
+        &path,
+        &huge,
+        &setup,
+        &RenderOptions::default(),
+        &rows,
+        &cols,
+        false, // do not confirm — force the refusal
+        |_, _| {},
+        || false,
+    )
+    .expect_err("a large job without confirmation must be refused");
+    assert!(matches!(err, RenderError::TooManyPages(_)));
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        original, after,
+        "a refused large re-export must leave the previous file untouched"
+    );
+}
+
 // -------------------------------------------------------------------- HTML ==
 
 #[test]
