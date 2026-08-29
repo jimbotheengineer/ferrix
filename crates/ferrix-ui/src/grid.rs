@@ -575,6 +575,23 @@ pub struct GridResponse {
     pub rotated_texts: usize,
     /// Cells whose text was laid out WRAPPED this frame.
     pub wrapped_texts: usize,
+    /// Sparkline PRIMITIVES drawn this frame (issue #36): one per line
+    /// segment, one per bar.
+    ///
+    /// Counted at the point of drawing, and counted as the specific shape kind
+    /// this feature emits rather than as a slice of the frame total. A total
+    /// moves for a dozen unrelated reasons — a selection rectangle, one fewer
+    /// grid line — so "sparklines are painted" asserted against
+    /// `paint_shape_count()` alone would be a test of the whole frame. This
+    /// number is zero on every sheet without a sparkline group and is exactly
+    /// the count of marks the feature put on screen.
+    pub sparkline_shapes: usize,
+    /// Cells a sparkline group covers that drew NOTHING this frame, because
+    /// their source was empty or held no numbers.
+    ///
+    /// Separate from `sparkline_shapes` so "draws nothing rather than
+    /// erroring" is an assertable state and not merely the absence of one.
+    pub sparkline_blanks: usize,
 }
 
 pub struct Grid<'a> {
@@ -666,10 +683,85 @@ pub struct Grid<'a> {
     /// what a viewport of formula sources costs, and materialising every
     /// formula in the sheet never happens.
     pub show_formulas: bool,
+    /// Sparkline groups (issue #36). `None` when the sheet has none, which
+    /// keeps the default paint path free of lookups.
+    ///
+    /// There are NO chart objects behind this. Each visible cell a group
+    /// covers reads its own row's source span, reduces it through
+    /// `ferrix_core::sparkline_shape`, and draws — inside the cell loop, from
+    /// the same `cell_rect` the value would have used. So the per-frame cost
+    /// is (visible sparklined cells x source span), the source span is
+    /// reduced to the cell's pixel width by `decimate_min_max`, and the row
+    /// count of the sheet does not appear in that product at all.
+    pub sparklines: Option<&'a ferrix_core::SparklineMap>,
 }
 
 fn sheet_c32(c: ferrix_core::Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// Draw one sparkline into `rect`, returning how many primitives it emitted.
+///
+/// Takes NORMALISED geometry from `ferrix_core::sparkline` and does nothing
+/// but map it onto pixels. The split is deliberate: extents, decimation and
+/// baseline choice are data questions and live in core beside `chart.rs`,
+/// while this function owns only the affine map into the cell -- so a test of
+/// what is drawn does not need a screen, and this function has no arithmetic
+/// that could disagree with the model about where a point belongs.
+///
+/// Every mark is added straight to the frame's `Painter`. Nothing is retained
+/// between frames, which is the whole reason there is no chart object.
+fn paint_sparkline(
+    painter: &egui::Painter,
+    rect: Rect,
+    shape: &ferrix_core::SparkShape,
+    th: Theme,
+    zoom: f32,
+) -> usize {
+    use ferrix_core::SparkShape;
+    // y is measured UP from the bottom of the cell in the model and DOWN from
+    // the top in egui, so the flip happens once, here.
+    let px = |nx: f64, ny: f64| -> egui::Pos2 {
+        egui::pos2(
+            rect.min.x + rect.width() * nx as f32,
+            rect.max.y - rect.height() * ny as f32,
+        )
+    };
+    match shape {
+        SparkShape::Line(points) => {
+            let stroke = Stroke::new(1.0_f32.max(zoom), th.accent);
+            if points.len() == 1 {
+                // A single point would be an empty polyline and so invisible;
+                // a lone reading is still a fact worth showing.
+                let p = px(points[0].x, points[0].y);
+                painter.circle_filled(p, 1.2 * zoom, th.accent);
+                return 1;
+            }
+            let mut drawn = 0usize;
+            for w in points.windows(2) {
+                painter.line_segment([px(w[0].x, w[0].y), px(w[1].x, w[1].y)], stroke);
+                drawn += 1;
+            }
+            drawn
+        }
+        SparkShape::Bars(bars) => {
+            let mut drawn = 0usize;
+            for b in bars {
+                let top = px(b.x0, b.hi);
+                let bottom = px(b.x1, b.lo);
+                // A bar that rounds to sub-pixel height still has to be
+                // visible: a win/loss column of tiny values must not silently
+                // become an empty cell.
+                let r = Rect::from_min_max(
+                    egui::pos2(top.x, top.y),
+                    egui::pos2(bottom.x.max(top.x + 1.0), bottom.y.max(top.y + 1.0)),
+                );
+                painter.rect_filled(r, 0.0, if b.negative { th.error } else { th.accent });
+                drawn += 1;
+            }
+            drawn
+        }
+    }
 }
 
 /// THE row-height definition for wrapped text (issue #28).
@@ -1226,6 +1318,17 @@ impl<'a> Grid<'a> {
         let mut border_segments = 0usize;
         let mut rotated_texts = 0usize;
         let mut wrapped_texts = 0usize;
+        let mut sparkline_shapes = 0usize;
+        let mut sparkline_blanks = 0usize;
+        // Scratch buffer for ONE row's sparkline source, reused across every
+        // sparklined cell in the frame. Its capacity is the widest source span
+        // configured, never the sheet's row count — this is the allocation the
+        // scale invariant is about, so it is hoisted here where its lifetime
+        // is visibly per-frame rather than per-row.
+        let mut spark_src: Vec<Option<f64>> = Vec::new();
+        // A sheet with no groups at all short-circuits before any per-row or
+        // per-cell work; `Option::filter` here is the only cost it pays.
+        let sparklines = self.sparklines.filter(|s| !s.is_empty());
 
         // Narrow the match list to just the visible rows once per frame, so
         // per-cell highlight testing is a small linear probe rather than a
@@ -1400,6 +1503,13 @@ impl<'a> Grid<'a> {
                 .filter(|_| !is_pad)
                 .and_then(|m| m.row_comments(row));
 
+            // ONE probe per visible row, for the same reason: a scan of the
+            // GROUP list (a handful of rectangles), hoisted out of the column
+            // loop. A padding row is past the end of the sheet, so it has no
+            // source values to plot and is excluded here rather than in the
+            // cell loop.
+            let row_has_spark = !is_pad && sparklines.is_some_and(|s| s.covers_row(row));
+
             for (ci, &(c, x)) in col_bands.iter().enumerate() {
                 let in_lead_cols = ci < band_cols;
                 let w = width_of(c);
@@ -1564,6 +1674,57 @@ impl<'a> Grid<'a> {
                 }
 
                 let value = view.get(cref);
+                // --- sparklines (issue #36) ---
+                //
+                // Drawn HERE, in the cell loop, from the cell rect the value
+                // would have used. There is no chart object, no series cache
+                // and no per-row allocation: this row's source span is read
+                // into ONE reused scratch buffer, reduced to the cell's pixel
+                // width by `chart::decimate_min_max`, drawn, and forgotten.
+                //
+                // That is what makes the cost per VISIBLE ROW. A group over
+                // 200M rows reaches this line once per row actually on screen
+                // -- roughly 40 times -- exactly as a group over 40 rows does,
+                // so the two sheets paint a frame in the same time.
+                if row_has_spark {
+                    if let Some(g) = sparklines.and_then(|s| s.group_at(cref)) {
+                        // The source is read through `view.get`, the same
+                        // accessor the cell text uses, so a sparkline plots
+                        // the user's EDITS rather than the base file: a value
+                        // the user just typed is what they expect to move the
+                        // line.
+                        spark_src.clear();
+                        if let Some(cols) = g.source_cols(row) {
+                            spark_src.reserve(g.source_len());
+                            for sc in cols {
+                                spark_src.push(match view.get(CellRef::new(row, sc)) {
+                                    Value::Number(n) if n.is_finite() => Some(n),
+                                    Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+                                    // Text, errors and empties are GAPS, not
+                                    // zeros -- the same choice `numeric_column`
+                                    // makes, and for the same reason: plotting
+                                    // a missing measurement as 0 invents data.
+                                    _ => None,
+                                });
+                            }
+                        }
+                        let inner = cell_rect.shrink2(Vec2::new(2.0 * m.zoom, 3.0 * m.zoom));
+                        // An empty or entirely non-numeric source yields
+                        // `None`, and the cell then draws NOTHING. Not an
+                        // error marker, not a zero line: a sheet still being
+                        // filled in is not a broken sheet, and a column of red
+                        // flags would train the user to ignore them.
+                        match ferrix_core::sparkline_shape(g.kind, &spark_src, inner.width())
+                            .filter(|_| inner.width() > 1.0 && inner.height() > 1.0)
+                        {
+                            Some(shape) => {
+                                sparkline_shapes +=
+                                    paint_sparkline(&painter, inner, &shape, th, m.zoom);
+                            }
+                            None => sparkline_blanks += 1,
+                        }
+                    }
+                }
                 // Cell decoration (issue #28): borders, alignment, indent,
                 // wrap, rotation. Resolved from the plan built once for this
                 // column above, so a decorated 200M-row column costs exactly
@@ -2578,6 +2739,8 @@ impl<'a> Grid<'a> {
             border_segments,
             rotated_texts,
             wrapped_texts,
+            sparkline_shapes,
+            sparkline_blanks,
         }
     }
 }

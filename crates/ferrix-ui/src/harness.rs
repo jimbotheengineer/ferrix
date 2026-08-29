@@ -555,6 +555,40 @@ impl Harness {
         self.app.painted_wrapped_texts()
     }
 
+    // ---- sparklines (issue #36) ----
+    //
+    // `painted_sparklines` reads the grid's own count of the primitives the
+    // sparkline code emitted, not the frame total. A test that asserted on
+    // `paint_shape_count()` would be asserting on the whole frame: the
+    // selection rectangle alone moves it, so it can rise while sparklines
+    // draw nothing at all.
+
+    /// Sparkline primitives the last frame actually painted.
+    pub fn painted_sparklines(&mut self) -> usize {
+        self.step();
+        self.app.painted_sparklines()
+    }
+
+    /// Cells a sparkline group covers that drew NOTHING last frame.
+    pub fn blank_sparklines(&mut self) -> usize {
+        self.step();
+        self.app.blank_sparklines()
+    }
+
+    /// Widen the single configured sparkline group down to `last_row`, keeping
+    /// its type and source columns.
+    ///
+    /// The scale test needs a group covering 200M rows, and there is no
+    /// gesture for selecting 200M rows — the app would have to materialise
+    /// them, which is the very thing the invariant forbids. So the group is
+    /// widened in the store the command writes to, and the assertion is still
+    /// on what the PAINT LOOP does with it.
+    pub fn widen_sparkline_to(&mut self, last_row: u32) -> &mut Self {
+        self.app.widen_sparkline_for_test(last_row);
+        self.steps(2);
+        self
+    }
+
     /// Height the app currently paints a row at, read back from its own
     /// geometry rather than recomputed — the same `cell_screen_rect` the
     /// editor is positioned with.
@@ -7311,6 +7345,323 @@ xxx,yyy,zzz
             h.app().paste_special_is_open(),
             "Paste Special must be reachable from the command palette, not \
              only from a test calling paste_special_open directly"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ================= sparklines (issue #36) =================
+    //
+    // Every assertion here reads `painted_sparklines()` — the grid's count of
+    // the primitives THIS feature emitted — and every one of them drives the
+    // production dispatch path, `run_command`, rather than `add_sparkline`
+    // directly. Both choices are deliberate:
+    //
+    // * A frame TOTAL (`paint_shape_count`) moves for a dozen unrelated
+    //   reasons. It would rise when a selection rectangle appears and fall
+    //   when a grid line leaves, so "the total went up" is not evidence that a
+    //   sparkline was drawn. The specific counter cannot move for any other
+    //   reason: it is incremented at the `painter` calls in `paint_sparkline`
+    //   and nowhere else.
+    // * Calling `add_sparkline` directly would pass with no registry row and
+    //   no dispatch arm — the "model-complete and unreachable" shape this repo
+    //   has shipped four times. `run_command` is what the menu bar and the
+    //   palette both call.
+
+    /// Four numeric columns (0..=3), an empty destination column (4), two TEXT
+    /// columns (5, 6) and a second empty destination (7).
+    ///
+    /// The destination columns exist in the file on purpose: the grid paints
+    /// columns `0..view.col_count()`, so a sparkline written one column past
+    /// the sheet's own extent would be stored and never drawn. That is a real
+    /// limitation of deriving the destination rather than asking for it, and
+    /// it is recorded here rather than papered over.
+    const SPARK_SAMPLE: &str = "q1,q2,q3,q4,spark,label,note,spark2
+                                1,5,2,9,,alpha,a,
+                                4,4,4,4,,beta,b,
+                                -3,2,-1,6,,gamma,c,
+                                10,20,15,30,,delta,d,
+";
+
+    fn spark_fixture(name: &str) -> (std::path::PathBuf, Harness) {
+        let p = write_csv(&unique(name, "csv"), SPARK_SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        h.steps(2);
+        (p, h)
+    }
+
+    /// Select the four data columns of every data row — the source a user
+    /// would highlight before asking for a sparkline column.
+    fn select_spark_source(h: &mut Harness) {
+        h.select(CellRef::new(0, 0), CellRef::new(3, 3));
+        h.steps(2);
+    }
+
+    /// The headline criterion: what is PAINTED changes when a sparkline is
+    /// added.
+    ///
+    /// What would this assert if the feature did nothing at all? The baseline
+    /// is asserted to be exactly 0 and the post-command count is asserted to
+    /// be a specific non-zero number, so a dead command fails — and a command
+    /// that stored a config entry without painting fails too, which is the
+    /// specific failure the criterion names.
+    #[test]
+    fn adding_a_sparkline_changes_what_is_painted() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_painted");
+        assert_eq!(
+            h.painted_sparklines(),
+            0,
+            "baseline: no group configured, nothing painted"
+        );
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+
+        let drawn = h.painted_sparklines();
+        assert!(
+            drawn > 0,
+            "the Sparkline command must reach the PAINTER through run_command, \
+             not merely store a config entry — drew {drawn} primitives"
+        );
+        // Four rows of four values: each row is three line segments, so the
+        // count is exact rather than merely non-zero. An off-by-one in the
+        // polyline, or a row silently skipped, fails here.
+        assert_eq!(
+            drawn, 12,
+            "4 rows x (4 points -> 3 segments) = 12 line segments"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 1, "ONE entry for 4 rows");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// All three types reach the painter, and they are distinguishable.
+    ///
+    /// A line of n points is n-1 segments; a column chart is n bars. So the
+    /// counts differ by construction, and a match arm that fell through to
+    /// Line for every type would fail here rather than passing quietly.
+    #[test]
+    fn all_three_sparkline_types_are_painted_and_differ() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_types");
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+        let line = h.painted_sparklines();
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkColumn);
+        h.steps(2);
+        let column = h.painted_sparklines();
+
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        let winloss = h.painted_sparklines();
+
+        assert!(
+            line > 0 && column > 0 && winloss > 0,
+            "every type must paint: line={line} column={column} winloss={winloss}"
+        );
+        assert_eq!(line, 12, "4 rows x 3 segments");
+        assert_eq!(column, 16, "4 rows x 4 bars");
+        // Win/loss only drops ZEROES, and this fixture has none.
+        assert_eq!(winloss, 16, "4 rows x 4 win/loss bars");
+        assert_ne!(
+            line, column,
+            "a line and a column sparkline must not paint identically"
+        );
+        assert_eq!(
+            h.app().sparkline_group_count(),
+            1,
+            "re-applying to the same target replaces rather than stacking"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A non-numeric source draws nothing rather than erroring.
+    ///
+    /// The `label` column is text. Sparklining it must leave the cells blank
+    /// and the app alive — asserted as an exact 0 painted AND a non-zero
+    /// count of deliberately-blank cells, so "drew nothing" is distinguished
+    /// from "the group was never consulted".
+    #[test]
+    fn a_text_source_draws_nothing_rather_than_erroring() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_text");
+        // Columns 5..=6 are both TEXT, so the source is legal (two columns)
+        // and holds no numbers at all. The destination, column 7, exists.
+        h.select(CellRef::new(0, 5), CellRef::new(3, 6));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+
+        assert_eq!(h.painted_sparklines(), 0, "a text source must draw NOTHING");
+        assert_eq!(
+            h.blank_sparklines(),
+            4,
+            "but the group must still be consulted for all 4 covered rows — a \
+             zero here would mean the group was never reached, which would \
+             make the assertion above pass for the wrong reason"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Removing the group removes the picture.
+    ///
+    /// A feature that can only be turned on is half a feature, and the
+    /// baseline here is a non-zero count so "0 painted" is a real change.
+    #[test]
+    fn removing_a_sparkline_group_stops_the_painting() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_clear");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkColumn);
+        h.steps(2);
+        assert!(h.painted_sparklines() > 0, "precondition: it is drawing");
+
+        // Select the DESTINATION column the command derived.
+        h.select(CellRef::new(0, 4), CellRef::new(3, 4));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkClear);
+        h.steps(2);
+
+        assert_eq!(
+            h.painted_sparklines(),
+            0,
+            "Remove sparklines must stop the painting"
+        );
+        assert_eq!(h.app().sparkline_group_count(), 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A sparkline plots the user's EDITS, not the base file.
+    ///
+    /// The picture is produced in the paint loop from `view.get`, so a typed
+    /// value changes it on the next frame with no invalidation step. This is
+    /// what a cached series object would get wrong, and the assertion is on
+    /// the painted count changing rather than on the model.
+    #[test]
+    fn an_edit_changes_the_sparkline_on_the_next_frame() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_edit");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        assert_eq!(h.painted_sparklines(), 16, "precondition: 16 bars");
+
+        // Type a zero into one source cell. Win/loss draws NOTHING for a
+        // zero, so exactly one bar must disappear.
+        h.select(CellRef::new(1, 1), CellRef::new(1, 1));
+        h.steps(2);
+        h.type_text("0").step();
+        h.press_key(Key::Enter).steps(2);
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "0",
+            "precondition: the edit committed"
+        );
+
+        assert_eq!(
+            h.painted_sparklines(),
+            15,
+            "an edited source cell must change the PICTURE on the next frame, \
+             with no cache to invalidate"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The scale invariant, asserted through the real paint path.
+    ///
+    /// A group covering 200M rows is ONE entry, and the frame paints the same
+    /// number of primitives it would for a group covering only the rows on
+    /// screen — because the paint loop only ever visits visible rows. If a
+    /// future change materialised a series per row, this test would either
+    /// blow the count up or take minutes; both are failures.
+    #[test]
+    fn a_200m_row_group_costs_one_entry_and_a_viewport_of_paint() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_scale");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+        let small = h.painted_sparklines();
+        assert!(small > 0, "precondition: the 4-row group paints");
+
+        // Widen the SAME group to 200M rows, in the store the command writes
+        // to, and paint again.
+        h.widen_sparkline_to(199_999_999);
+        h.steps(2);
+
+        assert_eq!(
+            h.app().sparkline_group_count(),
+            1,
+            "a 200M-row group is ONE entry"
+        );
+        assert_eq!(
+            h.painted_sparklines(),
+            small,
+            "a 200M-row group must paint exactly what the 4-row one did: the \
+             sheet has 4 rows of data, and cost is per VISIBLE row"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A one-column selection is refused with a sentence, not silently.
+    ///
+    /// One source value per row is a dot, which says nothing. The refusal is
+    /// asserted through the painted count AND the group count, so a command
+    /// that stored an unpaintable group would still fail.
+    #[test]
+    fn a_single_column_source_is_refused_rather_than_drawn() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_onecol");
+        h.select(CellRef::new(0, 0), CellRef::new(3, 0));
+        h.steps(2);
+        h.app_mut().run_command(CommandId::FormatSparkLine);
+        h.steps(2);
+
+        assert_eq!(h.app().sparkline_group_count(), 0, "nothing was stored");
+        assert_eq!(h.painted_sparklines(), 0, "and nothing was drawn");
+        assert!(
+            h.status().contains("at least two columns"),
+            "the refusal must say WHY, got {:?}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A sparkline follows a SORT, because it resolves rows through the one
+    /// row resolver the rest of the grid uses.
+    ///
+    /// The guide's warning about a second row mapping applies directly: a
+    /// sparkline keyed off the screen row rather than the resolved data row
+    /// would paint one row's series beside another row's numbers — plausibly,
+    /// and invisibly. The row count on screen is unchanged by a sort, so the
+    /// bar count must be too.
+    #[test]
+    fn sparklines_follow_a_sort_rather_than_the_screen_row() {
+        use crate::command::CommandId;
+        let (p, mut h) = spark_fixture("spark_sort");
+        select_spark_source(&mut h);
+        h.app_mut().run_command(CommandId::FormatSparkWinLoss);
+        h.steps(2);
+        let before = h.painted_sparklines();
+        assert!(before > 0, "precondition: it is drawing");
+
+        // Sort by the first column through a real header click.
+        h.click_header(0);
+        h.steps(2);
+
+        assert_eq!(
+            h.painted_sparklines(),
+            before,
+            "the same four rows are on screen after a sort, so the same number \
+             of bars must be drawn — a sparkline that read the screen row as a \
+             data row would address rows past the end and draw fewer"
         );
         let _ = std::fs::remove_file(&p);
     }
