@@ -683,7 +683,10 @@ impl NumberFormat {
                 format!("{:.*}%", *places as usize, v * 100.0)
             }
             NumberFormat::Date(d) => render_serial(v, *d),
-            NumberFormat::Custom(_) => crate::value::format_number(v),
+            // A custom code is a real Excel format string. Interpreting it is
+            // the difference between showing the user their workbook and
+            // showing them a bare number where a currency or date belonged.
+            NumberFormat::Custom(code) => crate::numfmt::NumFmt::parse(code).render(v),
         }
     }
 }
@@ -737,6 +740,35 @@ fn group_thousands(v: f64, places: u8, prefix: &str) -> String {
         out.push_str(f);
     }
     out
+}
+
+/// Decompose an Excel serial into `(year, month, day, hour, minute, second,
+/// weekday)`, where weekday is 0 = Sunday.
+///
+/// Shares [`civil_from_serial`] with [`render_serial`] rather than doing its
+/// own calendar arithmetic, so the two can never disagree about what day a
+/// serial is.
+pub fn serial_parts(serial: f64) -> (i32, u32, u32, u32, u32, u32, u32) {
+    if !serial.is_finite() {
+        return (1900, 1, 1, 0, 0, 0, 0);
+    }
+    let days = serial.floor();
+    let frac = serial - days;
+    let secs_total = (frac * 86_400.0).round() as i64;
+    let (hh, mm, ss) = (secs_total / 3600, (secs_total % 3600) / 60, secs_total % 60);
+    let (y, m, d) = civil_from_serial(days as i64);
+    // Serial 1 is 1900-01-01, a Monday. Excel's phantom 1900-02-29 means the
+    // modulo is taken over the serial itself, which is what Excel does too.
+    let weekday = ((days as i64 % 7) + 6) % 7;
+    (
+        y as i32,
+        m,
+        d,
+        hh as u32,
+        mm as u32,
+        ss as u32,
+        weekday as u32,
+    )
 }
 
 /// Convert an xlsx serial number to a calendar date and render it.

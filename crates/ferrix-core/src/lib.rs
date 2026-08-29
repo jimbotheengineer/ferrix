@@ -17,6 +17,7 @@ pub mod chart;
 pub mod column;
 pub mod filter;
 pub mod format;
+pub mod numfmt;
 pub mod order;
 pub mod overlay;
 pub mod scene;
