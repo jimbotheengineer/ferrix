@@ -54,6 +54,18 @@ impl CellInput {
     }
 }
 
+/// A single cell's before/after state, recorded by a batch apply.
+///
+/// This is the unit an undo entry is built from. Making it a core type rather
+/// than a UI-private one is what lets a bulk operation be assembled by the
+/// overlay itself — the layer that actually knows what was there before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayChange {
+    pub cell: CellRef,
+    pub before: Option<CellInput>,
+    pub after: Option<CellInput>,
+}
+
 /// Sparse edit layer over an immutable base.
 ///
 /// `Clone` is what lets a long export run off the UI thread: the exporter
@@ -123,6 +135,49 @@ impl EditOverlay {
             None => {
                 self.clear(cell);
             }
+        }
+    }
+
+    /// One cell's before/after, as recorded by [`EditOverlay::apply_batch`].
+    ///
+    /// `None` on either side means "no overlay entry" — the cell deferred to
+    /// the base. Undo needs that distinction: restoring `Some(Empty)` leaves a
+    /// cell explicitly blanked, while restoring `None` gives the base value
+    /// back.
+    ///
+    /// Batch application is what keeps a bulk edit one undo step: the caller
+    /// collects these into a single entry rather than pushing one per cell.
+    pub fn apply_batch<I>(&mut self, edits: I, changes: &mut Vec<OverlayChange>) -> usize
+    where
+        I: IntoIterator<Item = (CellRef, Option<CellInput>)>,
+    {
+        let start = changes.len();
+        for (cell, after) in edits {
+            let before = self.get(cell).cloned();
+            match &after {
+                Some(input) => {
+                    self.set(cell, input.clone());
+                }
+                None => {
+                    self.clear(cell);
+                }
+            }
+            changes.push(OverlayChange {
+                cell,
+                before,
+                after,
+            });
+        }
+        changes.len() - start
+    }
+
+    /// Undo a batch produced by [`EditOverlay::apply_batch`].
+    ///
+    /// Reverse order, so overlapping writes to the same cell unwind exactly as
+    /// they were made.
+    pub fn revert_batch(&mut self, changes: &[OverlayChange]) {
+        for ch in changes.iter().rev() {
+            self.restore(ch.cell, ch.before.clone());
         }
     }
 
@@ -270,6 +325,86 @@ mod tests {
         assert_eq!(o.extent(), (1000, 6));
     }
 
+    #[test]
+    fn apply_batch_records_before_and_after_for_every_cell() {
+        let mut o = EditOverlay::new();
+        // One cell already edited, one untouched — undo must tell them apart.
+        o.set(CellRef::new(0, 0), CellInput::Literal(Value::Number(1.0)));
+
+        let mut changes = Vec::new();
+        let n = o.apply_batch(
+            vec![
+                (
+                    CellRef::new(0, 0),
+                    Some(CellInput::Literal(Value::Number(2.0))),
+                ),
+                (
+                    CellRef::new(1, 0),
+                    Some(CellInput::Literal(Value::Number(3.0))),
+                ),
+            ],
+            &mut changes,
+        );
+
+        assert_eq!(n, 2);
+        assert_eq!(
+            changes[0].before,
+            Some(CellInput::Literal(Value::Number(1.0)))
+        );
+        assert_eq!(
+            changes[1].before, None,
+            "an unedited cell defers to the base"
+        );
+        assert_eq!(o.value(CellRef::new(0, 0)), Some(Value::Number(2.0)));
+        assert_eq!(o.value(CellRef::new(1, 0)), Some(Value::Number(3.0)));
+    }
+
+    #[test]
+    fn revert_batch_restores_every_cell_exactly() {
+        let mut o = EditOverlay::new();
+        o.set(CellRef::new(0, 0), CellInput::Literal(Value::Number(1.0)));
+
+        let mut changes = Vec::new();
+        o.apply_batch(
+            (0..50u32).map(|r| {
+                (
+                    CellRef::new(r, 0),
+                    Some(CellInput::Literal(Value::Number(99.0))),
+                )
+            }),
+            &mut changes,
+        );
+        assert_eq!(o.len(), 50);
+
+        o.revert_batch(&changes);
+        // The pre-existing edit comes back as an EDIT; the other 49 go back to
+        // having no overlay entry at all, deferring to the base again.
+        assert_eq!(o.value(CellRef::new(0, 0)), Some(Value::Number(1.0)));
+        assert_eq!(o.len(), 1, "reverting must not leave 49 phantom entries");
+        for r in 1..50u32 {
+            assert_eq!(o.get(CellRef::new(r, 0)), None);
+        }
+    }
+
+    #[test]
+    fn revert_batch_unwinds_overlapping_writes_in_order() {
+        // Two writes to the same cell in one batch: undo must land on the
+        // state before the batch, not on the intermediate value.
+        let mut o = EditOverlay::new();
+        let c = CellRef::new(4, 4);
+        o.set(c, CellInput::Literal(Value::Number(0.0)));
+        let mut changes = Vec::new();
+        o.apply_batch(
+            vec![
+                (c, Some(CellInput::Literal(Value::Number(1.0)))),
+                (c, Some(CellInput::Literal(Value::Number(2.0)))),
+            ],
+            &mut changes,
+        );
+        assert_eq!(o.value(c), Some(Value::Number(2.0)));
+        o.revert_batch(&changes);
+        assert_eq!(o.value(c), Some(Value::Number(0.0)));
+    }
     #[test]
     fn formula_cells_enumerates_only_formulas() {
         let mut o = EditOverlay::new();

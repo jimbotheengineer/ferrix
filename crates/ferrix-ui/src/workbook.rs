@@ -50,6 +50,16 @@ pub const DEFAULT_UNDO_LIMIT: usize = 500;
 /// this — or to a different cell — stays its own step.
 pub const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// How many rows Replace All scans per window.
+///
+/// This is the knob that makes the scale invariant real. Peak memory during a
+/// Replace All is one window's hits, so the window bounds it: at most
+/// `REPLACE_WINDOW_ROWS x cols` `CellRef`s plus their text live at once,
+/// regardless of whether the sheet has 4 rows or 200 million. Large enough
+/// that the per-window arena pass is amortised to nothing; small enough that
+/// a window of all-matching cells is kilobytes, not gigabytes.
+pub const REPLACE_WINDOW_ROWS: usize = 65_536;
+
 #[derive(Debug)]
 struct CellChange {
     cell: CellRef,
@@ -182,6 +192,11 @@ pub struct Workbook {
     /// breaks the "same continuous edit" story: a bulk op, an undo, a redo, a
     /// save, a sheet switch, or an edit to a different cell.
     last_edit: Option<(SheetCell, std::time::Instant)>,
+    /// Rows scanned per Replace All window. Defaults to
+    /// [`REPLACE_WINDOW_ROWS`]; lowered by tests so a small fixture still
+    /// crosses several window boundaries, which is the only way to catch a
+    /// windowed walk that drops or double-counts a window.
+    replace_window_rows: usize,
     /// Edits made since the last save. Drives the dirty indicator and the
     /// close prompt; without it a user can lose work by closing the window.
     dirty: bool,
@@ -215,6 +230,7 @@ impl Workbook {
             redo: Vec::new(),
             undo_limit: DEFAULT_UNDO_LIMIT,
             last_edit: None,
+            replace_window_rows: REPLACE_WINDOW_ROWS,
             dirty: false,
         }
     }
@@ -457,6 +473,11 @@ impl Workbook {
     }
 
     // --------------------------------------------------------------- editing
+
+    /// Shrink the Replace All scan window. Test seam; see the field's docs.
+    pub fn set_replace_window_rows(&mut self, rows: usize) {
+        self.replace_window_rows = rows.max(1);
+    }
 
     /// Override the undo depth cap. Mainly for tests and future configuration;
     /// a limit of 0 disables undo entirely.
@@ -1113,6 +1134,156 @@ impl Workbook {
         });
         self.recalc_all();
         Ok(n)
+    }
+
+    /// Replace across the whole sheet as exactly ONE undo step.
+    ///
+    /// ## Why this streams
+    ///
+    /// The candidate cells are produced a row window at a time
+    /// ([`SheetView::replace_window`]), never as one list of every match. On a
+    /// 200M-row sheet a term matching 80 million cells would otherwise cost
+    /// 640 MB of `CellRef`s before a single edit was applied. Here the only
+    /// thing that grows with the result is the undo entry — which is exactly
+    /// what `max_edits` bounds, derived by the caller from
+    /// [`ferrix_core::budget::cost::REPLACE_CELL`].
+    ///
+    /// ## Why cancellation keeps its edits
+    ///
+    /// `cancel` is polled at [`ferrix_core::search::CANCEL_POLL_INTERVAL`]
+    /// candidates. When it fires the pass stops and everything already written
+    /// STAYS written, recorded in the same single undo entry — so one Ctrl+Z
+    /// still reverses the whole partial run. Silently rolling back would throw
+    /// away work the user watched happen; silently continuing would ignore the
+    /// cancel. Reporting the count is what makes the third option honest.
+    ///
+    /// The undo entry is pushed only if something actually changed, so a
+    /// replace that matches nothing leaves the history untouched.
+    pub fn replace_all(
+        &mut self,
+        spec: &ferrix_core::ReplaceSpec,
+        max_edits: usize,
+        cancel: &ferrix_core::CancelToken,
+        mut progress: impl FnMut(usize, usize),
+    ) -> ferrix_core::ReplaceReport {
+        use ferrix_core::{ReplaceOutcome, ReplaceReport};
+
+        let started = std::time::Instant::now();
+        let sheet = self.active_sheet();
+        let rows = self.view().row_count();
+        let window = self.replace_window_rows.max(1);
+
+        let mut changes: Vec<CellChange> = Vec::new();
+        let mut examined = 0usize;
+        let mut outcome = ReplaceOutcome::Completed;
+        let mut first_cell: Option<CellRef> = None;
+
+        let mut r0 = 0usize;
+        'outer: while r0 < rows {
+            let r1 = (r0 + window).min(rows);
+            // The borrow lives only as long as the scan. Dropping it before
+            // applying is what lets the loop hold `&mut self` at all — and it
+            // is also what bounds memory to one window.
+            let candidates = self
+                .view()
+                .replace_window(&spec.query, spec.look_in, r0, r1);
+            r0 = r1;
+
+            for (cell, text) in candidates {
+                if examined % ferrix_core::search::CANCEL_POLL_INTERVAL == 0 {
+                    progress(examined, changes.len());
+                    if cancel.is_cancelled() {
+                        outcome = ReplaceOutcome::Cancelled;
+                        break 'outer;
+                    }
+                }
+                examined += 1;
+                let Some(new_text) = spec.rewrite(&text) else {
+                    continue;
+                };
+                if changes.len() >= max_edits {
+                    outcome = ReplaceOutcome::BudgetExhausted;
+                    break 'outer;
+                }
+
+                let before = self.overlay.get(cell).cloned();
+                let after = self.classify(&new_text);
+                match &after {
+                    Some(input) => {
+                        self.overlay.set(cell, input.clone());
+                    }
+                    None => {
+                        self.overlay.clear(cell);
+                    }
+                }
+                // Keeps the dependency graph honest whether the rewrite
+                // produced a formula, destroyed one, or left a literal — which
+                // is what makes 'look in: formulas' recalculate correctly.
+                self.resync_graph(cell);
+                first_cell.get_or_insert(cell);
+                changes.push(CellChange {
+                    cell,
+                    before,
+                    after,
+                });
+            }
+
+            // A cancel between windows must still be honoured promptly on a
+            // sheet whose windows contain few or no matches. Reporting here
+            // too means progress advances with the SCAN, not only with the
+            // writes — a long pass over a sheet with sparse matches would
+            // otherwise look frozen.
+            progress(examined, changes.len());
+            if cancel.is_cancelled() {
+                outcome = ReplaceOutcome::Cancelled;
+                break;
+            }
+        }
+        progress(examined, changes.len());
+
+        let applied = changes.len();
+        if applied > 0 {
+            self.dirty = true;
+            // ONE entry for the whole pass, cancelled or not. `bulk: true`
+            // also stops it coalescing with a neighbouring keystroke, matching
+            // clear/paste/fill.
+            self.push_undo(UndoEntry {
+                sheet,
+                cell: first_cell.unwrap_or(CellRef::new(0, 0)),
+                changes,
+                side_effects: Vec::new(),
+                bulk: true,
+            });
+            self.recalc_all();
+        }
+
+        ReplaceReport {
+            applied,
+            examined,
+            outcome,
+            millis: started.elapsed().as_millis(),
+        }
+    }
+
+    /// Replace at exactly one cell, as an ordinary single-cell edit.
+    ///
+    /// Returns the new text when the cell changed. Goes through
+    /// `commit_edit`, so it recalculates and undoes like anything the user
+    /// typed — a single Replace should not behave differently from typing the
+    /// same result by hand.
+    pub fn replace_one(
+        &mut self,
+        cell: CellRef,
+        spec: &ferrix_core::ReplaceSpec,
+    ) -> Option<String> {
+        let text = self.view().replace_text(cell, spec.look_in)?;
+        let new_text = spec.rewrite(&text)?;
+        // Break any coalescing run: a replace is its own logical action, not a
+        // continuation of whatever the user last typed.
+        self.end_edit_run();
+        self.commit_edit(cell, &new_text);
+        self.end_edit_run();
+        Some(new_text)
     }
 
     /// Paste a block of text with its top-left corner at `origin`, as ONE

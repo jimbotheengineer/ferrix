@@ -227,6 +227,13 @@ pub mod cost {
     /// One overlay cell written by a paste or fill: `HashMap` entry, key,
     /// `CellInput`, and undo bookkeeping (before + after).
     pub const OVERLAY_CELL: u64 = 160;
+
+    /// One cell rewritten by Replace All. Costs an `OVERLAY_CELL` plus the two
+    /// replacement strings the before/after pair holds — a replace writes text,
+    /// where a clear writes `Value::Empty`. Deliberately generous: the cap
+    /// derived from this is what stops a Replace All over 200M rows from
+    /// building an undo entry larger than memory.
+    pub const REPLACE_CELL: u64 = OVERLAY_CELL + 128;
 }
 
 /// A cached process-wide sample, refreshed on demand.
