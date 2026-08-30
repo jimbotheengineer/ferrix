@@ -3744,6 +3744,13 @@ impl FerrixApp {
                         }
                     }
                     ui.separator();
+                    if ui
+                        .checkbox(&mut self.chart.y_log, "Log Y")
+                        .on_hover_text("Plot the value axis on a log10 scale")
+                        .changed()
+                    {
+                        rebuild = true;
+                    }
                     let placing = self.chart.placing_note;
                     if ui
                         .selectable_label(placing, "📌 Note")

@@ -1,0 +1,4 @@
+# Golden SVG fixtures are byte-compared by tests/golden_svg.rs. Pin them to LF
+# so a CRLF-autocrlf checkout on Windows cannot rewrite the bytes out from
+# under the comparison. (The test also normalises line endings defensively.)
+*.svg -text eol=lf

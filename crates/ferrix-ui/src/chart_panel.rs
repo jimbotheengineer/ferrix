@@ -15,7 +15,9 @@ use ferrix_core::annotation::{Annotation, Annotations};
 use ferrix_core::chart::{
     decimate_min_max, density_grid, group_by, histogram, Aggregate, Bounds, DataPoint,
 };
-use ferrix_core::scene::{to_svg, Anchor, LegendEntry, Primitive, Rgba, Scene, Viewport};
+use ferrix_core::scene::{
+    to_svg, Anchor, LegendEntry, Primitive, Rgba, Scale, ScaleHint, Scene, Viewport,
+};
 use ferrix_core::{CellRef, Selection, Value};
 
 use crate::sheet_view::SheetView;
@@ -108,6 +110,11 @@ pub struct ChartPanel {
     pub note_buffer: String,
     /// True when the next canvas click should place an annotation.
     pub placing_note: bool,
+    /// User toggle: plot the value (y) axis on a log scale. Useful for
+    /// heavy-tailed data — counts, prices — where a linear axis crushes the
+    /// small values against the baseline. X stays linear (it is a row number or
+    /// a category index, not a magnitude).
+    pub y_log: bool,
 }
 
 impl Default for ChartPanel {
@@ -126,6 +133,7 @@ impl Default for ChartPanel {
             editing_note: None,
             note_buffer: String::new(),
             placing_note: false,
+            y_log: false,
         }
     }
 }
@@ -176,9 +184,23 @@ impl ChartPanel {
             })
             .collect();
 
+        // Per-axis scale hint threaded into every builder. The y (value) axis
+        // follows the user's log toggle; x stays linear because it is a row
+        // number, a category index, or — for scatter — handed its own hint by
+        // the builder. Builders that log a non-positive value axis have their
+        // bounds sanitised inside `with_scale`.
+        let scale = ScaleHint::new(
+            Scale::Linear,
+            if self.y_log {
+                Scale::Log
+            } else {
+                Scale::Linear
+            },
+        );
+
         let scene = match kind {
-            ChartKind::Line => Self::build_line(&values, r0 as usize, &value_header),
-            ChartKind::Histogram => Self::build_histogram(&values, &value_header),
+            ChartKind::Line => Self::build_line(&values, r0 as usize, &value_header, scale),
+            ChartKind::Histogram => Self::build_histogram(&values, &value_header, scale),
             ChartKind::Bar => {
                 let labels: Vec<String> = if has_second {
                     (r0 as usize..last_row)
@@ -195,7 +217,7 @@ impl ChartPanel {
                     self.scene = None;
                     return;
                 }
-                Self::build_bar(&labels, &values, &first_header, &value_header)
+                Self::build_bar(&labels, &values, &first_header, &value_header, scale)
             }
             ChartKind::Scatter => {
                 if !has_second {
@@ -209,7 +231,7 @@ impl ChartPanel {
                         _ => None,
                     })
                     .collect();
-                Self::build_scatter(&xs, &values, &first_header, &value_header)
+                Self::build_scatter(&xs, &values, &first_header, &value_header, scale)
             }
         };
 
@@ -253,7 +275,12 @@ impl ChartPanel {
         }
     }
 
-    fn build_line(values: &[Option<f64>], row_offset: usize, value_header: &str) -> Option<Scene> {
+    fn build_line(
+        values: &[Option<f64>],
+        row_offset: usize,
+        value_header: &str,
+        scale: ScaleHint,
+    ) -> Option<Scene> {
         let series = decimate_min_max(values, BUCKETS);
         if series.points.is_empty() {
             return None;
@@ -282,7 +309,8 @@ impl ChartPanel {
             .with_legend(vec![LegendEntry::new(
                 value_header.to_string(),
                 SERIES_BLUE,
-            )]);
+            )])
+            .with_scale(scale);
         s.push(Primitive::Polyline {
             points,
             color: SERIES_BLUE,
@@ -291,7 +319,11 @@ impl ChartPanel {
         Some(s)
     }
 
-    fn build_histogram(values: &[Option<f64>], value_header: &str) -> Option<Scene> {
+    fn build_histogram(
+        values: &[Option<f64>],
+        value_header: &str,
+        scale: ScaleHint,
+    ) -> Option<Scene> {
         let bins = histogram(values, 40, None);
         if bins.is_empty() {
             return None;
@@ -309,7 +341,8 @@ impl ChartPanel {
         .with_legend(vec![LegendEntry::new(
             value_header.to_string(),
             SERIES_BLUE,
-        )]);
+        )])
+        .with_scale(scale);
         for b in &bins {
             s.push(Primitive::Rect {
                 x0: b.lo,
@@ -328,6 +361,7 @@ impl ChartPanel {
         values: &[Option<f64>],
         label_header: &str,
         value_header: &str,
+        scale: ScaleHint,
     ) -> Option<Scene> {
         let cats = group_by(labels, values, Aggregate::Sum);
         if cats.is_empty() {
@@ -352,10 +386,19 @@ impl ChartPanel {
         // and that it is a sum of it, so the reader is not left guessing which
         // aggregate produced the bar heights.
         let y_label = format!("sum of {value_header}");
+        // A bar chart's value axis includes zero and can go negative (sums),
+        // where a log scale is meaningless. Honour a log-y request only when
+        // every bar sits strictly above zero; otherwise keep the axis linear.
+        let bar_scale = if scale.y == Scale::Log && y.min > 0.0 {
+            scale
+        } else {
+            ScaleHint::new(scale.x, Scale::Linear)
+        };
         let mut s = Scene::new(Bounds::new(-0.6, shown as f64 - 0.4), y)
             .with_axis_labels(label_header, y_label.clone())
             .with_title(format!("{value_header} by {label_header}"))
-            .with_legend(vec![LegendEntry::new(y_label, SERIES_ORANGE)]);
+            .with_legend(vec![LegendEntry::new(y_label, SERIES_ORANGE)])
+            .with_scale(bar_scale);
         for (i, c) in cats.iter().take(shown).enumerate() {
             s.push(Primitive::Rect {
                 x0: i as f64 - 0.38,
@@ -382,6 +425,7 @@ impl ChartPanel {
         ys: &[Option<f64>],
         x_header: &str,
         y_header: &str,
+        scale: ScaleHint,
     ) -> Option<Scene> {
         let (cells, xb, yb) = density_grid(xs, ys, 100, 70);
         if cells.is_empty() {
@@ -389,6 +433,12 @@ impl ChartPanel {
         }
         let max = cells.iter().map(|c| c.count).max().unwrap_or(1) as f64;
         let (xw, yh) = (xb.span() / 100.0, yb.span() / 70.0);
+        // The density cells are binned uniformly in *linear* data space, so a
+        // log axis would misplace them (a cell's linear-space corners are not
+        // its log-space corners). Scatter therefore ignores a log-y request and
+        // keeps a linear mapping; the hint is still accepted for a uniform
+        // builder signature. A future log-scatter would re-bin in log space.
+        let _ = scale;
         // Both axes are real value columns here, so both carry their header.
         let mut s = Scene::new(xb, yb)
             .with_axis_labels(x_header, y_header)
@@ -497,19 +547,26 @@ pub fn paint_scene(
         ),
     );
 
-    let vp = Viewport::new(
+    let vp = Viewport::for_scene(
         (plot.left(), plot.top(), plot.width(), plot.height()),
-        scene.x,
-        scene.y,
+        scene,
     );
 
     // --- gridlines and axis labels ---
-    let y_ticks = ferrix_core::scene::nice_ticks(scene.y, 5);
-    let x_ticks = ferrix_core::scene::nice_ticks(scene.x, 6);
-    let y_step = y_ticks.windows(2).next().map_or(1.0, |w| w[1] - w[0]);
-    let x_step = x_ticks.windows(2).next().map_or(1.0, |w| w[1] - w[0]);
+    // Same source as the SVG writer: `axis_ticks` picks linear or log ticks and
+    // formats them, then `elide_overlapping` drops labels that would collide at
+    // this pixel width. Screen and export therefore agree on both.
+    let (y_ticks, y_labels) = ferrix_core::scene::axis_ticks(scene.y, scene.scale.y, 5);
+    let (x_ticks, x_labels) = ferrix_core::scene::axis_ticks(scene.x, scene.scale.x, 6);
+    let x_centers: Vec<f32> = x_ticks.iter().map(|t| vp.map_x(*t)).collect();
+    let y_centers: Vec<f32> = y_ticks.iter().map(|t| vp.map_y(*t)).collect();
+    let x_keep = ferrix_core::scene::elide_overlapping(&x_labels, &x_centers, 10.0);
+    let y_keep = ferrix_core::scene::elide_overlapping(&y_labels, &y_centers, 10.0);
 
-    for t in &y_ticks {
+    for (i, t) in y_ticks.iter().enumerate() {
+        if !y_keep[i] {
+            continue;
+        }
         let y = vp.map_y(*t);
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
@@ -518,17 +575,20 @@ pub fn paint_scene(
         painter.text(
             Pos2::new(plot.left() - 6.0, y),
             egui::Align2::RIGHT_CENTER,
-            ferrix_core::scene::format_tick(*t, y_step),
+            y_labels[i].clone(),
             egui::FontId::proportional(10.0),
             chrome.label,
         );
     }
-    for t in &x_ticks {
+    for (i, t) in x_ticks.iter().enumerate() {
+        if !x_keep[i] {
+            continue;
+        }
         let x = vp.map_x(*t);
         painter.text(
             Pos2::new(x, plot.bottom() + 4.0),
             egui::Align2::CENTER_TOP,
-            ferrix_core::scene::format_tick(*t, x_step),
+            x_labels[i].clone(),
             egui::FontId::proportional(10.0),
             chrome.label,
         );
@@ -748,8 +808,13 @@ mod tests {
 
     #[test]
     fn line_chart_labels_axis_and_title_with_the_value_header() {
-        let s = ChartPanel::build_line(&[Some(1.0), Some(2.0), Some(3.0)], 0, "revenue")
-            .expect("line scene");
+        let s = ChartPanel::build_line(
+            &[Some(1.0), Some(2.0), Some(3.0)],
+            0,
+            "revenue",
+            ScaleHint::default(),
+        )
+        .expect("line scene");
         assert_eq!(
             s.y_label.as_deref(),
             Some("revenue"),
@@ -771,8 +836,12 @@ mod tests {
 
     #[test]
     fn histogram_labels_x_axis_with_the_value_header() {
-        let s = ChartPanel::build_histogram(&[Some(1.0), Some(2.0), Some(9.0)], "latency_ms")
-            .expect("histogram scene");
+        let s = ChartPanel::build_histogram(
+            &[Some(1.0), Some(2.0), Some(9.0)],
+            "latency_ms",
+            ScaleHint::default(),
+        )
+        .expect("histogram scene");
         assert_eq!(s.x_label.as_deref(), Some("latency_ms"));
         assert_eq!(s.title.as_deref(), Some("Distribution of latency_ms"));
 
@@ -791,6 +860,7 @@ mod tests {
             &[Some(1.0), Some(2.0), Some(3.0)],
             "region",
             "sales",
+            ScaleHint::default(),
         )
         .expect("bar scene");
         assert_eq!(s.x_label.as_deref(), Some("region"), "x = label header");
@@ -810,7 +880,8 @@ mod tests {
     fn scatter_labels_both_axes_with_real_headers() {
         let xs = vec![Some(1.0), Some(2.0), Some(3.0)];
         let ys = vec![Some(4.0), Some(5.0), Some(6.0)];
-        let s = ChartPanel::build_scatter(&xs, &ys, "height", "weight").expect("scatter scene");
+        let s = ChartPanel::build_scatter(&xs, &ys, "height", "weight", ScaleHint::default())
+            .expect("scatter scene");
         assert_eq!(s.x_label.as_deref(), Some("height"));
         assert_eq!(s.y_label.as_deref(), Some("weight"));
 
