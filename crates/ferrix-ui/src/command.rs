@@ -319,6 +319,8 @@ registry! {
         "Switch between light and dark. Remembered between runs." }
     ViewShowFormulas { "view.show_formulas", Some(Menu::View), "ƒ Show formulas", Some("Ctrl+`"), false, None,
         "Show each cell's formula source instead of its value, for this sheet. Rendered from the viewport, so it costs the same on a 200M-row sheet." }
+    ViewPageBreaks { "view.page_breaks", Some(Menu::View), "⎘ Page Break Preview", None, false, None,
+        "Overlay a dashed line where each printed page would break. Read-only — shows the pagination the PDF/HTML export uses." }
     ViewEmptyRows { "view.empty_rows", Some(Menu::View), "⬓ Show empty rows", None, false, None,
         "Show empty rows past the end of the sheet so there is somewhere to type. They are not data: exports, SUM and the row count ignore them until you type in one." }
 

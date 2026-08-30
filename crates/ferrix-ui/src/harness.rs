@@ -398,6 +398,15 @@ impl Harness {
         self.app.print_area()
     }
 
+    /// How many page-break preview lines the last painted frame drew (#37).
+    pub fn page_break_line_count(&self) -> usize {
+        self.app.page_break_line_count()
+    }
+
+    pub fn page_breaks_shown(&self) -> bool {
+        self.app.page_breaks_shown()
+    }
+
     // ---- clipboard interop and Paste Special (issue #30) ----
     //
     // Copy goes through the REAL Ctrl+C path, so what these tests read back is
@@ -10126,6 +10135,59 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&csv);
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&out2);
+    }
+
+    #[test]
+    fn page_break_preview_draws_dashed_lines_only_when_it_is_on() {
+        // A sheet tall enough to page-break under the default Letter setup, so
+        // the preview has something to draw. Toggling it on must paint at least
+        // one break line; toggling it off must paint none. The count comes from
+        // the REAL frame paint, not the model.
+        let mut body = String::from("id,qty\n");
+        for i in 1..=300 {
+            body.push_str(&format!("{i},{}\n", i * 2));
+        }
+        let p = write_csv("page_breaks.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+
+        // Off by default: no break lines.
+        h.step();
+        assert_eq!(
+            h.page_break_line_count(),
+            0,
+            "page-break lines were drawn while the preview was off"
+        );
+
+        // Turn it on through the REAL command path.
+        h.run_command(crate::command::CommandId::ViewPageBreaks);
+        assert!(h.page_breaks_shown(), "toggle did not turn the preview on");
+        // The first page break falls well below the top of the sheet, so scroll
+        // it into view — the overlay only draws breaks currently on screen (the
+        // scale invariant: it never walks the whole sheet).
+        h.scroll_body_to(40.0);
+        h.step();
+        let on = h.page_break_line_count();
+        assert!(
+            on >= 1,
+            "a 300-row sheet must break across pages and draw at least one \
+             page-break line where one is on screen, drew {on}"
+        );
+
+        // Turn it off again: back to none.
+        h.run_command(crate::command::CommandId::ViewPageBreaks);
+        assert!(!h.page_breaks_shown());
+        h.step();
+        assert_eq!(
+            h.page_break_line_count(),
+            0,
+            "page-break lines survived turning the preview off"
+        );
+
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Pull the `(...)` string literals a PDF content stream draws with `Tj`,
