@@ -5394,7 +5394,8 @@ impl FerrixApp {
             self.status = "An export is already running — cancel it first".into();
             return;
         }
-        let cost = crate::sheet_view::OwnedSheet::snapshot_cost_bytes(&self.wb.overlay);
+        let cost = crate::sheet_view::OwnedSheet::snapshot_cost_bytes(&self.wb.overlay)
+            + crate::sheet_view::OwnedSheet::style_cost_bytes(&self.wb.format, &self.wb.merges);
         if let Err(msg) = ferrix_core::Budget::sample().admit(cost, "Printing this sheet's edits") {
             self.status = msg;
             return;
@@ -5405,7 +5406,8 @@ impl FerrixApp {
             std::sync::Arc::clone(&self.wb.base),
             &self.wb.overlay,
         )
-        .with_name(&name);
+        .with_name(&name)
+        .with_style(&self.wb.format, &self.wb.merges);
 
         let setup = ferrix_core::page::PageSetup::default();
         let opts = ferrix_io::render::RenderOptions {
