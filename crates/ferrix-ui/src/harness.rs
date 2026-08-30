@@ -10295,6 +10295,263 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&out2);
     }
 
+    // ---- Page Setup dialog (#37) ----
+
+    /// Click a dialog's REAL painted button at its reported rect. `rect` is the
+    /// `ok_rect`/`cancel_rect` the dialog recorded last frame; a button that was
+    /// never painted has `None` and fails the `.expect` here rather than the
+    /// test passing by calling a handler behind the button.
+    fn click_dialog_button(h: &mut Harness, rect: Option<egui::Rect>, what: &str) {
+        let r = rect.unwrap_or_else(|| panic!("the {what} button was never painted"));
+        h.click_at(r.center().x, r.center().y);
+        h.steps(2);
+    }
+
+    #[test]
+    fn page_setup_dialog_ok_commits_edits_to_the_sheet() {
+        // Open the dialog through the REAL command the menu runs, edit paper +
+        // orientation + gridlines the way the widgets would, then click the REAL
+        // OK button. The edit must land on the sheet's page_setup, and only on
+        // OK — proving the menu → dialog → commit path, not a direct model poke.
+        let (mut h, csv) = numeric_app("page_setup_ok.csv");
+        assert_eq!(
+            h.app().page_setup().paper,
+            ferrix_core::page::PaperSize::Letter,
+            "precondition: default paper is Letter"
+        );
+
+        h.run_command(crate::command::CommandId::FilePageSetup);
+        assert!(
+            h.app().page_setup_dialog().is_some(),
+            "the Page Setup command did not open the dialog"
+        );
+
+        // Edit the working copy the way the combo/radio/checkbox would.
+        {
+            let dlg = h.app_mut().page_setup_dialog_mut().unwrap();
+            dlg.setup.paper = ferrix_core::page::PaperSize::A4;
+            dlg.setup.orientation = ferrix_core::page::Orientation::Landscape;
+            dlg.setup.gridlines = true;
+            dlg.repeat_rows = "1:2".into();
+        }
+        h.steps(2);
+
+        // Nothing committed yet — the sheet still holds the defaults.
+        assert_eq!(
+            h.app().page_setup().paper,
+            ferrix_core::page::PaperSize::Letter,
+            "the edit leaked before OK was pressed"
+        );
+
+        let ok = h.app().page_setup_dialog().and_then(|s| s.ok_rect);
+        click_dialog_button(&mut h, ok, "Page Setup OK");
+
+        assert!(
+            h.app().page_setup_dialog().is_none(),
+            "OK did not close the dialog"
+        );
+        let ps = h.app().page_setup();
+        assert_eq!(
+            ps.paper,
+            ferrix_core::page::PaperSize::A4,
+            "paper not applied"
+        );
+        assert_eq!(
+            ps.orientation,
+            ferrix_core::page::Orientation::Landscape,
+            "orientation not applied"
+        );
+        assert!(ps.gridlines, "gridlines not applied");
+        assert_eq!(ps.repeat_rows, Some((0, 1)), "repeat rows not applied");
+
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn page_setup_dialog_cancel_discards_edits() {
+        // The same edit, but Cancel: the sheet must be untouched. Without this,
+        // an "OK commits" test would also pass if the dialog committed on every
+        // frame — Cancel is what proves the working-copy discipline.
+        let (mut h, csv) = numeric_app("page_setup_cancel.csv");
+        h.run_command(crate::command::CommandId::FilePageSetup);
+        {
+            let dlg = h.app_mut().page_setup_dialog_mut().unwrap();
+            dlg.setup.paper = ferrix_core::page::PaperSize::Legal;
+        }
+        h.steps(2);
+
+        let cancel = h.app().page_setup_dialog().and_then(|s| s.cancel_rect);
+        click_dialog_button(&mut h, cancel, "Page Setup Cancel");
+
+        assert!(
+            h.app().page_setup_dialog().is_none(),
+            "Cancel did not close the dialog"
+        );
+        assert_eq!(
+            h.app().page_setup().paper,
+            ferrix_core::page::PaperSize::Letter,
+            "Cancel still applied the edit"
+        );
+
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn page_setup_dialog_rejects_a_bad_repeat_range_and_stays_open() {
+        // A reversed repeat range is a form error: OK must NOT commit and the
+        // dialog must stay open with a problem shown, rather than silently
+        // writing a broken setup or closing on invalid input.
+        let (mut h, csv) = numeric_app("page_setup_bad.csv");
+        h.run_command(crate::command::CommandId::FilePageSetup);
+        {
+            let dlg = h.app_mut().page_setup_dialog_mut().unwrap();
+            dlg.repeat_rows = "5:2".into();
+        }
+        h.steps(2);
+
+        let ok = h.app().page_setup_dialog().and_then(|s| s.ok_rect);
+        click_dialog_button(&mut h, ok, "Page Setup OK");
+
+        assert!(
+            h.app().page_setup_dialog().is_some(),
+            "OK closed the dialog despite a bad repeat range"
+        );
+        assert!(
+            h.app()
+                .page_setup_dialog()
+                .and_then(|s| s.problem.as_deref())
+                .is_some(),
+            "no problem message was shown for the bad range"
+        );
+        assert_eq!(
+            h.app().page_setup().repeat_rows,
+            None,
+            "a bad repeat range was still committed"
+        );
+
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    // ---- Large-print confirmation dialog (#37) ----
+
+    /// Write a CSV tall enough that the default Letter setup paginates it into
+    /// more than LARGE_JOB_PAGES pages, so the export is refused until confirmed.
+    /// Kept programmatic (not a fixture file) so the row count can track the
+    /// threshold. ~40 data rows per Letter page × 45,000 rows ≫ 1000 pages.
+    fn tall_csv(name: &str, data_rows: usize) -> std::path::PathBuf {
+        let mut body = String::with_capacity(data_rows * 8 + 8);
+        body.push_str("id,qty\n");
+        for i in 1..=data_rows {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "{i},{}", i % 100);
+        }
+        write_csv(name, &body)
+    }
+
+    #[test]
+    fn a_too_large_print_is_refused_then_confirmed_through_the_dialog() {
+        // The acceptance criterion: warn before ~1000 pages, and let the user
+        // proceed. The first Print must write NOTHING and arm the confirmation;
+        // clicking Continue must re-issue the export confirmed and produce a
+        // real PDF. Both halves asserted — a warning with no way to proceed
+        // fails the "Continue?" half.
+        let p = tall_csv("print_large.csv", 60_000);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(600, |a| a.row_count() > 55_000),
+            "tall fixture never loaded"
+        );
+
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-print-large-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+
+        // First attempt: unconfirmed. It must refuse and write no file.
+        h.print_to_path(&out, false, false);
+        assert!(
+            h.app().has_pending_large_print(),
+            "an oversized job did not arm the confirmation dialog: {:?}",
+            h.status()
+        );
+        assert!(
+            !out.exists(),
+            "the refused job still wrote a file before confirmation"
+        );
+        assert!(
+            h.status().contains("Continue") || h.status().contains("confirm"),
+            "the status should invite confirmation, got {:?}",
+            h.status()
+        );
+
+        // Click the REAL Continue button at its painted rect — the dialog must
+        // have painted a frame first, which the print_to_path steps did.
+        let cont = h.app().large_print_continue_rect();
+        click_dialog_button(&mut h, cont, "large-print Continue");
+
+        assert!(
+            !h.app().has_pending_large_print(),
+            "confirming did not clear the pending job"
+        );
+        assert!(
+            out.exists(),
+            "the confirmed large job wrote no file: {:?}",
+            h.status()
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"%PDF"), "confirmed output is not a PDF");
+        assert!(
+            h.status().contains("Printed"),
+            "the confirmed job did not report success: {:?}",
+            h.status()
+        );
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn cancelling_a_large_print_writes_nothing() {
+        // The other branch: Cancel must drop the job and leave the disk clean.
+        let p = tall_csv("print_large_cancel.csv", 60_000);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(600, |a| a.row_count() > 55_000),
+            "tall fixture never loaded"
+        );
+
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-print-large-cancel-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+
+        h.print_to_path(&out, false, false);
+        assert!(h.app().has_pending_large_print(), "job was not armed");
+
+        // Click the REAL Cancel button.
+        let canc = h.app().large_print_cancel_rect();
+        click_dialog_button(&mut h, canc, "large-print Cancel");
+
+        assert!(
+            !h.app().has_pending_large_print(),
+            "cancel did not clear the pending job"
+        );
+        assert!(!out.exists(), "cancel still wrote a file");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&out);
+    }
+
     #[test]
     fn page_break_preview_draws_dashed_lines_only_when_it_is_on() {
         // A sheet tall enough to page-break under the default Letter setup, so

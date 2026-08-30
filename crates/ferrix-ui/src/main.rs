@@ -8,6 +8,7 @@ mod grid;
 #[cfg(test)]
 mod harness;
 mod import_wizard;
+mod page_setup_dialog;
 mod pivot_builder;
 mod prefs;
 mod protect_panel;
