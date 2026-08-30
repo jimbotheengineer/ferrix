@@ -22,6 +22,7 @@ pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
 pub mod pdf;
+pub mod pivot_sidecar;
 pub mod pool;
 pub mod protect_xlsx;
 pub mod render;
@@ -52,6 +53,9 @@ pub use encoding_rs::Encoding;
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
+pub use pivot_sidecar::{
+    agg_code, agg_name, load_pivots, pivot_path_for, save_pivots, PivotRecord, PivotSidecarError,
+};
 pub use protect_xlsx::{
     import_protection, import_protection_guarded, import_workbook_protection,
     inject_workbook_protection, write_protection, ImportedProtection,

@@ -343,6 +343,12 @@ pub struct FerrixApp {
     last_outline_buttons: usize,
     /// Where sizing is persisted, beside the base file.
     sizing_path: Option<PathBuf>,
+    /// Where pivot bindings are persisted, beside the base file (issue #33
+    /// Part B). Derived from `source_path` on open, the same way `sizing_path`
+    /// is, because a pivot binding — like sizing — is workbook state that stays
+    /// true when the base data is regenerated, so it is keyed to the file rather
+    /// than carried through the edits sidecar's base fingerprint.
+    pivots_path: Option<PathBuf>,
     /// Where each visible column header was painted last frame. Recorded from
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
@@ -737,6 +743,7 @@ impl FerrixApp {
             paste_special: None,
             last_outline_buttons: 0,
             sizing_path: None,
+            pivots_path: None,
             header_hitboxes: Vec::new(),
             row_header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
@@ -1040,6 +1047,11 @@ impl FerrixApp {
                 self.sizing_path = self.source_path.as_deref().map(ferrix_io::sizing_path_for);
                 self.set_sizing(ferrix_core::sizing::SheetSizing::new());
                 self.load_sizing_sidecar();
+                // Pivot bindings (issue #33 Part B): same timing and rationale
+                // as sizing — the path is known now, so a pivot sheet paints its
+                // computed result on the first frame instead of blank cells.
+                self.pivots_path = self.source_path.as_deref().map(ferrix_io::pivot_path_for);
+                self.load_pivots_sidecar();
                 // The workbook we just built has the FILE's sheet name, which
                 // is only known now — so this is where the sheet's remembered
                 // zoom is adopted. Doing it at construction would read the
@@ -1119,6 +1131,17 @@ impl FerrixApp {
         // double-click), which is why the check lives here and not in three
         // call sites that could drift apart.
         let cell = self.wb.merges.resolve(cell);
+        // A pivot sheet's cells are computed from a spec, not typed (issue #33
+        // Part B). Say so up front — like the spilled-cell hint below — rather
+        // than letting the commit be refused later with only a generic locked
+        // message. The commit path still refuses the write (guard_edit); this is
+        // the explanation the acceptance criterion asks for.
+        if self.wb.is_pivot_sheet(self.wb.active_sheet()) {
+            self.status = format!(
+                "{} is a pivot table cell — refresh or change the pivot instead of editing it",
+                cell.to_a1()
+            );
+        }
         // A spilled cell is owned by its host formula and refuses direct edits
         // (#27 P2). Say so up front rather than letting the commit fail
         // silently-looking later — the value the user sees is a projection of
@@ -1543,6 +1566,11 @@ impl FerrixApp {
         self.sizing_path = None;
         self.set_sizing(ferrix_core::sizing::SheetSizing::new());
         self.sizing_dirty = false;
+        // Pivot bindings belong to the file that is closing, same as sizing:
+        // carrying them into the next workbook would apply one file's pivots to
+        // another's data. The workbook's own pivot map is discarded with the
+        // workbook itself when the fresh one below replaces it.
+        self.pivots_path = None;
         // The print area is per sheet; a new file starts with none.
         self.print_area = None;
         self.show_page_breaks = false;
@@ -2116,6 +2144,10 @@ impl FerrixApp {
         // Sizing, for exactly the same reason: resizing a column leaves the
         // overlay empty, so it must be written before any early return.
         let sizing_written = self.save_sizing();
+        // Pivot bindings, same reason again (issue #33 Part B): defining a pivot
+        // leaves the overlay empty, so it must be persisted before the early
+        // return below or a pivot-only session would lose its binding.
+        self.save_pivots();
         let comment_count = self.wb.comments.len();
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
@@ -3826,6 +3858,75 @@ impl FerrixApp {
         if let Ok(Some(s)) = ferrix_io::load_sizing(&path) {
             self.set_sizing(s);
             self.sizing_dirty = false;
+        }
+    }
+
+    /// Persist the pivot sidecar beside the base file (issue #33 Part B).
+    ///
+    /// Written from `save_edits` unconditionally, like comments and sizing: a
+    /// session that only defined a pivot has an EMPTY overlay, and the edits
+    /// path returns early on that — so gating pivots behind it would silently
+    /// discard exactly the binding this feature exists to keep. Exporting the
+    /// current bindings and saving an empty list retires the sidecar when the
+    /// last pivot is cleared, so a removed pivot does not come back on reload.
+    pub fn save_pivots(&mut self) -> bool {
+        let Some(path) = self.pivots_path.clone() else {
+            return false;
+        };
+        let records = self.wb.export_pivots();
+        ferrix_io::save_pivots(&path, &records).is_ok()
+    }
+
+    /// Load the pivot sidecar for the file that was just opened, then refresh
+    /// each pivot so its cells show a computed result immediately.
+    ///
+    /// A corrupt or unreadable sidecar leaves the workbook with no pivots rather
+    /// than failing the whole load — the same "the DATA is fine" stance the
+    /// sizing and comment loaders take. Refreshing here (not lazily) means the
+    /// first painted frame already has the pivot's values.
+    pub fn load_pivots_sidecar(&mut self) {
+        let Some(path) = self.pivots_path.clone() else {
+            return;
+        };
+        if let Ok(Some(records)) = ferrix_io::load_pivots(&path) {
+            self.wb.adopt_pivots(&records);
+            // Populate each pivot's cached result from its restored spec.
+            let sheets: Vec<_> = self
+                .wb
+                .sheet_names()
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|&id| self.wb.is_pivot_sheet(id))
+                .collect();
+            for id in sheets {
+                self.wb.refresh_pivot(id);
+            }
+        }
+    }
+
+    /// Refresh the pivot on the active sheet on demand (issue #33 Part B).
+    ///
+    /// The menu/command the acceptance criteria ask for. Reports the group count
+    /// in the status bar, or explains that the active sheet is not a pivot —
+    /// never silently doing nothing.
+    pub fn refresh_active_pivot(&mut self) {
+        let active = self.wb.active_sheet();
+        if !self.wb.is_pivot_sheet(active) {
+            self.status = "The active sheet is not a pivot table".into();
+            return;
+        }
+        match self.wb.refresh_pivot(active) {
+            Some(groups) => {
+                self.status = format!(
+                    "Refreshed pivot · {} group{}",
+                    fmt_int(groups),
+                    if groups == 1 { "" } else { "s" }
+                );
+            }
+            None => {
+                // A pivot whose source sheet was deleted keeps its last result.
+                self.status = "Pivot source is unavailable — showing the last result".into();
+            }
         }
     }
 
@@ -8406,6 +8507,7 @@ impl FerrixApp {
             selection_label: self.selection.label(),
             rows: self.wb.view().row_count(),
             sheets: self.wb.sheet_count(),
+            active_is_pivot: self.wb.is_pivot_sheet(self.wb.active_sheet()),
         }
     }
 
@@ -8516,6 +8618,7 @@ impl FerrixApp {
             C::DataRemoveDuplicates => self.remove_duplicates(),
             C::DataSubtotals => self.toggle_subtotals(),
             C::DataConsolidate => self.consolidate_sheets(),
+            C::DataRefreshPivot => self.refresh_active_pivot(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),
             C::DataProtectSheet => self.protect_sheet_open(),
@@ -11824,5 +11927,118 @@ mod tests {
             "status was: {}",
             app.status_text()
         );
+    }
+
+    // ---- issue #33 Part B: pivot sheet at the app layer ----
+
+    /// A two-sheet app: Sheet1 (MAIN) is a source with region/amount, Sheet2 is
+    /// the pivot. Returns the app, source id and pivot id.
+    fn pivot_app() -> (FerrixApp, ferrix_core::SheetId, ferrix_core::SheetId) {
+        let mut app = FerrixApp::new(None);
+        let rows: [(&str, f64); 5] = [
+            ("East", 10.0),
+            ("West", 5.0),
+            ("East", 20.0),
+            ("West", 7.0),
+            ("East", 3.0),
+        ];
+        for (r, (region, amount)) in rows.iter().enumerate() {
+            app.wb.commit_edit(CellRef::new(r as u32, 0), region);
+            app.wb
+                .commit_edit(CellRef::new(r as u32, 1), &amount.to_string());
+        }
+        let source = app.wb.active_sheet();
+        let pivot = app
+            .wb
+            .add_sheet(
+                "Pivot",
+                crate::sheet_view::BaseData::Memory(Sheet::new("Pivot")),
+            )
+            .expect("add pivot sheet");
+        (app, source, pivot)
+    }
+
+    fn app_sum_spec() -> crate::workbook::PivotSpec {
+        crate::workbook::PivotSpec {
+            group_by: vec![ferrix_core::ColIdx(0)],
+            values: vec![(ferrix_core::ColIdx(1), ferrix_core::PivotAgg::Sum)],
+        }
+    }
+
+    #[test]
+    fn beginning_to_edit_a_pivot_cell_says_it_is_a_pivot() {
+        let (mut app, source, pivot) = pivot_app();
+        app.wb.set_pivot(pivot, source, app_sum_spec());
+        app.wb.refresh_pivot(pivot);
+        app.wb.activate(pivot).unwrap();
+
+        app.begin_edit_for_test(CellRef::new(1, 0), None);
+        assert!(
+            app.status_text().contains("pivot table cell"),
+            "status was: {}",
+            app.status_text()
+        );
+    }
+
+    #[test]
+    fn refresh_command_reports_the_group_count() {
+        let (mut app, source, pivot) = pivot_app();
+        app.wb.set_pivot(pivot, source, app_sum_spec());
+        app.wb.activate(pivot).unwrap();
+
+        app.run_command(crate::command::CommandId::DataRefreshPivot);
+        assert!(
+            app.status_text().contains("Refreshed pivot") && app.status_text().contains('2'),
+            "status was: {}",
+            app.status_text()
+        );
+    }
+
+    #[test]
+    fn pivot_spec_survives_a_sidecar_save_and_reload() {
+        // Save the app's pivot binding to a real .fxpivot file, then load it
+        // into a fresh app the way `poll_load` does. This exercises the app's
+        // production save_pivots / load_pivots_sidecar path end to end.
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix_pivot_app_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("book.ferrix");
+        let sidecar = ferrix_io::pivot_path_for(&base);
+
+        let (mut app, source, pivot) = pivot_app();
+        app.wb.set_pivot(pivot, source, app_sum_spec());
+        app.wb.set_pivot_auto_refresh(pivot, true);
+        app.pivots_path = Some(sidecar.clone());
+        assert!(app.save_pivots(), "save_pivots wrote the sidecar");
+        assert!(sidecar.exists(), "the .fxpivot file is on disk");
+
+        // Fresh app with the same two sheets, then load the sidecar.
+        let (mut app2, source2, pivot2) = pivot_app();
+        assert_eq!(source2, source, "same sheet ids in the rebuilt fixture");
+        assert_eq!(pivot2, pivot);
+        assert!(!app2.wb.is_pivot_sheet(pivot2), "no pivot before load");
+        app2.pivots_path = Some(sidecar.clone());
+        app2.load_pivots_sidecar();
+
+        assert!(
+            app2.wb.is_pivot_sheet(pivot2),
+            "pivot restored from sidecar"
+        );
+        let b = app2.wb.pivot_binding(pivot2).expect("binding");
+        assert_eq!(b.source, source2);
+        assert_eq!(b.spec, app_sum_spec(), "the spec survived the round trip");
+        assert!(b.auto_refresh, "the auto-refresh flag survived too");
+        // And it was refreshed on load, so the cells already show a result.
+        app2.wb.activate(pivot2).unwrap();
+        assert_eq!(app2.wb.view().get(CellRef::new(1, 1)), Value::Number(33.0));
+
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

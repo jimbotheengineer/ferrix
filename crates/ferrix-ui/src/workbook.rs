@@ -228,6 +228,218 @@ impl std::fmt::Display for SheetError {
     }
 }
 
+/// The recipe a pivot sheet applies to its source (issue #33 Part B).
+///
+/// A thin UI-side wrapper over the Part A kernel's request types: it names the
+/// group-by columns and the `(column, aggregate)` pairs to compute, exactly the
+/// two slices [`ferrix_core::compute_pivot`] takes. Kept here (not in
+/// ferrix-core) so the kernel stays `Value`-free — the coupling to the sheet
+/// model lives entirely on this side.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct PivotSpec {
+    /// Columns whose values define a group. Empty means one grand-total group.
+    pub group_by: Vec<ferrix_core::ColIdx>,
+    /// `(value column, aggregate)` pairs, one output field each.
+    pub values: Vec<(ferrix_core::ColIdx, ferrix_core::PivotAgg)>,
+}
+
+/// A pivot sheet's binding: what it pivots, how, and its last computed result.
+///
+/// Stored once per pivot sheet (see [`Workbook::pivots`]). The `cached` result
+/// is the ONLY materialised output and it is group-scaled, never row-scaled, so
+/// a pivot over a 200M-row source costs O(distinct groups) here — the Part A
+/// scale invariant carried up into the sheet model unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PivotBinding {
+    /// The sheet this pivot reads.
+    pub source: SheetId,
+    /// The recipe applied to that source.
+    pub spec: PivotSpec,
+    /// Recompute automatically when the source sheet is edited. Default off for
+    /// Part B: the plumbing is wired (see [`Workbook::note_source_edit`]) but a
+    /// user opts in. Manual refresh is always available.
+    pub auto_refresh: bool,
+    /// The most recent [`PivotResult`], or `None` before the first refresh.
+    ///
+    /// [`PivotResult`]: ferrix_core::PivotResult
+    pub cached: Option<ferrix_core::PivotResult>,
+}
+
+impl PivotBinding {
+    /// A fresh binding over `source` with `spec`, not yet computed.
+    pub fn new(source: SheetId, spec: PivotSpec) -> Self {
+        Self {
+            source,
+            spec,
+            auto_refresh: false,
+            cached: None,
+        }
+    }
+}
+
+/// Map a [`ferrix_core::PivotAgg`] to the stable on-disk aggregate code.
+///
+/// Routed through the sidecar's `agg_code`/name table by NAME rather than an
+/// `as u8` cast, so reordering the `Agg` enum in ferrix-core can never silently
+/// repoint an existing file's aggregates. The two helpers are inverses and the
+/// `agg_codes_round_trip` test guards that.
+fn agg_to_code(agg: ferrix_core::PivotAgg) -> u8 {
+    use ferrix_core::PivotAgg::*;
+    let name = match agg {
+        Sum => "Sum",
+        Count => "Count",
+        Avg => "Avg",
+        Min => "Min",
+        Max => "Max",
+        StdDev => "StdDev",
+    };
+    // The name arms above are exactly the sidecar's known set, so this cannot
+    // fail — but it stays a lookup (not a hard-coded number) so the two tables
+    // are physically the same source of truth.
+    ferrix_io::agg_code(name).expect("every PivotAgg has a sidecar code")
+}
+
+/// Inverse of [`agg_to_code`]: the aggregate for an on-disk code, or `None` for
+/// a code this build does not understand (a forward-compat file).
+fn agg_from_code(code: u8) -> Option<ferrix_core::PivotAgg> {
+    use ferrix_core::PivotAgg::*;
+    Some(match ferrix_io::agg_name(code)? {
+        "Sum" => Sum,
+        "Count" => Count,
+        "Avg" => Avg,
+        "Min" => Min,
+        "Max" => Max,
+        "StdDev" => StdDev,
+        _ => return None,
+    })
+}
+
+/// Adapts a source [`SheetView`] to the Part A [`ferrix_core::PivotSource`]
+/// trait — THE coupling point between the `Value`-free kernel and the sheet's
+/// `Value`-typed storage.
+///
+/// This lives with the sheet model on purpose (the kernel must not know about
+/// `Value` or `SheetView`). The mapping is total and cheap: a numeric cell is a
+/// [`ferrix_core::PivotCell::Number`], a text cell keeps its `StrId` as
+/// [`ferrix_core::PivotCell::Text`] (no `String` per row, so text grouping is
+/// allocation-free at scale), and everything else — empty, bool, error — folds
+/// to [`ferrix_core::PivotCell::Blank`] exactly as the kernel expects.
+struct SheetPivotSource<'a> {
+    view: SheetView<'a>,
+}
+
+impl ferrix_core::PivotSource for SheetPivotSource<'_> {
+    fn row_count(&self) -> usize {
+        self.view.row_count()
+    }
+
+    fn cell(&self, col: ferrix_core::ColIdx, row: usize) -> ferrix_core::PivotCell {
+        // `ColIdx`/`row` are bounded by what `compute` was handed; an
+        // out-of-range column reads as Blank via `SheetView::get`'s own
+        // bounds handling, matching the trait contract.
+        let cref = CellRef::new(row as u32, col.0);
+        match self.view.get(cref) {
+            Value::Number(n) => ferrix_core::PivotCell::Number(n),
+            Value::Text(id) => ferrix_core::PivotCell::Text(id),
+            // Empty, Bool and Error all form their own Blank bucket and
+            // contribute nothing to numeric aggregates — the kernel's rule.
+            _ => ferrix_core::PivotCell::Blank,
+        }
+    }
+}
+
+/// One projected cell value, before it lands in the pivot sheet's overlay.
+///
+/// Kept `Value`-adjacent but arena-free: group-key text is resolved to an owned
+/// `String` against the SOURCE arena, then re-interned into the pivot sheet's
+/// own arena when written — the two arenas are different, so a raw `StrId` could
+/// not be shared between them.
+enum ProjectedCell {
+    Number(f64),
+    Text(String),
+}
+
+/// Lay a [`PivotResult`] out as pivot-sheet cells (issue #33 Part B).
+///
+/// Row 0 is a header row — one label per group-by column, then one per value
+/// aggregate (e.g. `Sum of C`). Rows 1.. are one per group: the group key
+/// cells, then the aggregate results. A `None` aggregate (no numeric data for
+/// the group) simply leaves that cell blank, which is how the kernel's "no
+/// number here" is distinct from `Some(0.0)`.
+///
+/// Bounded by O(groups × columns): the sheet shows the group-scaled result, not
+/// a row per source row. `src` is only read for the DISPLAY names of group keys
+/// (their interned text) and column headers.
+///
+/// [`PivotResult`]: ferrix_core::PivotResult
+fn build_pivot_projection(
+    src: &SheetView<'_>,
+    group_by: &[ferrix_core::ColIdx],
+    values: &[(ferrix_core::ColIdx, ferrix_core::PivotAgg)],
+    result: &ferrix_core::PivotResult,
+) -> Vec<(CellRef, ProjectedCell)> {
+    let mut out = Vec::new();
+    let n_group = group_by.len() as u32;
+
+    // Header row (row 0): group-by column labels, then aggregate labels.
+    for (i, gc) in group_by.iter().enumerate() {
+        let label = src.header_or_letter(gc.0 as usize);
+        out.push((CellRef::new(0, i as u32), ProjectedCell::Text(label)));
+    }
+    for (j, (vc, agg)) in values.iter().enumerate() {
+        let col_label = src.header_or_letter(vc.0 as usize);
+        let label = format!("{} of {}", agg_display_name(*agg), col_label);
+        out.push((
+            CellRef::new(0, n_group + j as u32),
+            ProjectedCell::Text(label),
+        ));
+    }
+
+    // One row per group, starting at row 1.
+    for (gi, group) in result.groups.iter().enumerate() {
+        let row = gi as u32 + 1;
+        for (i, key) in group.key.iter().enumerate() {
+            let cell = CellRef::new(row, i as u32);
+            match *key {
+                ferrix_core::PivotCell::Number(n) => {
+                    out.push((cell, ProjectedCell::Number(n)));
+                }
+                ferrix_core::PivotCell::Text(id) => {
+                    // Resolve against the SOURCE arena while it is borrowed.
+                    out.push((cell, ProjectedCell::Text(src.resolve(id).to_string())));
+                }
+                ferrix_core::PivotCell::Blank => {
+                    out.push((cell, ProjectedCell::Text("(blank)".to_string())));
+                }
+            }
+        }
+        for (j, agg) in group.aggregates.iter().enumerate() {
+            if let Some(v) = agg {
+                out.push((
+                    CellRef::new(row, n_group + j as u32),
+                    ProjectedCell::Number(*v),
+                ));
+            }
+            // `None` leaves the cell blank — no entry needed.
+        }
+    }
+
+    out
+}
+
+/// The short display name for an aggregate, used in a pivot's header row.
+fn agg_display_name(agg: ferrix_core::PivotAgg) -> &'static str {
+    use ferrix_core::PivotAgg::*;
+    match agg {
+        Sum => "Sum",
+        Count => "Count",
+        Avg => "Average",
+        Min => "Min",
+        Max => "Max",
+        StdDev => "StdDev",
+    }
+}
+
 /// A workbook of one or more independently stored sheets.
 ///
 /// ## Why the active sheet's storage lives in a field
@@ -449,6 +661,16 @@ pub struct Workbook {
     /// "cannot edit a protected cell" while producing exactly the silent
     /// no-op the acceptance criteria call out.
     last_denial: Option<ferrix_core::Denied>,
+    /// Pivot-sheet bindings, keyed by the PIVOT sheet's id (issue #33 Part B).
+    ///
+    /// Sparse and workbook-wide, the same terms `merges`/`comments` are stored
+    /// on but keyed by SHEET rather than by cell: a pivot sheet is defined by a
+    /// source reference plus a [`PivotSpec`], not by its cells, so the binding
+    /// is one small entry per pivot sheet however many groups it produces.
+    /// Nothing here is per-row — the scale invariant is preserved because the
+    /// binding names COLUMNS and the cached result is already group-scaled by
+    /// the Part A kernel.
+    pivots: std::collections::HashMap<SheetId, PivotBinding>,
 }
 
 impl Workbook {
@@ -489,6 +711,7 @@ impl Workbook {
             dirty: false,
             wb_protection: ferrix_core::WorkbookProtection::new(),
             last_denial: None,
+            pivots: std::collections::HashMap::new(),
         }
     }
 
@@ -739,6 +962,17 @@ impl Workbook {
     /// the reason so the UI can say it out loud rather than silently doing
     /// nothing — which is the acceptance criterion this exists for.
     fn guard_edit(&mut self, cell: CellRef) -> Result<(), ferrix_core::Denied> {
+        // A pivot sheet's cells are the RESULT of a spec, not user data
+        // (issue #33 Part B). Typing over one would be edited away by the next
+        // refresh, so it is refused here the same way a spilled projection is —
+        // and, like a spill, it must SAY so rather than silently no-op. The
+        // whole active sheet is checked, not a per-cell flag, because every cell
+        // of a pivot sheet is computed.
+        if self.pivots.contains_key(&self.sheets[self.active].id) {
+            let d = ferrix_core::Denied::LockedCell(cell);
+            self.last_denial = Some(d);
+            return Err(d);
+        }
         // A spilled projection is owned by its host formula and refuses a
         // direct edit (#27 P2): the cell shows a computed value, and typing
         // over it would silently break the array. The host cell itself is NOT
@@ -1091,6 +1325,215 @@ impl Workbook {
         // ACTIVE sheet (see the field's docs), so a parked view is identity by
         // construction rather than by omission.
         self.parked.get(&id).map(|(b, o)| SheetView::new(b, o))
+    }
+
+    // ------------------------------------------------------ pivot sheets (#33)
+
+    /// Define, or replace, the pivot binding on `pivot_sheet`.
+    ///
+    /// The sheet becomes read-only for direct edits (see `guard_edit`) and its
+    /// cells display the pivot result. This does NOT compute the result — call
+    /// [`Workbook::refresh_pivot`] to populate the cache. Marks the workbook
+    /// dirty so the binding is persisted on the next save.
+    ///
+    /// The menu/toolbar that CREATES a pivot from a selection is the Part C
+    /// builder UI (drag columns into Rows/Values wells), a separate card gated
+    /// on this one — so this entry point currently has only test and load
+    /// callers. It stays because it is the correct model API the builder will
+    /// call, and it is exercised by the pivot tests.
+    #[allow(dead_code)]
+    pub fn set_pivot(&mut self, pivot_sheet: SheetId, source: SheetId, spec: PivotSpec) {
+        self.pivots
+            .insert(pivot_sheet, PivotBinding::new(source, spec));
+        self.dirty = true;
+    }
+
+    /// Remove the pivot binding from `pivot_sheet`, if any. The sheet becomes an
+    /// ordinary editable sheet again. Returns the binding that was removed.
+    ///
+    /// Part C UI (the builder's "delete pivot") is the caller-to-be; test and
+    /// export/import paths exercise it today.
+    #[allow(dead_code)]
+    pub fn clear_pivot(&mut self, pivot_sheet: SheetId) -> Option<PivotBinding> {
+        let removed = self.pivots.remove(&pivot_sheet);
+        if removed.is_some() {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Whether `sheet` is a pivot sheet (its contents come from a spec).
+    pub fn is_pivot_sheet(&self, sheet: SheetId) -> bool {
+        self.pivots.contains_key(&sheet)
+    }
+
+    /// The binding on `sheet`, if it is a pivot sheet. Read by the Part C
+    /// builder to populate its wells; used by tests today.
+    #[allow(dead_code)]
+    pub fn pivot_binding(&self, sheet: SheetId) -> Option<&PivotBinding> {
+        self.pivots.get(&sheet)
+    }
+
+    /// The last computed result for `sheet`'s pivot, if it has been refreshed.
+    /// A read accessor for the builder UI and tests.
+    #[allow(dead_code)]
+    pub fn pivot_result(&self, sheet: SheetId) -> Option<&ferrix_core::PivotResult> {
+        self.pivots.get(&sheet).and_then(|b| b.cached.as_ref())
+    }
+
+    /// Turn auto-refresh on or off for a pivot sheet (issue #33 Part B).
+    ///
+    /// Default off: Part B wires the plumbing (see
+    /// [`Workbook::note_source_edit`]) without making every source edit
+    /// recompute a pivot the user may not be looking at. Returns whether the
+    /// sheet was actually a pivot. The toggle in the builder UI is Part C; the
+    /// auto-refresh behaviour it controls is live and tested here.
+    #[allow(dead_code)]
+    pub fn set_pivot_auto_refresh(&mut self, pivot_sheet: SheetId, on: bool) -> bool {
+        if let Some(b) = self.pivots.get_mut(&pivot_sheet) {
+            if b.auto_refresh != on {
+                b.auto_refresh = on;
+                self.dirty = true;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Recompute `pivot_sheet`'s result from its source, caching it AND
+    /// projecting the result into the pivot sheet's cells so the grid displays
+    /// it (issue #33 Part B).
+    ///
+    /// One streaming pass over the source via the Part A kernel; peak memory is
+    /// O(distinct groups), never O(rows). The projection written into the pivot
+    /// sheet's overlay is also O(groups × columns) — the sheet materialises the
+    /// group-scaled result, never a row per source row, so the scale invariant
+    /// holds. Returns the number of groups produced, or `None` if the sheet is
+    /// not a pivot or its source no longer exists (a deleted source leaves the
+    /// last projection in place rather than blanking the sheet).
+    pub fn refresh_pivot(&mut self, pivot_sheet: SheetId) -> Option<usize> {
+        let binding = self.pivots.get(&pivot_sheet)?;
+        let source = binding.source;
+        // Clone the small spec so the source view borrow does not overlap the
+        // `&mut self.pivots` write below.
+        let group_by = binding.spec.group_by.clone();
+        let values = binding.spec.values.clone();
+        let view = self.sheet_view(source)?;
+        let src = SheetPivotSource { view };
+        let result = ferrix_core::compute_pivot(&src, &group_by, &values);
+        let groups = result.groups.len();
+
+        // Build the display projection WHILE the source view is alive: group
+        // key text must be resolved from the SOURCE arena to owned strings now,
+        // because the source borrow is dropped before we write into the pivot
+        // sheet's own overlay/arena below.
+        let projection = build_pivot_projection(&src.view, &group_by, &values, &result);
+        // `src` (and its borrow of self through the source view) is last used
+        // just above, so NLL ends the borrow here and the `&mut self` re-borrow
+        // below is legal without an explicit drop.
+
+        if let Some(b) = self.pivots.get_mut(&pivot_sheet) {
+            b.cached = Some(result);
+        }
+        // Replace the pivot sheet's overlay with a fresh one holding only the
+        // projected cells. A pivot sheet is never user-edited (guard_edit
+        // refuses it), so its overlay holds nothing but this projection —
+        // replacing it wholesale is the clean way to clear a previous, larger
+        // result without a per-cell wipe.
+        if let Some(overlay) = self.overlay_of_mut(pivot_sheet) {
+            let mut fresh = EditOverlay::new();
+            for (cell, cellval) in projection {
+                let input = match cellval {
+                    ProjectedCell::Number(n) => CellInput::Literal(Value::Number(n)),
+                    ProjectedCell::Text(s) => {
+                        let id = fresh.intern(&s);
+                        CellInput::Literal(Value::Text(id))
+                    }
+                };
+                fresh.set(cell, input);
+            }
+            *overlay = fresh;
+        }
+        Some(groups)
+    }
+
+    /// React to an edit on `edited` by refreshing every pivot that both reads it
+    /// AND has auto-refresh on (issue #33 Part B).
+    ///
+    /// The plumbing the acceptance criteria ask for: a manual refresh is always
+    /// available, and a pivot only follows its source automatically when the
+    /// user opted in. Bounded by the (small) number of pivot sheets, and each
+    /// refresh is itself group-scaled — so a source edit never becomes O(rows)
+    /// work here. Returns how many pivots were refreshed.
+    pub fn note_source_edit(&mut self, edited: SheetId) -> usize {
+        let to_refresh: Vec<SheetId> = self
+            .pivots
+            .iter()
+            .filter(|(_, b)| b.auto_refresh && b.source == edited)
+            .map(|(&id, _)| id)
+            .collect();
+        let n = to_refresh.len();
+        for id in to_refresh {
+            self.refresh_pivot(id);
+        }
+        n
+    }
+
+    /// Export every pivot binding for persistence (issue #33 Part B).
+    ///
+    /// Flattens the in-memory bindings to the crate-agnostic
+    /// [`ferrix_io::PivotRecord`] the `.fxpivot` sidecar writes. The cached
+    /// result is deliberately NOT persisted — it is recomputed on load from the
+    /// spec, so a stale result can never outlive the data it summarised.
+    /// Records are sorted by pivot-sheet id so two exports of one workbook are
+    /// byte-identical through the sidecar.
+    pub fn export_pivots(&self) -> Vec<ferrix_io::PivotRecord> {
+        let mut records: Vec<ferrix_io::PivotRecord> = self
+            .pivots
+            .iter()
+            .map(|(&sheet_id, b)| ferrix_io::PivotRecord {
+                sheet_id: sheet_id.0,
+                source_id: b.source.0,
+                auto_refresh: b.auto_refresh,
+                group_by: b.spec.group_by.iter().map(|c| c.0).collect(),
+                values: b
+                    .spec
+                    .values
+                    .iter()
+                    .map(|(col, agg)| (col.0, agg_to_code(*agg)))
+                    .collect(),
+            })
+            .collect();
+        records.sort_by_key(|r| r.sheet_id);
+        records
+    }
+
+    /// Adopt pivot bindings read from a sidecar, WITHOUT marking dirty.
+    ///
+    /// Separate from `set_pivot` for the reason `adopt_protection` is separate
+    /// from `protection_mut`: loading a file that already carried these bindings
+    /// is not a change worth flagging as unsaved. Unknown aggregate codes are
+    /// skipped for that one value rather than failing the whole load, matching
+    /// the "the DATA is fine" stance the other sidecar loaders take. Does not
+    /// compute results — the caller refreshes after adopting.
+    pub fn adopt_pivots(&mut self, records: &[ferrix_io::PivotRecord]) {
+        let was_dirty = self.dirty;
+        for r in records {
+            let group_by = r.group_by.iter().map(|&c| ferrix_core::ColIdx(c)).collect();
+            let values = r
+                .values
+                .iter()
+                .filter_map(|&(col, code)| {
+                    agg_from_code(code).map(|agg| (ferrix_core::ColIdx(col), agg))
+                })
+                .collect();
+            let spec = PivotSpec { group_by, values };
+            let mut binding = PivotBinding::new(SheetId(r.source_id), spec);
+            binding.auto_refresh = r.auto_refresh;
+            self.pivots.insert(SheetId(r.sheet_id), binding);
+        }
+        self.dirty = was_dirty;
     }
 
     /// A sheet index for the dependency graph, bound to the current tab strip.
@@ -2522,6 +2965,14 @@ impl Workbook {
             });
         }
         self.last_edit = Some((at, now));
+
+        // Auto-refresh pivots that read this sheet (issue #33 Part B). Only
+        // pivots with auto_refresh on and this sheet as their source recompute;
+        // the default-off case returns immediately after a bounded scan of the
+        // (small) pivot map, so a normal edit pays nothing.
+        if !self.pivots.is_empty() {
+            self.note_source_edit(sheet);
+        }
 
         report.micros = start.elapsed().as_micros();
         report
@@ -6563,5 +7014,244 @@ mod tests {
         // And the freed cells accept edits again.
         let rep = w.commit_edit(CellRef::new(1, 0), "hi");
         assert!(rep.denied.is_none());
+    }
+
+    // ------------------------------------------------------ pivot sheets (#33)
+
+    use ferrix_core::{ColIdx, PivotAgg};
+
+    /// A two-sheet workbook: MAIN is a source with a `region` text column (0)
+    /// and an `amount` number column (1); Sheet2 is empty, to become the pivot.
+    /// Returns the workbook, source id and the (to be) pivot sheet id.
+    fn pivot_wb() -> (Workbook, SheetId, SheetId) {
+        // region, amount: East 10, West 5, East 20, West 7, East 3.
+        let rows: [(&str, f64); 5] = [
+            ("East", 10.0),
+            ("West", 5.0),
+            ("East", 20.0),
+            ("West", 7.0),
+            ("East", 3.0),
+        ];
+        let mut w = Workbook::new(BaseData::Memory(Sheet::new("Sales")));
+        // Fill the source through the edit path so text interns into the arena
+        // the SheetPivotSource will resolve against.
+        for (r, (region, amount)) in rows.iter().enumerate() {
+            w.commit_edit(CellRef::new(r as u32, 0), region);
+            w.commit_edit(CellRef::new(r as u32, 1), &amount.to_string());
+        }
+        let pivot = w
+            .add_sheet("Pivot", BaseData::Memory(Sheet::new("Pivot")))
+            .expect("add pivot sheet");
+        (w, SheetId::MAIN, pivot)
+    }
+
+    fn sum_spec() -> PivotSpec {
+        PivotSpec {
+            group_by: vec![ColIdx(0)],
+            values: vec![(ColIdx(1), PivotAgg::Sum)],
+        }
+    }
+
+    #[test]
+    fn a_pivot_sheet_references_its_source_and_spec() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        assert!(w.is_pivot_sheet(pivot), "the sheet is now a pivot");
+        assert!(!w.is_pivot_sheet(source), "the source is not");
+        let b = w.pivot_binding(pivot).expect("binding present");
+        assert_eq!(b.source, source);
+        assert_eq!(b.spec, sum_spec());
+    }
+
+    #[test]
+    fn refresh_computes_the_grouped_result() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        assert!(w.pivot_result(pivot).is_none(), "no result before refresh");
+
+        let groups = w.refresh_pivot(pivot).expect("refreshed");
+        assert_eq!(groups, 2, "East and West");
+        let result = w.pivot_result(pivot).expect("cached now");
+        // Scale invariant carried up: two groups, two accumulators, regardless
+        // of the five source rows.
+        assert_eq!(result.accumulator_count(), 2);
+
+        // Resolve East's StrId on the source sheet, then look the group up.
+        let src_view = w.sheet_view(source).unwrap();
+        let east = src_view.get(CellRef::new(0, 0)); // "East"
+        let east_id = match east {
+            Value::Text(id) => id,
+            other => panic!("expected East text, got {other:?}"),
+        };
+        let g = result
+            .group(&[ferrix_core::PivotCell::Text(east_id)])
+            .expect("East group present");
+        assert_eq!(g.aggregates[0], Some(33.0), "10+20+3");
+    }
+
+    #[test]
+    fn editing_a_pivot_cell_is_refused_and_says_why() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        w.activate(pivot).unwrap();
+
+        // A direct edit on the pivot sheet must be refused — and NOT silently:
+        // the report carries a Denied the UI turns into a message.
+        let rep = w.commit_edit(CellRef::new(0, 0), "typed over");
+        assert!(
+            rep.denied.is_some(),
+            "a pivot cell edit is refused, not swallowed"
+        );
+        // Nothing was written.
+        assert_ne!(
+            w.view().display(CellRef::new(0, 0)),
+            "typed over",
+            "the pivot cell kept its computed content"
+        );
+    }
+
+    #[test]
+    fn clearing_a_pivot_makes_the_sheet_editable_again() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        w.activate(pivot).unwrap();
+        assert!(w.commit_edit(CellRef::new(0, 0), "x").denied.is_some());
+
+        let removed = w.clear_pivot(pivot).expect("was a pivot");
+        assert_eq!(removed.source, source);
+        assert!(!w.is_pivot_sheet(pivot));
+        // Now an ordinary editable sheet.
+        assert!(w.commit_edit(CellRef::new(0, 0), "x").denied.is_none());
+    }
+
+    #[test]
+    fn auto_refresh_off_by_default_and_manual_still_works() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        w.refresh_pivot(pivot).unwrap();
+        let before = w.pivot_result(pivot).unwrap().clone();
+
+        // Auto-refresh is off: a source edit does NOT recompute the pivot.
+        let refreshed = w.note_source_edit(source);
+        assert_eq!(refreshed, 0, "default off means no auto follow");
+        assert_eq!(
+            w.pivot_result(pivot).unwrap(),
+            &before,
+            "result unchanged while auto-refresh is off"
+        );
+
+        // Opt in, then a source edit does follow.
+        assert!(w.set_pivot_auto_refresh(pivot, true));
+        assert_eq!(w.note_source_edit(source), 1, "now it follows");
+    }
+
+    #[test]
+    fn auto_refresh_recomputes_after_a_source_change() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        w.set_pivot_auto_refresh(pivot, true);
+        w.refresh_pivot(pivot).unwrap();
+
+        // Change a source amount, then let auto-refresh recompute.
+        w.activate(source).unwrap();
+        w.commit_edit(CellRef::new(0, 1), "1000"); // East 10 -> 1000
+        w.note_source_edit(source);
+
+        let src_view = w.sheet_view(source).unwrap();
+        let east_id = match src_view.get(CellRef::new(0, 0)) {
+            Value::Text(id) => id,
+            other => panic!("expected East, got {other:?}"),
+        };
+        let result = w.pivot_result(pivot).unwrap();
+        let g = result
+            .group(&[ferrix_core::PivotCell::Text(east_id)])
+            .expect("East");
+        assert_eq!(g.aggregates[0], Some(1023.0), "1000+20+3 after the edit");
+    }
+
+    #[test]
+    fn setting_a_pivot_marks_dirty_and_adopting_does_not() {
+        let (mut w, source, pivot) = pivot_wb();
+        // The source fill above dirtied it; save to clear.
+        w.save_committed();
+        assert!(!w.is_dirty());
+
+        w.set_pivot(pivot, source, sum_spec());
+        assert!(w.is_dirty(), "defining a pivot is a real change");
+
+        w.save_committed();
+        let records = w.export_pivots();
+        w.clear_pivot(pivot);
+        w.save_committed();
+        assert!(!w.is_dirty());
+        // Adopting from a sidecar is not a user change.
+        w.adopt_pivots(&records);
+        assert!(
+            !w.is_dirty(),
+            "loading a binding does not dirty the workbook"
+        );
+        assert!(w.is_pivot_sheet(pivot));
+    }
+
+    #[test]
+    fn export_import_round_trips_the_spec() {
+        let (mut w, source, pivot) = pivot_wb();
+        let spec = PivotSpec {
+            group_by: vec![ColIdx(0)],
+            values: vec![
+                (ColIdx(1), PivotAgg::Sum),
+                (ColIdx(1), PivotAgg::Avg),
+                (ColIdx(1), PivotAgg::Count),
+            ],
+        };
+        w.set_pivot(pivot, source, spec.clone());
+        w.set_pivot_auto_refresh(pivot, true);
+
+        let records = w.export_pivots();
+        assert_eq!(records.len(), 1);
+
+        // Rebuild a fresh workbook and adopt.
+        let (mut w2, _, _) = pivot_wb();
+        w2.clear_pivot(pivot);
+        w2.adopt_pivots(&records);
+        let b = w2.pivot_binding(pivot).expect("adopted");
+        assert_eq!(b.source, source);
+        assert_eq!(b.spec, spec, "the spec survives export -> import");
+        assert!(b.auto_refresh, "the auto-refresh flag survives too");
+    }
+
+    #[test]
+    fn refresh_projects_result_into_the_pivot_sheet_cells() {
+        let (mut w, source, pivot) = pivot_wb();
+        w.set_pivot(pivot, source, sum_spec());
+        w.refresh_pivot(pivot);
+        w.activate(pivot).unwrap();
+        let v = w.view();
+
+        // Header row: group-by column A's letter, then the aggregate label.
+        assert_eq!(v.display(CellRef::new(0, 0)), "A");
+        assert_eq!(v.display(CellRef::new(0, 1)), "Sum of B");
+
+        // Groups are sorted by key: "East" before "West" (text order).
+        assert_eq!(v.display(CellRef::new(1, 0)), "East");
+        assert_eq!(v.display(CellRef::new(2, 0)), "West");
+        // And their sums land in the value column.
+        assert_eq!(w.view().get(CellRef::new(1, 1)), Value::Number(33.0));
+        assert_eq!(w.view().get(CellRef::new(2, 1)), Value::Number(12.0));
+    }
+
+    #[test]
+    fn agg_codes_round_trip() {
+        for agg in [
+            PivotAgg::Sum,
+            PivotAgg::Count,
+            PivotAgg::Avg,
+            PivotAgg::Min,
+            PivotAgg::Max,
+            PivotAgg::StdDev,
+        ] {
+            let code = agg_to_code(agg);
+            assert_eq!(agg_from_code(code), Some(agg), "code<->agg is an inverse");
+        }
     }
 }
