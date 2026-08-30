@@ -84,9 +84,9 @@ pub use validate_xlsx::{
 };
 pub use xlsx::{
     export_workbook, export_workbook_full, export_workbook_with_names, export_xlsx,
-    export_xlsx_with_formulas, export_xlsx_with_tables, import_defined_names, import_xlsx,
-    import_xlsx_full, ImportStats, ImportedSheet, SheetExport, XlsxError, XLSX_MAX_COLS,
-    XLSX_MAX_ROWS,
+    export_xlsx_with_formulas, export_xlsx_with_tables, import_defined_names, import_page_setup,
+    import_xlsx, import_xlsx_full, ImportStats, ImportedSheet, SheetExport, XlsxError,
+    XLSX_MAX_COLS, XLSX_MAX_ROWS,
 };
 
 /// Files at or above this size are converted and memory-mapped rather than

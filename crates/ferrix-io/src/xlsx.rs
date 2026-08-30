@@ -78,7 +78,11 @@
 use std::path::Path;
 
 use calamine::{Data, Reader, Xlsx};
+use ferrix_core::page::{HeaderFooter, Orientation, PageSetup, PaperSize, Scaling};
+use ferrix_core::table::TableRange;
 use ferrix_core::{CancelToken, CellInput, CellRef, EditOverlay, ErrorKind, Sheet, Value};
+
+use crate::page_sidecar::PageState;
 use ferrix_formula::{DefinedName, Expr, NameScope, NameTable};
 use rust_xlsxwriter::{Formula, Workbook};
 
@@ -711,6 +715,131 @@ fn write_defined_names(wb: &mut Workbook, names: &NameTable) -> Result<(), XlsxE
 
 // ---------------------------------------------------------------- export ---
 
+/// The OOXML `<pageSetup paperSize="..">` code for a [`PaperSize`].
+///
+/// These are the ECMA-376 paper-size indices, not arbitrary. Only the six
+/// sizes Ferrix models are mapped; the default (Letter=1) covers anything a
+/// future variant might add without emitting a code Excel would reject.
+fn paper_code(paper: PaperSize) -> u8 {
+    match paper {
+        PaperSize::Letter => 1,
+        PaperSize::Legal => 5,
+        PaperSize::Tabloid => 3,
+        PaperSize::A3 => 8,
+        PaperSize::A4 => 9,
+        PaperSize::A5 => 11,
+    }
+}
+
+/// Inverse of [`paper_code`], for read-back. An unknown code maps to the
+/// default so an exotic Excel paper size opens as Letter rather than failing
+/// the import.
+fn paper_from_code(code: u32) -> PaperSize {
+    match code {
+        5 => PaperSize::Legal,
+        3 => PaperSize::Tabloid,
+        8 => PaperSize::A3,
+        9 => PaperSize::A4,
+        11 => PaperSize::A5,
+        // 1 (Letter) and anything unrecognised.
+        _ => PaperSize::Letter,
+    }
+}
+
+/// Points to inches: xlsx margins are inches, Ferrix stores points (1/72in).
+fn pt_to_in(pt: ferrix_core::page::Points) -> f64 {
+    pt as f64 / 72.0
+}
+
+/// Inches to points, the inverse for read-back.
+fn in_to_pt(inches: f64) -> ferrix_core::page::Points {
+    (inches * 72.0) as ferrix_core::page::Points
+}
+
+/// Compose a [`HeaderFooter`]'s three parts into Excel's single `&L&C&R`
+/// string, omitting empty sections. Ferrix's field codes (`&P &N &D &T &F
+/// &A`, `&&` for a literal ampersand) are already Excel's, so the parts map
+/// through unchanged.
+///
+/// Returns `None` when every part is empty, so the writer skips
+/// `<oddHeader>`/`<oddFooter>` entirely rather than emitting an empty element.
+fn compose_header_footer(hf: &HeaderFooter) -> Option<String> {
+    if hf.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    if !hf.left.is_empty() {
+        s.push_str("&L");
+        s.push_str(&hf.left);
+    }
+    if !hf.center.is_empty() {
+        s.push_str("&C");
+        s.push_str(&hf.center);
+    }
+    if !hf.right.is_empty() {
+        s.push_str("&R");
+        s.push_str(&hf.right);
+    }
+    Some(s)
+}
+
+/// Split Excel's `&L&C&R` header/footer string back into a [`HeaderFooter`].
+///
+/// A section marker (`&L`, `&C`, `&R`) starts a part; text before any marker
+/// is treated as the centre section, which is how Excel renders an unadorned
+/// header. `&&` is a literal ampersand and is NOT a section marker, so it is
+/// stepped over rather than mis-read as `&`+section.
+fn parse_header_footer(s: &str) -> HeaderFooter {
+    let mut hf = HeaderFooter::default();
+    // Which of left/center/right we are currently appending to. Excel defaults
+    // an un-prefixed run to the centre.
+    let mut section = 'C';
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.peek().copied() {
+                Some('L') => {
+                    chars.next();
+                    section = 'L';
+                    continue;
+                }
+                Some('C') => {
+                    chars.next();
+                    section = 'C';
+                    continue;
+                }
+                Some('R') => {
+                    chars.next();
+                    section = 'R';
+                    continue;
+                }
+                // `&&` is a literal ampersand: keep BOTH characters so the
+                // round trip preserves Ferrix's own `&&` encoding.
+                Some('&') => {
+                    chars.next();
+                    let target = match section {
+                        'L' => &mut hf.left,
+                        'R' => &mut hf.right,
+                        _ => &mut hf.center,
+                    };
+                    target.push_str("&&");
+                    continue;
+                }
+                // Any other field code (`&P`, `&D`, ...) is content Ferrix
+                // stores verbatim; fall through and push the '&'.
+                _ => {}
+            }
+        }
+        let target = match section {
+            'L' => &mut hf.left,
+            'R' => &mut hf.right,
+            _ => &mut hf.center,
+        };
+        target.push(c);
+    }
+    hf
+}
+
 /// One worksheet to write.
 pub struct SheetExport<'a> {
     pub name: &'a str,
@@ -761,6 +890,16 @@ pub struct SheetExport<'a> {
     /// of frozen literal projections, which is a different, non-recalculating
     /// workbook.
     pub spills: Option<&'a ferrix_formula::SpillRegions>,
+    /// Page setup for printing / Excel interop (#37 follow-up). Drives the
+    /// worksheet's `<pageSetup>`, `<pageMargins>`, `<printOptions>`,
+    /// `<headerFooter>`, `<rowBreaks>`/`<colBreaks>`, and the
+    /// `_xlnm.Print_Titles` defined name (repeat rows/cols). Absent, the sheet
+    /// is written with Excel's defaults exactly as before.
+    pub page_setup: Option<&'a PageSetup>,
+    /// The print area, written as the `_xlnm.Print_Area` defined name. Stored
+    /// separately from [`Self::page_setup`] because it is a sheet selection,
+    /// not a page property — the app tracks it on its own.
+    pub print_area: Option<TableRange>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -778,6 +917,8 @@ impl<'a> SheetExport<'a> {
             validation: None,
             sparklines: None,
             spills: None,
+            page_setup: None,
+            print_area: None,
         }
     }
 
@@ -840,6 +981,20 @@ impl<'a> SheetExport<'a> {
     /// left to Excel to recompute rather than frozen as literals.
     pub fn with_spills(mut self, spills: &'a ferrix_formula::SpillRegions) -> Self {
         self.spills = Some(spills);
+        self
+    }
+
+    /// Attach page setup (#37 follow-up), so paper size, orientation, margins,
+    /// scaling, gridline/heading printing, headers/footers, manual page breaks
+    /// and repeat rows/cols reach the worksheet XML and `<definedNames>`.
+    pub fn with_page_setup(mut self, setup: &'a PageSetup) -> Self {
+        self.page_setup = Some(setup);
+        self
+    }
+
+    /// Attach the print area, written as the `_xlnm.Print_Area` defined name.
+    pub fn with_print_area(mut self, area: TableRange) -> Self {
+        self.print_area = Some(area);
         self
     }
 }
@@ -994,6 +1149,11 @@ pub fn export_workbook_full(
         if let Some(sp) = s.sparklines {
             crate::sparkline_xlsx::write_sparklines(ws, s.name, sp).map_err(write_err)?;
         }
+        // Page setup (#37 follow-up) is worksheet-level state written at save
+        // time, not a per-row property, so it is compatible with the
+        // constant-memory writer and does not force the buffering path — a
+        // 10GB landscape export still streams.
+        write_page_setup(ws, s).map_err(write_err)?;
     }
     write_defined_names(&mut wb, names)?;
     wb.save(path).map_err(write_err)?;
@@ -1205,6 +1365,143 @@ fn write_sizing(
     Ok(())
 }
 
+/// Write page setup (#37 follow-up) onto a worksheet: paper size, orientation,
+/// margins, scaling, gridline/heading printing, headers/footers, manual page
+/// breaks, repeat rows/cols (`_xlnm.Print_Titles`) and the print area
+/// (`_xlnm.Print_Area`).
+///
+/// # Why the defined names are the library's job
+///
+/// `set_print_area`, `set_repeat_rows` and `set_repeat_columns` each emit the
+/// matching built-in `_xlnm.*` defined name with the correct `localSheetId`
+/// themselves. Writing those names by hand into the workbook table would both
+/// duplicate them and race the library's own — so the print area and repeat
+/// ranges go through these methods rather than through [`write_defined_names`].
+///
+/// # Bounds
+///
+/// Print area, repeat ranges and breaks are all clamped to Excel's row/column
+/// limits. `check_limits` has already refused any sheet whose data exceeds
+/// them, but a print area or break can name a row past the data extent, so the
+/// clamp here is what keeps `set_print_area` from erroring on an out-of-range
+/// coordinate.
+fn write_page_setup(
+    ws: &mut rust_xlsxwriter::Worksheet,
+    s: &SheetExport,
+) -> Result<(), rust_xlsxwriter::XlsxError> {
+    // The print area is applied even when there is no PageSetup: it is a sheet
+    // selection the app tracks on its own, independent of the page dialog.
+    if let Some(area) = s.print_area {
+        let last_row = (area.last_row).min(XLSX_MAX_ROWS as u32 - 1);
+        let last_col = (area.last_col).min(XLSX_MAX_COLS as u32 - 1);
+        if area.first_row <= last_row && area.first_col <= last_col {
+            ws.set_print_area(
+                area.first_row,
+                area.first_col as u16,
+                last_row,
+                last_col as u16,
+            )?;
+        }
+    }
+
+    let Some(setup) = s.page_setup else {
+        return Ok(());
+    };
+
+    ws.set_paper_size(paper_code(setup.paper));
+    match setup.orientation {
+        Orientation::Portrait => {
+            ws.set_portrait();
+        }
+        Orientation::Landscape => {
+            ws.set_landscape();
+        }
+    }
+
+    let m = &setup.margins;
+    ws.set_margins(
+        pt_to_in(m.left),
+        pt_to_in(m.right),
+        pt_to_in(m.top),
+        pt_to_in(m.bottom),
+        pt_to_in(m.header),
+        pt_to_in(m.footer),
+    );
+
+    match setup.scaling {
+        Scaling::Percent(p) => {
+            // Excel accepts 10..=400; clamp so an out-of-range percent is
+            // written as the nearest legal value rather than silently dropped
+            // by the library's own range check.
+            ws.set_print_scale(p.clamp(10, 400));
+        }
+        Scaling::FitTo { wide, tall } => {
+            // `0` means "unconstrained on this axis", which is exactly what
+            // `set_print_fit_to_pages` encodes as a 0 for width/height.
+            ws.set_print_fit_to_pages(wide.unwrap_or(0), tall.unwrap_or(0));
+        }
+    }
+
+    // Excel's default is to print neither gridlines nor headings, so these are
+    // only turned on. `set_print_*` writes `<printOptions>` when enabled.
+    if setup.gridlines {
+        ws.set_print_gridlines(true);
+    }
+    if setup.headings {
+        ws.set_print_headings(true);
+    }
+
+    if let Some(h) = compose_header_footer(&setup.header) {
+        ws.set_header(h);
+    }
+    if let Some(f) = compose_header_footer(&setup.footer) {
+        ws.set_footer(f);
+    }
+
+    // Repeat rows/cols become `_xlnm.Print_Titles`. Inclusive 0-based in both
+    // Ferrix and the rust_xlsxwriter API, so they pass straight through.
+    if let Some((first, last)) = setup.repeat_rows {
+        let last = last.min(XLSX_MAX_ROWS as u32 - 1);
+        if first <= last {
+            ws.set_repeat_rows(first, last)?;
+        }
+    }
+    if let Some((first, last)) = setup.repeat_cols {
+        let last = last.min(XLSX_MAX_COLS as u32 - 1);
+        if first <= last {
+            ws.set_repeat_columns(first as u16, last as u16)?;
+        }
+    }
+
+    // Manual page breaks. Ferrix stores the break BEFORE a given 0-based
+    // row/col; xlsx's `<brk id="N">` is the same "break before row N" spelling,
+    // and `set_page_breaks` takes those ids directly.
+    if !setup.row_breaks.is_empty() {
+        let rows: Vec<u32> = setup
+            .row_breaks
+            .iter()
+            .copied()
+            .filter(|&r| r < XLSX_MAX_ROWS as u32)
+            .collect();
+        if !rows.is_empty() {
+            ws.set_page_breaks(&rows)?;
+        }
+    }
+    if !setup.col_breaks.is_empty() {
+        let cols: Vec<u32> = setup
+            .col_breaks
+            .iter()
+            .copied()
+            .filter(|&c| c < XLSX_MAX_COLS as u32)
+            .collect();
+        if !cols.is_empty() {
+            ws.set_vertical_page_breaks(&cols)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Read row/column sizing back out of a worksheet part (issue #29).
 ///
 /// calamine surfaces cell VALUES, not the `<cols>` element or the `<row>`
@@ -1338,6 +1635,412 @@ pub fn import_sizing(
         out.push((name.clone(), sizing));
     }
     Ok(out)
+}
+
+/// Read page setup (#37 follow-up) back out of an xlsx package, per sheet.
+///
+/// Reads the worksheet XML for `<pageSetup>`, `<pageMargins>`,
+/// `<printOptions>`, `<headerFooter>` (`<oddHeader>`/`<oddFooter>`),
+/// `<rowBreaks>`/`<colBreaks>` and the `fitToPage` flag, and the workbook
+/// `<definedNames>` for `_xlnm.Print_Area` and `_xlnm.Print_Titles` — the two
+/// built-in names [`import_defined_names`] deliberately skips because they are
+/// print settings, not user ranges. Reading them HERE keeps that reader's
+/// contract (user names only) intact while still letting an Excel file's page
+/// setup survive a Ferrix open→save.
+///
+/// A sheet with no page-setup elements comes back as [`PageState::default`],
+/// so the return always has one entry per sheet in workbook order — the same
+/// shape [`import_sizing`] returns.
+pub fn import_page_setup(path: impl AsRef<Path>) -> Result<Vec<(String, PageState)>, XlsxError> {
+    use quick_xml::events::Event;
+
+    let path = path.as_ref();
+    let limits = crate::safeguard::Limits::default();
+    let disp = path.display().to_string();
+    let (mut zip, _) = crate::safeguard::open_checked(path, &limits)?;
+    let parts = crate::safeguard::read_all_parts(&mut zip, &disp, &limits, None)?;
+
+    let Some(wb_xml) = parts.get("xl/workbook.xml") else {
+        return Ok(Vec::new());
+    };
+    let names = workbook_sheet_names(wb_xml, &disp)?;
+
+    // Built-in print names, resolved to (localSheetId -> range) up front so the
+    // per-sheet loop can attach them. `localSheetId` indexes the same sheet
+    // order as `names`, exactly as it does for user defined names.
+    let print_names = read_builtin_print_names(wb_xml, &disp)?;
+
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+        let mut state = PageState::default();
+
+        if let Some(xml) = parts.get(&part) {
+            let mut fit_to_page = false;
+            let mut in_odd_header = false;
+            let mut in_odd_footer = false;
+            let mut in_row_breaks = false;
+            let mut in_col_breaks = false;
+            let mut header_text = String::new();
+            let mut footer_text = String::new();
+
+            let mut rdr = quick_xml::Reader::from_reader(xml.as_slice());
+            // Header/footer text is significant whitespace, so text is NOT
+            // trimmed — a leading space in a footer is content.
+            let mut buf = Vec::new();
+            loop {
+                match rdr.read_event_into(&mut buf) {
+                    Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                        match e.local_name().as_ref() {
+                            b"pageSetUpPr" => {
+                                if xattr(&e, b"fitToPage").is_some_and(|v| v == "1" || v == "true")
+                                {
+                                    fit_to_page = true;
+                                }
+                            }
+                            b"pageSetup" => {
+                                if let Some(code) =
+                                    xattr(&e, b"paperSize").and_then(|v| v.parse::<u32>().ok())
+                                {
+                                    state.setup.paper = paper_from_code(code);
+                                }
+                                if xattr(&e, b"orientation").as_deref() == Some("landscape") {
+                                    state.setup.orientation = Orientation::Landscape;
+                                }
+                                let scale = xattr(&e, b"scale").and_then(|v| v.parse::<u16>().ok());
+                                let fit_w =
+                                    xattr(&e, b"fitToWidth").and_then(|v| v.parse::<u16>().ok());
+                                let fit_h =
+                                    xattr(&e, b"fitToHeight").and_then(|v| v.parse::<u16>().ok());
+                                // `fitToPage` on `<pageSetUpPr>` decides which
+                                // scaling model is active. Excel omits it and
+                                // relies on `scale` when the sheet is on a plain
+                                // percentage, and writes `fitToWidth`/Height when
+                                // it is fit-to. In OOXML both fit attributes
+                                // DEFAULT to 1, so an absent `fitToWidth` under
+                                // `fitToPage` means one page wide, not
+                                // unconstrained — the writer omits the attribute
+                                // precisely because 1 is the default.
+                                if fit_to_page {
+                                    let w = fit_w.unwrap_or(1);
+                                    let h = fit_h.unwrap_or(1);
+                                    state.setup.scaling = Scaling::FitTo {
+                                        wide: (w != 0).then_some(w),
+                                        tall: (h != 0).then_some(h),
+                                    };
+                                } else if let Some(s) = scale {
+                                    state.setup.scaling = Scaling::Percent(s);
+                                }
+                            }
+                            b"pageMargins" => {
+                                let g = |k: &[u8]| xattr(&e, k).and_then(|v| v.parse::<f64>().ok());
+                                let m = &mut state.setup.margins;
+                                if let Some(v) = g(b"left") {
+                                    m.left = in_to_pt(v);
+                                }
+                                if let Some(v) = g(b"right") {
+                                    m.right = in_to_pt(v);
+                                }
+                                if let Some(v) = g(b"top") {
+                                    m.top = in_to_pt(v);
+                                }
+                                if let Some(v) = g(b"bottom") {
+                                    m.bottom = in_to_pt(v);
+                                }
+                                if let Some(v) = g(b"header") {
+                                    m.header = in_to_pt(v);
+                                }
+                                if let Some(v) = g(b"footer") {
+                                    m.footer = in_to_pt(v);
+                                }
+                            }
+                            b"printOptions" => {
+                                if xattr(&e, b"gridLines").is_some_and(|v| v == "1" || v == "true")
+                                {
+                                    state.setup.gridlines = true;
+                                }
+                                if xattr(&e, b"headings").is_some_and(|v| v == "1" || v == "true") {
+                                    state.setup.headings = true;
+                                }
+                            }
+                            b"oddHeader" => in_odd_header = true,
+                            b"oddFooter" => in_odd_footer = true,
+                            b"rowBreaks" => in_row_breaks = true,
+                            b"colBreaks" => in_col_breaks = true,
+                            b"brk" => {
+                                // A `<brk>` with `man="1"` is a manual break;
+                                // Excel also emits automatic breaks, which are
+                                // not page setup Ferrix owns.
+                                let manual =
+                                    xattr(&e, b"man").is_none_or(|v| v == "1" || v == "true");
+                                if let Some(id) =
+                                    xattr(&e, b"id").and_then(|v| v.parse::<u32>().ok())
+                                {
+                                    if manual && id > 0 {
+                                        if in_row_breaks {
+                                            state.setup.add_row_break(id);
+                                        } else if in_col_breaks {
+                                            state.setup.add_col_break(id);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Event::Text(t)) => {
+                        if in_odd_header || in_odd_footer {
+                            if let Ok(s) = t.xml10_content() {
+                                if in_odd_header {
+                                    header_text.push_str(&s);
+                                } else {
+                                    footer_text.push_str(&s);
+                                }
+                            }
+                        }
+                    }
+                    // quick-xml surfaces entities (`&amp;` etc.) as their own
+                    // event rather than folding them into the surrounding text,
+                    // so a header like `&amp;L&amp;F` arrives as letters split by
+                    // GeneralRef events. Resolve the predefined XML entities and
+                    // the header's own `&` markers survive — without this every
+                    // `&` in a header/footer is silently dropped and the parse
+                    // collapses to one centre section.
+                    Ok(Event::GeneralRef(r)) => {
+                        if in_odd_header || in_odd_footer {
+                            let ch = if let Ok(Some(c)) = r.resolve_char_ref() {
+                                Some(c)
+                            } else {
+                                match r.decode().ok().as_deref() {
+                                    Some("amp") => Some('&'),
+                                    Some("lt") => Some('<'),
+                                    Some("gt") => Some('>'),
+                                    Some("quot") => Some('"'),
+                                    Some("apos") => Some('\''),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(c) = ch {
+                                if in_odd_header {
+                                    header_text.push(c);
+                                } else {
+                                    footer_text.push(c);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::End(e)) => match e.local_name().as_ref() {
+                        b"oddHeader" => in_odd_header = false,
+                        b"oddFooter" => in_odd_footer = false,
+                        b"rowBreaks" => in_row_breaks = false,
+                        b"colBreaks" => in_col_breaks = false,
+                        _ => {}
+                    },
+                    Ok(Event::Eof) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+                buf.clear();
+            }
+
+            if !header_text.is_empty() {
+                state.setup.header = parse_header_footer(&header_text);
+            }
+            if !footer_text.is_empty() {
+                state.setup.footer = parse_header_footer(&footer_text);
+            }
+        }
+
+        // Attach the built-in print names for this sheet index.
+        if let Some(pn) = print_names.get(&i) {
+            if let Some(area) = pn.print_area {
+                state.print_area = Some(area);
+            }
+            state.setup.repeat_rows = pn.repeat_rows;
+            state.setup.repeat_cols = pn.repeat_cols;
+        }
+
+        out.push((name.clone(), state));
+    }
+
+    Ok(out)
+}
+
+/// The `_xlnm.Print_Area`/`_xlnm.Print_Titles` values a workbook carries,
+/// keyed by the `localSheetId` they are scoped to.
+#[derive(Default)]
+struct BuiltinPrintNames {
+    print_area: Option<TableRange>,
+    repeat_rows: Option<(u32, u32)>,
+    repeat_cols: Option<(u32, u32)>,
+}
+
+/// Read the built-in `_xlnm.*` print names out of `xl/workbook.xml`.
+///
+/// These are exactly the names [`import_defined_names`] skips. A built-in name
+/// is always sheet-scoped (it carries a `localSheetId`), so the result is keyed
+/// by that index — the same index the sheet order in [`workbook_sheet_names`]
+/// uses.
+fn read_builtin_print_names(
+    wb_xml: &[u8],
+    disp: &str,
+) -> Result<std::collections::HashMap<usize, BuiltinPrintNames>, XlsxError> {
+    let mut out: std::collections::HashMap<usize, BuiltinPrintNames> =
+        std::collections::HashMap::new();
+    let mut pending: Option<(String, Option<usize>)> = None;
+    let mut text = String::new();
+
+    safeguard::scan_part(wb_xml, disp, "xl/workbook.xml", None, |ev| {
+        use quick_xml::events::Event as E;
+        match ev {
+            E::Start(e) if e.local_name().as_ref() == b"definedName" => {
+                let Some(name) = xattr(e, b"name") else {
+                    return Ok(());
+                };
+                let local = xattr(e, b"localSheetId").and_then(|v| v.parse::<usize>().ok());
+                pending = Some((name, local));
+                text.clear();
+            }
+            E::Text(t) if pending.is_some() => {
+                if let Ok(s) = t.xml10_content() {
+                    text.push_str(&s);
+                }
+            }
+            E::End(e) if e.local_name().as_ref() == b"definedName" => {
+                if let Some((name, local)) = pending.take() {
+                    let Some(idx) = local else {
+                        return Ok(());
+                    };
+                    let entry = out.entry(idx).or_default();
+                    match name.as_str() {
+                        "_xlnm.Print_Area" => {
+                            // Multi-area print regions are comma-separated; the
+                            // first rectangle is taken (Ferrix stores one).
+                            if let Some(first) = text.split(',').next() {
+                                if let Some(r) = parse_area_ref(first) {
+                                    entry.print_area = Some(r);
+                                }
+                            }
+                        }
+                        "_xlnm.Print_Titles" => {
+                            // Two comma-separated parts: `$A:$B` (repeat cols)
+                            // and `$1:$3` (repeat rows), in either order.
+                            for part in text.split(',') {
+                                if let Some((a, b)) = parse_title_ref(part) {
+                                    match b {
+                                        TitleAxis::Rows => entry.repeat_rows = Some(a),
+                                        TitleAxis::Cols => entry.repeat_cols = Some(a),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .map_err(XlsxError::from)?;
+
+    Ok(out)
+}
+
+/// Which axis a `_xlnm.Print_Titles` half describes.
+enum TitleAxis {
+    Rows,
+    Cols,
+}
+
+/// Parse a single column letter run (`A`, `AB`, `$XFD`) to a 0-based index.
+fn parse_col_letters(s: &str) -> Option<u32> {
+    let s = s.trim().trim_start_matches('$');
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphabetic()) || s.len() > 3 {
+        return None;
+    }
+    let mut col: u32 = 0;
+    for b in s.bytes() {
+        let v = (b.to_ascii_uppercase() - b'A') as u32 + 1;
+        col = col.checked_mul(26)?.checked_add(v)?;
+    }
+    Some(col - 1)
+}
+
+/// Parse a `$A$1` style single cell (sheet qualifier already stripped) to
+/// `(row, col)`, 0-based.
+fn parse_cell_ref(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'$') {
+        i += 1;
+    }
+    let letter_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let letters = &s[letter_start..i];
+    if bytes.get(i) == Some(&b'$') {
+        i += 1;
+    }
+    let digits = &s[i..];
+    let col = parse_col_letters(letters)?;
+    let row_1: u32 = digits.parse().ok()?;
+    if row_1 == 0 {
+        return None;
+    }
+    Some((row_1 - 1, col))
+}
+
+/// Strip a leading `Sheet!` (or `'My Sheet'!`) qualifier from a defined-name
+/// value, returning the reference part. The qualifier is everything up to the
+/// LAST `!` — a quoted sheet name may itself contain `!`.
+fn strip_sheet_qualifier(s: &str) -> &str {
+    match s.rfind('!') {
+        Some(pos) => &s[pos + 1..],
+        None => s,
+    }
+}
+
+/// Parse an `_xlnm.Print_Area` rectangle (`Sheet1!$A$1:$C$10`) to a
+/// [`TableRange`]. A single-cell area (`Sheet1!$A$1`) is a 1x1 rectangle.
+fn parse_area_ref(s: &str) -> Option<TableRange> {
+    let r = strip_sheet_qualifier(s).trim();
+    let (a, b) = match r.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (r, r),
+    };
+    let (r1, c1) = parse_cell_ref(a)?;
+    let (r2, c2) = parse_cell_ref(b)?;
+    Some(TableRange::new(r1, c1, r2, c2))
+}
+
+/// Parse one half of an `_xlnm.Print_Titles` value: a whole-row band
+/// (`Sheet1!$1:$3`) or a whole-column band (`Sheet1!$A:$B`), returning the
+/// inclusive 0-based range and which axis it is.
+fn parse_title_ref(s: &str) -> Option<((u32, u32), TitleAxis)> {
+    let r = strip_sheet_qualifier(s).trim();
+    let (a, b) = r.split_once(':')?;
+    let a = a.trim().trim_start_matches('$');
+    let b = b.trim().trim_start_matches('$');
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    // Whole-row band: both sides are digits.
+    if a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit()) {
+        let r1: u32 = a.parse().ok()?;
+        let r2: u32 = b.parse().ok()?;
+        if r1 == 0 || r2 == 0 {
+            return None;
+        }
+        let (lo, hi) = (r1.min(r2) - 1, r1.max(r2) - 1);
+        return Some(((lo, hi), TitleAxis::Rows));
+    }
+    // Whole-column band: both sides are letters.
+    let c1 = parse_col_letters(a)?;
+    let c2 = parse_col_letters(b)?;
+    Some(((c1.min(c2), c1.max(c2)), TitleAxis::Cols))
 }
 
 /// Excel's column width unit is "characters of the default font". The factor
@@ -2783,5 +3486,204 @@ mod tests {
             got.is_empty(),
             "a sheet exported without sizing must import with none, got {got:?}"
         );
+    }
+
+    // ------------------------------------------------------ page setup (#37) ---
+
+    /// A small sheet to hang page setup on. The data extent has to reach the
+    /// print-area corners, or `set_print_area` refuses the out-of-range cell.
+    fn page_sheet() -> Sheet {
+        let mut s = Sheet::new("Page");
+        for r in 0..12u32 {
+            for c in 0..5u32 {
+                s.set(CellRef::new(r, c), Value::Number((r * 5 + c) as f64));
+            }
+        }
+        s
+    }
+
+    /// A non-default page setup exercising every mapped field: A4, landscape,
+    /// fit-to, narrow margins, gridlines + headings on, three-part header and
+    /// footer with field codes, manual row/col breaks and repeat rows/cols.
+    fn nondefault_setup() -> PageSetup {
+        PageSetup {
+            paper: PaperSize::A4,
+            orientation: Orientation::Landscape,
+            margins: ferrix_core::page::Margins::narrow(),
+            scaling: Scaling::FitTo {
+                wide: Some(1),
+                tall: Some(2),
+            },
+            repeat_rows: Some((0, 1)),
+            repeat_cols: Some((0, 0)),
+            gridlines: true,
+            headings: true,
+            header: HeaderFooter {
+                left: "&F".into(),
+                center: "Report".into(),
+                right: "&D".into(),
+            },
+            footer: HeaderFooter {
+                left: String::new(),
+                center: "Page &P of &N".into(),
+                right: String::new(),
+            },
+            order: ferrix_core::page::PageOrder::default(),
+            row_breaks: vec![4, 8],
+            col_breaks: vec![2],
+        }
+    }
+
+    #[test]
+    fn page_setup_round_trips_through_xlsx() {
+        let t = TempXlsx::new("page-setup");
+        let sheet = page_sheet();
+        let setup = nondefault_setup();
+        let area = TableRange::new(0, 0, 9, 3); // A1:D10
+
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Page", &sheet)
+                .with_page_setup(&setup)
+                .with_print_area(area)],
+        )
+        .unwrap();
+
+        let back = import_page_setup(t.path()).unwrap();
+        let (name, state) = back.first().expect("one sheet");
+        assert_eq!(name, "Page");
+        let got = &state.setup;
+
+        assert_eq!(got.paper, PaperSize::A4, "paper size");
+        assert_eq!(got.orientation, Orientation::Landscape, "orientation");
+        assert_eq!(
+            got.scaling,
+            Scaling::FitTo {
+                wide: Some(1),
+                tall: Some(2)
+            },
+            "fit-to scaling"
+        );
+        assert!(got.gridlines, "print gridlines");
+        assert!(got.headings, "print headings");
+        assert_eq!(got.repeat_rows, Some((0, 1)), "repeat rows (Print_Titles)");
+        assert_eq!(got.repeat_cols, Some((0, 0)), "repeat cols (Print_Titles)");
+        assert_eq!(got.row_breaks, vec![4, 8], "manual row breaks");
+        assert_eq!(got.col_breaks, vec![2], "manual col breaks");
+        assert_eq!(got.header, setup.header, "three-part header");
+        assert_eq!(got.footer, setup.footer, "three-part footer");
+        assert_eq!(
+            state.print_area,
+            Some(area),
+            "print area (Print_Area defined name)"
+        );
+
+        // Margins survive the point->inch->point round trip within rounding.
+        let m = &got.margins;
+        let want = ferrix_core::page::Margins::narrow();
+        for (g, w, label) in [
+            (m.left, want.left, "left"),
+            (m.right, want.right, "right"),
+            (m.top, want.top, "top"),
+            (m.bottom, want.bottom, "bottom"),
+            (m.header, want.header, "header"),
+            (m.footer, want.footer, "footer"),
+        ] {
+            assert!((g - w).abs() < 0.5, "margin {label}: got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn percent_scaling_round_trips() {
+        let t = TempXlsx::new("page-percent");
+        let sheet = page_sheet();
+        let setup = PageSetup {
+            scaling: Scaling::Percent(75),
+            ..PageSetup::default()
+        };
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Page", &sheet).with_page_setup(&setup)],
+        )
+        .unwrap();
+        let back = import_page_setup(t.path()).unwrap();
+        let (_, state) = back.first().expect("one sheet");
+        assert_eq!(
+            state.setup.scaling,
+            Scaling::Percent(75),
+            "percent scaling must survive without fitToPage"
+        );
+    }
+
+    #[test]
+    fn fit_to_with_unset_width_axis_round_trips() {
+        // `wide: None` means "unconstrained across", which OOXML spells
+        // `fitToWidth="0"` — distinct from an omitted attribute (defaults to 1).
+        // The writer emits the 0 because it differs from the default, so the
+        // reader gets it back rather than collapsing it to one page.
+        let t = TempXlsx::new("page-fit-unset");
+        let sheet = page_sheet();
+        let setup = PageSetup {
+            scaling: Scaling::FitTo {
+                wide: None,
+                tall: Some(3),
+            },
+            ..PageSetup::default()
+        };
+        export_workbook(
+            t.path(),
+            &[SheetExport::new("Page", &sheet).with_page_setup(&setup)],
+        )
+        .unwrap();
+        let back = import_page_setup(t.path()).unwrap();
+        let (_, state) = back.first().expect("one sheet");
+        assert_eq!(
+            state.setup.scaling,
+            Scaling::FitTo {
+                wide: None,
+                tall: Some(3)
+            },
+            "an unconstrained fit-to width axis must survive as None, not Some(1)"
+        );
+    }
+
+    #[test]
+    fn a_sheet_with_no_page_setup_stays_default() {
+        // The default export path must be untouched: a sheet with no page setup
+        // and no print area must import as the defaults, not as some spurious
+        // paper/margin the writer invented.
+        let t = TempXlsx::new("page-none");
+        let sheet = page_sheet();
+        export_workbook(t.path(), &[SheetExport::new("Page", &sheet)]).unwrap();
+        let back = import_page_setup(t.path()).unwrap();
+        let (_, state) = back.first().expect("one sheet");
+        assert_eq!(
+            state.setup,
+            PageSetup::default(),
+            "no page setup exported must import as defaults, got {:?}",
+            state.setup
+        );
+        assert_eq!(state.print_area, None, "no print area exported");
+    }
+
+    #[test]
+    fn header_footer_parse_round_trips_the_three_parts() {
+        // The compose/parse pair is the fiddly half; test it directly so a
+        // regression is pinned to the string handling, not the whole export.
+        let hf = HeaderFooter {
+            left: "&F".into(),
+            center: "Title && more".into(),
+            right: "&P/&N".into(),
+        };
+        let composed = compose_header_footer(&hf).expect("non-empty");
+        assert_eq!(parse_header_footer(&composed), hf);
+
+        // Centre-only, the unadorned form Excel writes bare.
+        let centre = HeaderFooter {
+            center: "Just centre".into(),
+            ..HeaderFooter::default()
+        };
+        let composed = compose_header_footer(&centre).expect("non-empty");
+        assert_eq!(parse_header_footer(&composed), centre);
     }
 }
