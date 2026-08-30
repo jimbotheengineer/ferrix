@@ -100,6 +100,27 @@ pub enum Primitive {
     },
 }
 
+/// A named series and the colour it is drawn in, for the legend.
+///
+/// The colour is carried as an [`Rgba`] so the legend swatch matches the exact
+/// paint the series' primitives use — the same `Scene` feeds both the egui
+/// painter and the SVG writer, so a legend that hard-coded a colour string
+/// could drift from the geometry it describes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LegendEntry {
+    pub label: String,
+    pub color: Rgba,
+}
+
+impl LegendEntry {
+    pub fn new(label: impl Into<String>, color: Rgba) -> Self {
+        Self {
+            label: label.into(),
+            color,
+        }
+    }
+}
+
 /// A complete chart: primitives plus the data ranges they live in.
 #[derive(Clone, Debug)]
 pub struct Scene {
@@ -109,6 +130,10 @@ pub struct Scene {
     pub title: Option<String>,
     pub x_label: Option<String>,
     pub y_label: Option<String>,
+    /// Series legend. One entry per drawn series; rendered only when the panel
+    /// asks for it (a single-series chart usually communicates the series via
+    /// the y-axis label and title instead, so an empty legend draws nothing).
+    pub legend: Vec<LegendEntry>,
 }
 
 impl Scene {
@@ -120,6 +145,7 @@ impl Scene {
             title: None,
             x_label: None,
             y_label: None,
+            legend: Vec::new(),
         }
     }
 
@@ -135,6 +161,12 @@ impl Scene {
     pub fn with_axis_labels(mut self, x: impl Into<String>, y: impl Into<String>) -> Self {
         self.x_label = Some(x.into());
         self.y_label = Some(y.into());
+        self
+    }
+
+    /// Attach a series legend. Replaces any existing entries.
+    pub fn with_legend(mut self, entries: Vec<LegendEntry>) -> Self {
+        self.legend = entries;
         self
     }
 
@@ -466,6 +498,38 @@ pub fn to_svg(scene: &Scene, width: f32, height: f32) -> String {
             plot.1 + plot.3 / 2.0,
             escape(l)
         );
+    }
+
+    // Series legend, top-right inside the plot area. One row per series: a
+    // colour swatch matching the series' own paint, then its label. Drawn last
+    // so it sits above the gridlines and geometry.
+    if !scene.legend.is_empty() {
+        let sw = 12.0f32; // swatch size
+        let row_h = 18.0f32;
+        let pad = 8.0f32;
+        // Right-align the block just inside the plot's right edge.
+        let right = plot.0 + plot.2 - pad;
+        let top = plot.1 + pad;
+        for (i, e) in scene.legend.iter().enumerate() {
+            let y = top + i as f32 * row_h;
+            // Label sits to the LEFT of the swatch, right-anchored, so a long
+            // series name grows away from the edge rather than off it.
+            let _ = write!(
+                s,
+                r#"<rect x="{:.2}" y="{:.2}" width="{sw:.2}" height="{sw:.2}" fill="{}" fill-opacity="{}"/>"#,
+                right - sw,
+                y,
+                e.color.svg_hex(),
+                e.color.opacity()
+            );
+            let _ = write!(
+                s,
+                r##"<text x="{:.2}" y="{:.2}" font-family="sans-serif" font-size="11" text-anchor="end" fill="#404040">{}</text>"##,
+                right - sw - 5.0,
+                y + sw - 2.0,
+                escape(&e.label)
+            );
+        }
     }
 
     let _ = write!(s, "</svg>");
