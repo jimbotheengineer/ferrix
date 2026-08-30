@@ -295,6 +295,13 @@ pub struct FerrixApp {
     /// inclusive. `None` prints everything. Set from the selection and cleared
     /// by the File menu (#37). Stored once per sheet, not per cell.
     print_area: Option<ferrix_core::TableRange>,
+    /// Page Break Preview: when on, the grid draws a dashed line at every row
+    /// and column where a printed page would break (#37). Read-only — it shows
+    /// where the paginator splits; it does not let the user drag a break.
+    show_page_breaks: bool,
+    /// How many page-break lines the last frame painted, for tests and the
+    /// status note. Reset each frame.
+    last_page_break_lines: usize,
     /// Column being resized by its border: (column, pointer x at press, width
     /// at press). OWNED HERE rather than read from egui's `is_dragging`, which
     /// is cleared on the release frame — the width would be lost exactly when
@@ -717,6 +724,8 @@ impl FerrixApp {
             header_drag: None,
             sizing: ferrix_core::sizing::SheetSizing::new(),
             print_area: None,
+            show_page_breaks: false,
+            last_page_break_lines: 0,
             col_resize: None,
             header_menu: None,
             last_autofit_rows: 0,
@@ -1522,6 +1531,7 @@ impl FerrixApp {
         self.sizing_dirty = false;
         // The print area is per sheet; a new file starts with none.
         self.print_area = None;
+        self.show_page_breaks = false;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -5344,6 +5354,27 @@ impl FerrixApp {
         self.print_area
     }
 
+    /// Toggle Page Break Preview (#37): the grid overlays a dashed line at
+    /// every row and column where a printed page would break, so the user can
+    /// see the pagination before printing. Read-only — no dragging.
+    pub fn toggle_page_breaks(&mut self) {
+        self.show_page_breaks = !self.show_page_breaks;
+        self.status = if self.show_page_breaks {
+            "Page Break Preview on — dashed lines show where pages split".into()
+        } else {
+            "Page Break Preview off".into()
+        };
+    }
+
+    pub fn page_breaks_shown(&self) -> bool {
+        self.show_page_breaks
+    }
+
+    /// How many page-break lines the last frame drew, for tests.
+    pub fn page_break_line_count(&self) -> usize {
+        self.last_page_break_lines
+    }
+
     /// Write this sheet to `path` as a PDF or a single-file HTML page.
     ///
     /// Dialog-free so a test can drive the REAL export the menu runs (the
@@ -8484,6 +8515,7 @@ impl FerrixApp {
             C::ViewTheme => self.set_theme(self.theme.mode.toggled()),
             C::ViewEmptyRows => self.set_show_empty_rows(!self.show_empty_rows),
             C::ViewShowFormulas => self.toggle_show_formulas(),
+            C::ViewPageBreaks => self.toggle_page_breaks(),
             C::EditUndo => {
                 if let Some(c) = self.wb.undo() {
                     self.selection.move_to(c);
@@ -9714,6 +9746,85 @@ impl FerrixApp {
                     self.last_trace_total = 0;
                 }
 
+                // --- Page Break Preview (roadmap #37) ---
+                //
+                // Read-only overlay: a dashed line at every row and column
+                // where a printed page would break. The break positions come
+                // from the SAME `Paginator` the PDF/HTML export uses, so what
+                // the user previews is exactly where the print splits — not a
+                // second guess at pagination. Painted through the grid's own
+                // `cell_screen_rect`, like the trace arrows above.
+                if self.show_page_breaks {
+                    let extent = match self.print_area {
+                        Some(r) => ((r.first_row, r.last_row), (r.first_col, r.last_col)),
+                        None => {
+                            let rows = self.wb.view().row_count().max(1) as u32 - 1;
+                            let cols = self.wb.view().col_count().max(1) as u32 - 1;
+                            ((0, rows), (0, cols))
+                        }
+                    };
+                    let paginator = ferrix_core::page::Paginator::new(
+                        ferrix_core::page::PageSetup::default(),
+                        extent.0,
+                        extent.1,
+                        &self.sizing.rows,
+                        &self.sizing.cols,
+                    );
+                    let pad = self.pad_space();
+                    let resolver = self.row_resolver(pad);
+                    let metrics = crate::grid::Metrics::new(self.zoom);
+                    let painter = ui.painter().with_clip_rect(outer);
+                    let mut lines = 0usize;
+
+                    // A row break falls BEFORE `row`: draw a horizontal dashed
+                    // line along the top edge of that row's cells.
+                    for row in paginator.row_break_rows() {
+                        if let Some(rect) = Grid::cell_screen_rect(
+                            ferrix_core::CellRef::new(row, extent.1 .0),
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        ) {
+                            let y = rect.top();
+                            draw_page_break_line(
+                                &painter,
+                                egui::pos2(outer.left(), y),
+                                egui::pos2(outer.right(), y),
+                                th.accent,
+                            );
+                            lines += 1;
+                        }
+                    }
+                    // A column break falls BEFORE `col`: a vertical dashed line
+                    // along the left edge of that column's cells.
+                    for col in paginator.col_break_cols() {
+                        if let Some(rect) = Grid::cell_screen_rect(
+                            ferrix_core::CellRef::new(extent.0 .0, col),
+                            outer,
+                            &self.scroll,
+                            &self.col_widths,
+                            &resolver,
+                            metrics,
+                            self.panes,
+                        ) {
+                            let x = rect.left();
+                            draw_page_break_line(
+                                &painter,
+                                egui::pos2(x, outer.top()),
+                                egui::pos2(x, outer.bottom()),
+                                th.accent,
+                            );
+                            lines += 1;
+                        }
+                    }
+                    self.last_page_break_lines = lines;
+                } else {
+                    self.last_page_break_lines = 0;
+                }
+
                 // --- Circle Invalid Data (issue #41) ---
                 //
                 // Painted onto the grid's own Painter, through the SAME
@@ -10891,6 +11002,31 @@ fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
 /// A1-style label for a cell, for status messages.
 fn cell_label(cell: CellRef) -> String {
     format!("{}{}", ferrix_core::column_name(cell.col), cell.row + 1)
+}
+
+/// Draw a dashed page-break line between two points (#37). Dashed so it reads
+/// as a print guide, distinct from the solid grid lines.
+fn draw_page_break_line(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    // 6px dash, 4px gap, walked along the segment.
+    let total = (to - from).length();
+    if total <= 0.0 {
+        return;
+    }
+    let dir = (to - from) / total;
+    let (dash, gap) = (6.0_f32, 4.0_f32);
+    let mut t = 0.0_f32;
+    while t < total {
+        let a = from + dir * t;
+        let b = from + dir * (t + dash).min(total);
+        painter.line_segment([a, b], stroke);
+        t += dash + gap;
+    }
 }
 
 /// Draw one trace arrow from `from` to `to`. A cyclic edge is dashed so it
