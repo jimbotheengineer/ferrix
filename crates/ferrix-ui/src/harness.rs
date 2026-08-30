@@ -59,6 +59,9 @@ pub struct Harness {
     last_shapes: usize,
     /// Text shapes emitted by the last frame.
     last_texts: usize,
+    /// Cursor icon egui emitted on the last frame, so a test can assert the
+    /// hover-cursor feedback (#81) without a real pointer device.
+    last_cursor: egui::CursorIcon,
     /// Aggregate modifier state for the next frame.
     ///
     /// egui exposes `i.modifiers` from `RawInput.modifiers`, NOT from the
@@ -102,6 +105,7 @@ impl Harness {
             frame: 0,
             last_shapes: 0,
             last_texts: 0,
+            last_cursor: egui::CursorIcon::Default,
             pending_modifiers: Modifiers::default(),
         }
     }
@@ -133,6 +137,7 @@ impl Harness {
             .iter()
             .filter(|s| matches!(s.shape, egui::epaint::Shape::Text(_)))
             .count();
+        self.last_cursor = out.platform_output.cursor_icon;
         self.frame += 1;
         self
     }
@@ -405,6 +410,21 @@ impl Harness {
 
     pub fn page_breaks_shown(&self) -> bool {
         self.app.page_breaks_shown()
+    }
+
+    /// Move the pointer to a screen position, run a frame, and report the
+    /// cursor icon egui emitted there — the hover-feedback path (#81).
+    pub fn cursor_at(&mut self, x: f32, y: f32) -> egui::CursorIcon {
+        self.move_to(x, y);
+        self.step();
+        self.last_cursor
+    }
+
+    /// A cell's on-screen rectangle, read from the app's own painted geometry,
+    /// so a test can aim the pointer at a real edge or interior.
+    pub fn cell_rect(&mut self, cell: ferrix_core::CellRef) -> Option<egui::Rect> {
+        self.step();
+        self.app.cell_rect(cell)
     }
 
     // ---- clipboard interop and Paste Special (issue #30) ----
@@ -10193,6 +10213,53 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_cursor_tells_you_what_a_drag_will_do() {
+        // Hover feedback (#81): the pointer shape distinguishes the three things
+        // a press on the selection can start — expand (fill handle → crosshair),
+        // move (selection border → grab), and ordinary cell selection (interior
+        // → cell). All three read back from the REAL emitted cursor icon.
+        let (mut h, csv) = numeric_app("cursor.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+        // Turn empty-row padding off so the block edges are real data edges.
+        h.select(CellRef::new(1, 1), CellRef::new(4, 3));
+        h.step();
+
+        let tl = h
+            .cell_rect(CellRef::new(1, 1))
+            .expect("top-left cell on screen");
+        let br = h
+            .cell_rect(CellRef::new(4, 3))
+            .expect("bottom-right cell on screen");
+
+        // Interior: well inside the block → the plain cell cursor.
+        let mid = (
+            (tl.left() + br.right()) / 2.0,
+            (tl.top() + br.bottom()) / 2.0,
+        );
+        assert_eq!(
+            h.cursor_at(mid.0, mid.1),
+            egui::CursorIcon::Cell,
+            "the interior of a selection must show the ordinary cell cursor"
+        );
+
+        // Top border of the block → the grab hand (move affordance).
+        let border = ((tl.left() + br.right()) / 2.0, tl.top());
+        assert_eq!(
+            h.cursor_at(border.0, border.1),
+            egui::CursorIcon::Grab,
+            "the selection border must show the grab cursor so a move is discoverable"
+        );
+
+        // The fill handle sits at the block's bottom-right corner → crosshair.
+        assert_eq!(
+            h.cursor_at(br.right(), br.bottom()),
+            egui::CursorIcon::Crosshair,
+            "the fill handle must show the crosshair (expand) cursor"
+        );
+        let _ = std::fs::remove_file(&csv);
     }
 
     #[test]

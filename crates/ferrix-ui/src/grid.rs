@@ -2584,6 +2584,62 @@ impl<'a> Grid<'a> {
             fill_started = true;
             clicked = None; // Do not also move the selection.
         }
+
+        // --- hover cursor feedback (#81) ---
+        //
+        // The pointer shape tells the user what a press will do BEFORE they
+        // commit: a crosshair over the fill handle (drag to fill/expand), a
+        // grab hand over the selection's border (drag to move the block, #82),
+        // and the ordinary cell cursor everywhere else inside the grid. Only
+        // set it when not already dragging, so an in-flight gesture keeps its
+        // own cursor, and skip it in the gutters and over the handle-vs-border
+        // overlap (handle wins).
+        if !dragging && !self.filling {
+            if let Some(p) = pointer_pos.filter(|p| grid_rect.contains(*p) && !in_gutter) {
+                // The selection's full on-screen rectangle, for border testing.
+                let sel_rect = self
+                    .selection
+                    .filter(|_| self.editing.is_none())
+                    .and_then(|sel| {
+                        let (tl, br) = sel.bounds();
+                        let a = Self::cell_screen_rect(
+                            tl,
+                            outer,
+                            self.scroll,
+                            self.col_widths,
+                            &resolver,
+                            m,
+                            panes,
+                        )?;
+                        let b = Self::cell_screen_rect(
+                            br,
+                            outer,
+                            self.scroll,
+                            self.col_widths,
+                            &resolver,
+                            m,
+                            panes,
+                        )?;
+                        Some(a.union(b))
+                    });
+                // "On the border" = within a few px of the selection edge but
+                // not deep inside it, and not on the fill handle.
+                const BORDER_PX: f32 = 4.0;
+                let on_border = sel_rect.is_some_and(|r| {
+                    let outer_r = r.expand(BORDER_PX);
+                    let inner_r = r.shrink(BORDER_PX);
+                    outer_r.contains(p) && !inner_r.contains(p)
+                });
+                if on_handle {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                } else if on_border {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Cell);
+                }
+            }
+        }
+
         if self.filling {
             if dragging {
                 fill_to = pointer_pos.and_then(hit);
