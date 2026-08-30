@@ -297,6 +297,8 @@ registry! {
         "Insert a subtotal at each change of value in the cursor's column. A VIEW only — no rows are inserted, sort and filter keep working, and running it again restores the original view exactly." }
     DataConsolidate { "data.consolidate", Some(Menu::Data), "⊞ Consolidate sheets…", None, false, None,
         "Aggregate the selected labelled range from every sheet by row and column key. Keys missing from a sheet are REPORTED, never silently zeroed." }
+    DataRefreshPivot { "data.refresh_pivot", Some(Menu::Data), "⟳ Refresh pivot table", None, false, None,
+        "Recompute the active pivot sheet from its source. One streaming pass, scaled to the number of groups — not the source's row count." }
 
     // ---- View ----
     ViewFreezeRows { "view.freeze_rows", Some(Menu::View), "❄ Freeze rows above cursor", None, false, None,
@@ -408,6 +410,9 @@ impl Command {
             DataConsolidate if st.sheets < 2 => {
                 Some("Consolidate needs at least two sheets — this workbook has one".to_string())
             }
+            DataRefreshPivot if !st.active_is_pivot => {
+                Some("The active sheet is not a pivot table".to_string())
+            }
             ViewUnfreeze if !st.frozen => Some("Nothing is frozen or split".to_string()),
             EditUndo if !st.can_undo => Some("Nothing to undo".to_string()),
             EditRedo if !st.can_redo => Some("Nothing to redo".to_string()),
@@ -470,6 +475,9 @@ pub struct CommandState {
     /// "why is this grey" question for issue #34's commands.
     pub rows: usize,
     pub sheets: usize,
+    /// Whether the active sheet is a pivot table (issue #33 Part B), so
+    /// "Refresh pivot table" can say why it is grey off a pivot sheet.
+    pub active_is_pivot: bool,
 }
 
 /// Commands belonging to one menu, in registry order.
