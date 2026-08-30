@@ -707,6 +707,14 @@ pub struct OwnedSheet {
     /// CSV/Parquet paths do not need it, so it defaults to empty and is set
     /// only on the print path via [`OwnedSheet::with_name`].
     name: String,
+    /// Conditional formatting + decoration, cloned for the print snapshot so a
+    /// styled export renders fills, text colour, typography and alignment the
+    /// way the grid shows them. Stored per column/range, so the clone is a
+    /// function of how many formats the user applied, never of row count.
+    /// `None` on the CSV/Parquet paths, which do not carry style.
+    format: Option<ferrix_core::SheetFormat>,
+    /// Merged regions, cloned for the same reason. `None` = no merges carried.
+    merges: Option<ferrix_core::merge::MergeMap>,
 }
 
 impl OwnedSheet {
@@ -716,6 +724,8 @@ impl OwnedSheet {
             base,
             overlay: overlay.clone(),
             name: String::new(),
+            format: None,
+            merges: None,
         }
     }
 
@@ -723,6 +733,28 @@ impl OwnedSheet {
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
+    }
+
+    /// Carry the sheet's formatting and merges into the snapshot, so a styled
+    /// print (PDF/HTML) renders them. Both maps are per column/range, so this
+    /// is cheap regardless of sheet size; account for it via
+    /// [`OwnedSheet::style_cost_bytes`] before constructing the snapshot.
+    pub fn with_style(
+        mut self,
+        format: &ferrix_core::SheetFormat,
+        merges: &ferrix_core::merge::MergeMap,
+    ) -> Self {
+        self.format = Some(format.clone());
+        self.merges = Some(merges.clone());
+        self
+    }
+
+    /// Heap the style clone will allocate, for the budget check.
+    pub fn style_cost_bytes(
+        format: &ferrix_core::SheetFormat,
+        merges: &ferrix_core::merge::MergeMap,
+    ) -> u64 {
+        (format.heap_bytes() + merges.heap_bytes()) as u64
     }
 
     /// What taking this snapshot will actually allocate.
@@ -780,6 +812,52 @@ impl ferrix_io::render::RenderSource for OwnedSheet {
         } else {
             self.name.clone()
         }
+    }
+
+    /// Resolve a cell's fill, text colour, bold/italic and alignment the same
+    /// way the grid paints it, so a styled export matches the screen.
+    ///
+    /// Conditional rules that need a *window* of the column's values (data
+    /// bars, top-N) are NOT applied here: resolving them per cell would make
+    /// the export walk the column, breaking the one-page-at-a-time streaming
+    /// bound. Threshold/value rules, manual overrides and alignment — the
+    /// overwhelming majority — do resolve. Documented on the export.
+    fn paint(&self, cell: CellRef) -> ferrix_io::render::CellPaint {
+        let Some(format) = &self.format else {
+            return ferrix_io::render::CellPaint::default();
+        };
+        let view = self.view();
+        let mut plan = Vec::new();
+        format.plan(cell.col, &mut plan);
+        let value = view.get(cell);
+        let text = if ferrix_core::SheetFormat::plan_needs_text(&plan) {
+            view.display(cell)
+        } else {
+            String::new()
+        };
+        // Empty evals: window-dependent rules resolve to their unstyled state.
+        let style = format.resolve(cell, &value, &text, &plan, &[]);
+        let decor = format.decor_at(cell);
+        let align = match decor.h_align {
+            Some(ferrix_core::HAlign::Left) => ferrix_core::HAlign::Left,
+            Some(ferrix_core::HAlign::Center) => ferrix_core::HAlign::Center,
+            Some(ferrix_core::HAlign::Right) => ferrix_core::HAlign::Right,
+            Some(ferrix_core::HAlign::Justify) => ferrix_core::HAlign::Justify,
+            _ => ferrix_core::HAlign::General,
+        };
+        ferrix_io::render::CellPaint {
+            fill: style.fill,
+            text_color: style.text,
+            bold: style.typography.bold.unwrap_or(false),
+            italic: style.typography.italic.unwrap_or(false),
+            align,
+        }
+    }
+
+    fn merge_at(&self, cell: CellRef) -> Option<ferrix_core::TableRange> {
+        self.merges
+            .as_ref()
+            .and_then(|m| m.region_at(cell).copied())
     }
 }
 

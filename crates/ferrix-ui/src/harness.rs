@@ -10190,6 +10190,54 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&p);
     }
 
+    #[test]
+    fn a_conditional_format_fill_reaches_the_printed_html() {
+        // Styled print (#37): a threshold rule that fills qty > 100 must show
+        // up as a background colour on the matching cell in the exported HTML,
+        // and NOT on a non-matching one. This is the whole point of carrying
+        // the format map into the print snapshot — asserting both sides is what
+        // separates "styled export" from "fill everything" or "fill nothing".
+        let (mut h, csv) = numeric_app("cf_print.csv");
+        h.select(CellRef::new(0, 1), CellRef::new(9, 1));
+        h.cond_new_rule();
+        h.cond_form(|f| {
+            f.kind = crate::cond_format::RuleKind::Threshold;
+            f.op = ferrix_core::CmpOp::Gt;
+            f.value = 100.0;
+            f.fill = ferrix_core::Rgb(0xC6, 0xEF, 0xCE);
+            f.text = ferrix_core::Rgb(0x00, 0x61, 0x00);
+        });
+        h.cond_click_ok();
+        assert_eq!(h.app().rule_count(), 1, "the rule must exist");
+
+        let out = std::env::temp_dir().join(format!(
+            "ferrix-cf-print-{}-{}.html",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+        h.print_to_path(&out, true, false);
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // render.rs writes a fill as `background:#rrggbb;`. The rule colour is
+        // C6EFCE; it must appear (a qty > 100 cell got filled) …
+        assert!(
+            html.to_lowercase().contains("background:#c6efce"),
+            "the conditional-format fill did not reach the printed HTML"
+        );
+        // … and the fill's text colour too.
+        assert!(
+            html.to_lowercase().contains("color:#006100"),
+            "the conditional-format text colour did not reach the printed HTML"
+        );
+
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&out);
+    }
+
     /// Pull the `(...)` string literals a PDF content stream draws with `Tj`,
     /// decoding the `\(`, `\)`, `\\` escapes. A self-contained extractor so the
     /// print test reads the serialized bytes, not any in-memory state.
