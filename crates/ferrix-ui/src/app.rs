@@ -148,6 +148,19 @@ enum BreakAxis {
     Col,
 }
 
+/// A print job refused because it would produce more than `LARGE_JOB_PAGES`
+/// pages (#37). Kept so the confirmation dialog can re-run the exact same export
+/// — same path, same format — with `confirm_large = true` when the user says
+/// "Continue". `pages` is the count the (cheap, O(sized spans)) paginator
+/// reported, shown verbatim in the dialog so the user knows the size before
+/// committing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PendingLargePrint {
+    path: std::path::PathBuf,
+    html: bool,
+    pages: u64,
+}
+
 /// How many DISJOINT selection ranges are kept (issue #17).
 ///
 /// Ctrl+clicking headers accumulates ranges, and without a cap a user leaning
@@ -345,6 +358,21 @@ pub struct FerrixApp {
     /// press grabbed, so the release can move it from its old row/col to the one
     /// under the pointer. `None` when no drag is in flight.
     break_drag: Option<BreakDrag>,
+    /// The Page Setup dialog (#37), when open. Edits a working copy of
+    /// `page_setup` and only commits it back on OK, so Cancel is truly a cancel.
+    /// `None` when the dialog is closed.
+    page_setup_dialog: Option<crate::page_setup_dialog::PageSetupState>,
+    /// A print job the user asked for that the paginator refused as too large
+    /// (over `LARGE_JOB_PAGES`) (#37). Holds the destination and page count so
+    /// the "This will produce N pages. Continue?" dialog can re-issue the export
+    /// with `confirm_large = true` when the user confirms. `None` when no such
+    /// confirmation is pending.
+    pending_large_print: Option<PendingLargePrint>,
+    /// Last painted rects of the large-print prompt's Continue / Cancel buttons,
+    /// so a test can click the REAL button rather than call the handler behind
+    /// it. `None` until the prompt has painted a frame.
+    large_print_continue_rect: Option<egui::Rect>,
+    large_print_cancel_rect: Option<egui::Rect>,
     /// How many page-break lines the last frame painted, for tests and the
     /// status note. Reset each frame.
     last_page_break_lines: usize,
@@ -797,6 +825,10 @@ impl FerrixApp {
             dragging_content: false,
             page_setup: ferrix_core::page::PageSetup::default(),
             break_drag: None,
+            page_setup_dialog: None,
+            pending_large_print: None,
+            large_print_continue_rect: None,
+            large_print_cancel_rect: None,
             last_page_break_lines: 0,
             col_resize: None,
             header_menu: None,
@@ -1646,6 +1678,10 @@ impl FerrixApp {
         // Page setup (including any manual page breaks) is per sheet.
         self.page_setup = ferrix_core::page::PageSetup::default();
         self.break_drag = None;
+        // A page-setup or large-print dialog left open from the previous file
+        // has no meaning against the new one.
+        self.page_setup_dialog = None;
+        self.pending_large_print = None;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -6263,18 +6299,33 @@ impl FerrixApp {
         };
 
         self.status = match result {
-            Ok(stats) => format!(
-                "Printed {} page(s), {} row(s) ({:.1} MB) → {}",
-                fmt_int(stats.pages as usize),
-                fmt_int(stats.rows as usize),
-                stats.bytes as f64 / 1e6,
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ),
-            Err(ferrix_io::render::RenderError::TooManyPages(n)) => format!(
-                "This would print {} pages — nothing was written. Choose a print area or \
-                 confirm to proceed.",
-                fmt_int(n as usize)
-            ),
+            Ok(stats) => {
+                // A job that went through clears any pending large-print
+                // confirmation — the export the dialog was guarding is done.
+                self.pending_large_print = None;
+                format!(
+                    "Printed {} page(s), {} row(s) ({:.1} MB) → {}",
+                    fmt_int(stats.pages as usize),
+                    fmt_int(stats.rows as usize),
+                    stats.bytes as f64 / 1e6,
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )
+            }
+            Err(ferrix_io::render::RenderError::TooManyPages(n)) => {
+                // Nothing was written. Instead of a dead-end status line the
+                // user cannot act on, stash the job so the confirmation dialog
+                // can re-issue it with confirm_large = true. Only reachable when
+                // confirm_large was false — a confirmed job never returns this.
+                self.pending_large_print = Some(PendingLargePrint {
+                    path: path.to_path_buf(),
+                    html,
+                    pages: n,
+                });
+                format!(
+                    "This would print {} pages — confirm to proceed.",
+                    fmt_int(n as usize)
+                )
+            }
             Err(e) => format!("Print failed: {e}"),
         };
     }
@@ -6302,6 +6353,172 @@ impl FerrixApp {
             return;
         };
         self.print_to_path(&path, true, false);
+    }
+
+    // ---- Page Setup dialog (#37) ----
+
+    /// Open the Page Setup dialog on a working copy of this sheet's setup.
+    ///
+    /// The dialog edits the copy; `commit_page_setup` writes it back on OK.
+    /// Opening while already open is a no-op so the menu cannot stack dialogs.
+    pub fn open_page_setup(&mut self) {
+        if self.page_setup_dialog.is_none() {
+            self.page_setup_dialog = Some(crate::page_setup_dialog::PageSetupState::from_setup(
+                &self.page_setup,
+            ));
+        }
+    }
+
+    /// Write the dialog's edited setup back onto the sheet, preserving the
+    /// MANUAL page breaks the dialog does not touch (those come from dragging in
+    /// Page Break Preview and must survive a paper/margins edit).
+    fn commit_page_setup(&mut self) {
+        if let Some(mut dlg) = self.page_setup_dialog.take() {
+            // Carry the live breaks across: the dialog started from a clone that
+            // held them, but a concurrent drag could have changed them since.
+            dlg.setup.row_breaks = self.page_setup.row_breaks.clone();
+            dlg.setup.col_breaks = self.page_setup.col_breaks.clone();
+            let paper = dlg.setup.paper.label();
+            let orient = match dlg.setup.orientation {
+                ferrix_core::page::Orientation::Portrait => "portrait",
+                ferrix_core::page::Orientation::Landscape => "landscape",
+            };
+            self.page_setup = dlg.setup;
+            self.status = format!("Page setup: {paper} {orient}");
+        }
+    }
+
+    /// Close the dialog without applying anything (Cancel / Escape).
+    fn cancel_page_setup(&mut self) {
+        self.page_setup_dialog = None;
+    }
+
+    /// The live page setup — for tests asserting an edit landed on the sheet.
+    #[cfg(test)]
+    pub fn page_setup(&self) -> &ferrix_core::page::PageSetup {
+        &self.page_setup
+    }
+
+    /// The Page Setup dialog's state, if open — for tests that click its real
+    /// OK/Cancel buttons at their painted rects.
+    #[cfg(test)]
+    pub fn page_setup_dialog(&self) -> Option<&crate::page_setup_dialog::PageSetupState> {
+        self.page_setup_dialog.as_ref()
+    }
+
+    /// Mutable access to the open dialog's form — lets a test set the fields the
+    /// widgets would, then click the real OK.
+    #[cfg(test)]
+    pub fn page_setup_dialog_mut(
+        &mut self,
+    ) -> Option<&mut crate::page_setup_dialog::PageSetupState> {
+        self.page_setup_dialog.as_mut()
+    }
+
+    /// Paint the Page Setup dialog if it is open, applying OK / Cancel.
+    fn show_page_setup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.page_setup_dialog.take() else {
+            return;
+        };
+        let th = self.theme;
+        let outcome = crate::page_setup_dialog::show(ctx, &th, &mut state);
+        // Put the (possibly edited) state back before acting, so a mid-edit
+        // frame with no outcome keeps the user's typing.
+        self.page_setup_dialog = Some(state);
+        match outcome {
+            Some(true) => self.commit_page_setup(),
+            Some(false) => self.cancel_page_setup(),
+            None => {}
+        }
+    }
+
+    // ---- Large-print confirmation (#37) ----
+
+    /// Whether a >`LARGE_JOB_PAGES` print is waiting on the "Continue?" dialog.
+    #[cfg(test)]
+    pub fn has_pending_large_print(&self) -> bool {
+        self.pending_large_print.is_some()
+    }
+
+    /// The large-print prompt's Continue / Cancel button rects, for a test that
+    /// clicks the REAL painted buttons.
+    #[cfg(test)]
+    pub fn large_print_continue_rect(&self) -> Option<egui::Rect> {
+        self.large_print_continue_rect
+    }
+
+    #[cfg(test)]
+    pub fn large_print_cancel_rect(&self) -> Option<egui::Rect> {
+        self.large_print_cancel_rect
+    }
+
+    /// Confirm the pending large print, re-issuing the exact export with
+    /// `confirm_large = true`. Public so a test can confirm without clicking,
+    /// though the harness also clicks the real button.
+    pub fn confirm_large_print(&mut self) {
+        if let Some(job) = self.pending_large_print.take() {
+            self.print_to_path(&job.path, job.html, true);
+        }
+    }
+
+    /// Dismiss the pending large print without writing anything.
+    pub fn cancel_large_print(&mut self) {
+        if self.pending_large_print.take().is_some() {
+            self.status = "Print cancelled — nothing was written".into();
+        }
+    }
+
+    /// Paint the "This will produce N pages. Continue?" dialog when a print was
+    /// refused as too large. The Continue button re-runs the export confirmed;
+    /// Cancel drops it.
+    fn show_large_print_prompt(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.pending_large_print.clone() else {
+            return;
+        };
+        let th = self.theme;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Large print job")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "This will produce {} pages. Continue?",
+                        fmt_int(job.pages as usize)
+                    ))
+                    .size(13.5),
+                );
+                ui.label(
+                    RichText::new(
+                        "Tip: set a Print Area or a Fit-to-page scaling to make a smaller file.",
+                    )
+                    .color(th.text_dim)
+                    .size(11.5),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let cont = ui.button("Continue");
+                    self.large_print_continue_rect = Some(cont.rect);
+                    if cont.clicked() {
+                        confirm = true;
+                    }
+                    let canc = ui.button("Cancel");
+                    self.large_print_cancel_rect = Some(canc.rect);
+                    if canc.clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        if confirm {
+            self.confirm_large_print();
+        } else if cancel {
+            self.cancel_large_print();
+        }
     }
     ///
     /// Public because the export dialog wants it BEFORE writing, not only in
@@ -9249,6 +9466,7 @@ impl FerrixApp {
             C::FileExportParquet => self.export_parquet_dialog(),
             C::FilePrintPdf => self.print_pdf_dialog(),
             C::FilePrintHtml => self.print_html_dialog(),
+            C::FilePageSetup => self.open_page_setup(),
             C::FileSetPrintArea => self.set_print_area(),
             C::FileClearPrintArea => self.clear_print_area(),
             C::DataValidationNew => self.validation_new_rule(),
@@ -9620,6 +9838,14 @@ impl FerrixApp {
         }
         if self.pivot_builder.is_some() {
             self.show_pivot_builder(ctx);
+        }
+        // Page Setup (#37) and the large-print confirmation. Painted here with
+        // the other modeless editors; each is a no-op when its state is None.
+        if self.page_setup_dialog.is_some() {
+            self.show_page_setup_dialog(ctx);
+        }
+        if self.pending_large_print.is_some() {
+            self.show_large_print_prompt(ctx);
         }
         {}
 

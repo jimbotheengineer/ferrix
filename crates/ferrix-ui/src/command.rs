@@ -165,6 +165,8 @@ registry! {
         "Write this sheet, including edits, as a Parquet file. Columns keep their type, and the write streams one column stripe at a time." }
     FilePrintPdf { "file.print_pdf", Some(Menu::File), "🖨 Print to PDF…", None, false, None,
         "Render this sheet to a paginated PDF. Streams one page at a time; a very large sheet is refused until confirmed." }
+    FilePageSetup { "file.page_setup", Some(Menu::File), "⚙ Page Setup…", None, false, None,
+        "Paper size, orientation, margins, scaling, repeat rows/columns, gridlines and headers/footers for the printed output." }
     FilePrintHtml { "file.print_html", Some(Menu::File), "🖨 Print to HTML…", None, false, None,
         "Render this sheet to a single self-contained HTML page, one table per printed page." }
     FileSetPrintArea { "file.set_print_area", Some(Menu::File), "⌗ Set Print Area", None, false, Some(Note::Selection),
@@ -384,7 +386,7 @@ impl Command {
         use CommandId::*;
         match self.id {
             FileOpen | FileOpenXlsx | FileExportCsv | FileExportXlsx | FileExportParquet
-            | FilePrintPdf | FilePrintHtml
+            | FilePrintPdf | FilePrintHtml | FilePageSetup
                 if st.busy =>
             {
                 say(&st.busy_hint, "Wait for the current operation to finish")
