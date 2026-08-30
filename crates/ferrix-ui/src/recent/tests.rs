@@ -440,7 +440,12 @@ fn a_missing_or_malformed_prefs_file_falls_back_to_defaults() {
         let p = Prefs::load();
         // Never panics, never invents a setting the file did not contain.
         assert_eq!(p.theme, None, "{bad:?} invented a theme");
-        assert!(!p.show_empty_rows, "{bad:?} invented show_empty_rows");
+        // show_empty_rows now defaults to on; a bad file must fall back to that
+        // default, not invent its own value.
+        assert!(
+            p.show_empty_rows,
+            "{bad:?} lost the show_empty_rows default"
+        );
         assert!(
             p.recent.len() <= MAX_RECENT,
             "{bad:?} produced {} recent entries",

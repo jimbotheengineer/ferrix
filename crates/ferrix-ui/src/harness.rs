@@ -2544,6 +2544,11 @@ mod tests {
         let p = write_csv("fill.csv", "n\n0\n1\n\n\n\n\n\n\n\n");
         let mut h = Harness::new(Some(&p));
         assert!(h.step_until(200, |a| a.row_count() > 0));
+        // Empty-row padding is on by default now, which would let the drag land
+        // the cursor on a padding row past row_count(); turn it off so this
+        // regression test exercises exactly the bounded sheet it was written
+        // for (the fill-handle gesture, not the padding).
+        h.run_command(crate::command::CommandId::ViewEmptyRows);
 
         // Select A1:A2 (the 0,1 series) by dragging down one row.
         h.click_at(120.0, 150.0).steps(2);
@@ -10188,6 +10193,42 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn right_clicking_outside_the_selection_reselects_but_inside_keeps_the_block() {
+        // The right-click menu operates on what you pointed at: a right-click on
+        // a cell outside the current selection moves the selection there; a
+        // right-click inside a multi-cell block leaves the block intact.
+        let (mut h, csv) = numeric_app("ctxmenu.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Select a block B2:C4, then right-click a cell well outside it.
+        h.select(CellRef::new(1, 1), CellRef::new(3, 2));
+        h.app
+            .open_cell_menu(CellRef::new(6, 0), egui::Pos2::new(10.0, 10.0));
+        assert!(
+            h.app.cell_menu_open(),
+            "right-click must open the cell menu"
+        );
+        let sel = h.app.selection();
+        assert!(
+            sel.is_single() && sel.cursor == CellRef::new(6, 0),
+            "a right-click outside the selection must reselect the clicked cell, got {sel:?}"
+        );
+
+        // Now select a block again and right-click INSIDE it — block preserved.
+        h.select(CellRef::new(1, 1), CellRef::new(3, 2));
+        h.app
+            .open_cell_menu(CellRef::new(2, 2), egui::Pos2::new(20.0, 20.0));
+        let sel = h.app.selection();
+        assert!(
+            !sel.is_single()
+                && sel.contains(CellRef::new(1, 1))
+                && sel.contains(CellRef::new(3, 2)),
+            "a right-click inside a block must keep the whole block selected, got {sel:?}"
+        );
+        let _ = std::fs::remove_file(&csv);
     }
 
     #[test]
