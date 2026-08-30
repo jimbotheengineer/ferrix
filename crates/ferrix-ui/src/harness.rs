@@ -59,6 +59,11 @@ pub struct Harness {
     last_shapes: usize,
     /// Text shapes emitted by the last frame.
     last_texts: usize,
+    /// Cursor icon egui emitted on the last frame, so a test can assert the
+    /// hover-cursor feedback (#81) without a real pointer device.
+    last_cursor: egui::CursorIcon,
+    /// Repaint delay the app requested on the last frame (window-move guard).
+    last_repaint_delay: std::time::Duration,
     /// Aggregate modifier state for the next frame.
     ///
     /// egui exposes `i.modifiers` from `RawInput.modifiers`, NOT from the
@@ -102,6 +107,8 @@ impl Harness {
             frame: 0,
             last_shapes: 0,
             last_texts: 0,
+            last_cursor: egui::CursorIcon::Default,
+            last_repaint_delay: std::time::Duration::MAX,
             pending_modifiers: Modifiers::default(),
         }
     }
@@ -133,6 +140,16 @@ impl Harness {
             .iter()
             .filter(|s| matches!(s.shape, egui::epaint::Shape::Text(_)))
             .count();
+        self.last_cursor = out.platform_output.cursor_icon;
+        // Repaint scheduling the app asked for this frame. ZERO means "repaint
+        // again immediately" (continuous mode); a longer delay means reactive.
+        // Lets a test assert the window-move-jitter guard: an in-content drag
+        // repaints continuously, a title-bar drag does not.
+        self.last_repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX);
         self.frame += 1;
         self
     }
@@ -405,6 +422,50 @@ impl Harness {
 
     pub fn page_breaks_shown(&self) -> bool {
         self.app.page_breaks_shown()
+    }
+
+    /// Move the pointer to a screen position, run a frame, and report the
+    /// cursor icon egui emitted there — the hover-feedback path (#81).
+    pub fn cursor_at(&mut self, x: f32, y: f32) -> egui::CursorIcon {
+        self.move_to(x, y);
+        self.step();
+        self.last_cursor
+    }
+
+    /// A cell's on-screen rectangle, read from the app's own painted geometry,
+    /// so a test can aim the pointer at a real edge or interior.
+    pub fn cell_rect(&mut self, cell: ferrix_core::CellRef) -> Option<egui::Rect> {
+        self.step();
+        self.app.cell_rect(cell)
+    }
+
+    /// Move the current selection's block by (d_row, d_col) — the model behind
+    /// drag-to-move (#82).
+    pub fn move_selection_block(&mut self, d_row: i64, d_col: i64) -> &mut Self {
+        self.app.move_selection_block(d_row, d_col);
+        self.steps(1);
+        self
+    }
+
+    /// The repaint delay the app requested on the last stepped frame. ZERO is
+    /// continuous-repaint mode; anything longer is reactive. Used to prove the
+    /// window-move-jitter guard (#84): an in-content drag is continuous, a
+    /// title-bar drag is not.
+    pub fn last_repaint_delay(&self) -> std::time::Duration {
+        self.last_repaint_delay
+    }
+
+    /// Emit a primary-button press at an explicit position WITHOUT first moving
+    /// the pointer through the content — the shape of a title-bar / non-client
+    /// drag, where egui's last pointer pos is outside the content rect.
+    pub fn press_at_raw(&mut self, x: f32, y: f32) -> &mut Self {
+        self.events.push(Event::PointerButton {
+            pos: Pos2::new(x, y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        });
+        self
     }
 
     // ---- clipboard interop and Paste Special (issue #30) ----
@@ -2544,6 +2605,11 @@ mod tests {
         let p = write_csv("fill.csv", "n\n0\n1\n\n\n\n\n\n\n\n");
         let mut h = Harness::new(Some(&p));
         assert!(h.step_until(200, |a| a.row_count() > 0));
+        // Empty-row padding is on by default now, which would let the drag land
+        // the cursor on a padding row past row_count(); turn it off so this
+        // regression test exercises exactly the bounded sheet it was written
+        // for (the fill-handle gesture, not the padding).
+        h.run_command(crate::command::CommandId::ViewEmptyRows);
 
         // Select A1:A2 (the 0,1 series) by dragging down one row.
         h.click_at(120.0, 150.0).steps(2);
@@ -10188,6 +10254,229 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dragging_the_selection_border_moves_the_block() {
+        // Drag-to-move gesture (#82): press on the selection's border and drag
+        // to a new cell moves the block there. This exercises the REAL pointer
+        // path through the grid (press → moving → release), not just the model.
+        let (mut h, csv) = numeric_app("drag_move.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Put a distinctive value in a visible cell and select it alone.
+        let src = CellRef::new(2, 1); // a data cell comfortably on screen
+        h.select(src, src);
+        h.type_text("SENTINEL").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(src, src);
+        h.step();
+        assert_eq!(h.app().display(src), "SENTINEL", "fixture in place");
+
+        // Screen geometry: grab the selection's border (its top edge) and drag
+        // down two rows. cell_rect gives the on-screen rectangle.
+        let from = h.cell_rect(src).expect("source cell on screen");
+        let dest = CellRef::new(4, 1);
+        let to = h.cell_rect(dest).expect("destination cell on screen");
+        // Press on the border (top edge), move to the destination centre,
+        // release — the exact press/move/release a mouse produces.
+        h.move_to(from.center().x, from.top());
+        h.press();
+        h.step();
+        h.move_to(to.center().x, to.center().y);
+        h.step();
+        h.release();
+        h.steps(2);
+
+        // The value moved to the destination and left the source empty.
+        assert_eq!(
+            h.app().display(dest),
+            "SENTINEL",
+            "the drag must move the block to the drop cell; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().display(src),
+            "",
+            "the drag must clear the source cell (a move, not a copy)"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn moving_a_block_relocates_it_verbatim_and_undoes_in_one_step() {
+        // Drag-to-move (#82). A move is NOT a copy: the formula travels VERBATIM
+        // (its reference does not shift the way a copy would), the source is left
+        // empty, and the whole thing is a single undo.
+        let (mut h, csv) = numeric_app("move_block.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Build a tiny known block in empty cells well past the fixture data
+        // (row 20+), so typing lands in blank cells rather than appending to
+        // existing values. E21 = 10, F21 = =E21*2 (shows 20).
+        let a = CellRef::new(20, 4); // E21
+        let b = CellRef::new(20, 5); // F21
+        h.select(a, a);
+        h.type_text("10").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(b, b);
+        h.type_text("=E21*2").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(a), "10", "fixture: E21");
+        assert_eq!(h.app().display(b), "20", "fixture: F21 = E21*2");
+
+        // Select E21:F21 and move the block down 5 rows (to E26:F26).
+        h.select(a, b);
+        h.move_selection_block(5, 0);
+        let a2 = CellRef::new(25, 4); // E26
+        let b2 = CellRef::new(25, 5); // F26
+
+        // The value landed at the destination.
+        assert_eq!(h.app().display(a2), "10", "moved value must land at E26");
+
+        // The source cells are now empty — no ghost left behind.
+        assert_eq!(h.app().display(a), "", "source E21 must be cleared");
+        assert_eq!(h.app().display(b), "", "source F21 must be cleared");
+
+        // Prove the reference did NOT relativise (move, not copy): the moved
+        // formula is still =E21*2, and E21 is now empty (→0), so F26 recomputes
+        // to 0. A COPY would have shifted the ref to =E26*2 = 20. This is THE
+        // assertion that separates a move from a copy.
+        assert_eq!(
+            h.app().display(b2),
+            "0",
+            "the moved formula must still point at E21 (now empty→0), not shift to E26"
+        );
+
+        // One undo restores the block exactly.
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(h.app().display(a), "10", "undo must restore E21");
+        assert_eq!(h.app().display(b), "20", "undo must restore F21");
+        assert_eq!(h.app().display(a2), "", "undo must clear the moved E26");
+        assert_eq!(h.app().display(b2), "", "undo must clear the moved F26");
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn a_window_move_does_not_trigger_continuous_content_repaints() {
+        // Window-move jitter (#84): dragging the title bar counts as a button
+        // being down, but the pointer is then in the OS non-client area, not
+        // over the content. Driving a repaint every frame during the OS's modal
+        // move loop makes the content judder behind the frame. The guard: the
+        // app drives continuous repaints only for an in-CONTENT drag, never for
+        // a press whose position is OUTSIDE the content rect (a window move).
+        let (mut h, csv) = numeric_app("jitter.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // In-content drag: press and hold over a cell → continuous repaint on.
+        h.click_at(200.0, 200.0);
+        h.press().move_to(200.0, 260.0);
+        h.step();
+        assert!(
+            h.app().is_driving_continuous_repaint(),
+            "an in-content drag must drive continuous repaints so it tracks live"
+        );
+        h.release();
+        h.step();
+
+        // Title-bar drag: a button held with its position above the content
+        // (negative y — the OS non-client strip). The app must NOT drive
+        // continuous repaints; the OS owns the window move.
+        h.press_at_raw(700.0, -20.0);
+        h.step();
+        assert!(
+            !h.app().is_driving_continuous_repaint(),
+            "a window (title-bar) drag must not drive continuous content \
+             repaints — that is the jitter"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn the_cursor_tells_you_what_a_drag_will_do() {
+        // Hover feedback (#81): the pointer shape distinguishes the three things
+        // a press on the selection can start — expand (fill handle → crosshair),
+        // move (selection border → grab), and ordinary cell selection (interior
+        // → cell). All three read back from the REAL emitted cursor icon.
+        let (mut h, csv) = numeric_app("cursor.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+        // Turn empty-row padding off so the block edges are real data edges.
+        h.select(CellRef::new(1, 1), CellRef::new(4, 3));
+        h.step();
+
+        let tl = h
+            .cell_rect(CellRef::new(1, 1))
+            .expect("top-left cell on screen");
+        let br = h
+            .cell_rect(CellRef::new(4, 3))
+            .expect("bottom-right cell on screen");
+
+        // Interior: well inside the block → the plain cell cursor.
+        let mid = (
+            (tl.left() + br.right()) / 2.0,
+            (tl.top() + br.bottom()) / 2.0,
+        );
+        assert_eq!(
+            h.cursor_at(mid.0, mid.1),
+            egui::CursorIcon::Cell,
+            "the interior of a selection must show the ordinary cell cursor"
+        );
+
+        // Top border of the block → the grab hand (move affordance).
+        let border = ((tl.left() + br.right()) / 2.0, tl.top());
+        assert_eq!(
+            h.cursor_at(border.0, border.1),
+            egui::CursorIcon::Grab,
+            "the selection border must show the grab cursor so a move is discoverable"
+        );
+
+        // The fill handle sits at the block's bottom-right corner → crosshair.
+        assert_eq!(
+            h.cursor_at(br.right(), br.bottom()),
+            egui::CursorIcon::Crosshair,
+            "the fill handle must show the crosshair (expand) cursor"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn right_clicking_outside_the_selection_reselects_but_inside_keeps_the_block() {
+        // The right-click menu operates on what you pointed at: a right-click on
+        // a cell outside the current selection moves the selection there; a
+        // right-click inside a multi-cell block leaves the block intact.
+        let (mut h, csv) = numeric_app("ctxmenu.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Select a block B2:C4, then right-click a cell well outside it.
+        h.select(CellRef::new(1, 1), CellRef::new(3, 2));
+        h.app
+            .open_cell_menu(CellRef::new(6, 0), egui::Pos2::new(10.0, 10.0));
+        assert!(
+            h.app.cell_menu_open(),
+            "right-click must open the cell menu"
+        );
+        let sel = h.app.selection();
+        assert!(
+            sel.is_single() && sel.cursor == CellRef::new(6, 0),
+            "a right-click outside the selection must reselect the clicked cell, got {sel:?}"
+        );
+
+        // Now select a block again and right-click INSIDE it — block preserved.
+        h.select(CellRef::new(1, 1), CellRef::new(3, 2));
+        h.app
+            .open_cell_menu(CellRef::new(2, 2), egui::Pos2::new(20.0, 20.0));
+        let sel = h.app.selection();
+        assert!(
+            !sel.is_single()
+                && sel.contains(CellRef::new(1, 1))
+                && sel.contains(CellRef::new(3, 2)),
+            "a right-click inside a block must keep the whole block selected, got {sel:?}"
+        );
+        let _ = std::fs::remove_file(&csv);
     }
 
     #[test]

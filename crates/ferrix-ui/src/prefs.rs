@@ -81,7 +81,11 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             theme: None,
-            show_empty_rows: false,
+            // Empty rows past the data show by default: a spreadsheet the user
+            // opens should look like a spreadsheet — a full page of grid they
+            // can click and type into — not stop dead at the last data row.
+            // The View → Empty rows toggle turns it off for a data-only view.
+            show_empty_rows: true,
             autosave_secs: None,
             zoom: Vec::new(),
             recent: Vec::new(),
@@ -683,7 +687,8 @@ mod tests {
         ] {
             let p = Prefs::parse(bad);
             assert_eq!(p.theme, None, "parsed {bad:?} into a theme");
-            assert!(!p.show_empty_rows);
+            // Bad input leaves show_empty_rows at its default, which is now on.
+            assert!(p.show_empty_rows);
         }
     }
 

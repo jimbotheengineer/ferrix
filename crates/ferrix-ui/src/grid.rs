@@ -568,6 +568,16 @@ pub struct GridResponse {
     pub fill_to: Option<CellRef>,
     /// Set on the frame the fill drag is released.
     pub fill_released: bool,
+    /// Set on the frame a move-drag is pressed on the selection's border (#82),
+    /// carrying the cell under the pointer at press so the caller can measure
+    /// the drag delta on release.
+    pub move_started: Option<CellRef>,
+    /// Cell under the pointer while a move-drag is in flight (for a live
+    /// preview) or on the release frame — see `move_released`.
+    pub move_to: Option<CellRef>,
+    /// Set on the frame the move-drag is released; pairs with `move_to` to give
+    /// the drop cell.
+    pub move_released: bool,
     /// Set while the primary button is held and the pointer has moved to a new
     /// cell — the caller extends the selection to it.
     pub drag_to: Option<CellRef>,
@@ -745,6 +755,10 @@ pub struct Grid<'a> {
     /// True while the user is dragging the fill handle, so the grid reports
     /// fill targets rather than ordinary selection drags.
     pub filling: bool,
+    /// True while the user is dragging the selection block by its border to
+    /// move it (#82), so the grid reports the drop target rather than extending
+    /// the selection. Set by the app between press and release.
+    pub moving: bool,
     /// Display column currently being dragged by its header, if any. Set by
     /// the app between press and release so the grid can paint a drop
     /// indicator and report the target.
@@ -1462,6 +1476,9 @@ impl<'a> Grid<'a> {
         let mut fill_started = false;
         let mut fill_to = None;
         let mut fill_released = false;
+        let mut move_started = None;
+        let mut move_to = None;
+        let mut move_released = false;
         let mut painted_cells = 0usize;
         let mut comment_markers = 0usize;
         let mut dropdown_button: Option<(CellRef, egui::Rect)> = None;
@@ -2558,10 +2575,65 @@ impl<'a> Grid<'a> {
                 });
         let on_handle = pointer_pos
             .is_some_and(|p| handle_rect.is_some_and(|h| h.contains(p) && grid_rect.contains(p)));
+
+        // The selection's on-screen rectangle and whether the pointer is on its
+        // border — shared by the hover cursor (#81) and the move-drag (#82).
+        let sel_rect = self
+            .selection
+            .filter(|_| self.editing.is_none())
+            .and_then(|sel| {
+                let (tl, br) = sel.bounds();
+                let a = Self::cell_screen_rect(
+                    tl,
+                    outer,
+                    self.scroll,
+                    self.col_widths,
+                    &resolver,
+                    m,
+                    panes,
+                )?;
+                let b = Self::cell_screen_rect(
+                    br,
+                    outer,
+                    self.scroll,
+                    self.col_widths,
+                    &resolver,
+                    m,
+                    panes,
+                )?;
+                Some(a.union(b))
+            });
+        const BORDER_PX: f32 = 4.0;
+        let on_border = pointer_pos.is_some_and(|p| {
+            grid_rect.contains(p)
+                && !in_gutter
+                && !on_handle
+                && sel_rect.is_some_and(|r| {
+                    r.expand(BORDER_PX).contains(p) && !r.shrink(BORDER_PX).contains(p)
+                })
+        });
+
+        // A press on the border starts a move-drag rather than collapsing the
+        // selection; the caller flips `self.moving` on for subsequent frames.
+        if primary_pressed && on_border && !on_handle && !self.filling {
+            move_started = pointer_pos.and_then(hit);
+            clicked = None; // Do not also move the cursor/selection.
+        }
+        // While a move-drag is in flight the pointer's cell is the drop target,
+        // reported live and again on release.
+        if self.moving {
+            move_to = pointer_pos.and_then(hit);
+            if !dragging {
+                move_released = true;
+            }
+        }
+
         if dragging
             && !primary_clicked
             && !on_handle
             && !self.filling
+            && !self.moving
+            && move_started.is_none()
             && pointer_in_body
             && !in_gutter
         {
@@ -2584,6 +2656,31 @@ impl<'a> Grid<'a> {
             fill_started = true;
             clicked = None; // Do not also move the selection.
         }
+
+        // --- hover cursor feedback (#81) ---
+        //
+        // The pointer shape tells the user what a press will do BEFORE they
+        // commit: a crosshair over the fill handle (drag to fill/expand), a
+        // grab hand over the selection's border (drag to move the block, #82),
+        // and the ordinary cell cursor everywhere else inside the grid. Only
+        // set it when not already dragging, so an in-flight gesture keeps its
+        // own cursor, and skip it in the gutters and over the handle-vs-border
+        // overlap (handle wins).
+        if !dragging && !self.filling && !self.moving {
+            if pointer_pos.is_some_and(|p| grid_rect.contains(p) && !in_gutter) {
+                if on_handle {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                } else if on_border {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Cell);
+                }
+            }
+        } else if self.moving {
+            // A move-drag in flight shows the closed grabbing hand.
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+
         if self.filling {
             if dragging {
                 fill_to = pointer_pos.and_then(hit);
@@ -3029,6 +3126,9 @@ impl<'a> Grid<'a> {
             fill_started,
             fill_to,
             fill_released,
+            move_started,
+            move_to,
+            move_released,
             double_clicked,
             header_press,
             header_drag_to,

@@ -302,6 +302,10 @@ pub struct FerrixApp {
     /// How many page-break lines the last frame painted, for tests and the
     /// status note. Reset each frame.
     last_page_break_lines: usize,
+    /// Set each frame: true when the app is driving continuous repaints for an
+    /// in-content drag, false otherwise (incl. an OS window move). Testable
+    /// witness for the window-move-jitter guard (#84).
+    dragging_content: bool,
     /// Column being resized by its border: (column, pointer x at press, width
     /// at press). OWNED HERE rather than read from egui's `is_dragging`, which
     /// is cleared on the release frame — the width would be lost exactly when
@@ -369,6 +373,10 @@ pub struct FerrixApp {
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
     fill_target: Option<Selection>,
+    /// Cell grabbed at the start of a block move-drag (#82), so the drop cell's
+    /// offset from it gives the move delta. `Some` only while a move is in
+    /// flight.
+    move_origin: Option<CellRef>,
 
     /// Structured tables defined over the current sheet.
     ///
@@ -731,6 +739,7 @@ impl FerrixApp {
             sizing: ferrix_core::sizing::SheetSizing::new(),
             print_area: None,
             show_page_breaks: false,
+            dragging_content: false,
             last_page_break_lines: 0,
             col_resize: None,
             header_menu: None,
@@ -751,6 +760,7 @@ impl FerrixApp {
             last_grid_rect: None,
             fill_source: None,
             fill_target: None,
+            move_origin: None,
             tables: Vec::new(),
             table_mask: None,
             table_uniques: Vec::new(),
@@ -1952,6 +1962,39 @@ impl FerrixApp {
         }
     }
 
+    /// Move the current selection's block by (d_row, d_col) as one undo step,
+    /// and carry the selection to the block's new home (#82). The drag gesture
+    /// and any menu/keyboard mover both call this; it owns the meaning.
+    pub fn move_selection_block(&mut self, d_row: i64, d_col: i64) {
+        if d_row == 0 && d_col == 0 {
+            return;
+        }
+        let sel = self.selection;
+        let limit = self.max_overlay_cells();
+        match self.wb.move_block(sel, d_row, d_col, limit) {
+            Ok(0) => {}
+            Ok(n) => {
+                // The selection follows the block to its new position, so the
+                // user can immediately move it again or undo in one gesture.
+                let (tl, br) = sel.bounds();
+                let moved = Selection::new(
+                    CellRef::new(
+                        (tl.row as i64 + d_row) as u32,
+                        (tl.col as i64 + d_col) as u32,
+                    ),
+                    CellRef::new(
+                        (br.row as i64 + d_row) as u32,
+                        (br.col as i64 + d_col) as u32,
+                    ),
+                );
+                self.selection = moved;
+                self.status = format!("Moved {} cells", fmt_int(n));
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     /// Paste whatever arrived from the clipboard at the selection's top-left.
     ///
     /// Prefers the HTML flavour: if the incoming text is an HTML table (what
@@ -2881,13 +2924,44 @@ impl FerrixApp {
     /// because the grid paints onto a raw `Painter` and allocates no per-cell
     /// widget to hang a menu off — the whole reason a 200M-row sheet paints in
     /// constant time.
+    /// Open the right-click cell menu anchored at `pos`. Right-clicking a cell
+    /// OUTSIDE the current selection moves the selection to it first, so the
+    /// menu's actions operate on what the user pointed at (matching Excel);
+    /// right-clicking inside a multi-cell selection leaves it intact so block
+    /// operations still work. Public so the harness can exercise the reselect
+    /// rule without hit-testing a floating popup.
+    pub fn open_cell_menu(&mut self, cell: CellRef, pos: egui::Pos2) {
+        if !self.selection.contains(cell) {
+            self.selection = ferrix_core::Selection::new(cell, cell);
+        }
+        self.context_cell = Some(cell);
+        self.context_pos = pos;
+    }
+
+    /// True while the right-click cell menu is open, for tests.
+    pub fn cell_menu_open(&self) -> bool {
+        self.context_cell.is_some()
+    }
+
     fn show_cell_menu(&mut self, ctx: &egui::Context) {
         let Some(cell) = self.context_cell else {
             return;
         };
         let has_comment = self.wb.comments.contains(cell);
-        let mut insert = false;
-        let mut delete = false;
+        let multi = !self.selection.is_single();
+
+        // Actions collected from the menu, applied after the closure so the
+        // borrow of `self` inside the Area is released first.
+        let mut do_copy = false;
+        let mut do_cut = false;
+        let mut do_clear = false;
+        let mut do_insert_row = false;
+        let mut do_delete_row = false;
+        let mut do_insert_col = false;
+        let mut do_delete_col = false;
+        let mut do_set_print_area = false;
+        let mut insert_comment = false;
+        let mut delete_comment = false;
         let mut close = false;
 
         let resp = egui::Area::new(egui::Id::new("ferrix_cell_menu"))
@@ -2895,22 +2969,64 @@ impl FerrixApp {
             .fixed_pos(self.context_pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(170.0);
-                    ui.label(RichText::new(cell_label(cell)).weak().size(11.0));
+                    ui.set_min_width(190.0);
+                    let heading = if multi {
+                        format!("{} selected", cell_label(cell))
+                    } else {
+                        cell_label(cell)
+                    };
+                    ui.label(RichText::new(heading).weak().size(11.0));
                     ui.separator();
-                    let label = if has_comment {
+
+                    // Clipboard. Paste is intentionally absent: egui exposes no
+                    // clipboard-read API (it only delivers a Paste event on
+                    // Ctrl+V), so a menu item could not read the clipboard. The
+                    // item would have to lie or do nothing; Ctrl+V stays the way
+                    // to paste and the menu says so.
+                    if ui.button("Copy").clicked() {
+                        do_copy = true;
+                    }
+                    if ui.button("Cut").clicked() {
+                        do_cut = true;
+                    }
+                    if ui.button("Clear Contents").clicked() {
+                        do_clear = true;
+                    }
+                    ui.add_enabled(false, egui::Button::new("Paste  (Ctrl+V)"));
+                    ui.separator();
+
+                    // Structure.
+                    if ui.button("Insert row(s)").clicked() {
+                        do_insert_row = true;
+                    }
+                    if ui.button("Delete row(s)").clicked() {
+                        do_delete_row = true;
+                    }
+                    if ui.button("Insert column(s)").clicked() {
+                        do_insert_col = true;
+                    }
+                    if ui.button("Delete column(s)").clicked() {
+                        do_delete_col = true;
+                    }
+                    ui.separator();
+
+                    // Print / comment.
+                    if ui.button("Set Print Area").clicked() {
+                        do_set_print_area = true;
+                    }
+                    let comment_label = if has_comment {
                         "Edit Comment…"
                     } else {
                         "Insert Comment…"
                     };
-                    if ui.button(label).clicked() {
-                        insert = true;
+                    if ui.button(comment_label).clicked() {
+                        insert_comment = true;
                     }
                     if ui
                         .add_enabled(has_comment, egui::Button::new("Delete Comment"))
                         .clicked()
                     {
-                        delete = true;
+                        delete_comment = true;
                     }
                 });
             });
@@ -2926,11 +3042,44 @@ impl FerrixApp {
             close = true;
         }
 
-        if insert {
+        // Apply. Any chosen action closes the menu.
+        if do_copy {
+            self.copy_selection(ctx, false);
+            close = true;
+        }
+        if do_cut {
+            self.copy_selection(ctx, true);
+            close = true;
+        }
+        if do_clear {
+            self.clear_selection();
+            close = true;
+        }
+        if do_insert_row {
+            self.run_command(crate::command::CommandId::DataInsertRow);
+            close = true;
+        }
+        if do_delete_row {
+            self.run_command(crate::command::CommandId::DataDeleteRow);
+            close = true;
+        }
+        if do_insert_col {
+            self.run_command(crate::command::CommandId::DataInsertColumn);
+            close = true;
+        }
+        if do_delete_col {
+            self.run_command(crate::command::CommandId::DataDeleteColumn);
+            close = true;
+        }
+        if do_set_print_area {
+            self.run_command(crate::command::CommandId::FileSetPrintArea);
+            close = true;
+        }
+        if insert_comment {
             self.begin_comment(cell);
             close = true;
         }
-        if delete {
+        if delete_comment {
             self.delete_comment(cell);
             close = true;
         }
@@ -5483,6 +5632,13 @@ impl FerrixApp {
 
     pub fn page_breaks_shown(&self) -> bool {
         self.show_page_breaks
+    }
+
+    /// Whether the app drove a continuous repaint on the last frame. True only
+    /// for an in-content drag; false when idle or during an OS window move —
+    /// the witness for the window-move-jitter guard (#84).
+    pub fn is_driving_continuous_repaint(&self) -> bool {
+        self.dragging_content
     }
 
     /// How many page-break lines the last frame drew, for tests.
@@ -8785,6 +8941,49 @@ impl FerrixApp {
         if self.loading || self.exporting || self.compacting {
             ctx.request_repaint();
         }
+        // Interaction-aware repainting. The app is otherwise reactive (it
+        // redraws only when an event arrives), which leaves two visible
+        // artefacts: a drag lags a frame behind the pointer, and a transient
+        // overlay (the selection rectangle, a hover highlight) lingers until
+        // the next unrelated event repaints it away. While the pointer is held
+        // OVER THE APP'S CONTENT we repaint every frame so drags track live;
+        // for a short settle window after any pointer or key input we keep
+        // repainting so transient state clears promptly. When nothing is
+        // happening we fall back to reactive mode and cost no CPU.
+        //
+        // The "over the content" guard matters for window-move jitter: dragging
+        // the title bar counts as a button being down, but the pointer is then
+        // in the OS non-client area, NOT over the content. Repainting the grid
+        // every frame during the OS's modal window-move loop paints each frame
+        // at a position one frame stale relative to where the window has
+        // already moved, which reads as the content juddering behind the frame.
+        // So an in-app drag repaints live; a window move is left entirely to
+        // the OS.
+        let screen = ctx.screen_rect();
+        let (dragging_content, had_input) = ctx.input(|i| {
+            let any_down = i.pointer.any_down();
+            // The pointer position egui last saw, in content coordinates. During
+            // a title-bar drag this is outside `screen` (or absent), so the
+            // continuous-repaint arm below does not fire.
+            let over_content = i.pointer.latest_pos().is_some_and(|p| screen.contains(p));
+            let dragging_content = any_down && over_content;
+            let had_input = any_down
+                || i.pointer.velocity() != egui::Vec2::ZERO
+                || !i.events.is_empty()
+                || i.pointer.is_moving();
+            (dragging_content, had_input)
+        });
+        // Recorded so a test can assert the window-move-jitter guard directly:
+        // this is THE app's own decision to drive continuous repaints, which is
+        // true only for an in-content drag and false during an OS window move.
+        self.dragging_content = dragging_content;
+        if dragging_content {
+            ctx.request_repaint();
+        } else if had_input {
+            // Settle window: long enough to flush a selection/hover change and
+            // any short animation, short enough to idle out quickly afterwards.
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
         let frame_start = std::time::Instant::now();
 
         // Follow the OS preference until the user picks a theme themselves.
@@ -9749,6 +9948,7 @@ impl FerrixApp {
                         editing: self.editing,
                         matches: &self.search_results.matches,
                         filling: self.fill_source.is_some(),
+                        moving: self.move_origin.is_some(),
                         header_dragging: self.header_drag,
                         filter: self.row_filter.as_ref(),
                         sort: self.sort_order.as_ref(),
@@ -10093,8 +10293,7 @@ impl FerrixApp {
                 // point and remembered across frames, because the click event
                 // is gone by the frame the menu is first drawn.
                 if let Some((cell, pos)) = resp.context_click {
-                    self.context_cell = Some(cell);
-                    self.context_pos = pos;
+                    self.open_cell_menu(cell, pos);
                 }
 
                 // The hover tooltip. The grid paints onto a raw Painter and
@@ -10273,6 +10472,23 @@ impl FerrixApp {
                     }
                     self.header_drag = None;
                 }
+                // --- block move-drag (#82) ---
+                //
+                // Press on the selection border grabs the block; release drops
+                // it, and the delta from the grabbed cell to the drop cell is
+                // the move. One `move_selection_block` call → one undo step.
+                if let Some(origin) = resp.move_started {
+                    self.move_origin = Some(origin);
+                }
+                if resp.move_released {
+                    if let (Some(origin), Some(drop)) = (self.move_origin, resp.move_to) {
+                        let d_row = drop.row as i64 - origin.row as i64;
+                        let d_col = drop.col as i64 - origin.col as i64;
+                        self.move_selection_block(d_row, d_col);
+                    }
+                    self.move_origin = None;
+                }
+
                 // --- fill handle ---
                 if resp.fill_started {
                     self.fill_source = Some(self.selection);

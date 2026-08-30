@@ -1,0 +1,37 @@
+---
+name: Bug report
+description: File a bug report
+title: '[BUG] {{ title }}'
+body:
+  - type: checkboxes
+    id: search_issues
+    attributes:
+      label: 'Have you searched for existing issues?'
+      description: 'Please search to see if an issue already exists for the bug you encountered.'
+      options:
+        - label: I have searched existing issues
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 'Detailed description'
+      description: 'Explain the problem and how to reproduce it'
+      validations:
+        required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: 'Expected behavior'
+      validations:
+        required: true
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: 'Actual behavior'
+      validations:
+        required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: 'Additional context'
+---
