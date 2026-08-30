@@ -191,6 +191,21 @@ pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
         }
         Expr::Binary(op, lhs, rhs) => eval_binary(*op, lhs, rhs, src),
         Expr::Call(name, args) => eval_call(name, args, src),
+        // A lexical variable: resolve from scope. A value binding collapses to
+        // a scalar here (implicit intersection); a lambda binding has no scalar
+        // form — you cannot put a function in a cell — so it is `#VALUE!`, and
+        // an unbound name is `#NAME?` (no scope, or not found).
+        Expr::Var(name) => match crate::lambda::lookup_var(name) {
+            Some(crate::lambda::Binding::Value(r)) => r.into_scalar(),
+            Some(crate::lambda::Binding::Lambda(_)) => Value::Error(ErrorKind::Value),
+            None => Value::Error(ErrorKind::Name),
+        },
+        // LET/LAMBDA/Apply share their array-aware evaluation with the array
+        // fork and collapse the result to a scalar for the scalar caller, so
+        // there is exactly one implementation of each.
+        Expr::Let(..) | Expr::Lambda(..) | Expr::Apply(..) => {
+            eval_view_array(expr, src).into_scalar()
+        }
     }
 }
 
@@ -239,6 +254,30 @@ pub fn eval_view_array<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> crate::a
         Expr::Intersect(inner) => {
             crate::array::EvalResult::Scalar(eval_view_array(inner, src).into_scalar())
         }
+        // A lexical variable in array context yields its bound VALUE as-is: an
+        // array binding stays an array (so a LET name over `SEQUENCE(3)` can
+        // spill), a scalar binding stays scalar. A lambda binding is not a data
+        // shape — `#VALUE!`; an unbound name is `#NAME?`.
+        Expr::Var(name) => match crate::lambda::lookup_var(name) {
+            Some(crate::lambda::Binding::Value(r)) => r,
+            Some(crate::lambda::Binding::Lambda(_)) => {
+                crate::array::EvalResult::Scalar(Value::Error(ErrorKind::Value))
+            }
+            None => crate::array::EvalResult::Scalar(Value::Error(ErrorKind::Name)),
+        },
+        // LET binds names then evaluates its body in the extended scope; the
+        // body's array result flows straight through, so `=LET(s, SEQUENCE(3),
+        // s)` spills exactly as `=SEQUENCE(3)` does.
+        Expr::Let(bindings, body) => crate::lambda::eval_let(bindings, body, src),
+        // A bare LAMBDA is a function value, not a data shape: it has no array
+        // or scalar form a cell could hold, so evaluating one directly is
+        // `#VALUE!`. It becomes useful only when APPLIED.
+        Expr::Lambda(..) => crate::array::EvalResult::Scalar(Value::Error(ErrorKind::Value)),
+        // Applying a lambda: evaluate the callee to a closure, bind the
+        // arguments, and evaluate the body in the extended scope. The body's
+        // shape (scalar or array) is carried across intact, so a LAMBDA whose
+        // body produces an array spills.
+        Expr::Apply(callee, args) => crate::lambda::eval_apply(callee, args, src),
         // Everything else is scalar. Route through the single scalar evaluator
         // so the array and scalar paths can never disagree.
         _ => crate::array::EvalResult::Scalar(eval_view(expr, src)),

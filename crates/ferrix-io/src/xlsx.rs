@@ -148,6 +148,18 @@ fn calls_are_supported(e: &Expr) -> bool {
         // wrapper adds no function call of its own.
         Expr::Intersect(a) => calls_are_supported(a),
         Expr::Binary(_, a, b) => calls_are_supported(a) && calls_are_supported(b),
+        // LET/LAMBDA are supported (Excel has them natively; the writer emits
+        // them with the `_xlfn.` future-function prefix) exactly when every
+        // sub-expression they carry is supported. Their binding/parameter NAMES
+        // are not function calls, so a lexical `Var` is always supported.
+        Expr::Var(_) => true,
+        Expr::Let(bindings, body) => {
+            bindings.iter().all(|(_, v)| calls_are_supported(v)) && calls_are_supported(body)
+        }
+        Expr::Lambda(_, body) => calls_are_supported(body),
+        Expr::Apply(callee, args) => {
+            calls_are_supported(callee) && args.iter().all(calls_are_supported)
+        }
         Expr::Number(_)
         | Expr::Text(_)
         | Expr::Bool(_)
@@ -2018,6 +2030,24 @@ mod tests {
         assert!(!formula_is_supported(
             "=VLOOKUP(XMATCH(A1,B1:B2,0),B1:B2,1,FALSE)"
         ));
+    }
+
+    #[test]
+    fn let_and_lambda_formulas_stay_live() {
+        // LET/LAMBDA are Excel-native (the writer emits them with the `_xlfn.`
+        // future-function prefix), so a workbook using them must keep them as
+        // live formulas rather than downgrading to a cached value that never
+        // recalculates. Supported exactly when every sub-expression they carry
+        // is supported.
+        assert!(formula_is_supported("=LET(x, SUM(A1:A5), x / 5)"));
+        assert!(formula_is_supported("=LAMBDA(a, b, a + b)(1, 2)"));
+        assert!(formula_is_supported("=LET(f, LAMBDA(x, x * x), f(6))"));
+        // Case-insensitive, like every other function name.
+        assert!(formula_is_supported("=let(x, 1, x + 1)"));
+        // An unsupported call buried inside a LET value still degrades the whole
+        // formula — the recursion must reach into bindings and bodies.
+        assert!(!formula_is_supported("=LET(x, XMATCH(A1, B1:B2, 0), x)"));
+        assert!(!formula_is_supported("=LAMBDA(x, CONCATENATE(x, x))(A1)"));
     }
 
     #[test]
