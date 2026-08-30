@@ -138,6 +138,11 @@ fn every_array_arm_passes_arrays_through_the_shared_dispatch() {
 /// shadow a scalar family (if the array arm sits above it) or be dead (if
 /// below) — both are silent at runtime. Mirrors the mutual-exclusion pins in
 /// `compose_tests.rs`, now including the array family.
+///
+/// P3 (#27) grew `ARRAY_FN_NAMES` from 1 to 17 names; adding 16 names in one
+/// commit is exactly where a duplicate or a scalar-family collision would
+/// silently swallow another call, so this loop covers ALL of them — it iterates
+/// the single source of truth, so a future 17th name is covered automatically.
 #[test]
 fn array_family_owns_only_names_no_scalar_family_claims() {
     // Every name the array family answers for must be owned by exactly one
@@ -158,6 +163,34 @@ fn array_family_owns_only_names_no_scalar_family_claims() {
         );
     }
 
+    // The 16 P3 functions must all be present in the single source of truth —
+    // a missing name would leave the function unreachable through the seam and
+    // no other test would notice (it would silently fall to #NAME?).
+    for expected in [
+        "UNIQUE",
+        "SORT",
+        "SORTBY",
+        "FILTER",
+        "SEQUENCE",
+        "RANDARRAY",
+        "TOROW",
+        "TOCOL",
+        "WRAPROWS",
+        "WRAPCOLS",
+        "TAKE",
+        "DROP",
+        "CHOOSEROWS",
+        "CHOOSECOLS",
+        "HSTACK",
+        "VSTACK",
+    ] {
+        assert!(
+            is_array_fn(expected),
+            "{expected} (a P3 dynamic-array function) is not owned by the array \
+             family — it would be unreachable through the shared dispatch"
+        );
+    }
+
     // And the array family must not claim any name the evaluator handles by a
     // direct scalar arm (SUM, IF, ...), which sit above every guard.
     for name in [
@@ -167,6 +200,59 @@ fn array_family_owns_only_names_no_scalar_family_claims() {
         assert!(
             !is_array_fn(name),
             "array family claims {name}, a direct evaluator builtin"
+        );
+    }
+}
+
+/// Every one of the 16 P3 functions must be reachable through the SHARED
+/// `eval_view_array` dispatch and return an `Array` (or, for a genuinely
+/// scalar-result path, a `Scalar`) — never `#NAME?`, which is what a dropped
+/// dispatch arm produces. This is the P3 analogue of
+/// `every_array_arm_passes_arrays_through_the_shared_dispatch`: it proves each
+/// added name is not just listed in `ARRAY_FN_NAMES` but actually wired to a
+/// `call` arm. A missing arm returns `#VALUE!` from `call`'s fallthrough, which
+/// this catches.
+#[test]
+fn every_p3_function_is_reachable_and_array_producing() {
+    let s = fixture();
+    // (formula, expected result shape) — each exercises the real dispatch.
+    let array_producing = [
+        "=UNIQUE(A1:A5)",
+        "=SORT(A1:A5)",
+        "=SORTBY(A1:A5,A1:A5)",
+        "=FILTER(A1:A5,A1:A5>15)",
+        "=SEQUENCE(3)",
+        "=RANDARRAY(2,2,0,1,FALSE,1)",
+        "=TOROW(A1:A5)",
+        "=TOCOL(B1:C1)",
+        "=WRAPROWS(A1:A5,2)",
+        "=WRAPCOLS(A1:A5,2)",
+        "=TAKE(A1:A5,2)",
+        "=DROP(A1:A5,2)",
+        "=CHOOSEROWS(A1:A5,1,3)",
+        "=CHOOSECOLS(B1:C1,2)",
+        "=HSTACK(A1:A5,A1:A5)",
+        "=VSTACK(A1:A5,A1:A5)",
+    ];
+    assert_eq!(
+        array_producing.len(),
+        16,
+        "all 16 P3 functions must be exercised"
+    );
+    for f in array_producing {
+        match eval_view_array(&parse(f).unwrap(), &s) {
+            EvalResult::Array(_) => {}
+            EvalResult::Scalar(v) => {
+                panic!("{f} returned Scalar({v:?}) — the dispatch arm is missing or collapsed")
+            }
+        }
+        // And through the SCALAR seam it must collapse to a value, never
+        // #NAME? (which a missing dispatch arm would produce).
+        let scalar = eval_view(&parse(f).unwrap(), &s);
+        assert_ne!(
+            scalar,
+            Value::Error(ErrorKind::Name),
+            "{f} collapsed to #NAME? — it is not wired into the shared dispatch"
         );
     }
 }
