@@ -578,6 +578,11 @@ pub struct GridResponse {
     /// Set on the frame the move-drag is released; pairs with `move_to` to give
     /// the drop cell.
     pub move_released: bool,
+    /// True on the release frame when Ctrl/Cmd was held at drop — a Ctrl-drag
+    /// COPY rather than a move (#82, Excel semantics). Read from the aggregate
+    /// modifier state at drop time so holding Ctrl only before releasing still
+    /// copies, exactly as Excel decides at the moment of the drop.
+    pub move_copy: bool,
     /// Set while the primary button is held and the pointer has moved to a new
     /// cell — the caller extends the selection to it.
     pub drag_to: Option<CellRef>,
@@ -1479,6 +1484,7 @@ impl<'a> Grid<'a> {
         let mut move_started = None;
         let mut move_to = None;
         let mut move_released = false;
+        let mut move_copy = false;
         let mut painted_cells = 0usize;
         let mut comment_markers = 0usize;
         let mut dropdown_button: Option<(CellRef, egui::Rect)> = None;
@@ -2625,6 +2631,11 @@ impl<'a> Grid<'a> {
             move_to = pointer_pos.and_then(hit);
             if !dragging {
                 move_released = true;
+                // Ctrl/Cmd at the moment of the drop makes it a COPY, not a
+                // move (#82). Read the aggregate modifier state, which is the
+                // one that survives the release frame — a per-event modifier
+                // would already have lifted.
+                move_copy = ui.input(|i| i.modifiers.command);
             }
         }
 
@@ -3129,6 +3140,7 @@ impl<'a> Grid<'a> {
             move_started,
             move_to,
             move_released,
+            move_copy,
             double_clicked,
             header_press,
             header_drag_to,

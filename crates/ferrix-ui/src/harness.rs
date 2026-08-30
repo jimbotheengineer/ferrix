@@ -447,6 +447,33 @@ impl Harness {
         self
     }
 
+    /// Ctrl-drag COPY the current selection's block by (d_row, d_col) — the
+    /// model behind Ctrl-drag-to-copy (#82).
+    pub fn copy_selection_block(&mut self, d_row: i64, d_col: i64) -> &mut Self {
+        self.app.copy_selection_block(d_row, d_col);
+        self.steps(1);
+        self
+    }
+
+    /// True while the drag-drop overwrite confirmation modal is up (#82).
+    pub fn block_move_prompt_open(&self) -> bool {
+        self.app.block_move_prompt_open()
+    }
+
+    /// Answer "Replace" to the overwrite prompt (#82).
+    pub fn confirm_block_move(&mut self) -> &mut Self {
+        self.app.confirm_block_move();
+        self.steps(1);
+        self
+    }
+
+    /// Answer "Cancel" to the overwrite prompt (#82).
+    pub fn cancel_block_move(&mut self) -> &mut Self {
+        self.app.cancel_block_move();
+        self.steps(1);
+        self
+    }
+
     /// The sheet's manual page breaks (rows, cols), for asserting insert / move
     /// / remove / reset (#37, #76).
     pub fn manual_page_breaks(&self) -> (Vec<u32>, Vec<u32>) {
@@ -10335,6 +10362,14 @@ xxx,yyy,zzz
         h.type_text("SENTINEL").step();
         h.press_key(Key::Enter);
         h.steps(2);
+        // Clear the destination so this test stays about the drag GESTURE, not
+        // the overwrite prompt (which has its own test): the drop lands on empty
+        // space and needs no confirmation.
+        let dest = CellRef::new(4, 1);
+        h.select(dest, dest);
+        h.type_text("").step();
+        h.press_key(Key::Delete);
+        h.steps(2);
         h.select(src, src);
         h.step();
         assert_eq!(h.app().display(src), "SENTINEL", "fixture in place");
@@ -10342,7 +10377,6 @@ xxx,yyy,zzz
         // Screen geometry: grab the selection's border (its top edge) and drag
         // down two rows. cell_rect gives the on-screen rectangle.
         let from = h.cell_rect(src).expect("source cell on screen");
-        let dest = CellRef::new(4, 1);
         let to = h.cell_rect(dest).expect("destination cell on screen");
         // Press on the border (top edge), move to the destination centre,
         // release — the exact press/move/release a mouse produces.
@@ -10454,6 +10488,208 @@ xxx,yyy,zzz
         assert_eq!(h.app().display(b), "20", "undo must restore F21");
         assert_eq!(h.app().display(a2), "", "undo must clear the moved E26");
         assert_eq!(h.app().display(b2), "", "undo must clear the moved F26");
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn a_reference_pointing_at_a_moved_cell_follows_it() {
+        // Move-with-refs (#82). This is the OTHER half of the move semantics,
+        // and the opposite of `moving_a_block_relocates_it_verbatim`: a formula
+        // ELSEWHERE that reads a cell being moved must keep reading it at its
+        // new address. E21 holds 10; H21 = =E21 reads it. Move E21 down 5 rows
+        // to E26 — H21 must now read =E26, still showing 10.
+        let (mut h, csv) = numeric_app("move_refs.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        let e21 = CellRef::new(20, 4); // E21
+        let h21 = CellRef::new(20, 7); // H21, an observer outside the block
+        h.select(e21, e21);
+        h.type_text("10").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(h21, h21);
+        h.type_text("=E21").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(h21), "10", "fixture: H21 reads E21");
+
+        // Move E21 down five rows.
+        h.select(e21, e21);
+        h.move_selection_block(5, 0);
+        let e26 = CellRef::new(25, 4); // E26
+
+        assert_eq!(h.app().display(e26), "10", "value moved to E26");
+        assert_eq!(h.app().display(e21), "", "source E21 cleared");
+        // THE assertion: the observer followed the moved cell. Its source text
+        // is now =E26, and it still reads 10.
+        assert_eq!(
+            h.app().formula_src_at_for_test(h21).as_deref(),
+            Some("=E26"),
+            "the reference must follow the moved cell to E26; move-with-refs"
+        );
+        assert_eq!(h.app().display(h21), "10", "and still reads the value");
+
+        // One undo restores both the block and the reference.
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(h.app().display(e21), "10", "undo restores E21");
+        assert_eq!(
+            h.app().formula_src_at_for_test(h21).as_deref(),
+            Some("=E21"),
+            "undo restores the reference to E21"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn ctrl_drag_copies_the_block_relativising_its_formulas() {
+        // Ctrl-drag-to-copy (#82). A COPY, not a move: the source stays put, and
+        // a copied formula relativises the way a paste does. E21 = 10,
+        // F21 = =E21*2 (shows 20). Copy E21:F21 down 5 rows to E26:F26.
+        let (mut h, csv) = numeric_app("copy_block.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        let a = CellRef::new(20, 4); // E21
+        let b = CellRef::new(20, 5); // F21
+        h.select(a, a);
+        h.type_text("10").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(b, b);
+        h.type_text("=E21*2").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(b), "20", "fixture: F21 = E21*2");
+
+        h.select(a, b);
+        h.copy_selection_block(5, 0);
+        let a2 = CellRef::new(25, 4); // E26
+        let b2 = CellRef::new(25, 5); // F26
+
+        // The source is untouched — a copy leaves the originals in place.
+        assert_eq!(h.app().display(a), "10", "copy must leave source E21");
+        assert_eq!(h.app().display(b), "20", "copy must leave source F21");
+
+        // The copy landed, and its formula RELATIVISED: =E21*2 copied down five
+        // rows reads =E26*2, so F26 = E26*2 = 20. This is what separates a copy
+        // from a move (a move would have carried =E21*2 verbatim → 0 here).
+        assert_eq!(h.app().display(a2), "10", "copied value at E26");
+        assert_eq!(
+            h.app().formula_src_at_for_test(b2).as_deref(),
+            Some("=E26*2"),
+            "a copied formula must relativise its references"
+        );
+        assert_eq!(h.app().display(b2), "20", "F26 = E26*2 = 20");
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn ctrl_held_at_the_drop_copies_through_the_real_pointer_path() {
+        // The gesture, end to end (#82): press the selection border, drag, and
+        // hold Ctrl at the drop — the block is COPIED, not moved. Exercises the
+        // real press → moving → release path and the modifier read at drop time.
+        let (mut h, csv) = numeric_app("ctrl_drag_copy.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        let src = CellRef::new(2, 1);
+        h.select(src, src);
+        h.type_text("SENTINEL").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        // Clear the drop cell so the copy lands on empty space (the overwrite
+        // prompt has its own test).
+        let dest = CellRef::new(5, 1);
+        h.select(dest, dest);
+        h.press_key(Key::Delete);
+        h.steps(2);
+        h.select(src, src);
+        h.step();
+
+        let from = h.cell_rect(src).expect("source cell on screen");
+        let to = h.cell_rect(dest).expect("destination cell on screen");
+        // Press the border, drag to the destination, then hold Ctrl on the
+        // release frame — the aggregate modifier the drop reads.
+        h.move_to(from.center().x, from.top());
+        h.press();
+        h.step();
+        h.move_to(to.center().x, to.center().y);
+        h.step();
+        h.set_modifiers(Modifiers::COMMAND);
+        h.release();
+        h.steps(2);
+
+        // A copy: the destination got it AND the source is still there.
+        assert_eq!(
+            h.app().display(dest),
+            "SENTINEL",
+            "Ctrl-drag must place the block at the drop cell; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().display(src),
+            "SENTINEL",
+            "Ctrl-drag is a COPY: the source must NOT be cleared"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn dropping_onto_data_prompts_before_overwriting() {
+        // Overwrite prompt (#82). Excel asks before a drag-drop clobbers data.
+        // Move E21 (=10) down 5 rows onto E26, which already holds 99: the move
+        // must NOT go through until the user confirms.
+        let (mut h, csv) = numeric_app("overwrite_prompt.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        let src = CellRef::new(20, 4); // E21
+        let occupied = CellRef::new(25, 4); // E26 — destination, already full
+        h.select(src, src);
+        h.type_text("10").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(occupied, occupied);
+        h.type_text("99").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+
+        // Ask to move E21 onto the occupied E26.
+        h.select(src, src);
+        h.move_selection_block(5, 0);
+
+        // Nothing has changed yet — the prompt is up, guarding the data.
+        assert!(
+            h.block_move_prompt_open(),
+            "a drop onto non-empty cells must raise the overwrite prompt"
+        );
+        assert_eq!(
+            h.app().display(src),
+            "10",
+            "source untouched while prompting"
+        );
+        assert_eq!(
+            h.app().display(occupied),
+            "99",
+            "destination untouched while prompting"
+        );
+
+        // Cancel: the gesture is dropped and every cell stays exactly as it was.
+        h.cancel_block_move();
+        assert!(!h.block_move_prompt_open(), "cancel closes the prompt");
+        assert_eq!(h.app().display(src), "10", "cancel keeps the source");
+        assert_eq!(h.app().display(occupied), "99", "cancel keeps the target");
+
+        // Ask again, then Replace: now the move goes through.
+        h.select(src, src);
+        h.move_selection_block(5, 0);
+        assert!(h.block_move_prompt_open(), "prompt raised again");
+        h.confirm_block_move();
+        assert!(!h.block_move_prompt_open(), "replace closes the prompt");
+        assert_eq!(
+            h.app().display(occupied),
+            "10",
+            "replace overwrites E26 with the moved value"
+        );
+        assert_eq!(h.app().display(src), "", "replace clears the source");
         let _ = std::fs::remove_file(&csv);
     }
 
