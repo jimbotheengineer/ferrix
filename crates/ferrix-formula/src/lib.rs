@@ -9,6 +9,7 @@ pub mod datetime;
 pub mod depgraph;
 pub mod eval;
 pub mod fill;
+pub mod lambda;
 pub mod lookup;
 pub mod names;
 pub mod parser;
@@ -30,6 +31,7 @@ pub use array::{ArrayData, EvalResult};
 pub use criteria::{Criterion, Pattern, Scalar};
 pub use depgraph::{DepGraph, Precedent};
 pub use eval::{eval, eval_view, CellSource};
+pub use lambda::{Binding, LambdaValue, ScopeFrame};
 pub use names::{DefinedName, NameError, NameScope, NameTable};
 pub use parser::{parse, parse_with_names, quote_sheet_name, BinOp, Expr, ParseError, UnOp};
 pub use remap::{

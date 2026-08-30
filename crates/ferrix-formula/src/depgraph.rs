@@ -128,6 +128,24 @@ pub fn collect_precedents(expr: &Expr, out: &mut Vec<Precedent>) {
                 collect_precedents(a, out);
             }
         }
+        // A lexical variable is a LET/LAMBDA name, not a cell — no precedent.
+        Expr::Var(_) => {}
+        // LET/LAMBDA/Apply carry references inside their value expressions,
+        // bodies, and arguments; those are the real dependencies. Parameter and
+        // binding NAMES are lexical and contribute nothing.
+        Expr::Let(bindings, body) => {
+            for (_, value) in bindings {
+                collect_precedents(value, out);
+            }
+            collect_precedents(body, out);
+        }
+        Expr::Lambda(_, body) => collect_precedents(body, out),
+        Expr::Apply(callee, args) => {
+            collect_precedents(callee, out);
+            for a in args {
+                collect_precedents(a, out);
+            }
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
     }
 }
@@ -176,6 +194,23 @@ pub fn collect_precedents_scoped(
             collect_precedents_scoped(r, home, sheets, out);
         }
         Expr::Call(_, args) => {
+            for a in args {
+                collect_precedents_scoped(a, home, sheets, out);
+            }
+        }
+        // Same as the unscoped twin: lexical names carry no dependency, but the
+        // references inside LET values, LAMBDA bodies, and application arguments
+        // do.
+        Expr::Var(_) => {}
+        Expr::Let(bindings, body) => {
+            for (_, value) in bindings {
+                collect_precedents_scoped(value, home, sheets, out);
+            }
+            collect_precedents_scoped(body, home, sheets, out);
+        }
+        Expr::Lambda(_, body) => collect_precedents_scoped(body, home, sheets, out),
+        Expr::Apply(callee, args) => {
+            collect_precedents_scoped(callee, home, sheets, out);
             for a in args {
                 collect_precedents_scoped(a, home, sheets, out);
             }

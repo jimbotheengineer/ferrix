@@ -161,6 +161,36 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// A lexical variable reference — a name bound by an enclosing `LET` or
+    /// `LAMBDA`, resolved from the evaluator's scope stack rather than the
+    /// workbook name table.
+    ///
+    /// The parser only ever emits this for an identifier that is in scope at
+    /// that point in the text (see the `scope` stack in [`Parser`]); a bare
+    /// word that is NOT a bound param or LET name still falls through to the
+    /// workbook resolver and, failing that, `#NAME?`. So `Var` never escapes
+    /// the LET/LAMBDA whose binding introduced it, and the reference-rewriting
+    /// passes (`refscan`/`refedit`/`remap`) — which work on formula TEXT and
+    /// leave bare identifiers untouched — need no new arm.
+    Var(String),
+    /// `LET(name1, value1, ..., body)` — lexical bindings. Each `(name, value)`
+    /// pair binds `name` to `value` (evaluated in the scope built by the
+    /// bindings BEFORE it, so later bindings can reference earlier ones), then
+    /// `body` is evaluated in the fully-extended scope. A special form, not an
+    /// `Expr::Call`, because its arguments are names, not values.
+    Let(Vec<(String, Expr)>, Box<Expr>),
+    /// `LAMBDA(param1, ..., body)` — a first-class function value. Evaluating it
+    /// captures the enclosing scope; applying it (via [`Expr::Apply`]) binds the
+    /// arguments to the parameters over that captured scope. A special form for
+    /// the same reason as `Let`: its leading arguments are parameter *names*.
+    Lambda(Vec<String>, Box<Expr>),
+    /// `callee(arg1, ...)` — application of a lambda-valued expression. This is
+    /// how `LAMBDA(x, x+1)(5)` and a LET-bound lambda called by name are
+    /// invoked. The callee is any expression that evaluates to a lambda (an
+    /// `Expr::Lambda`, or an `Expr::Var` bound to one); anything else is
+    /// `#VALUE!`. Kept separate from `Expr::Call` (whose head is a static
+    /// builtin NAME) because the head here is a runtime value.
+    Apply(Box<Expr>, Vec<Expr>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,6 +232,22 @@ pub enum ParseError {
     /// that keeps the process alive.
     #[error("formula nests {0} levels deep, over the {MAX_PARSE_DEPTH} limit")]
     TooDeep(usize),
+    /// `LAMBDA` needs at least a body: `LAMBDA(body)` or
+    /// `LAMBDA(p1, ..., body)`. Fewer than one argument is malformed.
+    #[error("LAMBDA needs at least a body argument")]
+    LambdaArity,
+    /// Every argument of `LAMBDA` before the body must be a bare identifier
+    /// (a parameter name), not an expression. `LAMBDA(1, x)` is malformed.
+    #[error("LAMBDA parameter {0} must be a bare name")]
+    LambdaParam(usize),
+    /// `LET` needs an odd argument count of at least three:
+    /// `LET(name, value, body)`. An even count leaves a name without a value.
+    #[error("LET needs name/value pairs then a body (odd count >= 3)")]
+    LetArity,
+    /// Every LET binding target must be a bare identifier, not an expression.
+    /// `LET(1, 2, body)` is malformed.
+    #[error("LET binding name #{0} must be a bare name")]
+    LetName(usize),
 }
 
 /// Deepest expression nesting the parser will build.
@@ -668,6 +714,7 @@ pub fn parse_with_names(
         pos: 0,
         depth: 0,
         resolve,
+        scope: Vec::new(),
     };
     let expr = p.parse_expr(0)?;
     if p.pos < p.tokens.len() {
@@ -689,6 +736,14 @@ struct Parser<'a> {
     /// Name table lookup. [`parse`] passes one that knows nothing, so a
     /// workbook with no names behaves exactly as it did before names existed.
     resolve: &'a dyn Fn(&str) -> Option<Expr>,
+    /// Lexical names in scope at the current point, innermost last. A `LET`
+    /// binding or `LAMBDA` parameter pushes its name here for the duration of
+    /// the sub-expression it governs and pops it on the way out, so a bare
+    /// identifier can be classified as an in-scope variable (`Expr::Var`)
+    /// versus a workbook name at PARSE time. This is what lets `x` inside
+    /// `LET(x, 1, x + 1)` become a variable reference instead of a `#NAME?`,
+    /// without any name ever leaking out of the form that bound it.
+    scope: Vec<String>,
 }
 
 impl Parser<'_> {
@@ -882,38 +937,7 @@ impl Parser<'_> {
                     Expr::X3D(first, last, cell, cell)
                 }
             }
-            Token::Ident(name) => {
-                // A following `(` makes it a function call; otherwise it is a
-                // defined name, and the name table gets the first look.
-                // Falling through to UnknownName (which the workbook renders
-                // as #NAME?) only AFTER the table has been consulted is what
-                // "resolution happens in the parser" means.
-                if !matches!(self.peek(), Some(Token::LParen)) {
-                    match (self.resolve)(&name) {
-                        Some(expr) => expr,
-                        None => return Err(ParseError::UnknownName(name)),
-                    }
-                } else {
-                    self.expect(&Token::LParen, "( after function name")?;
-                    let mut args = Vec::new();
-                    if matches!(self.peek(), Some(Token::RParen)) {
-                        self.pos += 1;
-                    } else {
-                        loop {
-                            args.push(self.parse_expr(0)?);
-                            match self.next() {
-                                Some(Token::Comma) => continue,
-                                Some(Token::RParen) => break,
-                                Some(t) => {
-                                    return Err(ParseError::Expected(", or )", format!("{t:?}")))
-                                }
-                                None => return Err(ParseError::UnexpectedEnd),
-                            }
-                        }
-                    }
-                    Expr::Call(name, args)
-                }
-            }
+            Token::Ident(name) => self.parse_ident_prefix(name)?,
             Token::LParen => {
                 let inner = self.parse_expr(0)?;
                 self.expect(&Token::RParen, ")")?;
@@ -921,12 +945,232 @@ impl Parser<'_> {
             }
             t => return Err(ParseError::Expected("a value", format!("{t:?}"))),
         };
+        let expr = self.parse_postfix(expr)?;
         // Postfix percent.
         if matches!(self.peek(), Some(Token::Percent)) {
             self.pos += 1;
             return Ok(Expr::Unary(UnOp::Percent, Box::new(expr)));
         }
         Ok(expr)
+    }
+
+    /// Handle an identifier prefix: LET/LAMBDA special forms, application of an
+    /// in-scope lambda variable, an ordinary builtin call, a bare lexical
+    /// variable, or a workbook name. Split out of [`Self::parse_prefix`] so its
+    /// locals do not inflate that function's stack frame — `parse_prefix` sits
+    /// on the parser's recursion path, and a fat frame there is what turns a
+    /// deeply-nested formula into a stack overflow rather than a `TooDeep`
+    /// refusal (see `pathological_nesting_errors_instead_of_blowing_the_stack`).
+    #[inline(never)]
+    fn parse_ident_prefix(&mut self, name: String) -> Result<Expr, ParseError> {
+        let has_paren = matches!(self.peek(), Some(Token::LParen));
+        if has_paren && name.eq_ignore_ascii_case("LET") {
+            // LET and LAMBDA are SPECIAL FORMS: their leading arguments are
+            // binding/parameter NAMES, not values, so they cannot go through the
+            // ordinary comma-separated argument loop (which would try to resolve
+            // each name as an expression and fail). They are intercepted before
+            // the generic call path, and parse their own bindings while pushing
+            // names onto the lexical scope stack.
+            self.parse_let()
+        } else if has_paren && name.eq_ignore_ascii_case("LAMBDA") {
+            self.parse_lambda()
+        } else if has_paren {
+            // A `(` makes this either an application of an in-scope lambda
+            // variable, or an ordinary builtin call. An in-scope name is a
+            // variable — invoking it is `Apply(Var, args)`; any other name is a
+            // builtin `Call`.
+            let args = self.parse_call_args()?;
+            if self.in_scope(&name) {
+                Ok(Expr::Apply(Box::new(Expr::Var(name)), args))
+            } else {
+                Ok(Expr::Call(name, args))
+            }
+        } else if self.in_scope(&name) {
+            // A bare in-scope name is a lexical variable reference, resolved from
+            // the evaluator's scope stack, never the workbook name table.
+            Ok(Expr::Var(name))
+        } else {
+            // Not in scope and no `(`: a defined name, and the workbook resolver
+            // gets the first look. Falling through to UnknownName (rendered
+            // `#NAME?`) only AFTER the table has been consulted is what
+            // "resolution happens in the parser" means.
+            match (self.resolve)(&name) {
+                Some(expr) => Ok(expr),
+                None => Err(ParseError::UnknownName(name)),
+            }
+        }
+    }
+
+    /// Postfix application: an in-place `LAMBDA(...)(...)` invocation. The callee
+    /// expression (a `LAMBDA(...)`, or a chained application) is immediately
+    /// applied to a following argument list. Only expressions that can evaluate
+    /// to a lambda are eligible — a `Ref`/`Range`/number followed by `(` is
+    /// still the syntax error it always was — so this is gated on the prefix
+    /// being a `Lambda` or `Apply` (chained application). Split out of
+    /// [`Self::parse_prefix`] to keep that function's frame small on the
+    /// recursion path.
+    #[inline(never)]
+    fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+        while matches!(expr, Expr::Lambda(..) | Expr::Apply(..))
+            && matches!(self.peek(), Some(Token::LParen))
+        {
+            let args = self.parse_call_args()?;
+            expr = Expr::Apply(Box::new(expr), args);
+        }
+        Ok(expr)
+    }
+
+    /// Is `name` a lexical variable in scope at the current point? Names are
+    /// upper-cased by the tokenizer and matched case-insensitively, so scope
+    /// membership is exact against what a later `Expr::Var` will look up.
+    fn in_scope(&self, name: &str) -> bool {
+        self.scope.iter().any(|n| n.eq_ignore_ascii_case(name))
+    }
+
+    /// Parse a `(`-led, comma-separated argument list into expressions. Shared
+    /// by ordinary calls and lambda applications; the leading `(` is consumed
+    /// here and the matching `)` closes the list. An empty list is `()`.
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect(&Token::LParen, "( after function name")?;
+        let mut args = Vec::new();
+        if matches!(self.peek(), Some(Token::RParen)) {
+            self.pos += 1;
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr(0)?);
+            match self.next() {
+                Some(Token::Comma) => continue,
+                Some(Token::RParen) => break,
+                Some(t) => return Err(ParseError::Expected(", or )", format!("{t:?}"))),
+                None => return Err(ParseError::UnexpectedEnd),
+            }
+        }
+        Ok(args)
+    }
+
+    /// Consume a bare identifier used as a binding/parameter NAME. Returns the
+    /// upper-cased name (as the tokenizer produced it) so scope membership and
+    /// evaluation lookup agree. Any non-identifier token is the caller's error.
+    fn expect_name(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(Token::Ident(n)) => {
+                let n = n.clone();
+                self.pos += 1;
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse `LET(name1, value1, ..., body)`. The opening `(` has NOT yet been
+    /// consumed. Each value is parsed in the scope built by the bindings before
+    /// it — so `LET(x, 1, y, x + 1, body)` sees `x` while binding `y` — and the
+    /// body sees them all. Every name is pushed onto the lexical scope stack for
+    /// the duration of this form and popped on exit, so nothing leaks out.
+    fn parse_let(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::LParen, "( after LET")?;
+        let scope_base = self.scope.len();
+        let mut bindings: Vec<(String, Expr)> = Vec::new();
+        let result = (|| {
+            loop {
+                // A name starts either another binding pair or — if the NEXT
+                // token after it is `)` rather than `,` — would be malformed;
+                // the body is a full expression, never a lone trailing name.
+                // We peek: if the current arg parses as a name AND is followed
+                // by a comma AND there is more after it, it is a binding target.
+                // Simpler and unambiguous: LET always alternates name, value,
+                // ..., body. So the body is the LAST argument; every argument at
+                // an even index (0,2,...) before the last is a name.
+                //
+                // Detect the body by lookahead: parse a name; if the token
+                // after it is `)`, the "name" was actually the body position
+                // and LET is malformed (even arg count). Otherwise expect a
+                // value expression.
+                let idx = bindings.len();
+                let Some(name) = self.expect_name() else {
+                    return Err(ParseError::LetName(idx + 1));
+                };
+                // After a binding name must come a comma then its value.
+                match self.next() {
+                    Some(Token::Comma) => {}
+                    _ => return Err(ParseError::LetArity),
+                }
+                // Bind the name for the value expressions that follow (later
+                // bindings and the body can reference it). Excel evaluates LET
+                // bindings top-to-bottom with earlier names visible to later
+                // values.
+                let value = self.parse_expr(0)?;
+                self.scope.push(name.clone());
+                bindings.push((name, value));
+                // What follows the value is either `,` (more bindings or the
+                // body) or `)` — but `)` here means no body, which is malformed.
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.pos += 1;
+                        // The argument after this comma is the body IFF the one
+                        // after THAT is `)`. Rather than deep lookahead, parse
+                        // it as the body speculatively only when we can tell it
+                        // is last. We detect "last" structurally: try to read a
+                        // name followed by a comma (=> another binding);
+                        // otherwise it is the body.
+                        if self.looks_like_binding_name() {
+                            continue;
+                        }
+                        let body = self.parse_expr(0)?;
+                        self.expect(&Token::RParen, ") to close LET")?;
+                        return Ok(Expr::Let(std::mem::take(&mut bindings), Box::new(body)));
+                    }
+                    _ => return Err(ParseError::LetArity),
+                }
+            }
+        })();
+        // Pop this form's names no matter how it exited, so a sibling
+        // expression never sees a binding that belonged to this LET.
+        self.scope.truncate(scope_base);
+        result
+    }
+
+    /// Lookahead: does the upcoming token stream start a `name ,` binding pair
+    /// (as opposed to the body expression)? A binding target is a bare
+    /// identifier immediately followed by a comma. Anything else — a number, a
+    /// reference, an identifier followed by `(` or an operator — is the body.
+    fn looks_like_binding_name(&self) -> bool {
+        matches!(self.tokens.get(self.pos), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Comma))
+    }
+
+    /// Parse `LAMBDA(param1, ..., body)`. The opening `(` has NOT yet been
+    /// consumed. Every argument except the last is a parameter name; the last
+    /// is the body, parsed with all parameters in scope. Parameters are pushed
+    /// onto the lexical scope stack for the body and popped on exit.
+    fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Token::LParen, "( after LAMBDA")?;
+        let scope_base = self.scope.len();
+        let mut params: Vec<String> = Vec::new();
+        let result = (|| {
+            // Consume `name ,` pairs while the next tokens look like a
+            // parameter (identifier followed by a comma). The final argument —
+            // an identifier NOT followed by a comma, or any non-identifier — is
+            // the body.
+            while self.looks_like_binding_name() {
+                let name = self
+                    .expect_name()
+                    .ok_or(ParseError::LambdaParam(params.len() + 1))?;
+                self.pos += 1; // the comma
+                self.scope.push(name.clone());
+                params.push(name);
+            }
+            // Whatever remains is the body. `LAMBDA()` with nothing is arity 0.
+            if matches!(self.peek(), Some(Token::RParen)) {
+                return Err(ParseError::LambdaArity);
+            }
+            let body = self.parse_expr(0)?;
+            self.expect(&Token::RParen, ") to close LAMBDA")?;
+            Ok(Expr::Lambda(std::mem::take(&mut params), Box::new(body)))
+        })();
+        self.scope.truncate(scope_base);
+        result
     }
 }
 
