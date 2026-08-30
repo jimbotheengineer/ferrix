@@ -252,4 +252,29 @@ mod tests {
         assert_eq!(tile_index(3, 3), 0);
         assert_eq!(tile_index(4, 3), 1);
     }
+
+    // --- A1# spill-range references survive a fill (#27 P4) ----------------
+
+    #[test]
+    fn a_spill_range_reference_moves_its_anchor_and_keeps_the_hash() {
+        // The `#` is not part of the reference WORD the scanner rewrites — it
+        // is a trailing byte copied verbatim — so filling `=A1#` moves the A1
+        // anchor like any relative reference and leaves the `#` attached. This
+        // is the whole reason the tokenizer lexes `#` as its own token: the
+        // text-editing rewrite model in `refscan` never has to learn about it.
+        assert_eq!(offset_formula("=A1#", 1, 1), "=B2#");
+        // Inside a call, and in a compound expression, the `#` still rides
+        // along with the reference it followed.
+        assert_eq!(offset_formula("=SUM(A1#)", 0, 2), "=SUM(C1#)");
+        assert_eq!(offset_formula("=A1#+B2", 1, 0), "=A2#+B3");
+    }
+
+    #[test]
+    fn an_absolute_spill_anchor_is_pinned_through_a_fill() {
+        // `$A$1#` — the `$` markers survive because the rewrite is textual (an
+        // AST round trip would drop them, per the module docs), so an absolute
+        // spill anchor stays put while the rest of the formula shifts.
+        assert_eq!(offset_formula("=$A$1#", 3, 3), "=$A$1#");
+        assert_eq!(offset_formula("=$A$1#+B2", 1, 0), "=$A$1#+B3");
+    }
 }

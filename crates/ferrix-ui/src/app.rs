@@ -5560,6 +5560,11 @@ impl FerrixApp {
                 // Excel cannot express is reported below rather than silently
                 // dropped.
                 .with_sparklines(&self.wb.sparklines)
+                // Dynamic-array spills (#27 P4): a spilling host is written as
+                // `<f t="array" ref="...">` and its projections are left for
+                // Excel to recompute, instead of freezing the array into a grid
+                // of literals that would block its own re-spill on reopen.
+                .with_spills(&self.wb.spills)
                 .with_protection(self.wb.protection())],
             &self.wb.names,
             self.wb.workbook_protection(),
