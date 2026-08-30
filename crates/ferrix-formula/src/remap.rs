@@ -355,4 +355,33 @@ mod tests {
         assert_eq!(paste_formula("=LOG10(A1)", 1, 0), "=LOG10(A2)");
         assert_eq!(paste_formula("=\"A1\"&A1", 1, 0), "=\"A1\"&A2");
     }
+
+    // --- A1# spill-range references survive a structural remap (#27 P4) ----
+
+    #[test]
+    fn a_spill_range_anchor_follows_its_column_and_keeps_the_hash() {
+        // Move column B (1) to D (3): a `B1#` spill-range anchor follows to D1,
+        // and the `#` suffix — a verbatim trailing byte, never part of the ref
+        // word — rides along, exactly as it does through a fill.
+        let cols = map_of(&[(1, 3), (2, 1), (3, 2)]);
+        assert_eq!(remap_columns("=B1#", &cols), "=D1#");
+        assert_eq!(remap_columns("=SUM(B1#)", &cols), "=SUM(D1#)");
+    }
+
+    #[test]
+    fn a_spill_range_anchor_on_a_deleted_column_breaks_like_any_reference() {
+        // Deleting the column a spill-range anchors on breaks the reference to
+        // `#REF!`, the same as a plain reference — the `#` cannot rescue a
+        // reference whose target no longer exists. The mechanical text rewrite
+        // leaves the `#` behind (`#REF!#`), which the parser absorbs back to a
+        // clean `#REF!` (see `parser::a_broken_spill_anchor_reparses_as_ref_error`).
+        let cols = deleting(&[0]);
+        assert_eq!(remap_columns("=A1#", &cols), "=#REF!#");
+    }
+
+    #[test]
+    fn a_pasted_spill_range_shifts_its_anchor() {
+        assert_eq!(paste_formula("=A1#", 1, 1), "=B2#");
+        assert_eq!(paste_formula("=$A$1#+B2", 1, 0), "=$A$1#+B3");
+    }
 }

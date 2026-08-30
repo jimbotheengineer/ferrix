@@ -4829,6 +4829,22 @@ impl ferrix_formula::CellSource for WorkbookSource<'_> {
         names[lo..=hi].iter().map(|s| s.to_string()).collect()
     }
 
+    /// The array a spilling host at `anchor` owns, resolving `A1#` (#27 P4).
+    ///
+    /// The spill store, like `merges`, is bound to the ACTIVE sheet — a parked
+    /// sheet never spills (see `eval_one_at`). So a `#` reference only resolves
+    /// when this source's home IS the active sheet; on a parked home there is
+    /// no spill overlay and `A1#` is `#REF!`, the honest answer for a feature
+    /// that does not run there. The array is cloned from the store (which owns
+    /// it once, sized by the spill extent, not the sheet) so the evaluator can
+    /// own its `ArrayData` without borrowing the workbook past this call.
+    fn spill_array_at(&self, anchor: CellRef) -> Option<ferrix_formula::ArrayData> {
+        if self.home != self.wb.active_sheet() {
+            return None;
+        }
+        self.wb.spills.array_of(anchor).cloned()
+    }
+
     fn sum_rect_in(&self, sheet: &str, start: CellRef, end: CellRef) -> Option<f64> {
         Some(self.named(sheet)?.sum_rect(start, end))
     }
@@ -7413,5 +7429,66 @@ mod tests {
             let code = agg_to_code(agg);
             assert_eq!(agg_from_code(code), Some(agg), "code<->agg is an inverse");
         }
+    }
+
+    // --- A1# spill-range resolves over the live P2 overlay (#27 P4) --------
+
+    #[test]
+    fn spill_range_reference_resolves_the_hosts_array_end_to_end() {
+        let mut w = empty_wb();
+        // D1:D3 = 10,20,30; A1 = the array, spilling A1:A3.
+        for (r, n) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            w.commit_edit(CellRef::new(r, 3), &n.to_string());
+        }
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+        assert_eq!(val(&w, 2, 0), Value::Number(30.0), "spill is live");
+
+        // `=A1#` references the WHOLE spilled array, so it is itself a dynamic
+        // array and re-spills — proving the spill-range resolves the host's
+        // array off the live P2 overlay. Put it in F1 (col 5): F1:F3 mirror the
+        // spill.
+        w.commit_edit(CellRef::new(0, 5), "=A1#");
+        assert_eq!(val(&w, 0, 5), Value::Number(10.0));
+        assert_eq!(val(&w, 1, 5), Value::Number(20.0));
+        assert_eq!(val(&w, 2, 5), Value::Number(30.0));
+        assert!(w.is_spilled_cell(CellRef::new(1, 5)), "F1# re-spills");
+
+        // ARRAYTOTEXT (P1's array-consuming builtin) proves the WHOLE array
+        // flows through `A1#` off the overlay, collapsed to one text cell at H1.
+        w.commit_edit(CellRef::new(0, 7), "=ARRAYTOTEXT(A1#)");
+        assert_eq!(w.view().display(CellRef::new(0, 7)), "10;20;30");
+    }
+
+    #[test]
+    fn a_spill_range_over_a_non_host_is_ref_error_end_to_end() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 0), "5"); // A1 is a plain value, not a host
+        w.commit_edit(CellRef::new(0, 2), "=A1#");
+        assert_eq!(
+            val(&w, 0, 2),
+            Value::Error(ErrorKind::Ref),
+            "A1# over a non-host is #REF!"
+        );
+    }
+
+    #[test]
+    fn editing_a_source_cell_flows_through_a_spill_range_consumer() {
+        let mut w = empty_wb();
+        for (r, n) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            w.commit_edit(CellRef::new(r, 3), &n.to_string());
+        }
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3"); // A1:A3
+        w.commit_edit(CellRef::new(0, 7), "=ARRAYTOTEXT(A1#)");
+        assert_eq!(w.view().display(CellRef::new(0, 7)), "10;20;30");
+
+        // Change a source cell. The host re-spills, and because the `A1#`
+        // consumer depends on the host cell (the depgraph edge), it recalculates
+        // with the new array — no manual re-entry.
+        w.commit_edit(CellRef::new(1, 3), "200");
+        assert_eq!(
+            w.view().display(CellRef::new(0, 7)),
+            "10;200;30",
+            "the A1# consumer must follow a source-cell edit"
+        );
     }
 }

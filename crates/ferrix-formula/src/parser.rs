@@ -63,6 +63,18 @@ pub enum Token {
     /// Unary minus is disambiguated by the parser, not the lexer.
     Minus,
     Plus,
+    /// The implicit-intersection prefix `@`, as in `@A1:A10`. Excel's
+    /// `_xlfn.SINGLE`/`@` operator: it forces a range or array expression to
+    /// collapse to a single value under implicit intersection, opting a cell
+    /// OUT of the spill behaviour a bare reference would otherwise trigger.
+    At,
+    /// The spill-range suffix `#`, as in `A1#`. It follows a cell reference and
+    /// stands for the WHOLE dynamic array that spilled out of the host at that
+    /// cell — resolved against the live spill overlay (#27 P2), not the sheet.
+    /// Lexed as its own token (never part of a ref word) so the `$` markers a
+    /// following rewrite needs stay attached to the reference, exactly as the
+    /// text-editing reference model in [`crate::refscan`] requires.
+    Hash,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -133,6 +145,19 @@ pub enum Expr {
     X3D(String, String, CellRef, CellRef),
     /// A literal error constant, e.g. the `#REF!` a delete leaves behind.
     Error(ferrix_core::ErrorKind),
+    /// `@expr` — the implicit-intersection prefix. Forces its operand to
+    /// collapse to a single scalar value (Excel's `@`/`SINGLE`), so a cell
+    /// holding `=@A1:A10` intersects rather than spilling. It is a no-op on an
+    /// operand that is already scalar, which is why it can wrap any `Expr`.
+    Intersect(Box<Expr>),
+    /// `A1#` — the spill-range operator. Stands for the entire dynamic array
+    /// that spilled from the host formula at this cell. It resolves against the
+    /// live spill overlay (#27 P2) at evaluation time, NOT the stored sheet:
+    /// `A1#` is `#REF!` when A1 is not a spilling host, and the whole
+    /// `rows x cols` array when it is. The `CellRef` is the anchor (the host);
+    /// the `$` anchoring the user wrote survives in the formula TEXT, which is
+    /// all the rewrite paths in [`crate::refscan`] ever consult.
+    SpillRange(CellRef),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -354,16 +379,24 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 // `#REF!` — the only error constant a Ferrix rewrite writes
                 // into formula text. Every other error is stored as a cell
                 // VALUE rather than as formula source, so none of them ever
-                // reach the tokenizer.
+                // reach the tokenizer. A bare `#` that is NOT `#REF!` is the
+                // spill-range suffix (`A1#`); it is lexed as its own token so
+                // the reference before it stays a plain, rewritable ref word.
                 const REF: &str = "#REF!";
                 if input.len() >= i + REF.len() && input[i..i + REF.len()].eq_ignore_ascii_case(REF)
                 {
                     out.push(Token::Error(ferrix_core::ErrorKind::Ref));
                     i += REF.len();
                 } else {
-                    let ch = input[i..].chars().next().unwrap_or('?');
-                    return Err(ParseError::BadChar(ch, i));
+                    out.push(Token::Hash);
+                    i += 1;
                 }
+            }
+            b'@' => {
+                // The implicit-intersection prefix. Only meaningful before a
+                // reference/range/array expression; the parser decides.
+                out.push(Token::At);
+                i += 1;
             }
             b'\'' => {
                 // A quoted sheet name: 'My Sheet'!A1, with '' as an escaped
@@ -746,10 +779,31 @@ impl Parser<'_> {
                 Expr::Unary(UnOp::Neg, Box::new(operand))
             }
             Token::Plus => self.parse_expr(5)?,
+            Token::At => {
+                // Implicit-intersection prefix. It binds to the reference or
+                // array expression that follows exactly as unary minus binds to
+                // its operand — `@A1:A10` intersects the range, `@SUM(A1:A3)`
+                // wraps the call — so it shares unary minus's precedence. It is
+                // idempotent and harmless on an already-scalar operand.
+                let operand = self.parse_expr(5)?;
+                Expr::Intersect(Box::new(operand))
+            }
             Token::Number(n) => Expr::Number(n),
             Token::Text(s) => Expr::Text(s),
             Token::Bool(b) => Expr::Bool(b),
-            Token::Error(e) => Expr::Error(e),
+            Token::Error(e) => {
+                // A `#` right after an error constant is the spill-range suffix
+                // on a BROKEN anchor: a structural delete rewrites `A1#`'s
+                // reference to `#REF!` and leaves the `#` behind, so `#REF!#` is
+                // the text that results. Absorb the `#` and stay `#REF!` — a
+                // spill-range whose host reference no longer exists is itself
+                // `#REF!`. Without this the rewritten text would fail to parse
+                // and show `#NAME?`, blaming an unknown name for a broken ref.
+                if matches!(self.peek(), Some(Token::Hash)) {
+                    self.pos += 1;
+                }
+                Expr::Error(e)
+            }
             Token::Ref { cell, .. } => {
                 // A colon here means this is a range.
                 if matches!(self.peek(), Some(Token::Colon)) {
@@ -764,6 +818,14 @@ impl Parser<'_> {
                         }
                         None => return Err(ParseError::UnexpectedEnd),
                     }
+                } else if matches!(self.peek(), Some(Token::Hash)) {
+                    // `A1#` — the spill-range suffix. The `#` binds to the
+                    // single reference it follows and turns it into the whole
+                    // spilled array anchored at that host. A range endpoint
+                    // (`A1:B2`) is handled above and never reaches here, so a
+                    // spill-range is always rooted at exactly one cell.
+                    self.pos += 1;
+                    Expr::SpillRange(cell)
                 } else {
                     Expr::Ref(cell)
                 }
@@ -1720,6 +1782,119 @@ mod tests {
         assert_eq!(
             parse_with_names("=SUM(Sales)+1", &r).unwrap(),
             parse("=SUM(Sheet1!B2:B4)+1").unwrap()
+        );
+    }
+
+    // --- @ implicit intersection and A1# spill-range (#27 P4) --------------
+
+    #[test]
+    fn at_prefix_parses_as_implicit_intersection() {
+        // `@A1:A10` forces the range to collapse to a single value.
+        assert_eq!(
+            parse("=@A1:A10").unwrap(),
+            Expr::Intersect(Box::new(Expr::Range(
+                CellRef::new(0, 0),
+                CellRef::new(9, 0)
+            )))
+        );
+        // `@` before a single reference is legal too (a no-op intersection).
+        assert_eq!(
+            parse("=@A1").unwrap(),
+            Expr::Intersect(Box::new(Expr::Ref(CellRef::new(0, 0))))
+        );
+        // `@` before a function call wraps the whole call.
+        assert_eq!(
+            parse("=@SUM(A1:A3)").unwrap(),
+            Expr::Intersect(Box::new(Expr::Call(
+                "SUM".into(),
+                vec![Expr::Range(CellRef::new(0, 0), CellRef::new(2, 0))]
+            )))
+        );
+    }
+
+    #[test]
+    fn at_prefix_binds_like_unary_minus() {
+        // `@A1:A3 + 1` intersects the range, then adds — the `@` binds to the
+        // reference, not to the whole sum, exactly as unary minus would.
+        assert_eq!(
+            parse("=@A1:A3+1").unwrap(),
+            Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Intersect(Box::new(Expr::Range(
+                    CellRef::new(0, 0),
+                    CellRef::new(2, 0)
+                )))),
+                Box::new(num(1.0)),
+            )
+        );
+    }
+
+    #[test]
+    fn hash_suffix_parses_as_spill_range() {
+        // `A1#` is the whole spill anchored at A1.
+        assert_eq!(parse("=A1#").unwrap(), Expr::SpillRange(CellRef::new(0, 0)));
+        // Inside a call: `SUM(A1#)` sums the spill.
+        assert_eq!(
+            parse("=SUM(A1#)").unwrap(),
+            Expr::Call("SUM".into(), vec![Expr::SpillRange(CellRef::new(0, 0))])
+        );
+        // In an arithmetic context the `#` binds only to the reference it
+        // follows, so `A1#+B2` is (spill-range A1) + (ref B2).
+        assert_eq!(
+            parse("=A1#+B2").unwrap(),
+            Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::SpillRange(CellRef::new(0, 0))),
+                Box::new(Expr::Ref(CellRef::new(1, 1))),
+            )
+        );
+    }
+
+    #[test]
+    fn hash_ref_constant_is_still_ref_not_a_spill_suffix() {
+        // A bare `#` is the spill suffix, but `#REF!` is the error constant and
+        // must keep parsing as one — the two share the `#` lead byte.
+        assert_eq!(
+            parse("=#REF!").unwrap(),
+            Expr::Error(ferrix_core::ErrorKind::Ref)
+        );
+        // `A1#` next to nothing is a spill range; `#REF!` alone is the error.
+        assert_eq!(parse("=A1#").unwrap(), Expr::SpillRange(CellRef::new(0, 0)));
+    }
+
+    #[test]
+    fn a_range_endpoint_is_never_a_spill_range() {
+        // `A1:B2` is a range; the `#` suffix only applies to a lone reference,
+        // so a range endpoint can never be silently turned into a spill anchor.
+        assert_eq!(
+            parse("=A1:B2").unwrap(),
+            Expr::Range(CellRef::new(0, 0), CellRef::new(1, 1))
+        );
+    }
+
+    #[test]
+    fn at_and_hash_compose() {
+        // `@A1#` — force the spilled array to collapse to one value.
+        assert_eq!(
+            parse("=@A1#").unwrap(),
+            Expr::Intersect(Box::new(Expr::SpillRange(CellRef::new(0, 0))))
+        );
+    }
+
+    #[test]
+    fn a_broken_spill_anchor_reparses_as_ref_error() {
+        // A structural delete rewrites `A1#`'s anchor to `#REF!` and leaves the
+        // `#` behind, so the reference-rewrite path emits `#REF!#`. That text
+        // must re-parse (to `#REF!`), or the cell would show `#NAME?` on reload
+        // — blaming an unknown name for what is a broken reference.
+        assert_eq!(
+            parse("=#REF!#").unwrap(),
+            Expr::Error(ferrix_core::ErrorKind::Ref)
+        );
+        // The `#REF!` constant on its own is unchanged.
+        assert_eq!(
+            parse("=#REF!").unwrap(),
+            Expr::Error(ferrix_core::ErrorKind::Ref)
         );
     }
 }

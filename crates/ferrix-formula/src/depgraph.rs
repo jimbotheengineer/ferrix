@@ -112,7 +112,13 @@ pub fn collect_precedents(expr: &Expr, out: &mut Vec<Precedent>) {
         Expr::Ref(c) => out.push(Precedent::Cell(*c)),
         Expr::Range(a, b) => out.push(Precedent::Range(*a, *b)),
         Expr::XRef(_, _) | Expr::XRange(_, _, _) | Expr::X3D(_, _, _, _) => {}
-        Expr::Unary(_, inner) => collect_precedents(inner, out),
+        // `A1#` depends on the spilling HOST at its anchor: any change that
+        // re-plans that host's spill updates the host cell, so tracking the
+        // anchor cell is exactly the edge that makes a spill-range consumer
+        // recalculate. The spill's extent is dynamic and unknown here, but it
+        // never needs to be — the host cell is the one stable dependency.
+        Expr::SpillRange(anchor) => out.push(Precedent::Cell(*anchor)),
+        Expr::Intersect(inner) | Expr::Unary(_, inner) => collect_precedents(inner, out),
         Expr::Binary(_, l, r) => {
             collect_precedents(l, out);
             collect_precedents(r, out);
@@ -157,7 +163,14 @@ pub fn collect_precedents_scoped(
                 out.push((id, Precedent::Range(*a, *b)));
             }
         }
-        Expr::Unary(_, inner) => collect_precedents_scoped(inner, home, sheets, out),
+        // A spill-range tracks its host on the home sheet (see the unscoped
+        // twin). The `#` operator is same-sheet only — there is no
+        // `Sheet2!A1#` form in the grammar — so `home` is always the right
+        // scope for the anchor.
+        Expr::SpillRange(anchor) => out.push((home, Precedent::Cell(*anchor))),
+        Expr::Intersect(inner) | Expr::Unary(_, inner) => {
+            collect_precedents_scoped(inner, home, sheets, out)
+        }
         Expr::Binary(_, l, r) => {
             collect_precedents_scoped(l, home, sheets, out);
             collect_precedents_scoped(r, home, sheets, out);

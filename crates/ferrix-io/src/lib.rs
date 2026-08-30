@@ -10,6 +10,7 @@
 //!   memory-mapped via [`MappedSheet`], so a 10GB dataset is bounded by disk
 //!   rather than RAM and opens instantly on subsequent runs.
 
+pub mod array_xlsx;
 pub mod arrow_io;
 pub mod comment_sidecar;
 pub mod compact;

@@ -144,12 +144,18 @@ fn calls_are_supported(e: &Expr) -> bool {
                 && args.iter().all(calls_are_supported)
         }
         Expr::Unary(_, a) => calls_are_supported(a),
+        // `@expr` is supported exactly when its operand is — the intersection
+        // wrapper adds no function call of its own.
+        Expr::Intersect(a) => calls_are_supported(a),
         Expr::Binary(_, a, b) => calls_are_supported(a) && calls_are_supported(b),
         Expr::Number(_)
         | Expr::Text(_)
         | Expr::Bool(_)
         | Expr::Ref(_)
         | Expr::Range(_, _)
+        // `A1#` is a reference form, always supported — it resolves against the
+        // spill overlay at evaluation time, not against any function.
+        | Expr::SpillRange(_)
         // A `#REF!` constant is a real thing a broken formula holds; it must
         // survive the round trip rather than being dropped as unsupported.
         | Expr::Error(_) => true,
@@ -734,6 +740,15 @@ pub struct SheetExport<'a> {
     /// the group is EXPANDED to one element per destination cell (OOXML has
     /// no other spelling) and what is reported rather than written.
     pub sparklines: Option<&'a ferrix_core::SparklineMap>,
+    /// Dynamic-array spill regions for this sheet (#27 P4). When a formula
+    /// host cell has a live spill here, its `<f>` is written in the dynamic
+    /// array form `<f t="array" ref="A1:A10">` covering the spill rectangle,
+    /// and the projected cells it painted are NOT written as their own
+    /// literals — Excel recomputes the spill from the host. Absent this, a
+    /// dynamic array would round-trip as a lone top-left formula plus a grid
+    /// of frozen literal projections, which is a different, non-recalculating
+    /// workbook.
+    pub spills: Option<&'a ferrix_formula::SpillRegions>,
 }
 
 impl<'a> SheetExport<'a> {
@@ -750,6 +765,7 @@ impl<'a> SheetExport<'a> {
             format: None,
             validation: None,
             sparklines: None,
+            spills: None,
         }
     }
 
@@ -804,6 +820,14 @@ impl<'a> SheetExport<'a> {
     /// Attach sparkline groups, written as `<extLst><x14:sparklineGroups>`.
     pub fn with_sparklines(mut self, map: &'a ferrix_core::SparklineMap) -> Self {
         self.sparklines = Some(map);
+        self
+    }
+
+    /// Attach dynamic-array spill regions (#27 P4), so a spilling host formula
+    /// is written as `<f t="array" ref="...">` and its painted projections are
+    /// left to Excel to recompute rather than frozen as literals.
+    pub fn with_spills(mut self, spills: &'a ferrix_formula::SpillRegions) -> Self {
+        self.spills = Some(spills);
         self
     }
 }
@@ -1021,10 +1045,38 @@ fn write_sheet(
         for c in 0..cols as u32 {
             let cell = CellRef::new(r, c);
 
+            // A cell a spill PAINTED into (not its host) is not written at all:
+            // Excel recomputes the whole array from the host's `t="array"`
+            // formula, so writing the projection as a literal would both
+            // duplicate the value and, on reopen, block the host's spill with
+            // its own frozen copy (a self-inflicted #SPILL!).
+            if s.spills.is_some_and(|sp| sp.is_locked_spill_cell(cell)) {
+                continue;
+            }
+
             if let Some(CellInput::Formula { src, cached }) = s.formulas.and_then(|o| o.get(cell)) {
                 let body = src.strip_prefix('=').unwrap_or(src);
                 let result = overlay_display(cached, s.formulas.unwrap(), s.sheet);
-                ws.write_formula(r, c as u16, Formula::new(body).set_result(result))?;
+                // A spilling host writes the dynamic-array form `<f t="array"
+                // ref="A1:A10">` over the rectangle it covers, so Excel treats
+                // it as one dynamic array and re-spills on open. A non-spilling
+                // formula (or one on a sheet with no spill store) writes the
+                // ordinary `<f>` exactly as before.
+                match s.spills.and_then(|sp| sp.rect_of(cell)) {
+                    Some(rect) => {
+                        let br = rect.bottom_right();
+                        ws.write_dynamic_array_formula(
+                            r,
+                            c as u16,
+                            br.row,
+                            br.col as u16,
+                            Formula::new(body).set_result(result),
+                        )?;
+                    }
+                    None => {
+                        ws.write_formula(r, c as u16, Formula::new(body).set_result(result))?;
+                    }
+                }
                 continue;
             }
 
@@ -1411,6 +1463,118 @@ mod tests {
             Some(CellInput::Formula { src, .. }) => Some(src.as_str()),
             _ => None,
         }
+    }
+
+    // --- dynamic-array formula round trip (#27 P4) ---
+
+    #[test]
+    fn dynamic_array_formula_round_trips_as_t_array_ref() {
+        use ferrix_formula::{ArrayData, SpillRect, SpillRegions};
+
+        // THE acceptance criterion: a workbook with a dynamic-array formula,
+        // written then re-read, preserves `<f t="array" ref="...">` and the
+        // same spilled result. The host A1 holds `=D1:D3`, which materialises
+        // to a 3x1 array (P1) and spills down A1:A3 (P2).
+        let mut sheet = Sheet::new("Spill");
+        // The producer cells the array reads from.
+        for (r, n) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+            sheet.set(CellRef::new(r as u32, 3), Value::Number(n)); // D1:D3
+        }
+
+        let host = CellRef::new(0, 0); // A1
+        let array = ArrayData::from_cells(
+            3,
+            1,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        );
+
+        // The overlay: A1 is a live formula; A2/A3 are its spilled projections
+        // (literals the store marks as spill-owned), exactly as the workbook
+        // lays a spill down.
+        let mut fx = EditOverlay::new();
+        fx.set(
+            host,
+            CellInput::Formula {
+                src: "=D1:D3".to_string(),
+                cached: Value::Number(1.0),
+            },
+        );
+        fx.set(CellRef::new(1, 0), CellInput::Literal(Value::Number(2.0)));
+        fx.set(CellRef::new(2, 0), CellInput::Literal(Value::Number(3.0)));
+
+        // The spill store marking A1 the host of a 3x1 spill.
+        let mut spills = SpillRegions::new();
+        spills.set_spilled(host, SpillRect::new(host, 3, 1), array);
+
+        let tmp = TempXlsx::new("array-roundtrip");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("Spill", &sheet)
+                .with_formulas(&fx)
+                .with_spills(&spills)],
+        )
+        .expect("export");
+
+        // 1) The array-formula region survives as `<f t="array" ref="A1:A3">`.
+        let regions = crate::array_xlsx::import_array_formulas(tmp.path()).expect("read regions");
+        assert_eq!(regions.len(), 1, "one sheet has array formulas");
+        let sheet0 = &regions[0];
+        assert_eq!(sheet0.sheet_index, 0);
+        assert_eq!(sheet0.regions.len(), 1, "exactly one array-formula host");
+        let region = sheet0.regions[0];
+        assert_eq!(region.host, host, "host recovered from the ref anchor");
+        assert_eq!((region.rows, region.cols), (3, 1), "3x1 spill rectangle");
+
+        // 2) The host formula SOURCE round-trips as a live formula, not a frozen
+        //    value — the whole point of keeping it a dynamic array.
+        let got = import_xlsx_full(tmp.path()).expect("reimport");
+        assert_eq!(imported_src(&got[0], host), Some("=D1:D3"));
+
+        // 3) The spilled projections were NOT written as their own literals: on
+        //    reopen only the host carries a formula, and the covered cells are
+        //    left for the reader/Excel to recompute. (calamine hands back the
+        //    cached `<v>` as a plain value; what matters is they are not live
+        //    formulas competing with the host's spill.)
+        assert_eq!(
+            imported_src(&got[0], CellRef::new(1, 0)),
+            None,
+            "A2 must not come back as its own formula"
+        );
+        assert_eq!(
+            imported_src(&got[0], CellRef::new(2, 0)),
+            None,
+            "A3 must not come back as its own formula"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_formula_is_not_written_as_an_array_formula() {
+        // Sabotage guard: without a spill region, a plain formula must NOT pick
+        // up the `t="array"` form — otherwise every formula would round-trip as
+        // a spurious dynamic array.
+        let mut sheet = Sheet::new("Plain");
+        sheet.set(CellRef::new(0, 0), Value::Number(2.0));
+        let mut fx = EditOverlay::new();
+        fx.set(
+            CellRef::new(0, 1),
+            CellInput::Formula {
+                src: "=A1*2".to_string(),
+                cached: Value::Number(4.0),
+            },
+        );
+
+        let tmp = TempXlsx::new("plain-not-array");
+        export_workbook(
+            tmp.path(),
+            &[SheetExport::new("Plain", &sheet).with_formulas(&fx)],
+        )
+        .expect("export");
+
+        let regions = crate::array_xlsx::import_array_formulas(tmp.path()).expect("read regions");
+        assert!(
+            regions.is_empty(),
+            "a non-spilling formula must not be an array formula, got {regions:?}"
+        );
     }
 
     #[test]

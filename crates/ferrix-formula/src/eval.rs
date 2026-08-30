@@ -84,6 +84,24 @@ pub trait CellSource {
     fn sheet_span(&self, _first: &str, _last: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// The dynamic array a spilling host at `anchor` currently owns, for the
+    /// `A1#` spill-range operator (#27 P4).
+    ///
+    /// Returns the host's live [`crate::array::ArrayData`] (#27 P2 overlay)
+    /// when `anchor` is a spilling host, and `None` otherwise — a plain
+    /// `Sheet`, or any source with no spill overlay, has no dynamic arrays, so
+    /// `A1#` over it is a `#REF!`, exactly as it is in Excel when A1 is not a
+    /// spill anchor. Kept on `CellSource` with a `None` default, like the
+    /// cross-sheet reads above, so every existing implementor keeps compiling
+    /// and behaving identically.
+    ///
+    /// Bounded by the RESULT extent: the array is cloned from the overlay,
+    /// which owns it once and sizes it by the spill's own dimensions, never by
+    /// the sheet.
+    fn spill_array_at(&self, _anchor: CellRef) -> Option<crate::array::ArrayData> {
+        None
+    }
 }
 
 impl CellSource for Sheet {
@@ -147,6 +165,19 @@ pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
                 Value::Error(ErrorKind::Value)
             }
         }
+        // `@expr` forces implicit intersection: evaluate in ARRAY context, then
+        // collapse to a single value. On an already-scalar operand this is the
+        // identity; on a range or an array-native call it is what stops a cell
+        // from spilling — `=@A1:A10` takes one value, never the whole column.
+        Expr::Intersect(inner) => eval_view_array(inner, src).into_scalar(),
+        // `A1#` in scalar context collapses the spilled array to its top-left,
+        // the same implicit intersection every array undergoes when a scalar
+        // caller consumes it. When A1 is not a spilling host there is no array
+        // to take, which is a `#REF!` — the spill-range points at nothing.
+        Expr::SpillRange(anchor) => match src.spill_array_at(*anchor) {
+            Some(array) => array.top_left(),
+            None => Value::Error(ErrorKind::Ref),
+        },
         Expr::Unary(op, inner) => {
             let v = eval_view(inner, src);
             if let Some(e) = v.error() {
@@ -193,6 +224,21 @@ pub fn eval_view_array<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> crate::a
         // to the scalar path — it is a plain scalar, not a 1x1 array — so the
         // fork adds no allocation to ordinary cell reads.
         Expr::Range(..) | Expr::XRange(..) => crate::array::materialize(expr, src),
+        // `A1#` — the spill-range operator. This is the array-context arm that
+        // makes it useful: it resolves to the WHOLE array the host at `anchor`
+        // spilled, so `=SUM(A1#)` sums the entire spill and `=A1#` re-spills a
+        // copy of it. A non-host anchor has no array, which is `#REF!` (a
+        // scalar error, never a phantom 1x1 array).
+        Expr::SpillRange(anchor) => match src.spill_array_at(*anchor) {
+            Some(array) => crate::array::EvalResult::Array(array),
+            None => crate::array::EvalResult::Scalar(Value::Error(ErrorKind::Ref)),
+        },
+        // `@expr` collapses even in array context — that is its whole job. It
+        // evaluates its operand as an array, then intersects to a single
+        // scalar, so `@A1:A10` never spills no matter where it is used.
+        Expr::Intersect(inner) => {
+            crate::array::EvalResult::Scalar(eval_view_array(inner, src).into_scalar())
+        }
         // Everything else is scalar. Route through the single scalar evaluator
         // so the array and scalar paths can never disagree.
         _ => crate::array::EvalResult::Scalar(eval_view(expr, src)),
@@ -1646,5 +1692,119 @@ mod tests {
             ms < 100,
             "SUM over 100k cells took {ms}ms; columnar path may be broken"
         );
+    }
+
+    // --- @ intersection and A1# spill-range resolution (#27 P4) ------------
+
+    /// A `Sheet` with a stand-in spill overlay: `spill_array_at` answers from a
+    /// map of host cell -> array, everything else delegates to the sheet. This
+    /// is the minimal `CellSource` an `A1#` needs — the real workbook overlay
+    /// (P2) is exercised end-to-end in the ferrix-ui integration tests.
+    struct SpillSource {
+        sheet: Sheet,
+        spills: std::collections::HashMap<CellRef, crate::array::ArrayData>,
+    }
+
+    impl CellSource for SpillSource {
+        fn get(&self, cell: CellRef) -> Value {
+            self.sheet.get(cell)
+        }
+        fn resolve(&self, id: ferrix_core::StrId) -> &str {
+            self.sheet.resolve(id)
+        }
+        fn sum_rect(&self, start: CellRef, end: CellRef) -> f64 {
+            self.sheet.sum_rect(start, end)
+        }
+        fn count_rect(&self, start: CellRef, end: CellRef) -> usize {
+            self.sheet.count_rect(start, end)
+        }
+        fn row_count(&self) -> usize {
+            self.sheet.row_count()
+        }
+        fn spill_array_at(&self, anchor: CellRef) -> Option<crate::array::ArrayData> {
+            self.spills.get(&anchor).cloned()
+        }
+    }
+
+    fn spill_source() -> SpillSource {
+        // A1 is a spilling host owning the column array [1;2;3].
+        let mut spills = std::collections::HashMap::new();
+        spills.insert(
+            CellRef::new(0, 0),
+            crate::array::ArrayData::from_cells(
+                3,
+                1,
+                vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+            ),
+        );
+        SpillSource {
+            sheet: sheet_with_numbers(),
+            spills,
+        }
+    }
+
+    #[test]
+    fn at_prefix_forces_implicit_intersection_on_a_range() {
+        // Bare `A1:A5` is #VALUE! in scalar context; `@A1:A5` collapses to the
+        // top-left, which is A1 = 1. That collapse is the whole point of `@`.
+        let s = sheet_with_numbers();
+        assert_eq!(ev("=A1:A5", &s), Value::Error(ErrorKind::Value));
+        assert_eq!(ev("=@A1:A5", &s), Value::Number(1.0));
+        // Intersecting an already-scalar operand is the identity.
+        assert_eq!(ev("=@A1", &s), Value::Number(1.0));
+        assert_eq!(ev("=@(1+2)", &s), Value::Number(3.0));
+    }
+
+    #[test]
+    fn spill_range_resolves_the_hosts_array_over_the_overlay() {
+        let src = spill_source();
+        // Scalar context: `A1#` collapses to the array's top-left (1), the same
+        // implicit intersection any array undergoes for a scalar caller.
+        assert_eq!(eval_view(&parse("=A1#").unwrap(), &src), Value::Number(1.0));
+        // Array context is where the spill-range earns its keep: it resolves to
+        // the WHOLE `3x1` array the host owns, straight off the overlay.
+        match eval_view_array(&parse("=A1#").unwrap(), &src) {
+            crate::array::EvalResult::Array(a) => {
+                assert_eq!((a.rows(), a.cols()), (3, 1));
+                assert_eq!(a.get(0, 0), Value::Number(1.0));
+                assert_eq!(a.get(2, 0), Value::Number(3.0));
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+        // `ARRAYTOTEXT` is the P1 array-consuming builtin: it walks the whole
+        // spilled array through the seam, proving `A1#` reaches a function as
+        // an array and not as a collapsed scalar. (Making the ordinary
+        // aggregates like SUM array-aware is #27 P3, not P4.)
+        match eval_view(&parse("=ARRAYTOTEXT(A1#)").unwrap(), &src) {
+            Value::Text(id) => assert_eq!(src.resolve(id), "1;2;3"),
+            other => panic!("ARRAYTOTEXT(A1#) = {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spill_range_over_a_non_host_is_ref_error() {
+        // B1 is not a spilling host, so `B1#` points at nothing: #REF!.
+        let src = spill_source();
+        assert_eq!(
+            eval_view(&parse("=B1#").unwrap(), &src),
+            Value::Error(ErrorKind::Ref)
+        );
+        // A plain Sheet has no overlay at all — every `A1#` is #REF!.
+        let s = sheet_with_numbers();
+        assert_eq!(ev("=A1#", &s), Value::Error(ErrorKind::Ref));
+    }
+
+    #[test]
+    fn at_collapses_a_spill_range() {
+        // `@A1#` takes just the first element of the spill, never the array.
+        let src = spill_source();
+        assert_eq!(
+            eval_view(&parse("=@A1#").unwrap(), &src),
+            Value::Number(1.0)
+        );
+        match eval_view_array(&parse("=@A1#").unwrap(), &src) {
+            crate::array::EvalResult::Scalar(Value::Number(n)) => assert_eq!(n, 1.0),
+            other => panic!("@ must collapse to a scalar, got {other:?}"),
+        }
     }
 }
