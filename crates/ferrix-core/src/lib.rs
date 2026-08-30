@@ -27,6 +27,7 @@ pub mod numfmt;
 pub mod order;
 pub mod overlay;
 pub mod page;
+pub mod pivot;
 pub mod protect;
 pub mod scene;
 pub mod search;
@@ -60,6 +61,10 @@ pub use format::{
 };
 pub use order::{AxisOrder, AxisShift, OrderError, SheetOrder};
 pub use overlay::{CellInput, EditOverlay, OverlayChange};
+pub use pivot::{
+    compute as compute_pivot, Agg as PivotAgg, Cell as PivotCell, ColIdx, PivotGroup, PivotResult,
+    PivotSource,
+};
 pub use protect::{
     Action as ProtectAction, Allowances, CellLockState, Denied, LockMap, PasswordHash,
     SheetProtection, StructureOp, WorkbookProtection,
