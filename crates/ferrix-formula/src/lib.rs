@@ -15,6 +15,7 @@ pub mod parser;
 pub mod refedit;
 pub mod refscan;
 pub mod remap;
+pub mod spill;
 pub mod stats;
 pub mod text;
 
@@ -32,3 +33,4 @@ pub use eval::{eval, eval_view, CellSource};
 pub use names::{DefinedName, NameError, NameScope, NameTable};
 pub use parser::{parse, parse_with_names, quote_sheet_name, BinOp, Expr, ParseError, UnOp};
 pub use remap::{paste_formula, remap_columns, remap_formula, remap_rows, AxisMap};
+pub use spill::{plan_spill, SpillPlan, SpillRect, SpillRegions};

@@ -1119,6 +1119,16 @@ impl FerrixApp {
         // double-click), which is why the check lives here and not in three
         // call sites that could drift apart.
         let cell = self.wb.merges.resolve(cell);
+        // A spilled cell is owned by its host formula and refuses direct edits
+        // (#27 P2). Say so up front rather than letting the commit fail
+        // silently-looking later — the value the user sees is a projection of
+        // the host's array, not something they can type over.
+        if self.wb.is_spilled_cell(cell) {
+            self.status = format!(
+                "{} is part of a spilled array — edit its source formula instead",
+                cell.to_a1()
+            );
+        }
         // Captured BEFORE the seed is applied. When the edit began by typing
         // over the cell, the seed is the single character the user pressed and
         // the cell's real text exists nowhere else by the time Escape arrives
@@ -1206,6 +1216,10 @@ impl FerrixApp {
             format!("{} not changed — {denied}", cell.to_a1())
         } else if let Some(err) = &report.parse_error {
             format!("{}: {err}", cell.to_a1())
+        } else if let Some(blocker) = self.wb.spill_blocker_at(cell) {
+            // #27 P2: a blocked spill must not be a dead-end #SPILL!. Name the
+            // cell that is in the way so the user knows what to clear.
+            format!("{}: #SPILL! — blocked by {}", cell.to_a1(), blocker.to_a1())
         } else if report.circular {
             format!("{}: circular reference", cell.to_a1())
         } else if report.recalculated > 0 {
@@ -11790,5 +11804,25 @@ mod tests {
         assert_eq!(got, vec!["id", "name", "prix"]);
         assert_eq!(got.len(), 3, "a hardcoded comma would yield one column");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// #27 P2: starting to edit a spilled cell explains it is read-only rather
+    /// than letting the refusal look like a broken keyboard. Drives the real
+    /// `begin_edit` chokepoint through the app.
+    #[test]
+    fn editing_a_spilled_cell_says_it_is_part_of_a_spill() {
+        let mut app = FerrixApp::new(None);
+        app.wb.commit_edit(CellRef::new(0, 3), "10"); // D1
+        app.wb.commit_edit(CellRef::new(1, 3), "20"); // D2
+        app.wb.commit_edit(CellRef::new(0, 0), "=D1:D3"); // A1 host spills A1:A2
+
+        // A2 is a spilled projection.
+        assert!(app.wb.is_spilled_cell(CellRef::new(1, 0)));
+        app.begin_edit_for_test(CellRef::new(1, 0), None);
+        assert!(
+            app.status_text().contains("part of a spilled array"),
+            "status was: {}",
+            app.status_text()
+        );
     }
 }

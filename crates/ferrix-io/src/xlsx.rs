@@ -503,7 +503,7 @@ fn data_to_value(data: &Data, sheet: &mut Sheet) -> Value {
 /// Recognize a canonical error spelling written as text. This is how `#CIRC!`
 /// gets home, and it matches Excel's own behaviour for typed-in error text.
 fn error_from_str(s: &str) -> Option<ErrorKind> {
-    const ALL: [ErrorKind; 8] = [
+    const ALL: [ErrorKind; 9] = [
         ErrorKind::DivZero,
         ErrorKind::Value,
         ErrorKind::Ref,
@@ -512,6 +512,7 @@ fn error_from_str(s: &str) -> Option<ErrorKind> {
         ErrorKind::NotAvailable,
         ErrorKind::Null,
         ErrorKind::Circular,
+        ErrorKind::Spill,
     ];
     ALL.into_iter().find(|e| e.as_str() == s)
 }

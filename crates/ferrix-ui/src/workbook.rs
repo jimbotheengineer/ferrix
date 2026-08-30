@@ -10,7 +10,9 @@ use ferrix_core::{
 };
 use ferrix_formula::depgraph::DepGraph;
 use ferrix_formula::fill::FillKind;
-use ferrix_formula::{eval_view, DefinedName, NameError, NameScope, ParseError};
+use ferrix_formula::{
+    eval_view, DefinedName, EvalResult, NameError, NameScope, ParseError, SpillRect,
+};
 
 use crate::grid::ScrollState;
 use crate::sheet_view::{BaseData, SheetView};
@@ -369,6 +371,14 @@ pub struct Workbook {
     /// Sparse rectangles beside the data, so merged headers cost nothing per
     /// row on a 200M-row sheet.
     pub merges: ferrix_core::merge::MergeMap,
+    /// Dynamic-array spill regions for the ACTIVE sheet (#27 P2).
+    ///
+    /// Keyed by HOST cell — a workbook quantity, like `merges` — so a spilling
+    /// formula costs one entry however tall its array, and the array's bytes
+    /// live once in the region rather than per covered cell. Each covered cell
+    /// keeps a plain scalar projection in `overlay`; the store is what marks it
+    /// as spill-owned (read-only, re-planned as a whole from the host).
+    pub spills: ferrix_formula::SpillRegions,
     /// Cell comments for the ACTIVE sheet.
     ///
     /// Sparse, and keyed by DISPLAY position — the same space `overlay` is
@@ -467,6 +477,7 @@ impl Workbook {
             validation: ferrix_core::SheetValidation::new(),
             sparklines: ferrix_core::SparklineMap::new(),
             merges: ferrix_core::merge::MergeMap::new(),
+            spills: ferrix_formula::SpillRegions::new(),
             comments: ferrix_core::CommentMap::new(),
             parked: std::collections::HashMap::new(),
             next_id: 1,
@@ -728,6 +739,15 @@ impl Workbook {
     /// the reason so the UI can say it out loud rather than silently doing
     /// nothing — which is the acceptance criterion this exists for.
     fn guard_edit(&mut self, cell: CellRef) -> Result<(), ferrix_core::Denied> {
+        // A spilled projection is owned by its host formula and refuses a
+        // direct edit (#27 P2): the cell shows a computed value, and typing
+        // over it would silently break the array. The host cell itself is NOT
+        // refused — editing or deleting the host is how a user removes a spill.
+        if self.spills.is_locked_spill_cell(cell) {
+            let d = ferrix_core::Denied::LockedCell(cell);
+            self.last_denial = Some(d);
+            return Err(d);
+        }
         match self.sheets[self.active].protection.deny_edit(cell) {
             Some(d) => {
                 self.last_denial = Some(d);
@@ -2379,6 +2399,21 @@ impl Workbook {
             }
         }
 
+        // A spilling host that just stopped being a healthy array formula —
+        // cleared, turned into a literal, or broke with a parse error/cycle —
+        // must release the cells it painted. When it is STILL a formula,
+        // `eval_one_at` below re-plans (spill / scalar / #SPILL!) and tears the
+        // old region down itself, so only the not-a-formula cases are handled
+        // here.
+        if at.sheet == self.active_sheet() {
+            let still_formula = matches!(new_input, Some(CellInput::Formula { .. }))
+                && !report.circular
+                && report.parse_error.is_none();
+            if !still_formula {
+                self.clear_spill_region(cell);
+            }
+        }
+
         // Evaluate this cell if it is a healthy formula.
         if !report.circular && report.parse_error.is_none() {
             self.eval_one_at(at);
@@ -2412,6 +2447,31 @@ impl Workbook {
                         ov.update_cached(c.cell, Value::Error(ErrorKind::Circular));
                     }
                 }
+            }
+        }
+
+        // Blocked-spill recovery (#27 P2): deleting (or moving out of) the cell
+        // that blocked a spill must make the spill appear again WITHOUT the user
+        // re-entering the host formula. The blocker is not one of the host's
+        // formula precedents, so the dependency-graph recalc above never
+        // revisits the host — we do it here. Any host whose recorded blocker is
+        // no longer blocking is re-planned from its existing formula; the
+        // re-plan spills if the whole rect is now clear.
+        if at.sheet == self.active_sheet() {
+            let freed_hosts: Vec<SheetCell> = self
+                .spills
+                .hosts()
+                .into_iter()
+                .filter(|host| {
+                    self.spills
+                        .blocker_of(*host)
+                        .is_some_and(|b| !self.is_spill_blocker(b))
+                })
+                .map(SheetCell::main)
+                .collect();
+            for host in freed_hosts {
+                self.eval_one_at(host);
+                report.recalculated += 1;
             }
         }
 
@@ -2613,21 +2673,173 @@ impl Workbook {
     /// Evaluation goes through [`WorkbookSource`] rather than a bare
     /// `SheetView`, so `Sheet2!A1` inside the formula resolves — including
     /// when the formula itself lives on a parked sheet.
+    ///
+    /// On the ACTIVE sheet this is spill-aware (#27 P2): a formula whose result
+    /// is an array PAINTS into neighbouring cells instead of collapsing to its
+    /// top-left. Parked sheets stay scalar-only — the spill store, like
+    /// `merges`, is bound to the active sheet — so a parked formula behaves
+    /// exactly as it did before P2.
     fn eval_one_at(&mut self, at: SheetCell) {
         let src = match self.overlay_of(at.sheet).and_then(|o| o.get(at.cell)) {
             Some(CellInput::Formula { src, .. }) => src.clone(),
             _ => return,
         };
-        let value = match self.parse_on(at.sheet, &src) {
+
+        // Spill only participates on the active sheet, where `spills`/`merges`
+        // live. Everywhere else evaluate the legacy scalar way.
+        if at.sheet != self.active_sheet() {
+            let value = match self.parse_on(at.sheet, &src) {
+                Ok(expr) => {
+                    let source = WorkbookSource::new(self, at.sheet);
+                    eval_view(&expr, &source)
+                }
+                Err(_) => Value::Error(ErrorKind::Name),
+            };
+            if let Some(ov) = self.overlay_of_mut(at.sheet) {
+                ov.update_cached(at.cell, value);
+            }
+            return;
+        }
+
+        // Active sheet: evaluate PRESERVING an array result, then spill it.
+        let result = match self.parse_on(at.sheet, &src) {
             Ok(expr) => {
                 let source = WorkbookSource::new(self, at.sheet);
-                eval_view(&expr, &source)
+                ferrix_formula::eval::eval_view_array(&expr, &source)
             }
-            Err(_) => Value::Error(ErrorKind::Name),
+            Err(_) => EvalResult::Scalar(Value::Error(ErrorKind::Name)),
         };
-        if let Some(ov) = self.overlay_of_mut(at.sheet) {
-            ov.update_cached(at.cell, value);
+        self.apply_eval_result(at.cell, result);
+    }
+
+    /// Apply a host formula's [`EvalResult`] on the active sheet: a scalar is
+    /// cached as before; an array spills (#27 P2).
+    ///
+    /// This is the single door every active-sheet host result passes through,
+    /// so a formula that STOPS being an array (its inputs shrank to a scalar)
+    /// tears down its old spill here, in the same place one is built.
+    fn apply_eval_result(&mut self, host: CellRef, result: EvalResult) {
+        match result {
+            EvalResult::Scalar(v) => {
+                // A host that used to spill but now yields a scalar must release
+                // the cells it painted, or stale projections would linger.
+                self.clear_spill_region(host);
+                self.overlay.update_cached(host, v);
+            }
+            EvalResult::Array(array) => self.spill_array(host, array),
         }
+    }
+
+    /// Plan and apply the spill of `array` rooted at `host` on the active sheet.
+    ///
+    /// Two phases so the immutable evaluation borrow is dropped before the
+    /// overlay is mutated: first compute the plan against a read-only snapshot
+    /// of occupancy, then write projections (or the `#SPILL!` marker).
+    fn spill_array(&mut self, host: CellRef, array: ferrix_formula::ArrayData) {
+        // The rectangle this host owned before (if any), so a re-plan can free
+        // the cells the new spill no longer covers.
+        let previous = self.spills.rect_of(host);
+
+        // Phase 1 — plan. A target cell blocks the spill when it holds a real
+        // value the user put there, OR is part of a merged region. A cell this
+        // same host already owns from its PREVIOUS spill is NOT a blocker: a
+        // re-spill must not trip over its own old projection.
+        let plan = ferrix_formula::plan_spill(host, &array, |cell| {
+            if let Some(prev) = previous {
+                if prev.contains(cell) {
+                    return false;
+                }
+            }
+            self.is_spill_blocker(cell)
+        });
+
+        // Phase 2 — apply.
+        match plan {
+            ferrix_formula::SpillPlan::Spilled { rect, projections } => {
+                // Free any previously-owned cell the new rect no longer covers.
+                self.clear_spill_cells_outside(previous, Some(rect));
+                // Write each covered cell's scalar projection. The host keeps
+                // its formula (only its cached value is updated); the other
+                // covered cells become plain literals the store marks as
+                // spilled.
+                for (cell, value) in &projections {
+                    if *cell == host {
+                        self.overlay.update_cached(host, *value);
+                    } else {
+                        self.overlay.set(*cell, CellInput::Literal(*value));
+                    }
+                }
+                self.spills.set_spilled(host, rect, array);
+            }
+            ferrix_formula::SpillPlan::Blocked { blocker } => {
+                // Nothing spills: free the old rect and mark the host #SPILL!.
+                // The blocker address is kept in the store so the hover/error
+                // can name it — an unexplained #SPILL! is a dead end.
+                self.clear_spill_cells_outside(previous, None);
+                self.spills.set_blocked(host, blocker);
+                self.overlay
+                    .update_cached(host, Value::Error(ErrorKind::Spill));
+            }
+        }
+    }
+
+    /// Is `cell` occupied by something a spill must not overwrite?
+    ///
+    /// A non-empty value the user (or another formula) put there blocks, and so
+    /// does a merged region — the merge is a blocker like any other occupied
+    /// cell, so a spill can never silently swallow it. Reads through the active
+    /// view, so it sees base data and overlay edits alike.
+    fn is_spill_blocker(&self, cell: CellRef) -> bool {
+        if self.merges.region_at(cell).is_some() {
+            return true;
+        }
+        !self.view().get(cell).is_empty()
+    }
+
+    /// Remove `host`'s spill region and every projection it painted. Used when
+    /// a host's formula is deleted, replaced, or collapses to a scalar.
+    fn clear_spill_region(&mut self, host: CellRef) {
+        if let Some(rect) = self.spills.clear(host) {
+            for cell in rect.cells() {
+                if cell != host {
+                    self.overlay.clear(cell);
+                }
+            }
+        } else {
+            // A blocked host owns no cells but still has a store entry to drop.
+            self.spills.clear(host);
+        }
+    }
+
+    /// Clear projections in the OLD rect that the NEW rect no longer covers.
+    ///
+    /// The host cell is never cleared here — it holds the formula. A `new` of
+    /// `None` clears the whole old rect (a spill that became blocked keeps
+    /// nothing beyond the host).
+    fn clear_spill_cells_outside(&mut self, previous: Option<SpillRect>, new: Option<SpillRect>) {
+        let Some(prev) = previous else { return };
+        for cell in prev.cells() {
+            if cell == prev.top_left {
+                continue; // host stays
+            }
+            let still_covered = new.is_some_and(|r| r.contains(cell));
+            if !still_covered {
+                self.overlay.clear(cell);
+            }
+        }
+    }
+
+    /// The blocker address for a host currently showing `#SPILL!`, so the UI
+    /// hover/error can name the offending cell. `None` when the host is not a
+    /// blocked spill.
+    pub fn spill_blocker_at(&self, host: CellRef) -> Option<CellRef> {
+        self.spills.blocker_of(host)
+    }
+
+    /// Is `cell` a spilled projection (a covered cell that is not its host)?
+    /// Such a cell refuses direct edits — see [`Workbook::guard_edit`].
+    pub fn is_spilled_cell(&self, cell: CellRef) -> bool {
+        self.spills.is_locked_spill_cell(cell)
     }
 
     /// Recompute every formula in the workbook, in dependency order.
@@ -6166,5 +6378,190 @@ mod tests {
             "B1 must be back at its original value, not at a leftover probe"
         );
         assert_eq!(w.undo_depth(), depth, "nothing to undo when nothing landed");
+    }
+
+    // ======================================================================
+    // Dynamic-array spill (#27 P2)
+    // ======================================================================
+    //
+    // P2's array PRODUCER for these tests is a bare multi-cell range reference:
+    // in array context `=D1:D3` materialises an `ArrayData` (P1), so a host
+    // holding `=D1:D3` spills those three values into its own column. SEQUENCE
+    // and friends are P3; nothing here depends on them.
+
+    /// An empty single-sheet workbook — no base data — so a spill has clear
+    /// cells to paint into.
+    fn empty_wb() -> Workbook {
+        Workbook::new(BaseData::Memory(Sheet::new("t")))
+    }
+
+    #[test]
+    fn an_array_result_spills_into_neighbouring_cells() {
+        let mut w = empty_wb();
+        // Source column D1:D3 = 10, 20, 30.
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(2, 3), "30");
+        // Host A1 = the array. It fills A1:A3.
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+
+        assert_eq!(val(&w, 0, 0), Value::Number(10.0));
+        assert_eq!(val(&w, 1, 0), Value::Number(20.0));
+        assert_eq!(val(&w, 2, 0), Value::Number(30.0));
+        // The spilled cells are marked as owned by the host; the host is not.
+        assert!(!w.is_spilled_cell(CellRef::new(0, 0)));
+        assert!(w.is_spilled_cell(CellRef::new(1, 0)));
+        assert!(w.is_spilled_cell(CellRef::new(2, 0)));
+    }
+
+    #[test]
+    fn a_spilled_cell_refuses_a_direct_edit() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3"); // fills A1:A2
+
+        // Typing over A2 (a spilled cell) is refused and writes nothing.
+        let rep = w.commit_edit(CellRef::new(1, 0), "999");
+        assert!(rep.denied.is_some(), "a spilled cell must refuse edits");
+        assert_eq!(
+            val(&w, 1, 0),
+            Value::Number(20.0),
+            "the projection must survive a refused edit"
+        );
+    }
+
+    #[test]
+    fn a_blocked_spill_reports_spill_and_names_the_blocker() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(2, 3), "30");
+        // A2 is occupied BEFORE the host spills — it blocks the A1:A3 spill.
+        w.commit_edit(CellRef::new(1, 0), "IN THE WAY");
+
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+        // The host shows #SPILL!, nothing was painted over the blocker, and the
+        // blocker address is recoverable — no dead-end #SPILL!.
+        assert_eq!(val(&w, 0, 0), Value::Error(ErrorKind::Spill));
+        assert_eq!(
+            w.spill_blocker_at(CellRef::new(0, 0)),
+            Some(CellRef::new(1, 0)),
+            "the blocking cell must be nameable"
+        );
+        // The blocker's own value is untouched.
+        assert_eq!(w.view().display(CellRef::new(1, 0)), "IN THE WAY");
+        // A3 was never painted — the spill is all-or-nothing.
+        assert_eq!(val(&w, 2, 0), Value::Empty);
+    }
+
+    #[test]
+    fn deleting_the_blocker_makes_the_spill_appear_without_re_entering_the_formula() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(2, 3), "30");
+        w.commit_edit(CellRef::new(1, 0), "blocker"); // A2 occupied
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+        assert_eq!(val(&w, 0, 0), Value::Error(ErrorKind::Spill), "blocked");
+
+        // Delete the blocker — and DO NOT touch A1's formula.
+        w.commit_edit(CellRef::new(1, 0), "");
+
+        // The spill now appears in full.
+        assert_eq!(val(&w, 0, 0), Value::Number(10.0));
+        assert_eq!(val(&w, 1, 0), Value::Number(20.0));
+        assert_eq!(val(&w, 2, 0), Value::Number(30.0));
+        assert!(w.is_spilled_cell(CellRef::new(1, 0)));
+        assert_eq!(
+            w.spill_blocker_at(CellRef::new(0, 0)),
+            None,
+            "no longer blocked"
+        );
+    }
+
+    #[test]
+    fn a_spill_into_a_merged_region_is_spill_and_leaves_the_merge_untouched() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(2, 3), "30");
+        // Merge A2:B2 — an empty merged region sitting in the spill's path.
+        w.merges
+            .merge(TableRange::new(1, 0, 1, 1))
+            .expect("merge A2:B2");
+
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+        // The merge is a blocker like any occupied cell: #SPILL!, and it names
+        // the merged anchor.
+        assert_eq!(val(&w, 0, 0), Value::Error(ErrorKind::Spill));
+        assert_eq!(
+            w.spill_blocker_at(CellRef::new(0, 0)),
+            Some(CellRef::new(1, 0))
+        );
+        // The merge is still there, unchanged.
+        assert!(
+            w.merges.region_at(CellRef::new(1, 0)).is_some(),
+            "the spill must not have dissolved the merge"
+        );
+        assert_eq!(
+            w.merges.region_at(CellRef::new(1, 0)).copied(),
+            Some(TableRange::new(1, 0, 1, 1))
+        );
+    }
+
+    #[test]
+    fn editing_a_source_cell_updates_the_whole_spill() {
+        let mut w = empty_wb();
+        w.commit_edit(CellRef::new(0, 3), "10");
+        w.commit_edit(CellRef::new(1, 3), "20");
+        w.commit_edit(CellRef::new(2, 3), "30");
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3"); // A1:A3 = 10,20,30
+
+        // Change a SOURCE cell (D2). The entire spill must follow, not just the
+        // one covered cell that maps to D2.
+        w.commit_edit(CellRef::new(1, 3), "200");
+
+        assert_eq!(val(&w, 0, 0), Value::Number(10.0));
+        assert_eq!(val(&w, 1, 0), Value::Number(200.0), "the changed element");
+        assert_eq!(val(&w, 2, 0), Value::Number(30.0));
+    }
+
+    #[test]
+    fn a_shrinking_array_releases_the_cells_it_no_longer_covers() {
+        let mut w = empty_wb();
+        for (r, n) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            w.commit_edit(CellRef::new(r, 3), &n.to_string());
+        }
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3"); // A1:A3
+        assert_eq!(val(&w, 2, 0), Value::Number(30.0));
+
+        // Re-point the host at a shorter range. A3 must be released, not left
+        // holding a stale projection.
+        w.commit_edit(CellRef::new(0, 0), "=D1:D2");
+        assert_eq!(val(&w, 0, 0), Value::Number(10.0));
+        assert_eq!(val(&w, 1, 0), Value::Number(20.0));
+        assert_eq!(val(&w, 2, 0), Value::Empty, "A3 must be released");
+        assert!(!w.is_spilled_cell(CellRef::new(2, 0)));
+    }
+
+    #[test]
+    fn deleting_the_host_formula_clears_the_whole_spill() {
+        let mut w = empty_wb();
+        for (r, n) in [(0u32, 10.0), (1, 20.0), (2, 30.0)] {
+            w.commit_edit(CellRef::new(r, 3), &n.to_string());
+        }
+        w.commit_edit(CellRef::new(0, 0), "=D1:D3");
+        assert_eq!(val(&w, 1, 0), Value::Number(20.0));
+
+        // Clear the host. Every spilled cell goes with it.
+        w.commit_edit(CellRef::new(0, 0), "");
+        assert_eq!(val(&w, 0, 0), Value::Empty);
+        assert_eq!(val(&w, 1, 0), Value::Empty);
+        assert_eq!(val(&w, 2, 0), Value::Empty);
+        assert!(!w.is_spilled_cell(CellRef::new(1, 0)));
+        // And the freed cells accept edits again.
+        let rep = w.commit_edit(CellRef::new(1, 0), "hi");
+        assert!(rep.denied.is_none());
     }
 }
