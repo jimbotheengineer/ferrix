@@ -163,6 +163,42 @@ pub fn eval_view<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> Value {
     }
 }
 
+/// Evaluate against any cell source, PRESERVING an array result instead of
+/// collapsing it to a scalar (#27 P1).
+///
+/// This is the array-aware sibling of [`eval_view`]. The two share one
+/// contract: `eval_view(expr, src) == eval_view_array(expr, src).into_scalar()`
+/// for every `expr`. `eval_view` is the boundary every existing caller uses
+/// (formula bar, dependency graph, xlsx writeback) and MUST keep returning a
+/// bare `Value`; `eval_view_array` is the inner form that spill (#27 P2) will
+/// consume to paint an array into neighbouring cells.
+///
+/// Only an array-native call or a multi-cell range at the top can produce an
+/// `Array` today. Everything else is a `Scalar`, delegated straight to
+/// [`eval_view`] so there is exactly ONE scalar evaluation path and no
+/// behaviour can drift between them.
+pub fn eval_view_array<S: CellSource + ?Sized>(expr: &Expr, src: &S) -> crate::array::EvalResult {
+    match expr {
+        // An array-native call carries its own chosen shape across the seam.
+        // This is the only arm that routes into `crate::array::call`.
+        Expr::Call(name, args) if crate::array::is_array_fn(name) => {
+            crate::array::call(name, args, src)
+        }
+        // A multi-cell range reference IS a dynamic array in array context —
+        // this is the substrate every spilled formula stands on. It stays
+        // `#VALUE!` through the SCALAR `eval_view` (unchanged, so no existing
+        // caller is affected) and only materialises here, bounded by the range
+        // extent via the columnar `spec_get` path (five cells for `A1:A5`
+        // whether the column is 5 rows or 200M). A single-cell `Ref` is left
+        // to the scalar path — it is a plain scalar, not a 1x1 array — so the
+        // fork adds no allocation to ordinary cell reads.
+        Expr::Range(..) | Expr::XRange(..) => crate::array::materialize(expr, src),
+        // Everything else is scalar. Route through the single scalar evaluator
+        // so the array and scalar paths can never disagree.
+        _ => crate::array::EvalResult::Scalar(eval_view(expr, src)),
+    }
+}
+
 fn eval_binary<S: CellSource + ?Sized>(op: BinOp, lhs: &Expr, rhs: &Expr, src: &S) -> Value {
     let a = eval_view(lhs, src);
     if let Some(e) = a.error() {
@@ -568,6 +604,18 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
         // on purpose: the whole library is one module file, so it can grow
         // without touching this match again.
         name if crate::text::is_text_fn(name) => crate::text::call(name, args, src),
+        // Array-native functions (#27) live entirely in `crate::array`. Like
+        // the family guards around it, this arm must claim ONLY names no other
+        // family or direct builtin owns — guard arms match in order, so an
+        // over-claim would silently swallow another family's call. The array
+        // family is the one path that can return a 2-D result; here, on the
+        // SCALAR entrypoint, that result is collapsed to its top-left cell
+        // (implicit intersection) so every existing caller still receives a
+        // bare `Value`. `crate::array_compose_tests` pins the mutual exclusion
+        // and that arrays cross this seam uncollapsed on the array entrypoint.
+        name if crate::array::is_array_fn(name) => {
+            crate::array::call(name, args, src).into_scalar()
+        }
         // Lookup functions live entirely in `crate::lookup`. One arm again —
         // and note that this guard, like the three above it, must claim ONLY
         // names no other family owns: guard arms match in order, so the first
