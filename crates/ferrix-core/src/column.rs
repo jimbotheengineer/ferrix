@@ -404,6 +404,7 @@ const fn encode_error(e: ErrorKind) -> u8 {
         ErrorKind::NotAvailable => 5,
         ErrorKind::Null => 6,
         ErrorKind::Circular => 7,
+        ErrorKind::Spill => 8,
     }
 }
 
@@ -417,6 +418,7 @@ const fn decode_error(b: u8) -> ErrorKind {
         4 => ErrorKind::Num,
         5 => ErrorKind::NotAvailable,
         6 => ErrorKind::Null,
+        8 => ErrorKind::Spill,
         _ => ErrorKind::Circular,
     }
 }

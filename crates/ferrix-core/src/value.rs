@@ -26,6 +26,12 @@ pub enum ErrorKind {
     Null,
     /// Circular reference detected by the dependency graph.
     Circular,
+    /// #SPILL! — a dynamic-array formula's result could not spill because a
+    /// cell in its target rectangle is occupied (#27 P2). The blocking cell's
+    /// address is NOT carried in the value (that would break the 16-byte
+    /// budget); it is recorded beside the data in the spill region store, and
+    /// recovered by host cell for the hover/error message.
+    Spill,
 }
 
 impl ErrorKind {
@@ -41,6 +47,7 @@ impl ErrorKind {
             ErrorKind::NotAvailable => 5,
             ErrorKind::Null => 6,
             ErrorKind::Circular => 7,
+            ErrorKind::Spill => 8,
         }
     }
 
@@ -55,6 +62,7 @@ impl ErrorKind {
             4 => ErrorKind::Num,
             5 => ErrorKind::NotAvailable,
             6 => ErrorKind::Null,
+            8 => ErrorKind::Spill,
             _ => ErrorKind::Circular,
         }
     }
@@ -70,6 +78,7 @@ impl ErrorKind {
             ErrorKind::NotAvailable => "#N/A",
             ErrorKind::Null => "#NULL!",
             ErrorKind::Circular => "#CIRC!",
+            ErrorKind::Spill => "#SPILL!",
         }
     }
 }
@@ -229,6 +238,30 @@ mod tests {
         assert_eq!(ErrorKind::DivZero.to_string(), "#DIV/0!");
         assert_eq!(ErrorKind::NotAvailable.to_string(), "#N/A");
         assert_eq!(ErrorKind::Name.to_string(), "#NAME?");
+        // #27 P2: a blocked spill surfaces as Excel's #SPILL!.
+        assert_eq!(ErrorKind::Spill.to_string(), "#SPILL!");
+    }
+
+    #[test]
+    fn spill_error_code_roundtrips_and_is_appended() {
+        // The on-disk code must be a NEW value (8), never a renumber of an
+        // existing one, or old files would decode to the wrong error.
+        assert_eq!(ErrorKind::Spill.to_code(), 8);
+        assert_eq!(ErrorKind::from_code(8), ErrorKind::Spill);
+        // Every existing code keeps its meaning.
+        for k in [
+            ErrorKind::DivZero,
+            ErrorKind::Value,
+            ErrorKind::Ref,
+            ErrorKind::Name,
+            ErrorKind::Num,
+            ErrorKind::NotAvailable,
+            ErrorKind::Null,
+            ErrorKind::Circular,
+            ErrorKind::Spill,
+        ] {
+            assert_eq!(ErrorKind::from_code(k.to_code()), k);
+        }
     }
 
     #[test]

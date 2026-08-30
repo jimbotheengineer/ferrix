@@ -593,6 +593,8 @@ fn eval_call<S: CellSource + ?Sized>(name: &str, args: &[Expr], src: &S) -> Valu
                     ErrorKind::Num => 6.0,
                     ErrorKind::NotAvailable => 7.0,
                     ErrorKind::Circular => 8.0,
+                    // Excel assigns #SPILL! the ERROR.TYPE code 9.
+                    ErrorKind::Spill => 9.0,
                 }),
                 None => Value::Error(ErrorKind::NotAvailable),
             }
