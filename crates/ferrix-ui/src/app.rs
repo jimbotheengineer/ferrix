@@ -6008,32 +6008,45 @@ impl FerrixApp {
         // `export_workbook_full` is the variant that writes
         // `<sheetProtection>` and injects `<workbookProtection>`; the
         // plain `_with_names` call this used to make silently stripped both.
+        let sheet_export = ferrix_io::SheetExport::new("Sheet1", sheet)
+            .with_formulas(&self.wb.overlay)
+            .with_tables(&self.tables)
+            // Cell decoration (issue #28) must survive the round trip for
+            // the same reason protection does: a sheet the user bordered
+            // and re-exported must still have its borders.
+            .with_format(&self.wb.format)
+            // Data validation must survive the round trip for the same
+            // reason protection and decoration do (issue #41): a sheet
+            // whose column the user restricted to a list, re-exported,
+            // must still carry that list. This is the SAME chokepoint the
+            // menu item runs, so a sibling export variant cannot silently
+            // omit it.
+            .with_validation(&self.wb.validation)
+            // Sparklines (issue #36) survive as `<extLst>` groups. A group
+            // Excel cannot express is reported below rather than silently
+            // dropped.
+            .with_sparklines(&self.wb.sparklines)
+            // Dynamic-array spills (#27 P4): a spilling host is written as
+            // `<f t="array" ref="...">` and its projections are left for
+            // Excel to recompute, instead of freezing the array into a grid
+            // of literals that would block its own re-spill on reopen.
+            .with_spills(&self.wb.spills)
+            .with_protection(self.wb.protection())
+            // Page setup (#37 follow-up): paper size, orientation, margins,
+            // scaling, gridline/heading printing, headers/footers, manual
+            // page breaks and repeat rows/cols reach the worksheet XML and
+            // `_xlnm.Print_Titles`. This is the SAME chokepoint the menu
+            // export runs, so page setup cannot be silently dropped by a
+            // sibling export variant. The print area, when set, becomes
+            // `_xlnm.Print_Area`.
+            .with_page_setup(&self.page_setup);
+        let sheet_export = match self.print_area {
+            Some(area) => sheet_export.with_print_area(area),
+            None => sheet_export,
+        };
         self.status = match ferrix_io::export_workbook_full(
             path,
-            &[ferrix_io::SheetExport::new("Sheet1", sheet)
-                .with_formulas(&self.wb.overlay)
-                .with_tables(&self.tables)
-                // Cell decoration (issue #28) must survive the round trip for
-                // the same reason protection does: a sheet the user bordered
-                // and re-exported must still have its borders.
-                .with_format(&self.wb.format)
-                // Data validation must survive the round trip for the same
-                // reason protection and decoration do (issue #41): a sheet
-                // whose column the user restricted to a list, re-exported,
-                // must still carry that list. This is the SAME chokepoint the
-                // menu item runs, so a sibling export variant cannot silently
-                // omit it.
-                .with_validation(&self.wb.validation)
-                // Sparklines (issue #36) survive as `<extLst>` groups. A group
-                // Excel cannot express is reported below rather than silently
-                // dropped.
-                .with_sparklines(&self.wb.sparklines)
-                // Dynamic-array spills (#27 P4): a spilling host is written as
-                // `<f t="array" ref="...">` and its projections are left for
-                // Excel to recompute, instead of freezing the array into a grid
-                // of literals that would block its own re-spill on reopen.
-                .with_spills(&self.wb.spills)
-                .with_protection(self.wb.protection())],
+            &[sheet_export],
             &self.wb.names,
             self.wb.workbook_protection(),
         ) {
