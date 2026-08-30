@@ -367,6 +367,10 @@ pub struct FerrixApp {
     /// Selection a fill drag started from, and the live target while dragging.
     fill_source: Option<Selection>,
     fill_target: Option<Selection>,
+    /// Cell grabbed at the start of a block move-drag (#82), so the drop cell's
+    /// offset from it gives the move delta. `Some` only while a move is in
+    /// flight.
+    move_origin: Option<CellRef>,
 
     /// Structured tables defined over the current sheet.
     ///
@@ -749,6 +753,7 @@ impl FerrixApp {
             last_grid_rect: None,
             fill_source: None,
             fill_target: None,
+            move_origin: None,
             tables: Vec::new(),
             table_mask: None,
             table_uniques: Vec::new(),
@@ -1912,6 +1917,39 @@ impl FerrixApp {
             }
         } else {
             self.status = format!("Copied {} cells to clipboard", fmt_int(n as usize));
+        }
+    }
+
+    /// Move the current selection's block by (d_row, d_col) as one undo step,
+    /// and carry the selection to the block's new home (#82). The drag gesture
+    /// and any menu/keyboard mover both call this; it owns the meaning.
+    pub fn move_selection_block(&mut self, d_row: i64, d_col: i64) {
+        if d_row == 0 && d_col == 0 {
+            return;
+        }
+        let sel = self.selection;
+        let limit = self.max_overlay_cells();
+        match self.wb.move_block(sel, d_row, d_col, limit) {
+            Ok(0) => {}
+            Ok(n) => {
+                // The selection follows the block to its new position, so the
+                // user can immediately move it again or undo in one gesture.
+                let (tl, br) = sel.bounds();
+                let moved = Selection::new(
+                    CellRef::new(
+                        (tl.row as i64 + d_row) as u32,
+                        (tl.col as i64 + d_col) as u32,
+                    ),
+                    CellRef::new(
+                        (br.row as i64 + d_row) as u32,
+                        (br.col as i64 + d_col) as u32,
+                    ),
+                );
+                self.selection = moved;
+                self.status = format!("Moved {} cells", fmt_int(n));
+                self.sync_formula_bar();
+            }
+            Err(e) => self.status = e,
         }
     }
 
@@ -9793,6 +9831,7 @@ impl FerrixApp {
                         editing: self.editing,
                         matches: &self.search_results.matches,
                         filling: self.fill_source.is_some(),
+                        moving: self.move_origin.is_some(),
                         header_dragging: self.header_drag,
                         filter: self.row_filter.as_ref(),
                         sort: self.sort_order.as_ref(),
@@ -10316,6 +10355,23 @@ impl FerrixApp {
                     }
                     self.header_drag = None;
                 }
+                // --- block move-drag (#82) ---
+                //
+                // Press on the selection border grabs the block; release drops
+                // it, and the delta from the grabbed cell to the drop cell is
+                // the move. One `move_selection_block` call → one undo step.
+                if let Some(origin) = resp.move_started {
+                    self.move_origin = Some(origin);
+                }
+                if resp.move_released {
+                    if let (Some(origin), Some(drop)) = (self.move_origin, resp.move_to) {
+                        let d_row = drop.row as i64 - origin.row as i64;
+                        let d_col = drop.col as i64 - origin.col as i64;
+                        self.move_selection_block(d_row, d_col);
+                    }
+                    self.move_origin = None;
+                }
+
                 // --- fill handle ---
                 if resp.fill_started {
                     self.fill_source = Some(self.selection);

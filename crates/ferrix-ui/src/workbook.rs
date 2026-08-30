@@ -3416,6 +3416,166 @@ impl Workbook {
         Ok(n)
     }
 
+    /// Move a rectangular block by (d_row, d_col) as exactly ONE undo step
+    /// (#82 — drag a selection to relocate it).
+    ///
+    /// A move is NOT a copy: a formula is carried VERBATIM, its references
+    /// unchanged (`=A1+B1` moved anywhere is still `=A1+B1`, matching Excel),
+    /// which is why this reconstructs each cell's raw input string and writes it
+    /// through `write_cells_bulk` rather than going through the ref-relativising
+    /// paste path. Source cells the destination does not cover are cleared, so
+    /// the block leaves no ghost behind. All in one batch → one Ctrl+Z.
+    ///
+    /// Returns the number of destination cells written, or an error string if
+    /// the move would run off the sheet, exceed the cell budget, or hit a
+    /// protected cell (in which case nothing is written).
+    pub fn move_block(
+        &mut self,
+        sel: Selection,
+        d_row: i64,
+        d_col: i64,
+        max_cells: u64,
+    ) -> Result<usize, String> {
+        if d_row == 0 && d_col == 0 {
+            return Ok(0);
+        }
+        let (tl, br) = sel.bounds();
+        // Off-sheet guard: the destination top-left must stay non-negative.
+        let dest_tl_row = tl.row as i64 + d_row;
+        let dest_tl_col = tl.col as i64 + d_col;
+        if dest_tl_row < 0 || dest_tl_col < 0 {
+            return Err("That would move the block off the sheet".to_string());
+        }
+        if sel.cell_count() > max_cells {
+            return Err(format!(
+                "{} cells is too many to move at once (limit {})",
+                sel.cell_count(),
+                max_cells
+            ));
+        }
+
+        // Read every source cell's raw input string first, before any write.
+        // Formula source is carried verbatim; a literal uses its display text.
+        let view = self.view();
+        let mut sources: Vec<(CellRef, String)> = Vec::new();
+        for cell in sel.iter() {
+            let text = match self.formula_src_at(cell) {
+                Some(src) => src,
+                None => view.display(cell),
+            };
+            sources.push((cell, text));
+        }
+        // `view` borrows self immutably; the writes below need &mut self. It
+        // holds no resources, so letting it fall out of scope is enough — but a
+        // reborrow happens explicitly below, so nothing lingers.
+        let _ = view;
+
+        // Destination rectangle, so a source cell it re-covers is not cleared.
+        let dest = Selection::new(
+            CellRef::new(dest_tl_row as u32, dest_tl_col as u32),
+            CellRef::new(
+                (br.row as i64 + d_row) as u32,
+                (br.col as i64 + d_col) as u32,
+            ),
+        );
+
+        // Protection chokepoint (issue #42): a move that would clear a protected
+        // source or write a protected destination is refused whole, before any
+        // cell is touched.
+        {
+            let prot = &self.sheets[self.active].protection;
+            if prot.is_enabled() {
+                for (cell, _) in &sources {
+                    if let Some(d) = prot.deny_edit(*cell) {
+                        self.last_denial = Some(d);
+                        return Err(d.to_string());
+                    }
+                    let to = CellRef::new(
+                        (cell.row as i64 + d_row) as u32,
+                        (cell.col as i64 + d_col) as u32,
+                    );
+                    if let Some(d) = prot.deny_edit(to) {
+                        self.last_denial = Some(d);
+                        return Err(d.to_string());
+                    }
+                }
+            }
+        }
+
+        // Assemble ONE undo entry that both CLEARS the vacated source cells and
+        // WRITES the block at its destination. `write_cells_bulk` cannot do the
+        // clear half — `classify("")` is `None`, so an empty string is skipped
+        // rather than emptying the cell — so the changes are built directly.
+        let sheet = self.active_sheet();
+        let mut changes: Vec<CellChange> = Vec::new();
+
+        // Clear each source not re-covered by the destination.
+        for (cell, _) in &sources {
+            if dest.contains(*cell) {
+                continue;
+            }
+            let before = self.overlay.get(*cell).cloned();
+            if before.is_none() && self.view().get(*cell) == Value::Empty {
+                continue;
+            }
+            self.overlay.set(*cell, CellInput::Literal(Value::Empty));
+            self.graph.remove_at(SheetCell::new(sheet, *cell));
+            changes.push(CellChange {
+                cell: *cell,
+                before,
+                after: Some(CellInput::Literal(Value::Empty)),
+            });
+        }
+
+        // Write each source's text at its destination offset. Destination writes
+        // come last so a self-overlapping move wins over the clears above.
+        let mut written = 0usize;
+        for (cell, text) in &sources {
+            let to = CellRef::new(
+                (cell.row as i64 + d_row) as u32,
+                (cell.col as i64 + d_col) as u32,
+            );
+            let before = self.overlay.get(to).cloned();
+            let Some(input) = self.classify(text) else {
+                // An empty source cell writes nothing at the destination, but if
+                // the destination held something it must still be cleared.
+                if before.is_some() || self.view().get(to) != Value::Empty {
+                    self.overlay.set(to, CellInput::Literal(Value::Empty));
+                    self.graph.remove_at(SheetCell::new(sheet, to));
+                    changes.push(CellChange {
+                        cell: to,
+                        before,
+                        after: Some(CellInput::Literal(Value::Empty)),
+                    });
+                }
+                continue;
+            };
+            self.overlay.set(to, input.clone());
+            self.resync_graph_at(SheetCell::new(sheet, to));
+            changes.push(CellChange {
+                cell: to,
+                before,
+                after: Some(input),
+            });
+            written += 1;
+        }
+
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        self.dirty = true;
+        self.push_undo(UndoEntry {
+            sheet,
+            cell: dest.bounds().0,
+            changes,
+            side_effects: Vec::new(),
+            bulk: true,
+            order: None,
+        });
+        self.recalc_all();
+        Ok(written)
+    }
+
     /// Replace across the whole sheet as exactly ONE undo step.
     ///
     /// ## Why this streams

@@ -439,6 +439,14 @@ impl Harness {
         self.app.cell_rect(cell)
     }
 
+    /// Move the current selection's block by (d_row, d_col) — the model behind
+    /// drag-to-move (#82).
+    pub fn move_selection_block(&mut self, d_row: i64, d_col: i64) -> &mut Self {
+        self.app.move_selection_block(d_row, d_col);
+        self.steps(1);
+        self
+    }
+
     /// The repaint delay the app requested on the last stepped frame. ZERO is
     /// continuous-repaint mode; anything longer is reactive. Used to prove the
     /// window-move-jitter guard (#84): an in-content drag is continuous, a
@@ -10246,6 +10254,111 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dragging_the_selection_border_moves_the_block() {
+        // Drag-to-move gesture (#82): press on the selection's border and drag
+        // to a new cell moves the block there. This exercises the REAL pointer
+        // path through the grid (press → moving → release), not just the model.
+        let (mut h, csv) = numeric_app("drag_move.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Put a distinctive value in a visible cell and select it alone.
+        let src = CellRef::new(2, 1); // a data cell comfortably on screen
+        h.select(src, src);
+        h.type_text("SENTINEL").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(src, src);
+        h.step();
+        assert_eq!(h.app().display(src), "SENTINEL", "fixture in place");
+
+        // Screen geometry: grab the selection's border (its top edge) and drag
+        // down two rows. cell_rect gives the on-screen rectangle.
+        let from = h.cell_rect(src).expect("source cell on screen");
+        let dest = CellRef::new(4, 1);
+        let to = h.cell_rect(dest).expect("destination cell on screen");
+        // Press on the border (top edge), move to the destination centre,
+        // release — the exact press/move/release a mouse produces.
+        h.move_to(from.center().x, from.top());
+        h.press();
+        h.step();
+        h.move_to(to.center().x, to.center().y);
+        h.step();
+        h.release();
+        h.steps(2);
+
+        // The value moved to the destination and left the source empty.
+        assert_eq!(
+            h.app().display(dest),
+            "SENTINEL",
+            "the drag must move the block to the drop cell; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            h.app().display(src),
+            "",
+            "the drag must clear the source cell (a move, not a copy)"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn moving_a_block_relocates_it_verbatim_and_undoes_in_one_step() {
+        // Drag-to-move (#82). A move is NOT a copy: the formula travels VERBATIM
+        // (its reference does not shift the way a copy would), the source is left
+        // empty, and the whole thing is a single undo.
+        let (mut h, csv) = numeric_app("move_block.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // Build a tiny known block in empty cells well past the fixture data
+        // (row 20+), so typing lands in blank cells rather than appending to
+        // existing values. E21 = 10, F21 = =E21*2 (shows 20).
+        let a = CellRef::new(20, 4); // E21
+        let b = CellRef::new(20, 5); // F21
+        h.select(a, a);
+        h.type_text("10").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        h.select(b, b);
+        h.type_text("=E21*2").step();
+        h.press_key(Key::Enter);
+        h.steps(2);
+        assert_eq!(h.app().display(a), "10", "fixture: E21");
+        assert_eq!(h.app().display(b), "20", "fixture: F21 = E21*2");
+
+        // Select E21:F21 and move the block down 5 rows (to E26:F26).
+        h.select(a, b);
+        h.move_selection_block(5, 0);
+        let a2 = CellRef::new(25, 4); // E26
+        let b2 = CellRef::new(25, 5); // F26
+
+        // The value landed at the destination.
+        assert_eq!(h.app().display(a2), "10", "moved value must land at E26");
+
+        // The source cells are now empty — no ghost left behind.
+        assert_eq!(h.app().display(a), "", "source E21 must be cleared");
+        assert_eq!(h.app().display(b), "", "source F21 must be cleared");
+
+        // Prove the reference did NOT relativise (move, not copy): the moved
+        // formula is still =E21*2, and E21 is now empty (→0), so F26 recomputes
+        // to 0. A COPY would have shifted the ref to =E26*2 = 20. This is THE
+        // assertion that separates a move from a copy.
+        assert_eq!(
+            h.app().display(b2),
+            "0",
+            "the moved formula must still point at E21 (now empty→0), not shift to E26"
+        );
+
+        // One undo restores the block exactly.
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(h.app().display(a), "10", "undo must restore E21");
+        assert_eq!(h.app().display(b), "20", "undo must restore F21");
+        assert_eq!(h.app().display(a2), "", "undo must clear the moved E26");
+        assert_eq!(h.app().display(b2), "", "undo must clear the moved F26");
+        let _ = std::fs::remove_file(&csv);
     }
 
     #[test]
