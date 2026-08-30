@@ -607,6 +607,11 @@ pub struct FerrixApp {
     /// bar so it survives the dialog closing.
     cond_warning: Option<String>,
 
+    /// The pivot builder panel, when it is open (issue #33 Part C). `None`
+    /// costs nothing. Holds the source sheet, the wells being assembled, and —
+    /// when reshaping an existing pivot — the sheet id to refresh on commit.
+    pivot_builder: Option<crate::pivot_builder::PivotBuilderState>,
+
     // ---- data validation and autocomplete (issue #41) ----
     /// The validation editor, when it is open. `None` costs nothing.
     validation: Option<crate::validation_panel::ValidationState>,
@@ -876,6 +881,7 @@ impl FerrixApp {
             name_box_sheet_scope: false,
             cond: None,
             cond_warning: None,
+            pivot_builder: None,
             validation: None,
             autocomplete: crate::validation_panel::AutocompleteState::default(),
             autocomplete_on: true,
@@ -4061,6 +4067,14 @@ impl FerrixApp {
         ferrix_io::save_pivots(&path, &records).is_ok()
     }
 
+    /// Point the pivot sidecar at `path`, for the round-trip harness test. The
+    /// production path derives this from `source_path` on open; a headless
+    /// harness has no file, so a test sets it explicitly.
+    #[cfg(test)]
+    pub fn set_pivots_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.pivots_path = Some(path);
+    }
+
     /// Load the pivot sidecar for the file that was just opened, then refresh
     /// each pivot so its cells show a computed result immediately.
     ///
@@ -4117,6 +4131,181 @@ impl FerrixApp {
     /// Whether sizing has unsaved changes.
     pub fn sizing_is_dirty(&self) -> bool {
         self.sizing_dirty
+    }
+
+    // ============================ pivot builder (issue #33 Part C) ==========
+
+    /// Open the pivot builder bound to the current selection's source columns.
+    ///
+    /// If the ACTIVE sheet is already a pivot, this edits it: the builder is
+    /// seeded from the existing spec and commit refreshes THAT sheet rather
+    /// than making a new one (the "editing refreshes the same sheet" criterion).
+    /// Otherwise the active sheet is the source and commit creates a fresh
+    /// pivot sheet.
+    ///
+    /// The column list is the selection's column span — a single-cell selection
+    /// offers the whole sheet's columns, a multi-column selection narrows to
+    /// those. Either way it is bounded by column count, never row count.
+    pub fn open_pivot_builder(&mut self) {
+        let active = self.wb.active_sheet();
+        let (source, editing, seed_spec) = if self.wb.is_pivot_sheet(active) {
+            let binding = self
+                .wb
+                .pivot_binding(active)
+                .expect("is_pivot_sheet implies a binding");
+            (binding.source, Some(active), Some(binding.spec.clone()))
+        } else {
+            (active, None, None)
+        };
+
+        let Some(view) = self.wb.sheet_view(source) else {
+            self.status = "Pivot source sheet is unavailable".into();
+            return;
+        };
+        let col_count = view.col_count();
+        // The selection's column span, clamped to the source's columns. A
+        // single-cell selection means "no column restriction" -> all columns.
+        let (a, b) = self.selection.bounds();
+        let (lo, hi) = if a.col == b.col && self.selection.is_single() {
+            (0u32, col_count.saturating_sub(1) as u32)
+        } else {
+            (a.col.min(b.col), a.col.max(b.col))
+        };
+        let hi = (hi as usize).min(col_count.saturating_sub(1)) as u32;
+        let columns: Vec<(ferrix_core::ColIdx, String)> = (lo..=hi)
+            .map(|c| (ferrix_core::ColIdx(c), view.header_or_letter(c as usize)))
+            .collect();
+
+        let mut st = crate::pivot_builder::PivotBuilderState::new(source, columns, editing);
+        if let Some(spec) = seed_spec {
+            st.seed(&spec);
+        }
+        self.pivot_builder = Some(st);
+        self.status = "Pivot builder — drag columns into Rows and Values".into();
+    }
+
+    /// Commit the builder's spec, creating a new pivot sheet or refreshing the
+    /// one being edited, then switch to it. Funnels entirely through Part B's
+    /// `add_sheet` + `set_pivot` + `refresh_pivot`; the builder reimplements
+    /// none of that.
+    ///
+    /// Exposed (not private) so a harness test drives the exact production
+    /// commit path rather than a parallel one — the discipline the harness
+    /// module documents.
+    pub fn commit_pivot_builder(&mut self) {
+        let Some(st) = self.pivot_builder.take() else {
+            return;
+        };
+        // An empty spec would compute a single blank group — never a pivot the
+        // user meant to create. The panel disables its commit button for this,
+        // but guarding here too keeps the invariant at the method boundary that
+        // a harness test and the UI both rely on. Put the builder back so the
+        // panel stays open rather than silently vanishing.
+        if !st.is_committable() {
+            self.status = "Add at least one Row or Value before creating a pivot".into();
+            self.pivot_builder = Some(st);
+            return;
+        }
+        let spec = st.spec();
+
+        let pivot_sheet = match st.editing {
+            // Editing: reshape the SAME sheet. No new tab.
+            Some(existing) => existing,
+            // Fresh build: add a pivot sheet just after the source's tab.
+            None => {
+                let name = self.unique_sheet_name("Pivot");
+                match self.wb.add_sheet(
+                    &name,
+                    crate::sheet_view::BaseData::Memory(ferrix_core::Sheet::new(&name)),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.status = format!("Cannot create pivot sheet: {e}");
+                        // Put the builder back so the user's work is not lost.
+                        self.pivot_builder = Some(st);
+                        return;
+                    }
+                }
+            }
+        };
+
+        self.wb.set_pivot(pivot_sheet, st.source, spec);
+        let groups = self.wb.refresh_pivot(pivot_sheet).unwrap_or(0);
+        // Switch to the pivot so the user sees the result they just built.
+        let _ = self.wb.activate(pivot_sheet);
+        self.selection = ferrix_core::Selection::default();
+        self.sync_formula_bar();
+        self.status = format!(
+            "{} pivot · {} group{}",
+            if st.editing.is_some() {
+                "Updated"
+            } else {
+                "Created"
+            },
+            fmt_int(groups),
+            if groups == 1 { "" } else { "s" }
+        );
+    }
+
+    /// A sheet name of the form `base`, `base 2`, `base 3`, … that no existing
+    /// sheet uses. `add_sheet` refuses duplicates, so the builder must not hand
+    /// it one when several pivots are created in a row.
+    fn unique_sheet_name(&self, base: &str) -> String {
+        let taken: std::collections::HashSet<String> = self
+            .wb
+            .sheet_names()
+            .iter()
+            .map(|(_, n)| n.to_lowercase())
+            .collect();
+        if !taken.contains(&base.to_lowercase()) {
+            return base.to_string();
+        }
+        for n in 2.. {
+            let candidate = format!("{base} {n}");
+            if !taken.contains(&candidate.to_lowercase()) {
+                return candidate;
+            }
+        }
+        unreachable!("the loop is unbounded")
+    }
+
+    /// Draw the pivot builder panel and act on what it reported.
+    fn show_pivot_builder(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        let Some(mut st) = self.pivot_builder.take() else {
+            return;
+        };
+        let outcome = crate::pivot_builder::show(ctx, &mut st, th);
+        // Put the (mutated) state back before acting, so a commit sees the
+        // final wells and a cancel simply drops it.
+        match outcome {
+            crate::pivot_builder::PivotBuilderOutcome::Commit => {
+                self.pivot_builder = Some(st);
+                self.commit_pivot_builder();
+            }
+            crate::pivot_builder::PivotBuilderOutcome::Cancel => {
+                self.status = "Pivot builder closed".into();
+            }
+            crate::pivot_builder::PivotBuilderOutcome::None => {
+                self.pivot_builder = Some(st);
+            }
+        }
+    }
+
+    /// The builder's live state, for tests that assert or drive the wells
+    /// without going through pixel drags (the harness's stated discipline).
+    #[cfg(test)]
+    pub fn pivot_builder_state(&self) -> Option<&crate::pivot_builder::PivotBuilderState> {
+        self.pivot_builder.as_ref()
+    }
+
+    /// Mutable builder state, so a harness test can drop columns into wells the
+    /// same way the egui drag handlers do.
+    #[cfg(test)]
+    pub fn pivot_builder_state_mut(
+        &mut self,
+    ) -> Option<&mut crate::pivot_builder::PivotBuilderState> {
+        self.pivot_builder.as_mut()
     }
 
     /// Merge the current selection, or unmerge if it already covers merges.
@@ -9004,6 +9193,7 @@ impl FerrixApp {
             C::DataRemoveDuplicates => self.remove_duplicates(),
             C::DataSubtotals => self.toggle_subtotals(),
             C::DataConsolidate => self.consolidate_sheets(),
+            C::DataPivotTable => self.open_pivot_builder(),
             C::DataRefreshPivot => self.refresh_active_pivot(),
             C::DataLockCells => self.lock_selection(),
             C::DataUnlockCells => self.unlock_selection(),
@@ -9293,6 +9483,9 @@ impl FerrixApp {
         }
         if self.validation.is_some() {
             self.show_validation_editor(ctx);
+        }
+        if self.pivot_builder.is_some() {
+            self.show_pivot_builder(ctx);
         }
         {}
 

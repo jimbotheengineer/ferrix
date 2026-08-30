@@ -297,6 +297,8 @@ registry! {
         "Insert a subtotal at each change of value in the cursor's column. A VIEW only — no rows are inserted, sort and filter keep working, and running it again restores the original view exactly." }
     DataConsolidate { "data.consolidate", Some(Menu::Data), "⊞ Consolidate sheets…", None, false, None,
         "Aggregate the selected labelled range from every sheet by row and column key. Keys missing from a sheet are REPORTED, never silently zeroed." }
+    DataPivotTable { "data.pivot_table", Some(Menu::Data), "⊟ Pivot Table…", None, true, Some(Note::Selection),
+        "Build a pivot table from the selected range: drag columns into Rows and Values wells. Creates a new pivot sheet scaled to the number of groups, never the source's row count." }
     DataRefreshPivot { "data.refresh_pivot", Some(Menu::Data), "⟳ Refresh pivot table", None, false, None,
         "Recompute the active pivot sheet from its source. One streaming pass, scaled to the number of groups — not the source's row count." }
 
@@ -412,6 +414,12 @@ impl Command {
             // concludes the feature does not exist.
             DataRemoveDuplicates | DataSubtotals if st.rows == 0 => {
                 Some("This sheet has no rows".to_string())
+            }
+            // A pivot needs a source with data. Building one from an empty
+            // sheet would produce a single blank group — said out loud rather
+            // than hidden, like the other Data commands.
+            DataPivotTable if st.rows == 0 && !st.active_is_pivot => {
+                Some("This sheet has no rows to pivot".to_string())
             }
             DataConsolidate if st.sheets < 2 => {
                 Some("Consolidate needs at least two sheets — this workbook has one".to_string())
