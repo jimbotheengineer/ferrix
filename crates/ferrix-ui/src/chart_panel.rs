@@ -15,7 +15,7 @@ use ferrix_core::annotation::{Annotation, Annotations};
 use ferrix_core::chart::{
     decimate_min_max, density_grid, group_by, histogram, Aggregate, Bounds, DataPoint,
 };
-use ferrix_core::scene::{to_svg, Anchor, Primitive, Rgba, Scene, Viewport};
+use ferrix_core::scene::{to_svg, Anchor, LegendEntry, Primitive, Rgba, Scene, Viewport};
 use ferrix_core::{CellRef, Selection, Value};
 
 use crate::sheet_view::SheetView;
@@ -52,6 +52,12 @@ pub fn chart_row_budget() -> usize {
 /// so ~1,600 points across a typical canvas — more than the pixels can
 /// resolve, which is the point.
 const BUCKETS: usize = 800;
+
+/// Series paint colours. Named so the legend swatch and the geometry that
+/// draws the series are guaranteed the same colour — a legend that hard-coded
+/// its swatch could drift from the line/bars it labels.
+const SERIES_BLUE: Rgba = Rgba::rgb(0x4a, 0x9e, 0xff);
+const SERIES_ORANGE: Rgba = Rgba::rgb(0xff, 0x9f, 0x40);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChartKind {
@@ -154,6 +160,14 @@ impl ChartPanel {
         let value_col = c1.min(c0 + 1).max(c0);
         let has_second = c1 > c0;
 
+        // Real column headers (falling back to the spreadsheet letter) so the
+        // axes, title and legend name the user's own columns rather than the
+        // placeholders "row"/"value"/"x"/"y" the panel used to draw. `c0` is
+        // the leading column of the selection: the label column for a bar
+        // chart, the x column for a scatter.
+        let value_header = view.header_or_letter(value_col as usize);
+        let first_header = view.header_or_letter(c0 as usize);
+
         let values: Vec<Option<f64>> = (r0 as usize..last_row)
             .map(|r| match view.get(CellRef::new(r as u32, value_col)) {
                 Value::Number(n) if n.is_finite() => Some(n),
@@ -163,8 +177,8 @@ impl ChartPanel {
             .collect();
 
         let scene = match kind {
-            ChartKind::Line => Self::build_line(&values, r0 as usize),
-            ChartKind::Histogram => Self::build_histogram(&values),
+            ChartKind::Line => Self::build_line(&values, r0 as usize, &value_header),
+            ChartKind::Histogram => Self::build_histogram(&values, &value_header),
             ChartKind::Bar => {
                 let labels: Vec<String> = if has_second {
                     (r0 as usize..last_row)
@@ -181,7 +195,7 @@ impl ChartPanel {
                     self.scene = None;
                     return;
                 }
-                Self::build_bar(&labels, &values)
+                Self::build_bar(&labels, &values, &first_header, &value_header)
             }
             ChartKind::Scatter => {
                 if !has_second {
@@ -195,7 +209,7 @@ impl ChartPanel {
                         _ => None,
                     })
                     .collect();
-                Self::build_scatter(&xs, &values)
+                Self::build_scatter(&xs, &values, &first_header, &value_header)
             }
         };
 
@@ -239,7 +253,7 @@ impl ChartPanel {
         }
     }
 
-    fn build_line(values: &[Option<f64>], row_offset: usize) -> Option<Scene> {
+    fn build_line(values: &[Option<f64>], row_offset: usize, value_header: &str) -> Option<Scene> {
         let series = decimate_min_max(values, BUCKETS);
         if series.points.is_empty() {
             return None;
@@ -259,40 +273,62 @@ impl ChartPanel {
             row_offset as f64 + values.len() as f64,
         );
 
-        let mut s = Scene::new(x, y).with_axis_labels("row", "value");
+        // The x axis is genuinely the sheet row number, not a data column, so
+        // it stays "row"; the y axis and title name the value column the user
+        // selected. The legend labels the single series with that same header.
+        let mut s = Scene::new(x, y)
+            .with_axis_labels("row", value_header)
+            .with_title(value_header.to_string())
+            .with_legend(vec![LegendEntry::new(
+                value_header.to_string(),
+                SERIES_BLUE,
+            )]);
         s.push(Primitive::Polyline {
             points,
-            color: Rgba::rgb(0x4a, 0x9e, 0xff),
+            color: SERIES_BLUE,
             width: 1.4,
         });
         Some(s)
     }
 
-    fn build_histogram(values: &[Option<f64>]) -> Option<Scene> {
+    fn build_histogram(values: &[Option<f64>], value_header: &str) -> Option<Scene> {
         let bins = histogram(values, 40, None);
         if bins.is_empty() {
             return None;
         }
         let max = bins.iter().map(|b| b.count).max().unwrap_or(1) as f64;
+        // The x axis of a histogram is the value column's own range; y is the
+        // count of rows falling in each bin, which is not a source column, so
+        // it stays "count". Title names the distribution being shown.
         let mut s = Scene::new(
             Bounds::new(bins[0].lo, bins[bins.len() - 1].hi),
             Bounds::new(0.0, max),
         )
-        .with_axis_labels("value", "count");
+        .with_axis_labels(value_header, "count")
+        .with_title(format!("Distribution of {value_header}"))
+        .with_legend(vec![LegendEntry::new(
+            value_header.to_string(),
+            SERIES_BLUE,
+        )]);
         for b in &bins {
             s.push(Primitive::Rect {
                 x0: b.lo,
                 y0: 0.0,
                 x1: b.hi,
                 y1: b.count as f64,
-                fill: Rgba::rgb(0x4a, 0x9e, 0xff),
+                fill: SERIES_BLUE,
                 stroke: None,
             });
         }
         Some(s)
     }
 
-    fn build_bar(labels: &[String], values: &[Option<f64>]) -> Option<Scene> {
+    fn build_bar(
+        labels: &[String],
+        values: &[Option<f64>],
+        label_header: &str,
+        value_header: &str,
+    ) -> Option<Scene> {
         let cats = group_by(labels, values, Aggregate::Sum);
         if cats.is_empty() {
             return None;
@@ -312,15 +348,21 @@ impl ChartPanel {
             .fold(f64::INFINITY, f64::min);
         let y = Bounds::new(min.min(0.0), max.max(0.0));
 
+        // X axis names the category column; y axis says both what was measured
+        // and that it is a sum of it, so the reader is not left guessing which
+        // aggregate produced the bar heights.
+        let y_label = format!("sum of {value_header}");
         let mut s = Scene::new(Bounds::new(-0.6, shown as f64 - 0.4), y)
-            .with_axis_labels("category", "sum");
+            .with_axis_labels(label_header, y_label.clone())
+            .with_title(format!("{value_header} by {label_header}"))
+            .with_legend(vec![LegendEntry::new(y_label, SERIES_ORANGE)]);
         for (i, c) in cats.iter().take(shown).enumerate() {
             s.push(Primitive::Rect {
                 x0: i as f64 - 0.38,
                 y0: 0.0,
                 x1: i as f64 + 0.38,
                 y1: c.value,
-                fill: Rgba::rgb(0xff, 0x9f, 0x40),
+                fill: SERIES_ORANGE,
                 stroke: None,
             });
             s.push(Primitive::Text {
@@ -335,14 +377,26 @@ impl ChartPanel {
         Some(s)
     }
 
-    fn build_scatter(xs: &[Option<f64>], ys: &[Option<f64>]) -> Option<Scene> {
+    fn build_scatter(
+        xs: &[Option<f64>],
+        ys: &[Option<f64>],
+        x_header: &str,
+        y_header: &str,
+    ) -> Option<Scene> {
         let (cells, xb, yb) = density_grid(xs, ys, 100, 70);
         if cells.is_empty() {
             return None;
         }
         let max = cells.iter().map(|c| c.count).max().unwrap_or(1) as f64;
         let (xw, yh) = (xb.span() / 100.0, yb.span() / 70.0);
-        let mut s = Scene::new(xb, yb).with_axis_labels("x", "y");
+        // Both axes are real value columns here, so both carry their header.
+        let mut s = Scene::new(xb, yb)
+            .with_axis_labels(x_header, y_header)
+            .with_title(format!("{y_header} vs {x_header}"))
+            .with_legend(vec![LegendEntry::new(
+                format!("{y_header} vs {x_header}"),
+                SERIES_BLUE,
+            )]);
         for c in &cells {
             // sqrt keeps sparse cells visible; a linear ramp makes everything
             // but the densest cell invisible.
@@ -565,6 +619,50 @@ pub fn paint_scene(
             chrome.label,
         );
     }
+    if let Some(l) = &scene.y_label {
+        // Draw the y-axis title rotated up the left margin, mirroring the SVG
+        // export so the on-screen chart and the exported file name the same
+        // axis the same way.
+        let galley =
+            painter.layout_no_wrap(l.clone(), egui::FontId::proportional(11.0), chrome.label);
+        let center = Pos2::new(rect.left() + 11.0, plot.center().y);
+        let mut shape = egui::epaint::TextShape::new(
+            center - Vec2::new(galley.size().x / 2.0, galley.size().y / 2.0),
+            galley,
+            chrome.label,
+        );
+        shape.angle = -std::f32::consts::FRAC_PI_2;
+        painter.add(shape);
+    }
+    // Chart title, centred along the top.
+    if let Some(t) = &scene.title {
+        painter.text(
+            Pos2::new(plot.center().x, rect.top() + 1.0),
+            egui::Align2::CENTER_TOP,
+            t,
+            egui::FontId::proportional(13.0),
+            chrome.label,
+        );
+    }
+    // Series legend, top-right of the plot, matching the SVG layout: a colour
+    // swatch beside each series' label.
+    if !scene.legend.is_empty() {
+        let (sw, row_h, pad) = (12.0f32, 18.0f32, 8.0f32);
+        let right = plot.right() - pad;
+        let top = plot.top() + pad;
+        for (i, e) in scene.legend.iter().enumerate() {
+            let y = top + i as f32 * row_h;
+            let swatch = Rect::from_min_size(Pos2::new(right - sw, y), Vec2::splat(sw));
+            painter.rect_filled(swatch, 0.0, to_color(e.color));
+            painter.text(
+                Pos2::new(right - sw - 5.0, y + sw / 2.0),
+                egui::Align2::RIGHT_CENTER,
+                &e.label,
+                egui::FontId::proportional(11.0),
+                chrome.label,
+            );
+        }
+    }
 
     let resp = ui.interact(plot, ui.id().with("chart_canvas"), Sense::click());
     (vp, resp)
@@ -633,5 +731,139 @@ mod tests {
         for k in ChartKind::ALL {
             assert!(!k.label().is_empty());
         }
+    }
+
+    // --- real-column-header regression tests -------------------------------
+    //
+    // The bug (#83) these pin: the chart panel drew placeholder axis labels
+    // "row"/"value"/"x"/"y" and had no legend or title, so a user could not
+    // tell which column mapped to which axis. Every assertion below checks for
+    // the *specific header string* in the built SVG and, where a placeholder
+    // used to sit, that the placeholder is gone — a "non-empty SVG" assertion
+    // would pass against the old placeholder output and prove nothing.
+
+    fn svg_of(scene: &Scene) -> String {
+        to_svg(scene, 800.0, 400.0)
+    }
+
+    #[test]
+    fn line_chart_labels_axis_and_title_with_the_value_header() {
+        let s = ChartPanel::build_line(&[Some(1.0), Some(2.0), Some(3.0)], 0, "revenue")
+            .expect("line scene");
+        assert_eq!(
+            s.y_label.as_deref(),
+            Some("revenue"),
+            "y axis = value header"
+        );
+        assert_eq!(s.title.as_deref(), Some("revenue"), "title = value header");
+        assert_eq!(s.legend.len(), 1);
+        assert_eq!(s.legend[0].label, "revenue");
+        assert_eq!(s.legend[0].color, SERIES_BLUE, "legend swatch matches line");
+
+        let svg = svg_of(&s);
+        assert!(svg.contains("revenue"), "header text missing from SVG");
+        // The old placeholder must not be what the y axis / title render.
+        assert!(
+            !svg.contains(">value<"),
+            "placeholder 'value' label regressed into the SVG"
+        );
+    }
+
+    #[test]
+    fn histogram_labels_x_axis_with_the_value_header() {
+        let s = ChartPanel::build_histogram(&[Some(1.0), Some(2.0), Some(9.0)], "latency_ms")
+            .expect("histogram scene");
+        assert_eq!(s.x_label.as_deref(), Some("latency_ms"));
+        assert_eq!(s.title.as_deref(), Some("Distribution of latency_ms"));
+
+        let svg = svg_of(&s);
+        assert!(
+            svg.contains("latency_ms"),
+            "header missing from histogram SVG"
+        );
+    }
+
+    #[test]
+    fn bar_chart_labels_both_axes_with_real_headers() {
+        let labels = vec!["west".to_string(), "east".to_string(), "west".to_string()];
+        let s = ChartPanel::build_bar(
+            &labels,
+            &[Some(1.0), Some(2.0), Some(3.0)],
+            "region",
+            "sales",
+        )
+        .expect("bar scene");
+        assert_eq!(s.x_label.as_deref(), Some("region"), "x = label header");
+        assert_eq!(s.y_label.as_deref(), Some("sum of sales"));
+        assert_eq!(s.legend[0].color, SERIES_ORANGE, "legend matches bars");
+
+        let svg = svg_of(&s);
+        assert!(svg.contains("region"), "label header missing");
+        assert!(svg.contains("sum of sales"), "value header missing");
+        assert!(
+            !svg.contains(">category<"),
+            "placeholder 'category' regressed"
+        );
+    }
+
+    #[test]
+    fn scatter_labels_both_axes_with_real_headers() {
+        let xs = vec![Some(1.0), Some(2.0), Some(3.0)];
+        let ys = vec![Some(4.0), Some(5.0), Some(6.0)];
+        let s = ChartPanel::build_scatter(&xs, &ys, "height", "weight").expect("scatter scene");
+        assert_eq!(s.x_label.as_deref(), Some("height"));
+        assert_eq!(s.y_label.as_deref(), Some("weight"));
+
+        let svg = svg_of(&s);
+        assert!(
+            svg.contains("height") && svg.contains("weight"),
+            "headers missing"
+        );
+        // Neither bare placeholder may render as an axis label.
+        assert!(
+            !svg.contains(">x<") && !svg.contains(">y<"),
+            "placeholder axis label regressed"
+        );
+    }
+
+    /// Wire-through-production guard (per roadmap comment #46): drive the exact
+    /// `ChartPanel::build` entry point `app.rs` calls, over a real `SheetView`
+    /// carrying named headers, and assert the header reaches the exported SVG.
+    /// A refactor that stops threading headers from the selection into the
+    /// builders — even if the builders' own unit tests still pass — fails here.
+    #[test]
+    fn build_through_the_panel_puts_real_headers_in_the_exported_svg() {
+        use crate::sheet_view::BaseData;
+        use crate::workbook::Workbook;
+        use ferrix_core::Sheet;
+
+        let mut sheet = Sheet::new("data");
+        sheet.set_headers(vec!["quarter".into(), "revenue".into()]);
+        for r in 0..6u32 {
+            sheet.set(CellRef::new(r, 0), Value::Number(r as f64));
+            sheet.set(CellRef::new(r, 1), Value::Number((r as f64) * 10.0 + 1.0));
+        }
+        let wb = Workbook::new(BaseData::Memory(sheet));
+
+        let mut panel = ChartPanel::default();
+        // Chart the "revenue" column (col 1) as a line, exactly as open_chart
+        // would after the user selects that column.
+        let sel = Selection::new(CellRef::new(0, 1), CellRef::new(5, 1));
+        {
+            let view = wb.view();
+            panel.build(&view, sel, ChartKind::Line);
+        }
+
+        let svg = panel
+            .to_svg(800.0, 400.0)
+            .expect("panel built a scene to export");
+        assert!(
+            svg.contains("revenue"),
+            "the real column header did not survive the production build+export path;\nSVG was: {svg}"
+        );
+        assert!(
+            !svg.contains(">value<"),
+            "the placeholder 'value' label reached the production SVG"
+        );
     }
 }
