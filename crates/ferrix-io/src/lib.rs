@@ -22,6 +22,7 @@ pub mod export;
 pub mod format;
 pub mod format_sidecar;
 pub mod mapped;
+pub mod page_sidecar;
 pub mod pdf;
 pub mod pivot_sidecar;
 pub mod pool;
@@ -54,6 +55,7 @@ pub use encoding_rs::Encoding;
 pub use format::FormatError;
 pub use format_sidecar::{format_path_for, load_format, save_format, FormatSidecarError};
 pub use mapped::MappedSheet;
+pub use page_sidecar::{load_page, page_path_for, save_page, PageSidecarError, PageState};
 pub use pivot_sidecar::{
     agg_code, agg_name, load_pivots, pivot_path_for, save_pivots, PivotRecord, PivotSidecarError,
 };
