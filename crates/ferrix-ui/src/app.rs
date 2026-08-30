@@ -302,6 +302,10 @@ pub struct FerrixApp {
     /// How many page-break lines the last frame painted, for tests and the
     /// status note. Reset each frame.
     last_page_break_lines: usize,
+    /// Set each frame: true when the app is driving continuous repaints for an
+    /// in-content drag, false otherwise (incl. an OS window move). Testable
+    /// witness for the window-move-jitter guard (#84).
+    dragging_content: bool,
     /// Column being resized by its border: (column, pointer x at press, width
     /// at press). OWNED HERE rather than read from egui's `is_dragging`, which
     /// is cleared on the release frame — the width would be lost exactly when
@@ -725,6 +729,7 @@ impl FerrixApp {
             sizing: ferrix_core::sizing::SheetSizing::new(),
             print_area: None,
             show_page_breaks: false,
+            dragging_content: false,
             last_page_break_lines: 0,
             col_resize: None,
             header_menu: None,
@@ -5476,6 +5481,13 @@ impl FerrixApp {
         self.show_page_breaks
     }
 
+    /// Whether the app drove a continuous repaint on the last frame. True only
+    /// for an in-content drag; false when idle or during an OS window move —
+    /// the witness for the window-move-jitter guard (#84).
+    pub fn is_driving_continuous_repaint(&self) -> bool {
+        self.dragging_content
+    }
+
     /// How many page-break lines the last frame drew, for tests.
     pub fn page_break_line_count(&self) -> usize {
         self.last_page_break_lines
@@ -8779,19 +8791,38 @@ impl FerrixApp {
         // artefacts: a drag lags a frame behind the pointer, and a transient
         // overlay (the selection rectangle, a hover highlight) lingers until
         // the next unrelated event repaints it away. While the pointer is held
-        // we repaint every frame so drags track live; for a short settle window
-        // after any pointer or key input we keep repainting so transient state
-        // clears promptly. When nothing is happening we fall back to reactive
-        // mode and cost no CPU.
-        let (pointer_down, had_input) = ctx.input(|i| {
-            let pointer_down = i.pointer.any_down();
-            let had_input = pointer_down
+        // OVER THE APP'S CONTENT we repaint every frame so drags track live;
+        // for a short settle window after any pointer or key input we keep
+        // repainting so transient state clears promptly. When nothing is
+        // happening we fall back to reactive mode and cost no CPU.
+        //
+        // The "over the content" guard matters for window-move jitter: dragging
+        // the title bar counts as a button being down, but the pointer is then
+        // in the OS non-client area, NOT over the content. Repainting the grid
+        // every frame during the OS's modal window-move loop paints each frame
+        // at a position one frame stale relative to where the window has
+        // already moved, which reads as the content juddering behind the frame.
+        // So an in-app drag repaints live; a window move is left entirely to
+        // the OS.
+        let screen = ctx.screen_rect();
+        let (dragging_content, had_input) = ctx.input(|i| {
+            let any_down = i.pointer.any_down();
+            // The pointer position egui last saw, in content coordinates. During
+            // a title-bar drag this is outside `screen` (or absent), so the
+            // continuous-repaint arm below does not fire.
+            let over_content = i.pointer.latest_pos().is_some_and(|p| screen.contains(p));
+            let dragging_content = any_down && over_content;
+            let had_input = any_down
                 || i.pointer.velocity() != egui::Vec2::ZERO
                 || !i.events.is_empty()
                 || i.pointer.is_moving();
-            (pointer_down, had_input)
+            (dragging_content, had_input)
         });
-        if pointer_down {
+        // Recorded so a test can assert the window-move-jitter guard directly:
+        // this is THE app's own decision to drive continuous repaints, which is
+        // true only for an in-content drag and false during an OS window move.
+        self.dragging_content = dragging_content;
+        if dragging_content {
             ctx.request_repaint();
         } else if had_input {
             // Settle window: long enough to flush a selection/hover change and

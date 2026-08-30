@@ -62,6 +62,8 @@ pub struct Harness {
     /// Cursor icon egui emitted on the last frame, so a test can assert the
     /// hover-cursor feedback (#81) without a real pointer device.
     last_cursor: egui::CursorIcon,
+    /// Repaint delay the app requested on the last frame (window-move guard).
+    last_repaint_delay: std::time::Duration,
     /// Aggregate modifier state for the next frame.
     ///
     /// egui exposes `i.modifiers` from `RawInput.modifiers`, NOT from the
@@ -106,6 +108,7 @@ impl Harness {
             last_shapes: 0,
             last_texts: 0,
             last_cursor: egui::CursorIcon::Default,
+            last_repaint_delay: std::time::Duration::MAX,
             pending_modifiers: Modifiers::default(),
         }
     }
@@ -138,6 +141,15 @@ impl Harness {
             .filter(|s| matches!(s.shape, egui::epaint::Shape::Text(_)))
             .count();
         self.last_cursor = out.platform_output.cursor_icon;
+        // Repaint scheduling the app asked for this frame. ZERO means "repaint
+        // again immediately" (continuous mode); a longer delay means reactive.
+        // Lets a test assert the window-move-jitter guard: an in-content drag
+        // repaints continuously, a title-bar drag does not.
+        self.last_repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX);
         self.frame += 1;
         self
     }
@@ -425,6 +437,27 @@ impl Harness {
     pub fn cell_rect(&mut self, cell: ferrix_core::CellRef) -> Option<egui::Rect> {
         self.step();
         self.app.cell_rect(cell)
+    }
+
+    /// The repaint delay the app requested on the last stepped frame. ZERO is
+    /// continuous-repaint mode; anything longer is reactive. Used to prove the
+    /// window-move-jitter guard (#84): an in-content drag is continuous, a
+    /// title-bar drag is not.
+    pub fn last_repaint_delay(&self) -> std::time::Duration {
+        self.last_repaint_delay
+    }
+
+    /// Emit a primary-button press at an explicit position WITHOUT first moving
+    /// the pointer through the content — the shape of a title-bar / non-client
+    /// drag, where egui's last pointer pos is outside the content rect.
+    pub fn press_at_raw(&mut self, x: f32, y: f32) -> &mut Self {
+        self.events.push(Event::PointerButton {
+            pos: Pos2::new(x, y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        });
+        self
     }
 
     // ---- clipboard interop and Paste Special (issue #30) ----
@@ -10213,6 +10246,41 @@ xxx,yyy,zzz
         );
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_window_move_does_not_trigger_continuous_content_repaints() {
+        // Window-move jitter (#84): dragging the title bar counts as a button
+        // being down, but the pointer is then in the OS non-client area, not
+        // over the content. Driving a repaint every frame during the OS's modal
+        // move loop makes the content judder behind the frame. The guard: the
+        // app drives continuous repaints only for an in-CONTENT drag, never for
+        // a press whose position is OUTSIDE the content rect (a window move).
+        let (mut h, csv) = numeric_app("jitter.csv");
+        h.step_until(200, |a| a.row_count() > 0);
+
+        // In-content drag: press and hold over a cell → continuous repaint on.
+        h.click_at(200.0, 200.0);
+        h.press().move_to(200.0, 260.0);
+        h.step();
+        assert!(
+            h.app().is_driving_continuous_repaint(),
+            "an in-content drag must drive continuous repaints so it tracks live"
+        );
+        h.release();
+        h.step();
+
+        // Title-bar drag: a button held with its position above the content
+        // (negative y — the OS non-client strip). The app must NOT drive
+        // continuous repaints; the OS owns the window move.
+        h.press_at_raw(700.0, -20.0);
+        h.step();
+        assert!(
+            !h.app().is_driving_continuous_repaint(),
+            "a window (title-bar) drag must not drive continuous content \
+             repaints — that is the jitter"
+        );
+        let _ = std::fs::remove_file(&csv);
     }
 
     #[test]
