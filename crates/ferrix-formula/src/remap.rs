@@ -170,6 +170,137 @@ pub fn paste_formula(src: &str, drow: i64, dcol: i64) -> String {
     crate::fill::offset_formula(src, drow, dcol)
 }
 
+/// A rectangle of cells, 0-based and inclusive on all four sides.
+///
+/// The unit a block move works in. `contains` is the test that decides whether
+/// a reference points *at* a cell that is moving, which is the whole question
+/// [`remap_block`] answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellRect {
+    /// Top row (inclusive).
+    pub top: u32,
+    /// Left column (inclusive).
+    pub left: u32,
+    /// Bottom row (inclusive).
+    pub bottom: u32,
+    /// Right column (inclusive).
+    pub right: u32,
+}
+
+impl CellRect {
+    /// A rectangle from two corners in any order.
+    pub fn new(a_row: u32, a_col: u32, b_row: u32, b_col: u32) -> Self {
+        CellRect {
+            top: a_row.min(b_row),
+            left: a_col.min(b_col),
+            bottom: a_row.max(b_row),
+            right: a_col.max(b_col),
+        }
+    }
+
+    /// True when `(row, col)` is inside the rectangle.
+    #[inline]
+    pub fn contains(&self, row: u32, col: u32) -> bool {
+        row >= self.top && row <= self.bottom && col >= self.left && col <= self.right
+    }
+}
+
+/// Rewrite every reference in `src` that points AT a cell inside `block` so it
+/// follows the block by `(d_row, d_col)`.
+///
+/// ## What this is for — and why it is not [`remap_formula`]
+///
+/// Dragging a rectangular block of cells to a new home is Excel's
+/// "move-with-refs": a formula *elsewhere on the sheet* that reads a cell the
+/// user just dragged must keep reading it at its new address. `=D1` where `D1`
+/// moved down five rows becomes `=D6`.
+///
+/// This is a RECTANGULAR predicate — both axes together — so it cannot be
+/// expressed as [`remap_formula`]'s two independent [`AxisMap`]s. A reference
+/// at the block's row but a different column is NOT inside the block and must
+/// not move; an axis map would move it. So this walks each reference's
+/// `(row, col)` and shifts only the ones the rectangle actually contains.
+///
+/// ## Absolute markers, ranges, and partial overlap
+///
+/// * Absolute markers ride along but do not pin — same rule and same reason as
+///   [`remap_formula`]: `$D$1` means "always this cell", and that cell moved,
+///   so the reference moves and the `$` is preserved in the output. Excel does
+///   this too.
+/// * A range moves ONLY when BOTH endpoints are inside the block. A range that
+///   straddles the block boundary (`A1:D10` when only `A1:B10` moved) is left
+///   exactly as written — Excel does not silently reshape a range whose data
+///   only partly moved, and shifting one endpoint would resize it into a
+///   rectangle the user never asked for.
+/// * Like the rest of this family it edits the formula TEXT, so every `$`,
+///   every space, and every reference it does not touch comes out
+///   byte-identical.
+pub fn remap_block(src: &str, block: &CellRect, d_row: i64, d_col: i64) -> String {
+    if d_row == 0 && d_col == 0 {
+        return src.to_string();
+    }
+    let words = refscan::scan(src);
+
+    // Shift one parsed reference, or leave it where it is if it is not inside
+    // the block. `None` only when the shift would push it off the top/left
+    // edge, which cannot happen for a move whose destination is on the sheet
+    // but is guarded anyway so a corner case renders nothing rather than wrap.
+    let shifted = |p: &ParsedRef| -> Option<ParsedRef> {
+        if !block.contains(p.row, p.col) {
+            return Some(*p);
+        }
+        let row = i64::from(p.row).checked_add(d_row)?;
+        let col = i64::from(p.col).checked_add(d_col)?;
+        if row < 0 || col < 0 {
+            return None;
+        }
+        Some(ParsedRef {
+            row: row as u32,
+            col: col as u32,
+            abs_col: p.abs_col,
+            abs_row: p.abs_row,
+        })
+    };
+
+    refscan::rewrite(src, &words, |i, w| {
+        let p = refscan::parse_ref(&src[w.start..w.end])?;
+        // A range endpoint only moves when its PARTNER endpoint is also inside
+        // the block, so a straddling range is left untouched. Detect the range
+        // by the same colon rule the rest of the module uses.
+        let opens = refscan::range_follows(src, w.end);
+        if opens {
+            // Left endpoint: consult the right endpoint.
+            let partner = words
+                .get(i + 1)
+                .and_then(|w2| refscan::parse_ref(&src[w2.start..w2.end]));
+            match partner {
+                Some(q) if block.contains(p.row, p.col) && block.contains(q.row, q.col) => {
+                    shifted(&p).map(|r| r.render())
+                }
+                // Either endpoint outside the block: the range straddles or
+                // sits wholly outside, so leave this endpoint verbatim.
+                _ => None,
+            }
+        } else if i > 0 && refscan::range_follows(src, words[i - 1].end) {
+            // Right endpoint of a range: consult the left endpoint.
+            let partner = refscan::parse_ref(&src[words[i - 1].start..words[i - 1].end]);
+            match partner {
+                Some(q) if block.contains(p.row, p.col) && block.contains(q.row, q.col) => {
+                    shifted(&p).map(|r| r.render())
+                }
+                _ => None,
+            }
+        } else {
+            // A standalone single-cell reference.
+            if block.contains(p.row, p.col) {
+                shifted(&p).map(|r| r.render())
+            } else {
+                None
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +514,79 @@ mod tests {
     fn a_pasted_spill_range_shifts_its_anchor() {
         assert_eq!(paste_formula("=A1#", 1, 1), "=B2#");
         assert_eq!(paste_formula("=$A$1#+B2", 1, 0), "=$A$1#+B3");
+    }
+
+    // --- block move-with-refs (#82) ------------------------------------------
+
+    #[test]
+    fn a_reference_to_a_moved_cell_follows_the_block() {
+        // THE acceptance criterion for #82's move-with-refs: D1 is dragged
+        // down five rows, and a formula elsewhere that read D1 must read D6.
+        let block = CellRect::new(0, 3, 0, 3); // D1 alone
+        assert_eq!(remap_block("=D1", &block, 5, 0), "=D6");
+        assert_eq!(remap_block("=D1*2+A1", &block, 5, 0), "=D6*2+A1");
+    }
+
+    #[test]
+    fn a_reference_outside_the_block_is_left_alone() {
+        // E1 shares D1's row but not its column, so a row-only block that only
+        // contains D1 must not touch a reference to E1.
+        let block = CellRect::new(0, 3, 0, 3); // D1
+        assert_eq!(remap_block("=E1", &block, 5, 0), "=E1");
+        // A1 is on neither the block's row nor its column.
+        assert_eq!(remap_block("=A1", &block, 5, 0), "=A1");
+    }
+
+    #[test]
+    fn moved_absolute_references_keep_their_dollars() {
+        // $ rides along but does not pin: the cell moved, so the reference
+        // moves, and the marker survives verbatim in the output.
+        let block = CellRect::new(0, 3, 0, 3); // D1
+        assert_eq!(remap_block("=$D$1", &block, 5, 0), "=$D$6");
+        assert_eq!(remap_block("=D$1", &block, 5, 0), "=D$6");
+        assert_eq!(remap_block("=$D1", &block, 5, 0), "=$D6");
+    }
+
+    #[test]
+    fn a_range_wholly_inside_the_block_moves_as_a_unit() {
+        // B2:C3 is entirely inside the moved block, so both endpoints shift.
+        let block = CellRect::new(1, 1, 2, 2); // B2:C3
+        assert_eq!(remap_block("=SUM(B2:C3)", &block, 0, 3), "=SUM(E2:F3)");
+    }
+
+    #[test]
+    fn a_range_that_straddles_the_block_is_left_untouched() {
+        // The block moved only B2:C3, but the formula reads A1:C3 — a range
+        // that only partly moved. Reshaping it into a rectangle the user never
+        // wrote is worse than leaving it, so it is left exactly as written.
+        let block = CellRect::new(1, 1, 2, 2); // B2:C3
+        assert_eq!(remap_block("=SUM(A1:C3)", &block, 0, 3), "=SUM(A1:C3)");
+    }
+
+    #[test]
+    fn a_no_op_block_move_is_byte_identical() {
+        let block = CellRect::new(0, 0, 4, 4);
+        let src = "=SUM($A$1:A1)*LOG10(B2)+\"text\"";
+        assert_eq!(remap_block(src, &block, 0, 0), src);
+    }
+
+    #[test]
+    fn remap_block_never_treats_text_or_functions_as_references() {
+        // The LOG10 / string-literal traps the whole family exists to avoid.
+        let block = CellRect::new(0, 0, 9, 9);
+        assert_eq!(remap_block("=LOG10(A1)", &block, 1, 0), "=LOG10(A2)");
+        assert_eq!(remap_block("=\"A1\"&A1", &block, 1, 0), "=\"A1\"&A2");
+        assert_eq!(remap_block("=Sheet1!A1", &block, 1, 0), "=Sheet1!A2");
+    }
+
+    #[test]
+    fn cellrect_normalises_its_corners() {
+        // Built from bottom-right + top-left, it still describes the rectangle.
+        let r = CellRect::new(5, 5, 1, 1);
+        assert!(r.contains(3, 3));
+        assert!(r.contains(1, 1));
+        assert!(r.contains(5, 5));
+        assert!(!r.contains(0, 3));
+        assert!(!r.contains(6, 3));
     }
 }

@@ -4079,24 +4079,43 @@ impl Workbook {
         Ok(n)
     }
 
-    /// Move a rectangular block by (d_row, d_col) as exactly ONE undo step
-    /// (#82 — drag a selection to relocate it).
+    /// Move (or, when `copy`, COPY) a rectangular block by (d_row, d_col) as
+    /// exactly ONE undo step (#82 — drag a selection to relocate it, or
+    /// Ctrl-drag to duplicate it).
     ///
-    /// A move is NOT a copy: a formula is carried VERBATIM, its references
-    /// unchanged (`=A1+B1` moved anywhere is still `=A1+B1`, matching Excel),
-    /// which is why this reconstructs each cell's raw input string and writes it
-    /// through `write_cells_bulk` rather than going through the ref-relativising
-    /// paste path. Source cells the destination does not cover are cleared, so
-    /// the block leaves no ghost behind. All in one batch → one Ctrl+Z.
+    /// ## Move vs. copy — the two Excel gestures this owns
+    ///
+    /// A **move** (`copy == false`) carries each cell's formula VERBATIM: its
+    /// own references do not shift (`=A1+B1` dragged anywhere is still
+    /// `=A1+B1`), the source cells the destination does not re-cover are
+    /// CLEARED, and — the move-with-refs half — every formula ELSEWHERE on the
+    /// sheet that pointed AT a moved cell is rewritten to follow it to its new
+    /// address (`=D1` becomes `=D6` when D1 moved down five rows). That last
+    /// rewrite reuses [`ferrix_formula::remap_block`], the same text-splice
+    /// machinery as the reorder path, so every `$` and every untouched
+    /// reference comes out byte-identical.
+    ///
+    /// A **copy** (`copy == true`) is a fill by another name: the source cells
+    /// stay put, and each copied formula is RELATIVISED through
+    /// [`ferrix_formula::paste_formula`] so `=A1` copied one row down reads
+    /// `=A2` while `$A$1` stays pinned — exactly Excel's Ctrl-drag semantics.
+    /// A copy does not move any data, so references elsewhere are left alone.
+    ///
+    /// Everything — the clears, the destination writes, and the move-with-refs
+    /// rewrites — goes into one batch, so a single Ctrl+Z reverses the whole
+    /// gesture.
     ///
     /// Returns the number of destination cells written, or an error string if
-    /// the move would run off the sheet, exceed the cell budget, or hit a
-    /// protected cell (in which case nothing is written).
+    /// the operation would run off the sheet, exceed the cell budget, or hit a
+    /// protected cell (in which case nothing is written). See
+    /// [`Self::block_move_would_overwrite`] for the collision check the UI runs
+    /// first so it can prompt before clobbering non-empty cells.
     pub fn move_block(
         &mut self,
         sel: Selection,
         d_row: i64,
         d_col: i64,
+        copy: bool,
         max_cells: u64,
     ) -> Result<usize, String> {
         if d_row == 0 && d_col == 0 {
@@ -4107,18 +4126,20 @@ impl Workbook {
         let dest_tl_row = tl.row as i64 + d_row;
         let dest_tl_col = tl.col as i64 + d_col;
         if dest_tl_row < 0 || dest_tl_col < 0 {
-            return Err("That would move the block off the sheet".to_string());
+            let verb = if copy { "copy" } else { "move" };
+            return Err(format!("That would {verb} the block off the sheet"));
         }
         if sel.cell_count() > max_cells {
+            let verb = if copy { "copy" } else { "move" };
             return Err(format!(
-                "{} cells is too many to move at once (limit {})",
+                "{} cells is too many to {verb} at once (limit {})",
                 sel.cell_count(),
                 max_cells
             ));
         }
 
         // Read every source cell's raw input string first, before any write.
-        // Formula source is carried verbatim; a literal uses its display text.
+        // Formula source is carried verbatim here; a copy relativises it below.
         let view = self.view();
         let mut sources: Vec<(CellRef, String)> = Vec::new();
         for cell in sel.iter() {
@@ -4142,16 +4163,20 @@ impl Workbook {
             ),
         );
 
-        // Protection chokepoint (issue #42): a move that would clear a protected
-        // source or write a protected destination is refused whole, before any
-        // cell is touched.
+        // Protection chokepoint (issue #42): an operation that would clear a
+        // protected source (move only) or write a protected destination is
+        // refused whole, before any cell is touched.
         {
             let prot = &self.sheets[self.active].protection;
             if prot.is_enabled() {
                 for (cell, _) in &sources {
-                    if let Some(d) = prot.deny_edit(*cell) {
-                        self.last_denial = Some(d);
-                        return Err(d.to_string());
+                    // A copy leaves the source in place, so only a move needs
+                    // the source to be editable.
+                    if !copy {
+                        if let Some(d) = prot.deny_edit(*cell) {
+                            self.last_denial = Some(d);
+                            return Err(d.to_string());
+                        }
                     }
                     let to = CellRef::new(
                         (cell.row as i64 + d_row) as u32,
@@ -4165,41 +4190,50 @@ impl Workbook {
             }
         }
 
-        // Assemble ONE undo entry that both CLEARS the vacated source cells and
-        // WRITES the block at its destination. `write_cells_bulk` cannot do the
-        // clear half — `classify("")` is `None`, so an empty string is skipped
-        // rather than emptying the cell — so the changes are built directly.
+        // Assemble ONE undo entry. `write_cells_bulk` cannot do the clear half
+        // — `classify("")` is `None`, so an empty string is skipped rather than
+        // emptying the cell — so the changes are built directly.
         let sheet = self.active_sheet();
         let mut changes: Vec<CellChange> = Vec::new();
 
-        // Clear each source not re-covered by the destination.
-        for (cell, _) in &sources {
-            if dest.contains(*cell) {
-                continue;
+        // Clear each source not re-covered by the destination — MOVE only. A
+        // copy leaves the originals exactly where they are.
+        if !copy {
+            for (cell, _) in &sources {
+                if dest.contains(*cell) {
+                    continue;
+                }
+                let before = self.overlay.get(*cell).cloned();
+                if before.is_none() && self.view().get(*cell) == Value::Empty {
+                    continue;
+                }
+                self.overlay.set(*cell, CellInput::Literal(Value::Empty));
+                self.graph.remove_at(SheetCell::new(sheet, *cell));
+                changes.push(CellChange {
+                    cell: *cell,
+                    before,
+                    after: Some(CellInput::Literal(Value::Empty)),
+                });
             }
-            let before = self.overlay.get(*cell).cloned();
-            if before.is_none() && self.view().get(*cell) == Value::Empty {
-                continue;
-            }
-            self.overlay.set(*cell, CellInput::Literal(Value::Empty));
-            self.graph.remove_at(SheetCell::new(sheet, *cell));
-            changes.push(CellChange {
-                cell: *cell,
-                before,
-                after: Some(CellInput::Literal(Value::Empty)),
-            });
         }
 
         // Write each source's text at its destination offset. Destination writes
-        // come last so a self-overlapping move wins over the clears above.
+        // come last so a self-overlapping move wins over the clears above. A
+        // copy relativises each formula the way a paste does; a move carries it
+        // verbatim.
         let mut written = 0usize;
         for (cell, text) in &sources {
             let to = CellRef::new(
                 (cell.row as i64 + d_row) as u32,
                 (cell.col as i64 + d_col) as u32,
             );
+            let out_text = if copy && text.starts_with('=') {
+                ferrix_formula::paste_formula(text, d_row, d_col)
+            } else {
+                text.clone()
+            };
             let before = self.overlay.get(to).cloned();
-            let Some(input) = self.classify(text) else {
+            let Some(input) = self.classify(&out_text) else {
                 // An empty source cell writes nothing at the destination, but if
                 // the destination held something it must still be cleared.
                 if before.is_some() || self.view().get(to) != Value::Empty {
@@ -4223,6 +4257,42 @@ impl Workbook {
             written += 1;
         }
 
+        // Move-with-refs (#82): every formula ELSEWHERE on the sheet that
+        // pointed at a moved cell now points at where it landed. A copy moves no
+        // data, so this is a move-only rewrite.
+        //
+        // Both the source AND destination rectangles are skipped. A formula
+        // inside the block was carried VERBATIM to the destination above (its
+        // own internal references staying put is a move's defining behaviour),
+        // so rewriting it here — now that it sits at a destination cell that
+        // still references a source address inside the block — would wrongly
+        // relativise it. Only formulas that were never part of the block are
+        // observers whose references must follow the moved data.
+        if !copy {
+            let block = ferrix_formula::CellRect::new(tl.row, tl.col, br.row, br.col);
+            let rewrites: Vec<(CellRef, String)> = self
+                .overlay
+                .formula_cells()
+                .filter(|(cell, _)| !sel.contains(*cell) && !dest.contains(*cell))
+                .filter_map(|(cell, src)| {
+                    let out = ferrix_formula::remap_block(src, &block, d_row, d_col);
+                    (out != src).then_some((cell, out))
+                })
+                .collect();
+            for (cell, out) in rewrites {
+                let before = self.overlay.get(cell).cloned();
+                if let Some(input) = self.classify(&out) {
+                    self.overlay.set(cell, input.clone());
+                    self.resync_graph_at(SheetCell::new(sheet, cell));
+                    changes.push(CellChange {
+                        cell,
+                        before,
+                        after: Some(input),
+                    });
+                }
+            }
+        }
+
         if changes.is_empty() {
             return Ok(0);
         }
@@ -4237,6 +4307,48 @@ impl Workbook {
         });
         self.recalc_all();
         Ok(written)
+    }
+
+    /// Would a move/copy of `sel` by (d_row, d_col) overwrite any non-empty
+    /// cell the operation does not itself vacate?
+    ///
+    /// The UI runs this BEFORE [`Self::move_block`] so it can prompt before
+    /// clobbering the user's data (Excel pops the same "There's already data
+    /// here" dialog). For a MOVE, a destination cell that is part of the source
+    /// block is not a collision — it is being vacated by the same gesture — so
+    /// those are excluded; for a COPY the source stays put, so every occupied
+    /// destination counts. Off-sheet or over-budget operations report `false`
+    /// here and surface their own error from `move_block` instead.
+    pub fn block_move_would_overwrite(
+        &self,
+        sel: Selection,
+        d_row: i64,
+        d_col: i64,
+        copy: bool,
+    ) -> bool {
+        if d_row == 0 && d_col == 0 {
+            return false;
+        }
+        let (tl, _br) = sel.bounds();
+        if tl.row as i64 + d_row < 0 || tl.col as i64 + d_col < 0 {
+            return false;
+        }
+        let view = self.view();
+        for cell in sel.iter() {
+            let to = CellRef::new(
+                (cell.row as i64 + d_row) as u32,
+                (cell.col as i64 + d_col) as u32,
+            );
+            // A move vacates its own source cells, so a destination that lands
+            // back on the block is not a collision.
+            if !copy && sel.contains(to) {
+                continue;
+            }
+            if view.get(to) != Value::Empty {
+                return true;
+            }
+        }
+        false
     }
 
     /// Replace across the whole sheet as exactly ONE undo step.

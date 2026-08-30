@@ -171,6 +171,22 @@ struct RefDrag {
     from: CellRef,
 }
 
+/// A block move/copy the user asked for whose destination would overwrite
+/// non-empty cells — parked here while the confirmation modal is up (#82).
+///
+/// Excel prompts before a drag-drop clobbers data ("There's already data
+/// here. Do you want to replace it?"); this holds the exact gesture so the
+/// answer can carry it out unchanged, or drop it on Cancel.
+#[derive(Clone, Copy, Debug)]
+struct PendingBlockMove {
+    /// The selection being moved/copied, as it stood when the drop landed.
+    sel: Selection,
+    d_row: i64,
+    d_col: i64,
+    /// True for a Ctrl-drag copy, false for a plain move.
+    copy: bool,
+}
+
 pub struct FerrixApp {
     wb: Workbook,
     stats_rows: usize,
@@ -407,6 +423,10 @@ pub struct FerrixApp {
     /// offset from it gives the move delta. `Some` only while a move is in
     /// flight.
     move_origin: Option<CellRef>,
+    /// A block move/copy whose destination would overwrite data, awaiting the
+    /// user's answer to the confirmation modal (#82). `None` the rest of the
+    /// time, which costs nothing.
+    pending_block_move: Option<PendingBlockMove>,
 
     /// Structured tables defined over the current sheet.
     ///
@@ -793,6 +813,7 @@ impl FerrixApp {
             fill_source: None,
             fill_target: None,
             move_origin: None,
+            pending_block_move: None,
             tables: Vec::new(),
             table_mask: None,
             table_uniques: Vec::new(),
@@ -2000,17 +2021,48 @@ impl FerrixApp {
     /// Move the current selection's block by (d_row, d_col) as one undo step,
     /// and carry the selection to the block's new home (#82). The drag gesture
     /// and any menu/keyboard mover both call this; it owns the meaning.
+    ///
+    /// A MOVE (not a copy). If the destination would overwrite non-empty cells
+    /// the block does not itself vacate, this parks the gesture and raises the
+    /// confirmation modal instead of clobbering silently — the user answers via
+    /// [`Self::confirm_block_move`] / [`Self::cancel_block_move`].
     pub fn move_selection_block(&mut self, d_row: i64, d_col: i64) {
+        self.request_block_move(d_row, d_col, false);
+    }
+
+    /// Ctrl-drag: COPY the current selection's block to (d_row, d_col) rather
+    /// than moving it (#82). Same overwrite-prompt discipline as a move.
+    pub fn copy_selection_block(&mut self, d_row: i64, d_col: i64) {
+        self.request_block_move(d_row, d_col, true);
+    }
+
+    /// Shared entry for both gestures: prompt first if the drop would overwrite
+    /// data, otherwise carry it out at once.
+    fn request_block_move(&mut self, d_row: i64, d_col: i64, copy: bool) {
         if d_row == 0 && d_col == 0 {
             return;
         }
         let sel = self.selection;
+        if self.wb.block_move_would_overwrite(sel, d_row, d_col, copy) {
+            self.pending_block_move = Some(PendingBlockMove {
+                sel,
+                d_row,
+                d_col,
+                copy,
+            });
+            return;
+        }
+        self.apply_block_move(sel, d_row, d_col, copy);
+    }
+
+    /// Carry out a (possibly already-confirmed) block move/copy, and move the
+    /// selection to the block's new home so the user can chain another gesture
+    /// or undo in one step.
+    fn apply_block_move(&mut self, sel: Selection, d_row: i64, d_col: i64, copy: bool) {
         let limit = self.max_overlay_cells();
-        match self.wb.move_block(sel, d_row, d_col, limit) {
+        match self.wb.move_block(sel, d_row, d_col, copy, limit) {
             Ok(0) => {}
             Ok(n) => {
-                // The selection follows the block to its new position, so the
-                // user can immediately move it again or undo in one gesture.
                 let (tl, br) = sel.bounds();
                 let moved = Selection::new(
                     CellRef::new(
@@ -2023,10 +2075,32 @@ impl FerrixApp {
                     ),
                 );
                 self.selection = moved;
-                self.status = format!("Moved {} cells", fmt_int(n));
+                let verb = if copy { "Copied" } else { "Moved" };
+                self.status = format!("{verb} {} cells", fmt_int(n));
                 self.sync_formula_bar();
             }
             Err(e) => self.status = e,
+        }
+    }
+
+    /// True while the block-move overwrite confirmation modal is up (#82).
+    pub fn block_move_prompt_open(&self) -> bool {
+        self.pending_block_move.is_some()
+    }
+
+    /// Answer "Replace" to the overwrite prompt: carry out the parked move/copy.
+    pub fn confirm_block_move(&mut self) {
+        if let Some(p) = self.pending_block_move.take() {
+            self.apply_block_move(p.sel, p.d_row, p.d_col, p.copy);
+        }
+    }
+
+    /// Answer "Cancel" to the overwrite prompt: drop the parked gesture and
+    /// leave every cell exactly as it was.
+    pub fn cancel_block_move(&mut self) {
+        if self.pending_block_move.is_some() {
+            self.pending_block_move = None;
+            self.status = "Move cancelled".into();
         }
     }
 
@@ -3458,6 +3532,61 @@ impl FerrixApp {
             // on the next launch would override that choice.
             self.clear_autosave();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The overwrite confirmation for a drag-drop that would clobber non-empty
+    /// cells (#82). Excel shows the same "There's already data here." prompt.
+    ///
+    /// Replace carries out the parked move/copy; Cancel drops it and leaves
+    /// every cell untouched. Escape and clicking away both cancel, matching the
+    /// rest of the app's dialogs — the safe default when the answer would
+    /// destroy data.
+    fn show_block_move_prompt(&mut self, ctx: &egui::Context) {
+        let th = self.theme;
+        let mut replace = false;
+        let mut cancel = false;
+        let copy = self.pending_block_move.map(|p| p.copy).unwrap_or(false);
+        let verb = if copy { "copied" } else { "moved" };
+
+        egui::Window::new("Replace existing data?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("There's already data here.")
+                        .size(13.5)
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "The cells being {verb} would overwrite existing values."
+                    ))
+                    .color(th.text_dim)
+                    .size(11.5),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        replace = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        // Escape cancels, matching every other dialog in the app.
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            cancel = true;
+        }
+
+        if replace {
+            self.confirm_block_move();
+        } else if cancel {
+            self.cancel_block_move();
         }
     }
 
@@ -9282,6 +9411,11 @@ impl FerrixApp {
         if self.recovery.is_some() {
             self.show_recovery_prompt(ctx);
         }
+        // The overwrite confirmation for a drag-drop that would clobber data
+        // (#82). Shown here so it sits above the grid but below a close/compact.
+        if self.pending_block_move.is_some() {
+            self.show_block_move_prompt(ctx);
+        }
         // The autosave timer. Runs every frame; almost every call returns
         // immediately without touching the disk.
         self.tick_autosave();
@@ -10738,7 +10872,12 @@ impl FerrixApp {
                     if let (Some(origin), Some(drop)) = (self.move_origin, resp.move_to) {
                         let d_row = drop.row as i64 - origin.row as i64;
                         let d_col = drop.col as i64 - origin.col as i64;
-                        self.move_selection_block(d_row, d_col);
+                        // Ctrl held at the drop copies instead of moving (#82).
+                        if resp.move_copy {
+                            self.copy_selection_block(d_row, d_col);
+                        } else {
+                            self.move_selection_block(d_row, d_col);
+                        }
                     }
                     self.move_origin = None;
                 }
