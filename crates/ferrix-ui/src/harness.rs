@@ -626,6 +626,50 @@ impl Harness {
         self
     }
 
+    // ---- pivot builder (issue #33 Part C) ----
+
+    /// Open the pivot builder on the current selection, the exact entry point
+    /// the Data ▸ Pivot Table… menu item calls.
+    ///
+    /// Exposed for the same reason as `freeze_at_cursor` and the cond-format
+    /// entry points: the menu item lives at a pixel that moves with the theme
+    /// and window width, and a test about SPEC ASSEMBLY should not be a test
+    /// about where a menu opens.
+    pub fn open_pivot_builder(&mut self) -> &mut Self {
+        self.app.open_pivot_builder();
+        self
+    }
+
+    /// Drop a source column into the Rows well, the same mutation the egui
+    /// drag handler performs. Panics if the builder is not open, which is a
+    /// test-setup error, not a product state.
+    pub fn pivot_drop_row(&mut self, col: ferrix_core::ColIdx) -> &mut Self {
+        self.app
+            .pivot_builder_state_mut()
+            .expect("pivot builder is open")
+            .drop_row(col);
+        self
+    }
+
+    /// Drop a source column into the Values well with `agg`.
+    pub fn pivot_drop_value(
+        &mut self,
+        col: ferrix_core::ColIdx,
+        agg: ferrix_core::PivotAgg,
+    ) -> &mut Self {
+        self.app
+            .pivot_builder_state_mut()
+            .expect("pivot builder is open")
+            .drop_value(col, agg);
+        self
+    }
+
+    /// Commit the builder, the exact path the "Create pivot" button drives.
+    pub fn pivot_commit(&mut self) -> &mut Self {
+        self.app.commit_pivot_builder();
+        self
+    }
+
     /// Click a column header, cycling its sort. Real move/press/release at the
     /// header's ACTUAL painted centre.
     ///
@@ -10767,5 +10811,254 @@ xxx,yyy,zzz
             }
         }
         None
+    }
+
+    // ---- issue #33 Part C: pivot builder ----
+
+    /// A fresh harness whose Sheet1 holds a region/amount source table:
+    /// East 10, West 5, East 20, West 7, East 3. Two groups (East=33, West=12)
+    /// when summing amount by region — numbers no accidental grouping produces.
+    fn pivot_source_harness() -> Harness {
+        let mut h = Harness::new(None);
+        let rows: [(&str, &str); 5] = [
+            ("East", "10"),
+            ("West", "5"),
+            ("East", "20"),
+            ("West", "7"),
+            ("East", "3"),
+        ];
+        for (r, (region, amount)) in rows.iter().enumerate() {
+            h.app_mut()
+                .commit_edit_for_test(CellRef::new(r as u32, 0), region);
+            h.app_mut()
+                .commit_edit_for_test(CellRef::new(r as u32, 1), amount);
+        }
+        h.steps(2);
+        h
+    }
+
+    /// The acceptance test: open the builder, drop a Row column and a Value
+    /// column with Sum, commit, and assert a NEW pivot sheet exists carrying the
+    /// exact spec — driven entirely through the harness, never synthetic egui
+    /// input.
+    #[test]
+    fn pivot_builder_drops_commit_and_create_a_pivot_sheet() {
+        use ferrix_core::{ColIdx, PivotAgg};
+
+        let mut h = pivot_source_harness();
+        let source = h.app().workbook().active_sheet();
+        let sheets_before = h.app().workbook().sheet_names().len();
+
+        // A single-cell selection means "the whole sheet's columns are
+        // available to drag", which is what a user gets from just clicking in.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.open_pivot_builder();
+        assert!(
+            h.app().pivot_builder_state().is_some(),
+            "the builder must be open after the command"
+        );
+
+        // Drag region (col 0) into Rows, amount (col 1) into Values as Sum.
+        h.pivot_drop_row(ColIdx(0));
+        h.pivot_drop_value(ColIdx(1), PivotAgg::Sum);
+        h.pivot_commit();
+
+        // A brand-new pivot sheet exists, and the builder closed.
+        assert_eq!(
+            h.app().workbook().sheet_names().len(),
+            sheets_before + 1,
+            "commit must add exactly one pivot sheet"
+        );
+        assert!(
+            h.app().pivot_builder_state().is_none(),
+            "committing closes the builder"
+        );
+
+        // It is the ACTIVE sheet (commit switches to it) and it is a pivot.
+        let pivot = h.app().workbook().active_sheet();
+        assert_ne!(pivot, source, "the pivot is a different sheet");
+        assert!(
+            h.app().workbook().is_pivot_sheet(pivot),
+            "the new sheet is a pivot"
+        );
+
+        // And it carries exactly the spec the wells described.
+        let binding = h.app().workbook().pivot_binding(pivot).expect("binding");
+        assert_eq!(binding.source, source, "pivot reads the source sheet");
+        assert_eq!(
+            binding.spec,
+            crate::workbook::PivotSpec {
+                group_by: vec![ColIdx(0)],
+                values: vec![(ColIdx(1), PivotAgg::Sum)],
+            },
+            "the committed spec matches the dropped columns"
+        );
+
+        // The result rendered: East's amount sum is 10+20+3 = 33.
+        let result = h
+            .app()
+            .workbook()
+            .pivot_result(pivot)
+            .expect("refreshed on commit");
+        assert_eq!(result.groups.len(), 2, "region has two groups");
+    }
+
+    /// Editing an existing pivot must REFRESH THE SAME SHEET, not spawn a new
+    /// one on every edit (the acceptance criterion the wording calls out).
+    #[test]
+    fn editing_a_pivot_refreshes_the_same_sheet() {
+        use ferrix_core::{ColIdx, PivotAgg};
+
+        let mut h = pivot_source_harness();
+
+        // Build a first pivot: group by region, Sum amount.
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.open_pivot_builder();
+        h.pivot_drop_row(ColIdx(0));
+        h.pivot_drop_value(ColIdx(1), PivotAgg::Sum);
+        h.pivot_commit();
+
+        let pivot = h.app().workbook().active_sheet();
+        let sheets_after_create = h.app().workbook().sheet_names().len();
+
+        // Re-open the builder ON the pivot sheet: it should seed from the
+        // existing spec and be in "editing" mode.
+        h.open_pivot_builder();
+        {
+            let st = h.app().pivot_builder_state().expect("builder open");
+            assert_eq!(st.editing, Some(pivot), "editing the same pivot sheet");
+            assert_eq!(st.rows, vec![ColIdx(0)], "seeded with the existing rows");
+            assert_eq!(st.values.len(), 1, "seeded with the existing value");
+        }
+
+        // Add a second value (Count of amount) and commit the edit.
+        h.pivot_drop_value(ColIdx(1), PivotAgg::Count);
+        h.pivot_commit();
+
+        // NO new sheet — the same pivot was reshaped in place.
+        assert_eq!(
+            h.app().workbook().sheet_names().len(),
+            sheets_after_create,
+            "editing must not create another sheet"
+        );
+        assert_eq!(
+            h.app().workbook().active_sheet(),
+            pivot,
+            "still on the same pivot sheet"
+        );
+        let binding = h.app().workbook().pivot_binding(pivot).expect("binding");
+        assert_eq!(
+            binding.spec.values,
+            vec![(ColIdx(1), PivotAgg::Sum), (ColIdx(1), PivotAgg::Count)],
+            "the edit added the Count value to the same spec"
+        );
+    }
+
+    /// Round-trip: a pivot built through the UI survives a sidecar save and a
+    /// reload into a fresh app, re-rendering from the restored spec. Part B owns
+    /// persistence; this proves the builder's product feeds it correctly.
+    #[test]
+    fn a_built_pivot_survives_save_and_reopen() {
+        use ferrix_core::{ColIdx, PivotAgg};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix_pivot_builder_rt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = ferrix_io::pivot_path_for(&dir.join("book.ferrix"));
+
+        // Build a pivot through the builder, then save its bindings.
+        let mut h = pivot_source_harness();
+        let source = h.app().workbook().active_sheet();
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.open_pivot_builder();
+        h.pivot_drop_row(ColIdx(0));
+        h.pivot_drop_value(ColIdx(1), PivotAgg::Sum);
+        h.pivot_commit();
+        let pivot = h.app().workbook().active_sheet();
+
+        h.app_mut().set_pivots_path_for_test(sidecar.clone());
+        assert!(h.app_mut().save_pivots(), "save_pivots wrote the sidecar");
+        assert!(sidecar.exists(), "the .fxpivot file is on disk");
+
+        // Reload into a fresh, identically-shaped app.
+        let mut h2 = pivot_source_harness();
+        // The fresh app needs the same extra pivot sheet id to exist before the
+        // sidecar (keyed by sheet id) can bind to it.
+        let pivot2 = h2
+            .app_mut()
+            .workbook_mut()
+            .add_sheet(
+                "Pivot",
+                crate::sheet_view::BaseData::Memory(ferrix_core::Sheet::new("Pivot")),
+            )
+            .expect("add pivot sheet");
+        assert_eq!(pivot2, pivot, "same sheet ids in the rebuilt fixture");
+        assert!(
+            !h2.app().workbook().is_pivot_sheet(pivot2),
+            "no pivot before load"
+        );
+
+        h2.app_mut().set_pivots_path_for_test(sidecar.clone());
+        h2.app_mut().load_pivots_sidecar();
+
+        assert!(
+            h2.app().workbook().is_pivot_sheet(pivot2),
+            "the built pivot was restored from the sidecar"
+        );
+        let binding = h2.app().workbook().pivot_binding(pivot2).expect("binding");
+        assert_eq!(binding.source, source);
+        assert_eq!(
+            binding.spec,
+            crate::workbook::PivotSpec {
+                group_by: vec![ColIdx(0)],
+                values: vec![(ColIdx(1), PivotAgg::Sum)],
+            },
+            "the spec survived the round trip"
+        );
+        // Refreshed on load, so the cells already show the result: East = 33.
+        h2.app_mut().workbook_mut().activate(pivot2).unwrap();
+        assert_eq!(
+            h2.app()
+                .workbook()
+                .pivot_result(pivot2)
+                .expect("result")
+                .groups
+                .len(),
+            2,
+            "the pivot re-rendered its two groups"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty spec is not committable: the "Create pivot" button is disabled
+    /// and a commit is a no-op, so a user cannot make a blank pivot.
+    #[test]
+    fn an_empty_builder_will_not_commit() {
+        let mut h = pivot_source_harness();
+        let sheets_before = h.app().workbook().sheet_names().len();
+
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.open_pivot_builder();
+        assert!(
+            !h.app()
+                .pivot_builder_state()
+                .expect("open")
+                .is_committable(),
+            "an empty spec is not committable"
+        );
+        h.pivot_commit();
+        // Nothing was created; the (still-empty) builder was put back.
+        assert_eq!(
+            h.app().workbook().sheet_names().len(),
+            sheets_before,
+            "committing an empty spec creates no sheet"
+        );
     }
 }
