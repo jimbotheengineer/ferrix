@@ -3,6 +3,7 @@
 //! Tokenizer, Pratt parser, evaluator, and dependency graph for spreadsheet
 //! formulas.
 
+pub mod array;
 pub mod criteria;
 pub mod datetime;
 pub mod depgraph;
@@ -18,10 +19,13 @@ pub mod stats;
 pub mod text;
 
 #[cfg(test)]
+mod array_compose_tests;
+#[cfg(test)]
 mod compose_tests;
 #[cfg(test)]
 mod rewrite_compose_tests;
 
+pub use array::{ArrayData, EvalResult};
 pub use criteria::{Criterion, Pattern, Scalar};
 pub use depgraph::{DepGraph, Precedent};
 pub use eval::{eval, eval_view, CellSource};
