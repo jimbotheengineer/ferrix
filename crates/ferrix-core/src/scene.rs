@@ -27,6 +27,65 @@ use std::fmt::Write as _;
 
 use crate::chart::{Bounds, DataPoint};
 
+/// How an axis maps data values onto the plot.
+///
+/// A `Linear` axis divides its range uniformly; a `Log` axis divides it
+/// uniformly in log10 space, so each factor of ten occupies the same screen
+/// distance. Log is the right default for data that spans many orders of
+/// magnitude (populations, prices, error counts) where a linear axis crushes
+/// everything below the largest value into the baseline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Scale {
+    #[default]
+    Linear,
+    Log,
+}
+
+impl Scale {
+    /// The smallest positive value a log axis will map. A log axis cannot
+    /// represent zero or negatives, and values at or below this floor are
+    /// clamped to it so a stray non-positive datum does not produce `-inf`.
+    const LOG_FLOOR: f64 = 1e-300;
+
+    /// Project a data value into the scale's linear-fraction space.
+    ///
+    /// For `Linear` this is the identity; for `Log` it is `log10(v)`, with
+    /// non-positive values clamped up to [`Scale::LOG_FLOOR`] so the mapping
+    /// stays finite. The result is *not* a screen coordinate — callers combine
+    /// it with the projected bounds to get a 0..1 fraction across the axis.
+    #[inline]
+    fn project(self, v: f64) -> f64 {
+        match self {
+            Scale::Linear => v,
+            Scale::Log => v.max(Self::LOG_FLOOR).log10(),
+        }
+    }
+
+    /// The inverse of [`Scale::project`]: turn a projected coordinate back into
+    /// a data value. `Linear` is the identity; `Log` raises ten to the power.
+    #[inline]
+    fn unproject(self, p: f64) -> f64 {
+        match self {
+            Scale::Linear => p,
+            Scale::Log => 10f64.powf(p),
+        }
+    }
+}
+
+/// A pair of per-axis scale hints, carried on a [`Scene`] so every consumer
+/// (the egui painter and the SVG writer) maps and ticks the axes identically.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScaleHint {
+    pub x: Scale,
+    pub y: Scale,
+}
+
+impl ScaleHint {
+    pub fn new(x: Scale, y: Scale) -> Self {
+        Self { x, y }
+    }
+}
+
 /// Where text sits relative to its anchor point.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Anchor {
@@ -134,6 +193,10 @@ pub struct Scene {
     /// asks for it (a single-series chart usually communicates the series via
     /// the y-axis label and title instead, so an empty legend draws nothing).
     pub legend: Vec<LegendEntry>,
+    /// Per-axis scale hint. Defaults to linear on both axes; a builder sets
+    /// this when the data warrants a log axis, and every consumer maps and
+    /// ticks the axes from it so the screen and the SVG export agree.
+    pub scale: ScaleHint,
 }
 
 impl Scene {
@@ -146,6 +209,7 @@ impl Scene {
             x_label: None,
             y_label: None,
             legend: Vec::new(),
+            scale: ScaleHint::default(),
         }
     }
 
@@ -170,6 +234,24 @@ impl Scene {
         self
     }
 
+    /// Set the per-axis scale hint (linear or log per axis).
+    ///
+    /// A log axis cannot represent zero or negative values, so any axis marked
+    /// `Log` whose lower bound is non-positive is raised to the first power of
+    /// ten at or below its upper bound (or `1.0` as a last resort). This keeps
+    /// the mapping finite without silently hiding that the data was clamped —
+    /// the axis simply starts at the first decade it can show.
+    pub fn with_scale(mut self, scale: ScaleHint) -> Self {
+        if scale.x == Scale::Log {
+            self.x = sanitize_log_bounds(self.x);
+        }
+        if scale.y == Scale::Log {
+            self.y = sanitize_log_bounds(self.y);
+        }
+        self.scale = scale;
+        self
+    }
+
     /// Number of primitives — the quantity that must stay bounded no matter
     /// how many rows were aggregated.
     pub fn len(&self) -> usize {
@@ -191,33 +273,76 @@ pub struct Viewport {
     pub rect: (f32, f32, f32, f32),
     pub x: Bounds,
     pub y: Bounds,
+    /// Per-axis scale. A log axis maps in log10 space; the default is linear.
+    pub scale: ScaleHint,
 }
 
 impl Viewport {
     pub fn new(rect: (f32, f32, f32, f32), x: Bounds, y: Bounds) -> Self {
-        Self { rect, x, y }
+        Self {
+            rect,
+            x,
+            y,
+            scale: ScaleHint::default(),
+        }
+    }
+
+    /// A viewport that maps `scene`'s data using the scene's own scale hint, so
+    /// hit-testing and export share exactly one mapping.
+    pub fn for_scene(rect: (f32, f32, f32, f32), scene: &Scene) -> Self {
+        Self {
+            rect,
+            x: scene.x,
+            y: scene.y,
+            scale: scene.scale,
+        }
+    }
+
+    /// Set the per-axis scale hint, returning the modified viewport.
+    pub fn with_scale(mut self, scale: ScaleHint) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    /// The 0..1 fraction of `v` across `bounds` under `scale`, guarding a
+    /// degenerate (zero-span) range by centring.
+    #[inline]
+    fn fraction(scale: Scale, bounds: Bounds, v: f64) -> Option<f32> {
+        let lo = scale.project(bounds.min);
+        let hi = scale.project(bounds.max);
+        let span = hi - lo;
+        if span.abs() < f64::EPSILON {
+            return None;
+        }
+        Some(((scale.project(v) - lo) / span) as f32)
+    }
+
+    /// The data value at 0..1 fraction `f` across `bounds` under `scale`.
+    #[inline]
+    fn unfraction(scale: Scale, bounds: Bounds, f: f32) -> f64 {
+        let lo = scale.project(bounds.min);
+        let hi = scale.project(bounds.max);
+        scale.unproject(lo + f as f64 * (hi - lo))
     }
 
     /// Data x to device x.
     #[inline]
     pub fn map_x(&self, x: f64) -> f32 {
         let (left, _, w, _) = self.rect;
-        let span = self.x.span();
-        if span.abs() < f64::EPSILON {
-            return left + w / 2.0;
+        match Self::fraction(self.scale.x, self.x, x) {
+            Some(f) => left + f * w,
+            None => left + w / 2.0,
         }
-        left + (((x - self.x.min) / span) as f32) * w
     }
 
     /// Data y to device y. Y is flipped: data grows upward, screens grow down.
     #[inline]
     pub fn map_y(&self, y: f64) -> f32 {
         let (_, top, _, h) = self.rect;
-        let span = self.y.span();
-        if span.abs() < f64::EPSILON {
-            return top + h / 2.0;
+        match Self::fraction(self.scale.y, self.y, y) {
+            Some(f) => top + h - f * h,
+            None => top + h / 2.0,
         }
-        top + h - (((y - self.y.min) / span) as f32) * h
     }
 
     #[inline]
@@ -232,7 +357,7 @@ impl Viewport {
         if w.abs() < f32::EPSILON {
             return self.x.min;
         }
-        self.x.min + ((px - left) / w) as f64 * self.x.span()
+        Self::unfraction(self.scale.x, self.x, (px - left) / w)
     }
 
     #[inline]
@@ -241,7 +366,7 @@ impl Viewport {
         if h.abs() < f32::EPSILON {
             return self.y.min;
         }
-        self.y.min + ((top + h - py) / h) as f64 * self.y.span()
+        Self::unfraction(self.scale.y, self.y, (top + h - py) / h)
     }
 }
 
@@ -285,6 +410,181 @@ pub fn nice_ticks(bounds: Bounds, target: usize) -> Vec<f64> {
         v += step;
     }
     ticks
+}
+
+/// Clamp a range to something a log axis can display.
+///
+/// A log axis cannot show zero or negatives. If the lower bound is
+/// non-positive, raise it to a decade at or below the upper bound (`1.0` when
+/// even the upper bound is non-positive) so `data_to_screen` stays finite. The
+/// caller has already decided the axis is logarithmic; this only makes the
+/// range representable.
+fn sanitize_log_bounds(b: Bounds) -> Bounds {
+    if b.is_empty() {
+        return Bounds::new(1.0, 10.0);
+    }
+    let max = if b.max > 0.0 { b.max } else { 1.0 };
+    let min = if b.min > 0.0 {
+        b.min
+    } else {
+        // First power of ten at or below `max`, but never above it.
+        let decade = 10f64.powf(max.log10().floor());
+        decade.min(max).max(f64::MIN_POSITIVE)
+    };
+    if min >= max {
+        // Degenerate after clamping: give it one decade of room.
+        Bounds::new(max / 10.0, max)
+    } else {
+        Bounds::new(min, max)
+    }
+}
+
+/// Choose log-axis tick positions: one major per power of ten across the range,
+/// plus the 2..9 minor ticks inside each decade that fall within `bounds`.
+///
+/// The result is sorted ascending and always includes at least the decades
+/// bracketing the data. Minors let a viewer read intermediate values (a point
+/// at 3×10^4 sits clearly between the 10^4 and 10^5 majors) without cluttering
+/// the axis with arbitrary fractions.
+///
+/// `bounds` must be positive; callers reach this only for a log axis, whose
+/// bounds are sanitised by [`sanitize_log_bounds`]. Non-positive input yields
+/// an empty vec rather than `NaN` ticks.
+pub fn log_ticks(bounds: Bounds) -> Vec<f64> {
+    if bounds.is_empty() || bounds.min <= 0.0 || bounds.max <= 0.0 {
+        return Vec::new();
+    }
+    let lo_exp = bounds.min.log10().floor() as i32;
+    let hi_exp = bounds.max.log10().ceil() as i32;
+    // Guard against a pathological range spanning enormous magnitudes.
+    let max_decades = 320;
+    let mut ticks = Vec::new();
+    let mut exp = lo_exp;
+    let mut decades = 0;
+    while exp <= hi_exp && decades <= max_decades {
+        let decade = 10f64.powi(exp);
+        for m in 1..=9 {
+            let v = m as f64 * decade;
+            // Keep ticks within the data range, with a small tolerance so a
+            // major sitting exactly on the bound is not lost to rounding.
+            if v >= bounds.min * (1.0 - 1e-9) && v <= bounds.max * (1.0 + 1e-9) {
+                ticks.push(v);
+            }
+        }
+        exp += 1;
+        decades += 1;
+    }
+    ticks
+}
+
+/// Format a log-axis tick. Majors (powers of ten) read as their plain value via
+/// [`format_tick`]; minors get the same compact formatting so `2000` shows as
+/// `2k`, keeping the label set consistent with the linear axis.
+pub fn format_log_tick(v: f64) -> String {
+    if v <= 0.0 {
+        return "0".to_string();
+    }
+    let decade = 10f64.powf(v.log10().floor());
+    format_tick(v, decade)
+}
+
+/// Approximate the rendered width, in device pixels, of a tick label at the
+/// axis font size. A proportional sans-serif digit is roughly 0.6em wide; this
+/// is deliberately a cheap estimate — the elide pass only needs to know when
+/// labels *collide*, not their exact metrics.
+fn approx_label_width(text: &str, font_px: f32) -> f32 {
+    text.chars().count() as f32 * font_px * 0.6
+}
+
+/// Decide which of a set of horizontally-placed tick labels to keep so that no
+/// two kept labels overlap.
+///
+/// `centers` are the device positions of each label's anchor (parallel to
+/// `labels`); `font_px` is the label font size. The pass keeps the first and
+/// last tick always, then repeatedly drops every other interior label until no
+/// two survivors' half-width boxes (plus a small gap) intersect. Returns a
+/// boolean keep-mask parallel to the inputs.
+///
+/// This exists because `nice_ticks` spacing is chosen in *data* space and says
+/// nothing about pixel width: at a narrow viewport, or with wide labels like
+/// `1.5M`, adjacent labels can still collide. Dropping every other label (a
+/// power-of-two thinning) keeps the surviving ticks evenly spaced.
+pub fn elide_overlapping(labels: &[String], centers: &[f32], font_px: f32) -> Vec<bool> {
+    let n = labels.len();
+    let mut keep = vec![true; n];
+    if n <= 2 {
+        return keep;
+    }
+    let gap = font_px * 0.35; // minimum whitespace between two labels
+    let half: Vec<f32> = labels
+        .iter()
+        .map(|l| approx_label_width(l, font_px) / 2.0)
+        .collect();
+
+    // Does any pair of currently-kept, adjacent-in-keep-order labels overlap?
+    let overlaps = |keep: &[bool]| -> bool {
+        let mut prev: Option<usize> = None;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            if let Some(p) = prev {
+                let dist = (centers[i] - centers[p]).abs();
+                if dist < half[i] + half[p] + gap {
+                    return true;
+                }
+            }
+            prev = Some(i);
+        }
+        false
+    };
+
+    // Thin interior labels by powers of two until nothing overlaps. `stride`
+    // doubles each round: keep indices 0, stride, 2*stride, ... and the last;
+    // this preserves even spacing and never drops the first or last tick.
+    let last = n - 1;
+    let mut stride = 1usize;
+    while overlaps(&keep) {
+        stride *= 2;
+        if stride >= n {
+            // Cannot thin further without dropping first/last; keep only the
+            // endpoints, which by construction do not overlap unless the
+            // viewport is narrower than a single label.
+            for k in keep.iter_mut() {
+                *k = false;
+            }
+            keep[0] = true;
+            keep[last] = true;
+            break;
+        }
+        for (i, k) in keep.iter_mut().enumerate() {
+            *k = i == 0 || i == last || i % stride == 0;
+        }
+    }
+    keep
+}
+
+/// Produce the tick values and their formatted labels for one axis, dispatching
+/// on the axis scale. This is the single place both the SVG writer and the egui
+/// painter derive ticks from, so screen and export never disagree on which
+/// values are marked or how they read.
+///
+/// `target` is the desired number of divisions for a linear axis; it is ignored
+/// for a log axis, whose ticks are decade-driven.
+pub fn axis_ticks(bounds: Bounds, scale: Scale, target: usize) -> (Vec<f64>, Vec<String>) {
+    match scale {
+        Scale::Log => {
+            let ticks = log_ticks(bounds);
+            let labels = ticks.iter().map(|t| format_log_tick(*t)).collect();
+            (ticks, labels)
+        }
+        Scale::Linear => {
+            let ticks = nice_ticks(bounds, target);
+            let step = ticks.windows(2).next().map_or(1.0, |w| w[1] - w[0]);
+            let labels = ticks.iter().map(|t| format_tick(*t, step)).collect();
+            (ticks, labels)
+        }
+    }
 }
 
 /// Format a tick value compactly, without trailing noise.
@@ -334,7 +634,7 @@ pub fn to_svg(scene: &Scene, width: f32, height: f32) -> String {
         (width - ml - mr).max(1.0),
         (height - mt - mb).max(1.0),
     );
-    let vp = Viewport::new(plot, scene.x, scene.y);
+    let vp = Viewport::for_scene(plot, scene);
 
     let mut s = String::with_capacity(4096);
     let _ = write!(
@@ -347,13 +647,23 @@ pub fn to_svg(scene: &Scene, width: f32, height: f32) -> String {
     );
 
     // --- axes ---
-    let x_ticks = nice_ticks(scene.x, 6);
-    let y_ticks = nice_ticks(scene.y, 5);
-    let x_step = x_ticks.windows(2).next().map_or(1.0, |w| w[1] - w[0]);
-    let y_step = y_ticks.windows(2).next().map_or(1.0, |w| w[1] - w[0]);
+    // Tick values and labels come from the axis scale: a log axis emits decade
+    // majors + 2..9 minors and formats each against its own decade; a linear
+    // axis keeps the nice 1/2/5 steps. The overlap-elide pass then drops
+    // labels that would collide at this pixel size, never the first or last.
+    let (x_ticks, x_labels) = axis_ticks(scene.x, scene.scale.x, 6);
+    let (y_ticks, y_labels) = axis_ticks(scene.y, scene.scale.y, 5);
+
+    let x_centers: Vec<f32> = x_ticks.iter().map(|t| vp.map_x(*t)).collect();
+    let y_centers: Vec<f32> = y_ticks.iter().map(|t| vp.map_y(*t)).collect();
+    let x_keep = elide_overlapping(&x_labels, &x_centers, 11.0);
+    let y_keep = elide_overlapping(&y_labels, &y_centers, 11.0);
 
     let _ = write!(s, r##"<g stroke="#d0d0d0" stroke-width="1">"##);
-    for t in &y_ticks {
+    for (i, t) in y_ticks.iter().enumerate() {
+        if !y_keep[i] {
+            continue;
+        }
         let y = vp.map_y(*t);
         let _ = write!(
             s,
@@ -368,22 +678,28 @@ pub fn to_svg(scene: &Scene, width: f32, height: f32) -> String {
         s,
         r##"<g font-family="sans-serif" font-size="11" fill="#404040">"##
     );
-    for t in &y_ticks {
+    for (i, t) in y_ticks.iter().enumerate() {
+        if !y_keep[i] {
+            continue;
+        }
         let _ = write!(
             s,
             r#"<text x="{:.2}" y="{:.2}" text-anchor="end">{}</text>"#,
             plot.0 - 6.0,
             vp.map_y(*t) + 4.0,
-            escape(&format_tick(*t, y_step))
+            escape(&y_labels[i])
         );
     }
-    for t in &x_ticks {
+    for (i, t) in x_ticks.iter().enumerate() {
+        if !x_keep[i] {
+            continue;
+        }
         let _ = write!(
             s,
             r#"<text x="{:.2}" y="{:.2}" text-anchor="middle">{}</text>"#,
             vp.map_x(*t),
             plot.1 + plot.3 + 16.0,
-            escape(&format_tick(*t, x_step))
+            escape(&x_labels[i])
         );
     }
     let _ = write!(s, "</g>");
@@ -766,5 +1082,185 @@ mod tests {
         let svg = to_svg(&s, 100.0, 100.0);
         assert!(svg.starts_with("<svg"));
         assert!(svg.ends_with("</svg>"));
+    }
+
+    // --- log scale -----------------------------------------------------------
+
+    #[test]
+    fn log_axis_round_trips_through_unmap() {
+        // A log viewport must map and unmap consistently, just like linear.
+        let vp = Viewport::new(
+            (10.0, 20.0, 200.0, 100.0),
+            Bounds::new(1.0, 1000.0),
+            Bounds::new(1.0, 1_000_000.0),
+        )
+        .with_scale(ScaleHint::new(Scale::Log, Scale::Log));
+        for x in [1.0, 3.0, 10.0, 100.0, 999.0] {
+            let back = vp.unmap_x(vp.map_x(x));
+            let rel = (back - x).abs() / x;
+            assert!(rel < 1e-4, "log x {x} -> {back} (rel {rel})");
+        }
+        for y in [1.0, 42.0, 1000.0, 1_000_000.0] {
+            let back = vp.unmap_y(vp.map_y(y));
+            let rel = (back - y).abs() / y;
+            assert!(rel < 1e-4, "log y {y} -> {back} (rel {rel})");
+        }
+    }
+
+    #[test]
+    fn log_axis_spaces_decades_evenly() {
+        // Each factor of ten occupies the same screen distance — that is the
+        // whole point of a log axis. A linear axis over 1..1000 would put 100
+        // almost at the far right; a log axis puts it two thirds across.
+        let vp = Viewport::new(
+            (0.0, 0.0, 300.0, 100.0),
+            Bounds::new(1.0, 1000.0),
+            Bounds::new(1.0, 1000.0),
+        )
+        .with_scale(ScaleHint::new(Scale::Log, Scale::Linear));
+        let x1 = vp.map_x(1.0);
+        let x10 = vp.map_x(10.0);
+        let x100 = vp.map_x(100.0);
+        let x1000 = vp.map_x(1000.0);
+        let d1 = x10 - x1;
+        let d2 = x100 - x10;
+        let d3 = x1000 - x100;
+        assert!((d1 - d2).abs() < 0.5, "decades uneven: {d1} vs {d2}");
+        assert!((d2 - d3).abs() < 0.5, "decades uneven: {d2} vs {d3}");
+        // And 100 sits at exactly two-thirds across three decades.
+        assert!((x100 - 200.0).abs() < 0.5, "100 at {x100}, expected ~200");
+    }
+
+    #[test]
+    fn log_ticks_are_decade_majors_plus_minors() {
+        // 1..1000 spans three decades. Majors are 1, 10, 100, 1000; minors are
+        // 2..9 inside each decade. So 1,2,..,9,10,20,..,90,100,...,1000.
+        let t = log_ticks(Bounds::new(1.0, 1000.0));
+        for major in [1.0, 10.0, 100.0, 1000.0] {
+            assert!(t.contains(&major), "missing decade major {major}: {t:?}");
+        }
+        for minor in [2.0, 5.0, 20.0, 50.0, 300.0] {
+            assert!(t.contains(&minor), "missing minor {minor}: {t:?}");
+        }
+        // Strictly ascending, all positive.
+        for w in t.windows(2) {
+            assert!(w[1] > w[0], "not ascending: {t:?}");
+            assert!(w[0] > 0.0);
+        }
+    }
+
+    #[test]
+    fn log_ticks_reject_non_positive_bounds() {
+        // A log axis cannot show zero or negatives; ticks bail rather than
+        // emitting NaN.
+        assert!(log_ticks(Bounds::new(0.0, 100.0)).is_empty());
+        assert!(log_ticks(Bounds::new(-5.0, 5.0)).is_empty());
+        assert!(log_ticks(Bounds::unbounded()).is_empty());
+    }
+
+    #[test]
+    fn with_scale_lifts_a_non_positive_log_axis_into_range() {
+        // A y range of 0..1000 marked log cannot start at 0. `with_scale`
+        // raises the lower bound to a displayable decade without panicking or
+        // producing an infinite mapping.
+        let s = Scene::new(Bounds::new(0.0, 1.0), Bounds::new(0.0, 1000.0))
+            .with_scale(ScaleHint::new(Scale::Linear, Scale::Log));
+        assert!(s.y.min > 0.0, "log y still starts at {}", s.y.min);
+        assert!(s.y.min <= s.y.max);
+        let vp = Viewport::for_scene((0.0, 0.0, 100.0, 100.0), &s);
+        assert!(vp.map_y(1000.0).is_finite());
+        assert!(vp.map_y(s.y.min).is_finite());
+    }
+
+    #[test]
+    fn log_tick_labels_read_as_plain_values() {
+        assert_eq!(format_log_tick(1.0), "1");
+        assert_eq!(format_log_tick(100.0), "100");
+        // Below the 1e4 k-threshold labels read in full; at and above it they
+        // take the same compact suffix `format_tick` gives a linear axis.
+        assert_eq!(format_log_tick(2000.0), "2000");
+        assert_eq!(format_log_tick(20000.0), "20k");
+        assert_eq!(format_log_tick(1_000_000.0), "1M");
+    }
+
+    #[test]
+    fn log_axis_ticks_flow_through_axis_ticks() {
+        // The dispatch both backends share must pick log ticks for a log axis
+        // and linear ticks for a linear one.
+        let (lt, ll) = axis_ticks(Bounds::new(1.0, 100.0), Scale::Log, 6);
+        assert!(lt.contains(&1.0) && lt.contains(&10.0) && lt.contains(&100.0));
+        assert_eq!(ll.len(), lt.len());
+        let (nt, _) = axis_ticks(Bounds::new(0.0, 100.0), Scale::Linear, 5);
+        assert!(nt.contains(&0.0), "linear axis keeps its clean zero");
+    }
+
+    // --- overlap elide -------------------------------------------------------
+
+    #[test]
+    fn elide_keeps_everything_when_labels_fit() {
+        // Widely spaced short labels: nothing to drop.
+        let labels: Vec<String> = ["0", "25", "50", "75", "100"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let centers = vec![0.0, 100.0, 200.0, 300.0, 400.0];
+        let keep = elide_overlapping(&labels, &centers, 11.0);
+        assert!(keep.iter().all(|&k| k), "dropped a label that fit");
+    }
+
+    #[test]
+    fn elide_drops_every_other_label_when_crowded() {
+        // Ten labels crammed into a narrow span must thin out, but the first
+        // and last must survive.
+        let labels: Vec<String> = (0..10).map(|i| format!("{}", i * 10)).collect();
+        let centers: Vec<f32> = (0..10).map(|i| i as f32 * 8.0).collect();
+        let keep = elide_overlapping(&labels, &centers, 11.0);
+        assert!(keep[0], "dropped the first tick");
+        assert!(keep[9], "dropped the last tick");
+        let kept = keep.iter().filter(|&&k| k).count();
+        assert!(kept < 10, "nothing was elided despite crowding");
+        // Surviving labels must not overlap: check consecutive kept centers.
+        let half = 11.0 * 0.6; // rough single-char half width upper bound
+        let mut prev: Option<f32> = None;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            if let Some(p) = prev {
+                assert!(centers[i] - p >= half, "kept labels still overlap");
+            }
+            prev = Some(centers[i]);
+        }
+    }
+
+    #[test]
+    fn elide_never_drops_first_or_last_even_when_two_labels_touch() {
+        // Two labels only: both must always survive, whatever the spacing.
+        let labels = vec!["1000000".to_string(), "2000000".to_string()];
+        let centers = vec![100.0, 101.0];
+        let keep = elide_overlapping(&labels, &centers, 11.0);
+        assert_eq!(keep, vec![true, true]);
+    }
+
+    #[test]
+    fn log_scene_svg_uses_log_labels_and_stays_well_formed() {
+        // End-to-end: a log-y scene renders with decade labels and one root.
+        let mut s = Scene::new(Bounds::new(0.0, 10.0), Bounds::new(1.0, 100_000.0))
+            .with_scale(ScaleHint::new(Scale::Linear, Scale::Log));
+        s.push(Primitive::Polyline {
+            points: vec![
+                DataPoint::new(0.0, 1.0),
+                DataPoint::new(5.0, 1000.0),
+                DataPoint::new(10.0, 100_000.0),
+            ],
+            color: Rgba::rgb(0x1f, 0x77, 0xb4),
+            width: 1.5,
+        });
+        let svg = to_svg(&s, 400.0, 300.0);
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        assert_eq!(svg.matches("<svg").count(), 1);
+        // Decade labels present on the log y axis.
+        assert!(svg.contains(">100k<"), "missing 100k decade label");
+        assert!(svg.contains(">10<"), "missing 10 decade label");
     }
 }
