@@ -427,6 +427,12 @@ pub struct FerrixApp {
     /// true when the base data is regenerated, so it is keyed to the file rather
     /// than carried through the edits sidecar's base fingerprint.
     pivots_path: Option<PathBuf>,
+    /// Where page setup and print area are persisted, beside the base file
+    /// (#37 follow-up). Derived from `source_path` on open, the same way
+    /// `sizing_path` and `pivots_path` are: page layout — like sizing — stays
+    /// true when the base data is regenerated, so it is keyed to the file
+    /// rather than carried through the edits sidecar's base fingerprint.
+    page_path: Option<PathBuf>,
     /// Where each visible column header was painted last frame. Recorded from
     /// the grid's own response so a caller never has to guess at header
     /// pixels, which move with every bar that opens above the grid.
@@ -842,6 +848,7 @@ impl FerrixApp {
             last_outline_buttons: 0,
             sizing_path: None,
             pivots_path: None,
+            page_path: None,
             header_hitboxes: Vec::new(),
             row_header_hitboxes: Vec::new(),
             last_painted_rows: Vec::new(),
@@ -1153,6 +1160,17 @@ impl FerrixApp {
                 // computed result on the first frame instead of blank cells.
                 self.pivots_path = self.source_path.as_deref().map(ferrix_io::pivot_path_for);
                 self.load_pivots_sidecar();
+                // Page setup and print area (#37 follow-up): same timing and
+                // rationale as sizing and pivots — the path is known now, so
+                // the first painted frame and the first print/PDF export
+                // already reflect the user's paper, margins, manual page breaks
+                // and print area rather than defaults. Reset to defaults first
+                // so a file with no sidecar does not inherit the last file's
+                // page setup.
+                self.page_path = self.source_path.as_deref().map(ferrix_io::page_path_for);
+                self.page_setup = ferrix_core::page::PageSetup::default();
+                self.print_area = None;
+                self.load_page_sidecar();
                 // The workbook we just built has the FILE's sheet name, which
                 // is only known now — so this is where the sheet's remembered
                 // zoom is adopted. Doing it at construction would read the
@@ -1672,6 +1690,11 @@ impl FerrixApp {
         // another's data. The workbook's own pivot map is discarded with the
         // workbook itself when the fresh one below replaces it.
         self.pivots_path = None;
+        // Page setup and print area belong to the file that is closing, same as
+        // sizing and pivots. Cleared here; the defaults below are what a new
+        // file starts from, and a file that HAS a sidecar overwrites them on
+        // open.
+        self.page_path = None;
         // The print area is per sheet; a new file starts with none.
         self.print_area = None;
         self.show_page_breaks = false;
@@ -2342,6 +2365,11 @@ impl FerrixApp {
         // leaves the overlay empty, so it must be persisted before the early
         // return below or a pivot-only session would lose its binding.
         self.save_pivots();
+        // Page setup and print area, same unconditional reasoning (#37
+        // follow-up): changing the paper size, dragging a page break or setting
+        // a print area all leave the edit overlay EMPTY, so this must run before
+        // the early return below or a page-setup-only session would lose it.
+        self.save_page();
         let comment_count = self.wb.comments.len();
         let (Some(path), Some(fp)) = (self.edits_path.clone(), self.fingerprint) else {
             self.status = "Nothing to save — no file is open".into();
@@ -4263,6 +4291,57 @@ impl FerrixApp {
                 .collect();
             for id in sheets {
                 self.wb.refresh_pivot(id);
+            }
+        }
+    }
+
+    /// Point the page sidecar at `path`, for the round-trip harness test. The
+    /// production path derives this from `source_path` on open; a headless
+    /// harness has no file, so a test sets it explicitly.
+    #[cfg(test)]
+    pub fn set_page_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.page_path = Some(path);
+    }
+
+    /// Persist the page sidecar beside the base file (#37 follow-up).
+    ///
+    /// Written from `save_edits` unconditionally, like comments, sizing and
+    /// pivots: a session that only changed the page setup, dragged a page
+    /// break, or set a print area has an EMPTY overlay, and the edits path
+    /// returns early on that — so gating page state behind it would silently
+    /// discard exactly the layout this feature exists to keep. Always writing
+    /// the current state (even all-default) retires a stale sidecar when the
+    /// user resets, so a cleared print area does not come back on reload.
+    pub fn save_page(&mut self) -> bool {
+        let Some(path) = self.page_path.clone() else {
+            return false;
+        };
+        let state = ferrix_io::PageState {
+            setup: self.page_setup.clone(),
+            print_area: self.print_area,
+        };
+        ferrix_io::save_page(&path, &state).is_ok()
+    }
+
+    /// Load the page sidecar for the file that was just opened.
+    ///
+    /// A corrupt or unreadable sidecar leaves page setup and print area at
+    /// their defaults rather than failing the whole load — the same "the DATA
+    /// is fine" stance the sizing, comment and pivot loaders take. Refusing to
+    /// open a 10GB file because a layout file is damaged would be a poor trade.
+    pub fn load_page_sidecar(&mut self) {
+        let Some(path) = self.page_path.clone() else {
+            return;
+        };
+        match ferrix_io::load_page(&path) {
+            Ok(Some(state)) => {
+                self.page_setup = state.setup;
+                self.print_area = state.print_area;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Log and fall back to defaults; never crash the open.
+                self.status = format!("Page setup sidecar ignored ({e})");
             }
         }
     }
@@ -6386,6 +6465,13 @@ impl FerrixApp {
             self.page_setup = dlg.setup;
             self.status = format!("Page setup: {paper} {orient}");
         }
+    }
+
+    /// Commit the open Page Setup dialog the way the OK button does, without a
+    /// painted frame — for tests that edit `page_setup_dialog_mut` then apply.
+    #[cfg(test)]
+    pub fn commit_page_setup_for_test(&mut self) {
+        self.commit_page_setup();
     }
 
     /// Close the dialog without applying anything (Cancel / Escape).
@@ -13067,6 +13153,158 @@ mod tests {
         assert_eq!(app2.wb.view().get(CellRef::new(1, 1)), Value::Number(33.0));
 
         let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_setup_and_print_area_survive_a_sidecar_save_and_reload() {
+        // The #37 gap this card fixes: page_setup and print_area lived only on
+        // FerrixApp and were lost on close/reopen. Save them to a real .fxpage
+        // file through the production save_page path, then drop the app and load
+        // them into a fresh one the way poll_load does — end to end.
+        use ferrix_core::page::{Orientation, PaperSize, Scaling};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix_page_app_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("book.ferrix");
+        let sidecar = ferrix_io::page_path_for(&base);
+
+        // ---- Build an app and customise page setup + print area the way the
+        // real UI does: through the Page Setup dialog, the manual-break command
+        // and the Set Print Area command. ----
+        let mut app = FerrixApp::new(None);
+        app.set_page_path_for_test(sidecar.clone());
+
+        // Edit the real dialog form, then commit it exactly as OK does.
+        app.open_page_setup();
+        {
+            let dlg = app.page_setup_dialog_mut().expect("dialog is open");
+            dlg.setup.paper = PaperSize::A4;
+            dlg.setup.orientation = Orientation::Landscape;
+            dlg.setup.margins = ferrix_core::page::Margins::narrow();
+            dlg.setup.scaling = Scaling::FitTo {
+                wide: Some(1),
+                tall: None,
+            };
+            dlg.setup.gridlines = true;
+            dlg.setup.headings = true;
+            dlg.setup.header.center = "&F".into();
+            dlg.setup.footer.right = "&P/&N".into();
+        }
+        app.commit_page_setup_for_test();
+
+        // A manual page break, inserted at the cursor the way Page Break Preview
+        // does — this proves manual breaks persist through the same sidecar.
+        app.set_selection_for_test(CellRef::new(120, 0), CellRef::new(120, 0));
+        app.insert_page_break_at_cursor();
+
+        // A print area, set from the selection.
+        app.set_selection_for_test(CellRef::new(2, 1), CellRef::new(40, 8));
+        app.set_print_area();
+
+        // Snapshot what we expect to survive.
+        let expected_setup = app.page_setup().clone();
+        let expected_print_area = app.print_area();
+        assert_eq!(expected_setup.paper, PaperSize::A4, "sanity: edit landed");
+        assert!(
+            expected_setup.row_breaks.contains(&120),
+            "sanity: manual break landed"
+        );
+        assert!(expected_print_area.is_some(), "sanity: print area set");
+
+        assert!(app.save_page(), "save_page wrote the sidecar");
+        assert!(sidecar.exists(), "the .fxpage file is on disk");
+
+        // Drop the app entirely — nothing carries over in memory.
+        drop(app);
+
+        // ---- Fresh app, same path, load the sidecar the way open does. ----
+        let mut app2 = FerrixApp::new(None);
+        // A brand-new app starts at defaults, so this is a real before/after.
+        assert_eq!(app2.page_setup().paper, PaperSize::Letter);
+        assert!(app2.print_area().is_none());
+
+        app2.set_page_path_for_test(sidecar.clone());
+        app2.load_page_sidecar();
+
+        assert_eq!(
+            *app2.page_setup(),
+            expected_setup,
+            "the full page setup — paper, orientation, margins, scaling, \
+             gridlines, headings, header/footer AND the manual page break — \
+             must survive close/reopen"
+        );
+        assert_eq!(
+            app2.print_area(),
+            expected_print_area,
+            "the print area must survive close/reopen"
+        );
+
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_page_sidecar_loads_defaults_without_error() {
+        // Migration: a workbook saved before this feature has no .fxpage file.
+        // Opening it must leave page setup at defaults, not fail the load.
+        let mut app = FerrixApp::new(None);
+        let absent = std::env::temp_dir().join(format!(
+            "ferrix_page_absent_{}_{}.fxpage",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.set_page_path_for_test(absent.clone());
+        app.load_page_sidecar();
+        assert_eq!(
+            app.page_setup().paper,
+            ferrix_core::page::PaperSize::Letter,
+            "no sidecar means defaults"
+        );
+        assert!(app.print_area().is_none());
+    }
+
+    #[test]
+    fn a_corrupt_page_sidecar_does_not_crash_open() {
+        // A damaged .fxpage must log and fall back to defaults, never panic the
+        // open — the same "the DATA is fine" stance the other loaders take.
+        let dir = std::env::temp_dir().join(format!(
+            "ferrix_page_corrupt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("book.ferrix.fxpage");
+        std::fs::write(&sidecar, b"NOTAPAGEFILE garbage bytes").unwrap();
+
+        let mut app = FerrixApp::new(None);
+        app.set_page_path_for_test(sidecar.clone());
+        // Must not panic.
+        app.load_page_sidecar();
+        assert_eq!(
+            app.page_setup().paper,
+            ferrix_core::page::PaperSize::Letter,
+            "a corrupt sidecar falls back to default page setup"
+        );
+        assert!(
+            app.status_text().contains("Page setup sidecar ignored"),
+            "the fallback is logged; status was: {}",
+            app.status_text()
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
