@@ -323,6 +323,12 @@ registry! {
         "Show each cell's formula source instead of its value, for this sheet. Rendered from the viewport, so it costs the same on a 200M-row sheet." }
     ViewPageBreaks { "view.page_breaks", Some(Menu::View), "⎘ Page Break Preview", None, false, None,
         "Overlay a dashed line where each printed page would break. Read-only — shows the pagination the PDF/HTML export uses." }
+    ViewInsertPageBreak { "view.insert_page_break", Some(Menu::View), "⎘ Insert Page Break", None, false, Some(Note::Selection),
+        "Force a page to start at the cursor: a break above its row and left of its column. Turns on Page Break Preview." }
+    ViewRemovePageBreak { "view.remove_page_break", Some(Menu::View), "⎘ Remove Page Break", None, false, Some(Note::Selection),
+        "Remove the manual page break at the cursor." }
+    ViewResetPageBreaks { "view.reset_page_breaks", Some(Menu::View), "⎘ Reset All Page Breaks", None, false, None,
+        "Clear every manual page break, back to automatic pagination." }
     ViewEmptyRows { "view.empty_rows", Some(Menu::View), "⬓ Show empty rows", None, false, None,
         "Show empty rows past the end of the sheet so there is somewhere to type. They are not data: exports, SUM and the row count ignore them until you type in one." }
 

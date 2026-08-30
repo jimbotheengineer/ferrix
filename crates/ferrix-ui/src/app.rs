@@ -129,6 +129,25 @@ pub const MAX_CIRCLED: usize = 4096;
 const CELL_EDITOR_ID: &str = "cell_editor";
 const FORMULA_BAR_ID: &str = "formula_bar_edit";
 
+/// Which axis a page-break drag is moving, and where it started (#76).
+///
+/// A break line is grabbed at the row (horizontal break) or column (vertical
+/// break) it currently sits before; the drag then moves that manual break to
+/// wherever the pointer is released. `origin` is the row/col the break was at
+/// when grabbed, so a drag that lands back on it is a no-op rather than a
+/// duplicate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct BreakDrag {
+    axis: BreakAxis,
+    origin: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BreakAxis {
+    Row,
+    Col,
+}
+
 /// How many DISJOINT selection ranges are kept (issue #17).
 ///
 /// Ctrl+clicking headers accumulates ranges, and without a cap a user leaning
@@ -299,6 +318,17 @@ pub struct FerrixApp {
     /// and column where a printed page would break (#37). Read-only — it shows
     /// where the paginator splits; it does not let the user drag a break.
     show_page_breaks: bool,
+    /// The sheet's page setup: paper, margins and MANUAL page breaks. Held here
+    /// (not rebuilt per frame) so a break the user inserts in the preview or
+    /// drags to a new row actually persists and reaches the PDF/HTML export —
+    /// both the preview overlay and the print path read this one value. Manual
+    /// breaks are stored as a short sorted Vec, never per row, so it stays cheap
+    /// on a 200M-row sheet. Reset when a new file loads (per sheet).
+    page_setup: ferrix_core::page::PageSetup,
+    /// A page-break line being dragged (#76). Records which break and axis the
+    /// press grabbed, so the release can move it from its old row/col to the one
+    /// under the pointer. `None` when no drag is in flight.
+    break_drag: Option<BreakDrag>,
     /// How many page-break lines the last frame painted, for tests and the
     /// status note. Reset each frame.
     last_page_break_lines: usize,
@@ -740,6 +770,8 @@ impl FerrixApp {
             print_area: None,
             show_page_breaks: false,
             dragging_content: false,
+            page_setup: ferrix_core::page::PageSetup::default(),
+            break_drag: None,
             last_page_break_lines: 0,
             col_resize: None,
             header_menu: None,
@@ -1584,6 +1616,9 @@ impl FerrixApp {
         // The print area is per sheet; a new file starts with none.
         self.print_area = None;
         self.show_page_breaks = false;
+        // Page setup (including any manual page breaks) is per sheet.
+        self.page_setup = ferrix_core::page::PageSetup::default();
+        self.break_drag = None;
         self.cache_path = None;
         self.cache_headers = Vec::new();
         self.col_widths = Vec::new();
@@ -5641,6 +5676,194 @@ impl FerrixApp {
         self.dragging_content
     }
 
+    /// Insert a manual page break at the cursor: a horizontal break above the
+    /// cursor's row and a vertical break to its left, so a page starts at the
+    /// cursor. Excel's "Insert Page Break". A break before row/col 0 is
+    /// meaningless (nothing is above/left of it) and is skipped. Turns the
+    /// preview on so the user sees what changed.
+    pub fn insert_page_break_at_cursor(&mut self) {
+        let cell = self.selection.cursor;
+        let mut added = Vec::new();
+        if cell.row > 0 {
+            self.page_setup.add_row_break(cell.row);
+            added.push(format!("above row {}", cell.row + 1));
+        }
+        if cell.col > 0 {
+            self.page_setup.add_col_break(cell.col);
+            added.push(format!("left of {}", ferrix_core::column_name(cell.col)));
+        }
+        self.show_page_breaks = true;
+        self.status = if added.is_empty() {
+            "A page break at A1 would have nothing before it".into()
+        } else {
+            format!("Page break inserted {}", added.join(" and "))
+        };
+    }
+
+    /// Remove the manual breaks at the cursor (the twin of insert). Reports
+    /// whether anything was actually there to remove.
+    pub fn remove_page_break_at_cursor(&mut self) {
+        let cell = self.selection.cursor;
+        let removed_row = self.page_setup.remove_row_break(cell.row);
+        let removed_col = self.page_setup.remove_col_break(cell.col);
+        self.status = if removed_row || removed_col {
+            "Manual page break removed".into()
+        } else {
+            "No manual page break at the cursor".into()
+        };
+    }
+
+    /// Clear every manual page break, so pagination is purely automatic again.
+    pub fn reset_page_breaks(&mut self) {
+        let had = !self.page_setup.row_breaks.is_empty() || !self.page_setup.col_breaks.is_empty();
+        self.page_setup.row_breaks.clear();
+        self.page_setup.col_breaks.clear();
+        self.status = if had {
+            "All manual page breaks reset".into()
+        } else {
+            "There were no manual page breaks".into()
+        };
+    }
+
+    /// Move a manual page break from one row/column to another (#76). This is
+    /// the model behind the drag: the gesture supplies `from`/`to`, this owns
+    /// the meaning. Dropping a break on row/col 0, or back where it started, is
+    /// a no-op. Returns whether the break set actually changed.
+    ///
+    /// Testable without a pointer: a harness drives `from`/`to` directly, so a
+    /// broken drag gesture is the only thing left needing a human to confirm.
+    pub fn move_row_break(&mut self, from: u32, to: u32) -> bool {
+        // Remove the old break (whether or not it existed) and add the new one,
+        // unless the target is the meaningless row 0.
+        let removed = self.page_setup.remove_row_break(from);
+        if to == 0 {
+            // Dragged off the top: the break is deleted, not recreated.
+            if removed {
+                self.status = "Page break removed".into();
+            }
+            return removed;
+        }
+        if to == from {
+            // Dropped back where it started: restore and report no change.
+            if removed {
+                self.page_setup.add_row_break(from);
+            }
+            return false;
+        }
+        self.page_setup.add_row_break(to);
+        self.status = format!("Page break moved to above row {}", to + 1);
+        true
+    }
+
+    /// Move a manual column break. Mirror of [`move_row_break`].
+    pub fn move_col_break(&mut self, from: u32, to: u32) -> bool {
+        let removed = self.page_setup.remove_col_break(from);
+        if to == 0 {
+            if removed {
+                self.status = "Page break removed".into();
+            }
+            return removed;
+        }
+        if to == from {
+            if removed {
+                self.page_setup.add_col_break(from);
+            }
+            return false;
+        }
+        self.page_setup.add_col_break(to);
+        self.status = format!(
+            "Page break moved to left of {}",
+            ferrix_core::column_name(to)
+        );
+        true
+    }
+
+    /// The sheet's manual page breaks (rows, cols), for tests.
+    pub fn manual_page_breaks(&self) -> (&[u32], &[u32]) {
+        (&self.page_setup.row_breaks, &self.page_setup.col_breaks)
+    }
+
+    /// Drive the page-break drag from the pointer (#76).
+    ///
+    /// Only MANUAL breaks are draggable — an automatic break has no stored
+    /// position to move. On press near a manual break line (within
+    /// `BREAK_GRAB_PX`), record which break was grabbed; on release, map the
+    /// pointer to a row/column with `cell_at_point` and move the break there.
+    /// The gesture only supplies coordinates; `move_row_break`/`move_col_break`
+    /// own the meaning and are unit-tested without a pointer.
+    fn handle_break_drag(
+        &mut self,
+        ctx: &egui::Context,
+        outer: egui::Rect,
+        row_lines: &[(f32, u32)],
+        col_lines: &[(f32, u32)],
+    ) {
+        const BREAK_GRAB_PX: f32 = 4.0;
+        let (pressed, down, released, pointer) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+        let manual_rows = &self.page_setup.row_breaks;
+        let manual_cols = &self.page_setup.col_breaks;
+
+        // Press: grab the nearest manual break line under the pointer.
+        if pressed {
+            if let Some(p) = pointer {
+                if outer.contains(p) {
+                    // Row break lines are horizontal → compare the pointer's y.
+                    let grabbed_row = row_lines
+                        .iter()
+                        .filter(|(_, r)| manual_rows.binary_search(r).is_ok())
+                        .find(|(y, _)| (p.y - y).abs() <= BREAK_GRAB_PX)
+                        .map(|(_, r)| *r);
+                    let grabbed_col = col_lines
+                        .iter()
+                        .filter(|(_, c)| manual_cols.binary_search(c).is_ok())
+                        .find(|(x, _)| (p.x - x).abs() <= BREAK_GRAB_PX)
+                        .map(|(_, c)| *c);
+                    // A row grab wins ties (horizontal lines are the common
+                    // case); either sets the drag in flight.
+                    if let Some(r) = grabbed_row {
+                        self.break_drag = Some(BreakDrag {
+                            axis: BreakAxis::Row,
+                            origin: r,
+                        });
+                    } else if let Some(c) = grabbed_col {
+                        self.break_drag = Some(BreakDrag {
+                            axis: BreakAxis::Col,
+                            origin: c,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Release: drop the grabbed break at the row/col under the pointer.
+        if released {
+            if let Some(drag) = self.break_drag.take() {
+                if let Some(cell) = pointer.and_then(|p| self.cell_at_point(p, outer)) {
+                    match drag.axis {
+                        BreakAxis::Row => {
+                            self.move_row_break(drag.origin, cell.row);
+                        }
+                        BreakAxis::Col => {
+                            self.move_col_break(drag.origin, cell.col);
+                        }
+                    }
+                }
+                // A release outside any cell drops the drag with no change.
+            }
+        } else if !down {
+            // Pointer lifted without a release event reaching us (focus lost):
+            // never leave a stale drag armed.
+            self.break_drag = None;
+        }
+    }
+
     /// How many page-break lines the last frame drew, for tests.
     pub fn page_break_line_count(&self) -> usize {
         self.last_page_break_lines
@@ -5680,7 +5903,9 @@ impl FerrixApp {
         .with_name(&name)
         .with_style(&self.wb.format, &self.wb.merges);
 
-        let setup = ferrix_core::page::PageSetup::default();
+        // The sheet's real page setup, so any manual page breaks the user set
+        // in the preview land in the printed output.
+        let setup = self.page_setup.clone();
         let opts = ferrix_io::render::RenderOptions {
             print_area: self.print_area,
             ..Default::default()
@@ -8791,6 +9016,9 @@ impl FerrixApp {
             C::ViewEmptyRows => self.set_show_empty_rows(!self.show_empty_rows),
             C::ViewShowFormulas => self.toggle_show_formulas(),
             C::ViewPageBreaks => self.toggle_page_breaks(),
+            C::ViewInsertPageBreak => self.insert_page_break_at_cursor(),
+            C::ViewRemovePageBreak => self.remove_page_break_at_cursor(),
+            C::ViewResetPageBreaks => self.reset_page_breaks(),
             C::EditUndo => {
                 if let Some(c) = self.wb.undo() {
                     self.selection.move_to(c);
@@ -10065,14 +10293,17 @@ impl FerrixApp {
                     self.last_trace_total = 0;
                 }
 
-                // --- Page Break Preview (roadmap #37) ---
+                // --- Page Break Preview (roadmap #37, drag #76) ---
                 //
-                // Read-only overlay: a dashed line at every row and column
-                // where a printed page would break. The break positions come
-                // from the SAME `Paginator` the PDF/HTML export uses, so what
-                // the user previews is exactly where the print splits — not a
-                // second guess at pagination. Painted through the grid's own
-                // `cell_screen_rect`, like the trace arrows above.
+                // A dashed line at every row and column where a printed page
+                // would break. The break positions come from the SAME
+                // `Paginator` the PDF/HTML export uses, so what the user
+                // previews is exactly where the print splits. When the preview
+                // is on, a line can be GRABBED and dragged to force a manual
+                // break at a different row/column (Excel's Page Break Preview);
+                // the grab/drop coordinates are turned into row/col via
+                // `cell_at_point` and handed to `move_row_break`/`move_col_break`,
+                // which own the meaning and are tested without a pointer.
                 if self.show_page_breaks {
                     let extent = match self.print_area {
                         Some(r) => ((r.first_row, r.last_row), (r.first_col, r.last_col)),
@@ -10083,7 +10314,7 @@ impl FerrixApp {
                         }
                     };
                     let paginator = ferrix_core::page::Paginator::new(
-                        ferrix_core::page::PageSetup::default(),
+                        self.page_setup.clone(),
                         extent.0,
                         extent.1,
                         &self.sizing.rows,
@@ -10095,8 +10326,13 @@ impl FerrixApp {
                     let painter = ui.painter().with_clip_rect(outer);
                     let mut lines = 0usize;
 
-                    // A row break falls BEFORE `row`: draw a horizontal dashed
-                    // line along the top edge of that row's cells.
+                    // On-screen break lines, kept so the pointer can hit-test
+                    // against them for the drag. (screen_coord, break_row/col).
+                    let mut row_lines: Vec<(f32, u32)> = Vec::new();
+                    let mut col_lines: Vec<(f32, u32)> = Vec::new();
+
+                    // A row break falls BEFORE `row`: a horizontal dashed line
+                    // along the top edge of that row's cells.
                     for row in paginator.row_break_rows() {
                         if let Some(rect) = Grid::cell_screen_rect(
                             ferrix_core::CellRef::new(row, extent.1 .0),
@@ -10114,6 +10350,7 @@ impl FerrixApp {
                                 egui::pos2(outer.right(), y),
                                 th.accent,
                             );
+                            row_lines.push((y, row));
                             lines += 1;
                         }
                     }
@@ -10136,12 +10373,24 @@ impl FerrixApp {
                                 egui::pos2(x, outer.bottom()),
                                 th.accent,
                             );
+                            col_lines.push((x, col));
                             lines += 1;
                         }
                     }
                     self.last_page_break_lines = lines;
+
+                    // --- drag interaction (#76) ---
+                    //
+                    // Only MANUAL breaks can be dragged (an automatic break has
+                    // no stored position to move); a manual break line is
+                    // grabbable within a few pixels. Editing suppresses it so a
+                    // text drag inside the editor is not stolen.
+                    if self.editing.is_none() {
+                        self.handle_break_drag(ctx, outer, &row_lines, &col_lines);
+                    }
                 } else {
                     self.last_page_break_lines = 0;
+                    self.break_drag = None;
                 }
 
                 // --- Circle Invalid Data (issue #41) ---
