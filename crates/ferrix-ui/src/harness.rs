@@ -447,6 +447,20 @@ impl Harness {
         self
     }
 
+    /// The sheet's manual page breaks (rows, cols), for asserting insert / move
+    /// / remove / reset (#37, #76).
+    pub fn manual_page_breaks(&self) -> (Vec<u32>, Vec<u32>) {
+        let (r, c) = self.app.manual_page_breaks();
+        (r.to_vec(), c.to_vec())
+    }
+
+    /// Move a manual row break, the model behind the drag (#76).
+    pub fn move_row_break(&mut self, from: u32, to: u32) -> &mut Self {
+        self.app.move_row_break(from, to);
+        self.steps(1);
+        self
+    }
+
     /// The repaint delay the app requested on the last stepped frame. ZERO is
     /// continuous-repaint mode; anything longer is reactive. Used to prove the
     /// window-move-jitter guard (#84): an in-content drag is continuous, a
@@ -465,6 +479,13 @@ impl Harness {
             pressed: true,
             modifiers: Modifiers::default(),
         });
+        self
+    }
+
+    /// Move a manual column break (#76).
+    pub fn move_col_break(&mut self, from: u32, to: u32) -> &mut Self {
+        self.app.move_col_break(from, to);
+        self.steps(1);
         self
     }
 
@@ -10305,6 +10326,37 @@ xxx,yyy,zzz
     }
 
     #[test]
+    fn inserting_a_page_break_at_the_cursor_records_it_and_shows_the_preview() {
+        // Insert Page Break at a cell makes a manual break above its row and
+        // left of its column, and turns the preview on so the user sees it.
+        let (mut h, csv) = numeric_app("insert_break.csv");
+        h.select(CellRef::new(3, 1), CellRef::new(3, 1));
+        h.run_command(crate::command::CommandId::ViewInsertPageBreak);
+        let (rows, cols) = h.manual_page_breaks();
+        assert!(
+            rows.contains(&3),
+            "a row break above row 3 must be recorded: {rows:?}"
+        );
+        assert!(
+            cols.contains(&1),
+            "a col break left of column 1 must be recorded: {cols:?}"
+        );
+        assert!(
+            h.page_breaks_shown(),
+            "Insert Page Break must turn the preview on"
+        );
+
+        // Remove it again from the same cursor.
+        h.run_command(crate::command::CommandId::ViewRemovePageBreak);
+        let (rows, cols) = h.manual_page_breaks();
+        assert!(
+            !rows.contains(&3) && !cols.contains(&1),
+            "remove must clear both breaks"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
     fn moving_a_block_relocates_it_verbatim_and_undoes_in_one_step() {
         // Drag-to-move (#82). A move is NOT a copy: the formula travels VERBATIM
         // (its reference does not shift the way a copy would), the source is left
@@ -10480,6 +10532,123 @@ xxx,yyy,zzz
     }
 
     #[test]
+    fn a_manual_break_actually_splits_the_printed_pdf_there() {
+        // The decisive test: a manual row break must change WHERE the printed
+        // PDF breaks — a page must start at the break row. Without the break the
+        // first ~50 data rows share page 1; with a break above row 5, row 5
+        // starts a new page. We read it back out of the serialized PDF.
+        let mut body = String::from("id,tag\n");
+        for i in 1..=120 {
+            // Distinct per-row text so we can locate a row's page.
+            body.push_str(&format!("{i},row{i}mark\n"));
+        }
+        let p = write_csv("break_split.csv", &body);
+        let mut h = Harness::new(Some(&p));
+        assert!(
+            h.step_until(200, |a| a.row_count() > 0),
+            "fixture never loaded"
+        );
+
+        // Baseline: which page is "row5mark" on with NO manual break?
+        let out0 = std::env::temp_dir().join(format!(
+            "ferrix-break0-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out0);
+        h.print_to_path(&out0, false, false);
+        let base_page = pdf_page_containing(&std::fs::read(&out0).unwrap(), "row5mark")
+            .expect("row5mark must appear somewhere in the baseline PDF");
+
+        // Now insert a manual break above the row holding row5mark. row5mark is
+        // id 5 → the 5th data row → sheet row 4 (0-based, header consumed).
+        h.select(CellRef::new(4, 0), CellRef::new(4, 0));
+        h.run_command(crate::command::CommandId::ViewInsertPageBreak);
+        let (rows, _) = h.manual_page_breaks();
+        assert!(
+            rows.contains(&4),
+            "the manual break must be recorded at row 4"
+        );
+
+        let out1 = out0.with_extension("broken.pdf");
+        let _ = std::fs::remove_file(&out1);
+        h.print_to_path(&out1, false, false);
+        let broke_page = pdf_page_containing(&std::fs::read(&out1).unwrap(), "row5mark")
+            .expect("row5mark must still be in the PDF after the break");
+
+        // With row 4 (row5mark) forced to start a page, its page number must be
+        // GREATER than in the baseline — the break pushed it onto its own page.
+        assert!(
+            broke_page > base_page,
+            "a manual break above row5mark must move it to a later page \
+             (baseline page {base_page}, after break {broke_page})"
+        );
+
+        // And row4mark (id 4, the row BEFORE the break) must be on an earlier
+        // page than row5mark now — the split lands between them.
+        let prev_page = pdf_page_containing(&std::fs::read(&out1).unwrap(), "row4mark").unwrap();
+        assert!(
+            prev_page < broke_page,
+            "the break must fall BETWEEN row4mark (page {prev_page}) and \
+             row5mark (page {broke_page})"
+        );
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&out0);
+        let _ = std::fs::remove_file(&out1);
+    }
+
+    #[test]
+    fn moving_a_break_relocates_it_and_reset_clears_everything() {
+        // The model behind the drag (#76): move_row_break(from, to) relocates a
+        // manual break; dropping it back is a no-op; reset clears all.
+        let (mut h, csv) = numeric_app("move_break.csv");
+        h.select(CellRef::new(2, 0), CellRef::new(2, 0));
+        h.run_command(crate::command::CommandId::ViewInsertPageBreak);
+        assert!(
+            h.manual_page_breaks().0.contains(&2),
+            "precondition: break at row 2"
+        );
+
+        // Move it from row 2 to row 5.
+        h.move_row_break(2, 5);
+        let (rows, _) = h.manual_page_breaks();
+        assert!(
+            rows.contains(&5) && !rows.contains(&2),
+            "break must move 2 -> 5: {rows:?}"
+        );
+
+        // Dropping it back on itself changes nothing.
+        h.move_row_break(5, 5);
+        assert_eq!(
+            h.manual_page_breaks().0,
+            vec![5],
+            "a no-op move must not duplicate"
+        );
+
+        // Dragging off the top (to row 0) deletes it.
+        h.move_row_break(5, 0);
+        assert!(
+            h.manual_page_breaks().0.is_empty(),
+            "dropping on row 0 must delete the break"
+        );
+
+        // Re-add two, then Reset clears everything.
+        h.select(CellRef::new(3, 1), CellRef::new(3, 1));
+        h.run_command(crate::command::CommandId::ViewInsertPageBreak);
+        h.run_command(crate::command::CommandId::ViewResetPageBreaks);
+        let (rows, cols) = h.manual_page_breaks();
+        assert!(
+            rows.is_empty() && cols.is_empty(),
+            "Reset must clear all manual breaks"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
+    #[test]
     fn a_conditional_format_fill_reaches_the_printed_html() {
         // Styled print (#37): a threshold rule that fills qty > 100 must show
         // up as a background colour on the matching cell in the exported HTML,
@@ -10560,5 +10729,43 @@ xxx,yyy,zzz
             }
         }
         out
+    }
+
+    /// Which 1-based page of a PDF a marker string is drawn on, or None.
+    ///
+    /// Each page is a separate `stream ... endstream`; we scan them in order and
+    /// return the first whose decoded text literals contain `needle`. This lets
+    /// a test assert not just THAT a value printed but WHICH page it landed on,
+    /// which is the whole point of a manual page break (#76).
+    fn pdf_page_containing(bytes: &[u8], needle: &str) -> Option<usize> {
+        let open = b"stream";
+        let close = b"endstream";
+        let mut page = 0usize;
+        let mut i = 0;
+        while i + open.len() <= bytes.len() {
+            if &bytes[i..i + open.len()] == open {
+                // Skip the CRLF/LF after the `stream` keyword.
+                let mut s = i + open.len();
+                while s < bytes.len() && matches!(bytes[s], 0x0d | 0x0a) {
+                    s += 1;
+                }
+                // Find the matching endstream.
+                let mut e = s;
+                while e + close.len() <= bytes.len() && &bytes[e..e + close.len()] != close {
+                    e += 1;
+                }
+                page += 1;
+                if pdf_text_literals(&bytes[s..e])
+                    .iter()
+                    .any(|lit| lit.contains(needle))
+                {
+                    return Some(page);
+                }
+                i = e + close.len();
+            } else {
+                i += 1;
+            }
+        }
+        None
     }
 }
