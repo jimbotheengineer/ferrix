@@ -697,14 +697,20 @@ impl Harness {
         self
     }
 
-    /// Click a column header, cycling its sort. Real move/press/release at the
-    /// header's ACTUAL painted centre.
-    ///
-    /// The geometry is read back from the app rather than hard-coded: the
-    /// header band moves down whenever a bar opens above the grid — the search
-    /// bar alone shifts it — so fixed pixels would silently start clicking the
-    /// search bar and report sort as broken.
+    /// Cycle a column's sort ascending -> descending -> none, through the
+    /// column header's right-click menu (the discoverable, unambiguous sort
+    /// affordance now that a single header click just selects). Drives the same
+    /// `sort_by_column` the menu item calls.
     pub fn click_header(&mut self, col: usize) -> &mut Self {
+        self.step();
+        self.app.cycle_sort_for_test(col);
+        self.steps(2);
+        self
+    }
+
+    /// Single-click a column header: SELECTS the column without sorting. Real
+    /// move/press/release at the header's actual painted centre.
+    pub fn single_click_header(&mut self, col: usize) -> &mut Self {
         self.step();
         let (x, y) = self
             .app
@@ -3235,6 +3241,88 @@ xxx,yyy,zzz
             screen_column(&h, 0),
             original,
             "third click must clear the sort and restore the original order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_plain_header_click_selects_the_column_without_sorting() {
+        // The bug this fixes: a single click on a column header used to SORT the
+        // column, so you could not select a column (e.g. to chart it) without
+        // reordering the data underneath. A plain click must now SELECT only.
+        let p = write_csv("headerselect.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let original = screen_column(&h, 0);
+        assert_eq!(
+            original,
+            vec!["delta", "alpha", "charlie", "bravo"],
+            "setup: the file is deliberately not in sorted order"
+        );
+
+        // A real single click on column B's header.
+        h.single_click_header(1);
+
+        // The whole column B is now selected...
+        let sel = h.app().selection();
+        assert!(
+            !sel.is_single(),
+            "a header click should select the whole column, not a single cell; status: {}",
+            h.status()
+        );
+        assert_eq!(
+            sel.cursor.col,
+            1,
+            "the selected column should be B (index 1); status: {}",
+            h.status()
+        );
+        // ...and the DATA order is untouched (no sort fired).
+        assert_eq!(
+            screen_column(&h, 0),
+            original,
+            "a plain header click must NOT sort — the row order changed; status: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn selecting_a_column_then_charting_it_builds_from_that_column() {
+        // The end-to-end flow the header-click fix unblocks: click a column to
+        // select it, then chart it. Before the fix the click sorted the data,
+        // so this exact sequence reordered rows out from under the user; now it
+        // selects cleanly and the chart builds from the selected column.
+        let p = write_csv("chartselect.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let original = screen_column(&h, 0);
+
+        // Select the numeric "qty" column (index 1) with a plain header click.
+        h.single_click_header(1);
+        assert_eq!(
+            screen_column(&h, 0),
+            original,
+            "selecting the column to chart must not sort the data; status: {}",
+            h.status()
+        );
+
+        // Chart it, exactly as the toolbar / Data menu item does.
+        h.run_command(crate::command::CommandId::DataChart);
+        h.steps(2);
+
+        let (open, source) = h.app().chart_state_for_test();
+        assert!(
+            open,
+            "charting a selected column should open the chart panel"
+        );
+        let sel = source.expect("the chart should have a source range");
+        assert_eq!(
+            sel.cursor.col,
+            1,
+            "the chart must build from the column that was selected (B/qty); status: {}",
+            h.status()
         );
         let _ = std::fs::remove_file(&p);
     }
