@@ -3683,6 +3683,14 @@ impl FerrixApp {
         self.status = self.chart.status.clone();
     }
 
+    /// What the chart panel is currently charting, for tests: `(open, source
+    /// selection)`. Lets a harness prove the full "select a column → chart it"
+    /// flow builds from the selection, without reaching into private state.
+    #[doc(hidden)]
+    pub fn chart_state_for_test(&self) -> (bool, Option<Selection>) {
+        (self.chart.open, self.chart.source)
+    }
+
     /// Rebuild the chart from its stored source range, after a kind change.
     fn rebuild_chart(&mut self) {
         if let Some(sel) = self.chart.source {
@@ -8047,9 +8055,61 @@ impl FerrixApp {
         self.scroll_to_selection();
     }
 
-    // ========================================================================
-    // Issue #34: Remove Duplicates, Subtotals, Consolidate
-    // ========================================================================
+    /// Cycle a column's sort (asc -> desc -> none), non-additive. Exposed so a
+    /// harness test can exercise sort SEMANTICS through the same entry point the
+    /// header menu calls, without depending on where that menu happens to open.
+    #[doc(hidden)]
+    pub fn cycle_sort_for_test(&mut self, col: usize) {
+        self.sort_by_column(col, false);
+    }
+
+    /// Sort a column to an explicit direction (not a cycle): used by the header
+    /// menu's "Sort ascending"/"Sort descending" items, which name the outcome
+    /// rather than toggling. Clears any existing keys first so the chosen column
+    /// becomes the sole sort key in the requested direction.
+    pub fn sort_column_to(&mut self, col: usize, dir: ferrix_core::SortDir) {
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::Sort)
+        {
+            self.status = format!("Sort refused — {d}");
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        // Land on `dir` regardless of the current state: cycle_click toggles, so
+        // reset first and drive it to the wanted direction deterministically.
+        self.sort_keys.clear();
+        ferrix_core::cycle_click(&mut self.sort_keys, col as u32, false); // -> Asc
+        if dir == ferrix_core::SortDir::Desc {
+            ferrix_core::cycle_click(&mut self.sort_keys, col as u32, false); // Asc -> Desc
+        }
+        self.rebuild_sort_order();
+        self.status = match dir {
+            ferrix_core::SortDir::Asc => format!(
+                "Sorted by {} ascending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+            ferrix_core::SortDir::Desc => format!(
+                "Sorted by {} descending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+        };
+        self.scroll_to_selection();
+    }
+
+    /// Clear all sort keys, restoring the original row order.
+    pub fn clear_sort(&mut self) {
+        if self.sort_keys.is_empty() {
+            return;
+        }
+        self.sort_keys.clear();
+        self.rebuild_sort_order();
+        self.status = "Sort cleared — original order restored".to_string();
+        self.scroll_to_selection();
+    }
 
     /// Cap on rows one Remove Duplicates can drop in a single undo step.
     ///
@@ -8597,6 +8657,21 @@ impl FerrixApp {
                         RichText::new(format!("Column {}", ferrix_core::column_name(col as u32)))
                             .strong(),
                     );
+                    ui.separator();
+                    if ui.button("Sort ascending").clicked() {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.sort_column_to(col, ferrix_core::SortDir::Asc);
+                        close = true;
+                    }
+                    if ui.button("Sort descending").clicked() {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.sort_column_to(col, ferrix_core::SortDir::Desc);
+                        close = true;
+                    }
+                    if ui.button("Clear sort").clicked() {
+                        self.clear_sort();
+                        close = true;
+                    }
                     ui.separator();
                     if ui.button("Hide").clicked() {
                         self.set_col_hidden(col, true);
@@ -11355,17 +11430,14 @@ impl FerrixApp {
                 if resp.header_released {
                     if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
                         if src == dst {
-                            // Released on the column it was pressed on: that is
-                            // a CLICK, not a reorder, and a click on a header
-                            // cycles that column's sort asc -> desc -> none.
-                            //
-                            // Keyed on release rather than press on purpose:
-                            // pressing must be free to become a drag, and
-                            // sorting on press would fire a full sort every
-                            // time the user started to move a column.
-                            let additive = ui.input(|i| i.modifiers.shift);
+                            // Released on the column it was pressed on: that is a
+                            // plain CLICK, which SELECTS the column (done on
+                            // press) and nothing more. Sorting used to fire here,
+                            // but that meant every attempt to select a column —
+                            // e.g. to chart it — also reordered the data. Sort is
+                            // now on the header right-click menu (Sort ascending /
+                            // descending / Clear sort).
                             self.header_drag = None;
-                            self.sort_by_column(src, additive);
                         } else {
                             // `to` is an insertion point in the ORIGINAL
                             // indexing: dropping onto a column to the right
