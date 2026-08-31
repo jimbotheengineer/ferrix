@@ -298,8 +298,18 @@ impl<'a> SheetView<'a> {
                 // An inserted column has no base header; it is named by its
                 // position, like a fresh spreadsheet column.
                 Some(c) => match c.data_of(col as u64) {
-                    Some(d) => self.base.header_or_letter(d as usize),
-                    None => ferrix_core::column_name(col as u32),
+                    // A FRESH inserted column carries a synthetic data index
+                    // allocated from beyond the base's extent (see
+                    // `AxisOrder::insert_fresh`). That index is not a base
+                    // column, so it must not be looked up in the base headers —
+                    // doing so named the new empty column after whatever letter
+                    // its synthetic index happened to land on (e.g. an insert in
+                    // a 5-column sheet showed "F"). Name it by its display
+                    // position instead, exactly like the no-base-header case.
+                    Some(d) if (d as usize) < self.base.col_count() => {
+                        self.base.header_or_letter(d as usize)
+                    }
+                    _ => ferrix_core::column_name(col as u32),
                 },
             },
         }

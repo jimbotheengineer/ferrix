@@ -8783,6 +8783,39 @@ xxx,yyy,zzz
     }
 
     #[test]
+    fn an_inserted_column_is_named_by_position_not_a_stray_letter() {
+        use crate::command::CommandId;
+        // Bug: inserting a column allocated it a synthetic data index from
+        // beyond the base extent, and the header resolver looked that index up
+        // in the base headers — so the new EMPTY column was named after a stray
+        // letter (an insert in a 3-column sheet showed "D" over position C).
+        let (p, mut h) = structural_fixture("ins_col_header.csv");
+
+        // Sanity: C (index 2) is "qty" before the insert.
+        assert_eq!(h.app().workbook().view().header_or_letter(2), "qty");
+
+        // Insert a column at C.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        h.run_command(CommandId::DataInsertColumn);
+        h.steps(2);
+
+        let v = h.app().workbook().view();
+        // The NEW empty column at C is named by its position, not "D".
+        assert_eq!(
+            v.header_or_letter(2),
+            "C",
+            "the inserted empty column must be named by its position, not a stray letter"
+        );
+        // The displaced data keeps its own header, now one column right.
+        assert_eq!(
+            v.header_or_letter(3),
+            "qty",
+            "the shifted column must carry its own header to its new position"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn structural_edits_are_reachable_from_the_command_registry() {
         use crate::command::{CommandId, REGISTRY};
         // The wiring assertion. Six features in this repo landed model-complete
