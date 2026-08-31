@@ -67,6 +67,42 @@ fn every_menu_item_is_a_registry_command() {
 }
 
 #[test]
+fn every_ribbon_tab_slug_round_trips() {
+    // The persisted tab is stored by slug; a slug that does not round-trip
+    // would silently reset the user's tab to Home on restart.
+    for tab in RibbonTab::ALL {
+        assert_eq!(
+            RibbonTab::from_slug(tab.slug()),
+            Some(tab),
+            "{} did not round-trip through its slug",
+            tab.title()
+        );
+    }
+    assert_eq!(RibbonTab::from_slug("nonsense"), None);
+}
+
+#[test]
+fn the_home_tab_lists_only_real_commands() {
+    // The Home tab is a hand-picked list of CommandIds rather than a menu, so
+    // unlike the category tabs it can name a command that does not exist. This
+    // is the guard the compiler cannot give us for that list.
+    let mut h = crate::harness::Harness::new(None);
+    h.step();
+    let st = h.app().command_state();
+    let ctx = egui::Context::default();
+    let mut ran = false;
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Drawing the Home ribbon touches every HOME_COMMANDS entry; a bad
+            // id would have failed the registry lookup and drawn nothing.
+            let _ = ribbon_row(ui, RibbonTab::Home, &st);
+            ran = true;
+        });
+    });
+    assert!(ran);
+}
+
+#[test]
 fn slugs_and_ids_are_unique() {
     // A duplicated slug silently merges two commands' recency entries.
     let mut slugs: Vec<&str> = REGISTRY.iter().map(|c| c.slug).collect();

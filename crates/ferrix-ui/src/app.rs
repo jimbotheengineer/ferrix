@@ -627,6 +627,8 @@ pub struct FerrixApp {
     theme_chosen: bool,
     /// Show empty rows past the end of the sheet (issue #20).
     show_empty_rows: bool,
+    /// The active ribbon toolbar tab (issue #102).
+    ribbon_tab: crate::command::RibbonTab,
     /// Frozen / split leading band for the active sheet.
     panes: crate::grid::Panes,
     /// Zoom for the active sheet, 0.25..=4.0. Persisted per sheet name.
@@ -925,6 +927,8 @@ impl FerrixApp {
             theme: Theme::of(prefs.theme.unwrap_or_default()),
             theme_chosen: prefs.theme.is_some(),
             show_empty_rows: prefs.show_empty_rows,
+            ribbon_tab: crate::command::RibbonTab::from_slug(&prefs.ribbon_tab)
+                .unwrap_or(crate::command::RibbonTab::Home),
             panes: crate::grid::Panes::default(),
             // The first sheet is named before any file is opened, so its
             // remembered zoom is adopted here and re-adopted on every sheet
@@ -9974,171 +9978,41 @@ impl FerrixApp {
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
+                // --- ribbon toolbar (issue #102) ---
+                //
+                // Row 1 is the tab bar: brand, tab selectors, right-aligned
+                // progress/stats. Row 2 is the active tab's controls, wrapped
+                // so they reflow instead of overflowing on a narrow window. The
+                // tab bodies are drawn from the same command REGISTRY the menu
+                // bar and palette use, so nothing drifts.
+                let cmd_state = self.command_state();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("FERRIX").color(th.accent).strong().size(15.0));
-                    ui.add_space(12.0);
-                    if ui.button("Open CSV…").clicked() {
-                        chosen_command = Some(crate::command::CommandId::FileOpen);
+                    ui.add_space(10.0);
+                    for tab in crate::command::RibbonTab::ALL {
+                        let selected = self.ribbon_tab == tab;
+                        if ui.selectable_label(selected, tab.title()).clicked() {
+                            self.ribbon_tab = tab;
+                            self.prefs.ribbon_tab = tab.slug().to_string();
+                            let _ = self.prefs.save();
+                        }
                     }
-                    if ui
-                        .button("⬈ Export CSV…")
-                        .on_hover_text("Write this sheet, including edits, to a CSV file")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileExportCsv);
-                    }
-                    if ui
-                        .button("📈 Chart…")
-                        .on_hover_text("Chart the selected range")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::DataChart);
-                    }
+                    // A compact overflow menu keeps the FULL command tree one
+                    // click away without the always-visible menu bar the ribbon
+                    // replaced. Every menu is drawn from the same REGISTRY, so
+                    // it never drifts from the ribbon or the palette.
                     ui.separator();
-                    if ui
-                        .button("⬓ Merge")
-                        .on_hover_text("Merge the selection, or unmerge it if already merged")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FormatMerge);
-                    }
-                    self.type_controls(ui, th);
-                    ui.separator();
-                    if ui
-                        .button("Open xlsx…")
-                        .on_hover_text(
-                            "Open a workbook, importing any Excel Tables with their \
-                             validation, formatting, and filters",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileOpenXlsx);
-                    }
-                    if ui
-                        .add_enabled(!self.tables.is_empty(), egui::Button::new("⬈ Export xlsx…"))
-                        .on_hover_text(
-                            "Write this sheet and its table as a real Excel Table, with \
-                             dataValidation, conditionalFormatting, and autoFilter parts",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileExportXlsx);
-                    }
-                    ui.add_space(4.0);
-                    let dirty = self.wb.is_dirty();
-                    if ui
-                        .add_enabled(
-                            dirty && self.edits_path.is_some(),
-                            egui::Button::new(if dirty { "💾 Save*" } else { "💾 Save" }),
-                        )
-                        .on_hover_text("Save edits (Ctrl+S)")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileSave);
-                    }
-                    if ui
-                        .add_enabled(self.wb.can_undo(), egui::Button::new("↶ Undo"))
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::EditUndo);
-                    }
-                    if ui
-                        .add_enabled(self.wb.can_redo(), egui::Button::new("↷ Redo"))
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::EditRedo);
-                    }
-                    ui.add_space(4.0);
-                    // --- theme toggle (issue #19) ---
-                    if ui
-                        .button(self.theme.mode.toggle_label())
-                        .on_hover_text("Switch between light and dark. Remembered between runs.")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewTheme);
-                    }
-                    // --- empty rows toggle (issue #20) ---
-                    if ui
-                        .selectable_label(self.showing_formulas(), "ƒ Formulas")
-                        .on_hover_text(
-                            "Ctrl+` — show formula source instead of values, for this sheet",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewShowFormulas);
-                    }
-                    if ui
-                        .selectable_label(self.show_empty_rows, "⬓ Empty rows")
-                        .on_hover_text(
-                            "Show empty rows past the end of the sheet so there is \
-                             somewhere to type. They are not data: exports, SUM and \
-                             the row count ignore them until you type in one.",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewEmptyRows);
-                    }
-                    // --- menu bar (issue #40) ---
-                    //
-                    // Every menu is drawn from command::REGISTRY, the same
-                    // table the palette searches. This used to be five
-                    // hand-written closures, which is exactly how a command
-                    // ends up in a menu and nowhere else. Availability, and
-                    // the reason for it, come from the registry too, so a
-                    // greyed item explains itself in both front-ends.
-                    let cmd_state = self.command_state();
-                    for menu in crate::command::Menu::ALL {
-                        ui.menu_button(menu.title(), |ui| {
-                            if let Some(id) = crate::command::menu_items(ui, menu, &cmd_state) {
-                                chosen_command = Some(id);
-                            }
-                        });
-                    }
-
-                    if self.loading {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        // A 10GB conversion takes minutes, so show real
-                        // progress rather than an indefinite spinner.
-                        if self.progress.total > 0 {
-                            let frac = self.progress.done as f32 / self.progress.total as f32;
-                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
-                                format!(
-                                    "{:.0}%  ({:.1}/{:.1} GB)",
-                                    frac * 100.0,
-                                    self.progress.done as f64 / 1e9,
-                                    self.progress.total as f64 / 1e9
-                                ),
-                            ));
-                        } else {
-                            ui.label(RichText::new("opening…").color(th.text_dim));
+                    ui.menu_button("☰", |ui| {
+                        for menu in crate::command::Menu::ALL {
+                            ui.menu_button(menu.title(), |ui| {
+                                if let Some(id) = crate::command::menu_items(ui, menu, &cmd_state) {
+                                    chosen_command = Some(id);
+                                }
+                            });
                         }
-                        // Every operation over a second needs a way out that
-                        // is not killing the process.
-                        if ui.button("✖ Cancel").clicked() {
-                            self.cancel_load();
-                        }
-                    }
-
-                    if self.exporting {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        if self.export_progress.total > 0 {
-                            let frac = self.export_progress.done as f32
-                                / self.export_progress.total as f32;
-                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
-                                format!(
-                                    "export {:.0}%  ({}/{} rows)",
-                                    frac * 100.0,
-                                    fmt_int(self.export_progress.done as usize),
-                                    fmt_int(self.export_progress.total as usize)
-                                ),
-                            ));
-                        } else {
-                            ui.label(RichText::new("exporting…").color(self.theme.text_dim));
-                        }
-                        if ui.button("✖ Cancel export").clicked() {
-                            self.cancel_export();
-                        }
-                    }
+                    })
+                    .response
+                    .on_hover_text("All commands, grouped by menu");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.stats_rows > 0 {
                             let edits = self.wb.edit_count();
@@ -10155,9 +10029,6 @@ impl FerrixApp {
                             }
                             ui.label(RichText::new(label).color(th.text_dim).size(12.0));
                         }
-                        // Say what the machine actually has and how much of it
-                        // we are willing to use. A cap the user cannot see is
-                        // indistinguishable from a bug.
                         ui.label(
                             RichText::new(format!(
                                 "{} · {}",
@@ -10167,7 +10038,84 @@ impl FerrixApp {
                             .color(self.theme.text_dim)
                             .size(12.0),
                         );
+                        if self.loading {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            if self.progress.total > 0 {
+                                let frac = self.progress.done as f32 / self.progress.total as f32;
+                                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(
+                                    format!(
+                                        "{:.0}%  ({:.1}/{:.1} GB)",
+                                        frac * 100.0,
+                                        self.progress.done as f64 / 1e9,
+                                        self.progress.total as f64 / 1e9
+                                    ),
+                                ));
+                            } else {
+                                ui.label(RichText::new("opening…").color(th.text_dim));
+                            }
+                            if ui.button("✖ Cancel").clicked() {
+                                self.cancel_load();
+                            }
+                        }
+                        if self.exporting {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            if self.export_progress.total > 0 {
+                                let frac = self.export_progress.done as f32
+                                    / self.export_progress.total as f32;
+                                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(
+                                    format!(
+                                        "export {:.0}%  ({}/{} rows)",
+                                        frac * 100.0,
+                                        fmt_int(self.export_progress.done as usize),
+                                        fmt_int(self.export_progress.total as usize)
+                                    ),
+                                ));
+                            } else {
+                                ui.label(RichText::new("exporting…").color(self.theme.text_dim));
+                            }
+                            if ui.button("✖ Cancel export").clicked() {
+                                self.cancel_export();
+                            }
+                        }
                     });
+                });
+
+                ui.separator();
+
+                // Row 2: the active tab's controls, wrapped so they reflow on a
+                // narrow window rather than overrunning the row.
+                let active = self.ribbon_tab;
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(id) = crate::command::ribbon_buttons(ui, active, &cmd_state) {
+                        chosen_command = Some(id);
+                    }
+                    if active == crate::command::RibbonTab::Format {
+                        ui.separator();
+                        self.type_controls(ui, th);
+                    }
+                    if active == crate::command::RibbonTab::View {
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.showing_formulas(), "ƒ Formulas")
+                            .on_hover_text(
+                                "Ctrl+` — show formula source instead of values, for this sheet",
+                            )
+                            .clicked()
+                        {
+                            chosen_command = Some(crate::command::CommandId::ViewShowFormulas);
+                        }
+                        if ui
+                            .selectable_label(self.show_empty_rows, "⬓ Empty rows")
+                            .on_hover_text(
+                                "Show empty rows past the end of the sheet so there is \
+                                 somewhere to type. They are not data: exports, SUM and \
+                                 the row count ignore them until you type in one.",
+                            )
+                            .clicked()
+                        {
+                            chosen_command = Some(crate::command::CommandId::ViewEmptyRows);
+                        }
+                    }
                 });
             });
 

@@ -548,6 +548,165 @@ pub fn menu_items(ui: &mut egui::Ui, menu: Menu, st: &CommandState) -> Option<Co
 }
 
 // ---------------------------------------------------------------------------
+// ribbon (issue #102): tabbed toolbar
+// ---------------------------------------------------------------------------
+
+/// One tab of the ribbon toolbar. `Home` is a curated set of the most-used
+/// commands across categories; the rest map one-to-one onto the menus, so a
+/// tab's contents come straight from the registry and never drift from the
+/// menu bar or the command palette.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RibbonTab {
+    Home,
+    File,
+    Format,
+    Formula,
+    Data,
+    View,
+}
+
+impl RibbonTab {
+    pub const ALL: [RibbonTab; 6] = [
+        RibbonTab::Home,
+        RibbonTab::File,
+        RibbonTab::Format,
+        RibbonTab::Formula,
+        RibbonTab::Data,
+        RibbonTab::View,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "Home",
+            RibbonTab::File => "File",
+            RibbonTab::Format => "Format",
+            RibbonTab::Formula => "Formula",
+            RibbonTab::Data => "Data",
+            RibbonTab::View => "View",
+        }
+    }
+
+    /// A stable slug for persisting the selected tab across runs.
+    pub fn slug(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "home",
+            RibbonTab::File => "file",
+            RibbonTab::Format => "format",
+            RibbonTab::Formula => "formula",
+            RibbonTab::Data => "data",
+            RibbonTab::View => "view",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<RibbonTab> {
+        Self::ALL.into_iter().find(|t| t.slug() == s)
+    }
+
+    /// The menu whose commands this tab shows, or `None` for `Home` (which
+    /// draws a hand-picked cross-category list instead).
+    fn menu(self) -> Option<Menu> {
+        match self {
+            RibbonTab::Home => None,
+            RibbonTab::File => Some(Menu::File),
+            RibbonTab::Format => Some(Menu::Format),
+            RibbonTab::Formula => Some(Menu::Formula),
+            RibbonTab::Data => Some(Menu::Data),
+            RibbonTab::View => Some(Menu::View),
+        }
+    }
+}
+
+/// The curated command list for the Home tab: the handful of actions a user
+/// reaches for constantly, pulled from across the categories. Order is the
+/// display order. Anything not here is one tab (or one palette search) away.
+const HOME_COMMANDS: &[CommandId] = &[
+    CommandId::FileOpen,
+    CommandId::FileSave,
+    CommandId::EditUndo,
+    CommandId::EditRedo,
+    CommandId::FormatBold,
+    CommandId::FormatItalic,
+    CommandId::FormatMerge,
+    CommandId::DataChart,
+    CommandId::EditFind,
+];
+
+/// Look a command up in the registry by id.
+pub fn command(id: CommandId) -> Option<&'static Command> {
+    REGISTRY.iter().find(|c| c.id == id)
+}
+
+/// Draw one command as a ribbon button (availability + hover come from the
+/// registry, exactly like the menu). Returns the id when clicked.
+fn ribbon_button(ui: &mut egui::Ui, cmd: &Command, st: &CommandState) -> Option<CommandId> {
+    let reason = cmd.disabled_reason(st);
+    let hover = match &reason {
+        Some(r) => r.clone(),
+        None => cmd.hint.to_string(),
+    };
+    // The ribbon shows the plain title (no shortcut suffix) to stay compact;
+    // the shortcut still lives in the hover text and the palette.
+    let resp = ui
+        .add_enabled(
+            reason.is_none(),
+            egui::Button::new(cmd.title).wrap_mode(egui::TextWrapMode::Extend),
+        )
+        .on_hover_text(&hover)
+        .on_disabled_hover_text(&hover);
+    if resp.clicked() {
+        Some(cmd.id)
+    } else {
+        None
+    }
+}
+
+/// Draw the buttons of one ribbon tab into the CURRENT ui (the caller owns the
+/// layout — typically a `horizontal_wrapped` so buttons reflow when narrow).
+/// Returns the chosen command, if any. Use this when the caller wants to add
+/// its own non-registry widgets (e.g. the font controls) to the same row.
+pub fn ribbon_buttons(ui: &mut egui::Ui, tab: RibbonTab, st: &CommandState) -> Option<CommandId> {
+    let mut chosen = None;
+    match tab.menu() {
+        // A category tab: every registry command in that menu, in order.
+        Some(menu) => {
+            let mut first = true;
+            for cmd in for_menu(menu) {
+                if cmd.separator_before && !first {
+                    ui.separator();
+                }
+                first = false;
+                if let Some(id) = ribbon_button(ui, cmd, st) {
+                    chosen = Some(id);
+                }
+            }
+        }
+        // Home: the curated cross-category list.
+        None => {
+            for &id in HOME_COMMANDS {
+                if let Some(cmd) = command(id) {
+                    if let Some(hit) = ribbon_button(ui, cmd, st) {
+                        chosen = Some(hit);
+                    }
+                }
+            }
+        }
+    }
+    chosen
+}
+
+/// Draw the body of one ribbon tab into a wrapped row (buttons reflow when the
+/// window is narrow). Thin wrapper over [`ribbon_buttons`]. Returns the chosen
+/// command, if any.
+#[cfg(test)]
+pub fn ribbon_row(ui: &mut egui::Ui, tab: RibbonTab, st: &CommandState) -> Option<CommandId> {
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        chosen = ribbon_buttons(ui, tab, st);
+    });
+    chosen
+}
+
+// ---------------------------------------------------------------------------
 // fuzzy matching
 // ---------------------------------------------------------------------------
 

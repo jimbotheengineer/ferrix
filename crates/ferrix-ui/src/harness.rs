@@ -2948,11 +2948,14 @@ mod tests {
         assert!(h.step_until(200, |a| a.row_count() > 0));
         assert_eq!(h.app().display(CellRef::new(0, 0)), "1");
 
-        // Real geometry at the default 1400x880 viewport: the header band
-        // spans y 72..98, and the three 64px columns sit at x 88, 152, 216.
-        // A destination past the last column resolves to nothing, so the drop
-        // must land inside column C (216..280).
-        h.drag((120.0, 85.0), (250.0, 85.0));
+        // Drive the drag from the header's ACTUAL painted centres rather than
+        // hard-coded pixels: the header band's y shifts whenever a bar above
+        // the grid changes height (the ribbon toolbar is two rows tall), so
+        // fixed coordinates would silently start dragging the wrong widget.
+        h.step();
+        let (ax, ay) = h.app().header_center(0).expect("column A header on screen");
+        let (cx, _cy) = h.app().header_center(2).expect("column C header on screen");
+        h.drag((ax, ay), (cx, ay));
         h.steps(3);
 
         assert_ne!(
@@ -3568,7 +3571,13 @@ xxx,yyy,zzz
         let mut h = Harness::new(Some(&p));
         assert!(h.step_until(200, |a| a.row_count() > 0));
 
-        h.drag((120.0, 85.0), (250.0, 85.0));
+        // Use the header's real painted centres (see
+        // `dragging_a_column_header_reorders_it`): the two-row ribbon toolbar
+        // shifts the header band down, so hard-coded y would miss it.
+        h.step();
+        let (ax, ay) = h.app().header_center(0).expect("column A header on screen");
+        let (cx, _cy) = h.app().header_center(2).expect("column C header on screen");
+        h.drag((ax, ay), (cx, ay));
         h.steps(3);
 
         assert_ne!(

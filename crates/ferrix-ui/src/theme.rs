@@ -63,14 +63,6 @@ impl ThemeMode {
             ThemeMode::Light => ThemeMode::Dark,
         }
     }
-
-    /// Label for the toolbar toggle: shows what clicking will switch TO.
-    pub fn toggle_label(self) -> &'static str {
-        match self {
-            ThemeMode::Dark => "☀ Light",
-            ThemeMode::Light => "🌙 Dark",
-        }
-    }
 }
 
 /// A full palette. `Copy` and 80-odd bytes, so it is passed by value.
