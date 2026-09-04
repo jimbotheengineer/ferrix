@@ -69,6 +69,16 @@ pub const EMPTY_ROW_PADDING: usize = 200;
 /// row does.
 pub const BLANK_SHEET_COLS: usize = 26;
 
+/// Blank spreadsheet columns continued past the last DATA column while "Show
+/// empty rows" is on — the column twin of [`EMPTY_ROW_PADDING`], and pure
+/// viewport for the same reasons: exports, `SheetView::col_count` and the
+/// status bar never see them, and typing in one extends the sheet through
+/// the overlay exactly as a padding row does. What this buys visually is the
+/// DESIGN.md grid-first composition: five data columns on a wide window
+/// continue as F, G, H… rather than stopping at a hard edge with an
+/// undifferentiated empty field beyond.
+pub const EMPTY_COL_PADDING: usize = 40;
+
 /// Base font size for cell text at 100% zoom.
 pub const BASE_FONT: f32 = 12.5;
 
@@ -586,6 +596,10 @@ pub struct GridResponse {
     /// Set while the primary button is held and the pointer has moved to a new
     /// cell — the caller extends the selection to it.
     pub drag_to: Option<CellRef>,
+    /// Cell under the pointer on the frame the primary button was PRESSED.
+    /// Clicks report on release, so a gesture that must know where a drag
+    /// STARTED (Ctrl+drag formula linking) keys off this instead.
+    pub cell_press: Option<CellRef>,
     pub double_clicked: Option<CellRef>,
     /// Display column whose header was pressed, to start a reorder drag.
     ///
@@ -1476,6 +1490,7 @@ impl<'a> Grid<'a> {
         }
 
         let mut clicked = None;
+        let mut cell_press = None;
         let mut double_clicked = None;
         let mut drag_to = None;
         let mut fill_started = false;
@@ -1856,11 +1871,15 @@ impl<'a> Grid<'a> {
 
                 // Selection painting. A range gets a translucent fill; the
                 // cursor cell keeps the strong border so the user can always
-                // see where typing will land.
+                // see where typing will land. The cursor's fill is the SAME
+                // translucent range fill — an opaque block would erase zebra
+                // striping, banding and conditional formatting underneath
+                // (DESIGN.md overlay rules), and the 2px accent edge is what
+                // says "active", not the fill.
                 if let Some(sel) = self.selection {
                     if sel.cursor == cref {
-                        painter.rect_filled(cell_rect, 0.0, th.accent_soft);
-                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(1.5_f32, th.accent));
+                        painter.rect_filled(cell_rect, 0.0, th.range_fill);
+                        painter.rect_stroke(cell_rect, 0.0, Stroke::new(2.0_f32, th.accent));
                     } else if !sel.is_single() && sel.contains(cref) {
                         painter.rect_filled(cell_rect, 0.0, th.range_fill);
                     }
@@ -2541,6 +2560,9 @@ impl<'a> Grid<'a> {
         if primary_clicked {
             clicked = pointer_pos.and_then(hit);
         }
+        if primary_pressed {
+            cell_press = pointer_pos.and_then(hit);
+        }
         if primary_double {
             double_clicked = pointer_pos.and_then(hit);
         }
@@ -2624,6 +2646,12 @@ impl<'a> Grid<'a> {
         if primary_pressed && on_border && !on_handle && !self.filling {
             move_started = pointer_pos.and_then(hit);
             clicked = None; // Do not also move the cursor/selection.
+            cell_press = None;
+        }
+        // A press in a scrollbar gutter is a scroll gesture, never a cell
+        // selection.
+        if in_gutter {
+            cell_press = None;
         }
         // While a move-drag is in flight the pointer's cell is the drop target,
         // reported live and again on release.
@@ -2666,6 +2694,7 @@ impl<'a> Grid<'a> {
         if primary_pressed && on_handle {
             fill_started = true;
             clicked = None; // Do not also move the selection.
+            cell_press = None;
         }
 
         // --- hover cursor feedback (#81) ---
@@ -3142,6 +3171,7 @@ impl<'a> Grid<'a> {
             move_released,
             move_copy,
             double_clicked,
+            cell_press,
             header_press,
             header_drag_to,
             header_released,

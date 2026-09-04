@@ -200,6 +200,15 @@ struct PendingBlockMove {
     copy: bool,
 }
 
+/// A clipboard action requested from a button, deferred one frame because it
+/// needs the frame's `ctx` to reach the system clipboard.
+#[derive(Clone, Copy)]
+enum ClipboardAction {
+    Copy,
+    Cut,
+    Paste,
+}
+
 pub struct FerrixApp {
     wb: Workbook,
     stats_rows: usize,
@@ -221,6 +230,18 @@ pub struct FerrixApp {
     focus: Focus,
     editing: Option<CellRef>,
     edit_buffer: String,
+    /// Byte range in `edit_buffer` of the last Ctrl+click-linked reference,
+    /// so a second Ctrl+click re-aims (replaces it) instead of stacking
+    /// references. Cleared by typing and when the edit ends.
+    linked_ref_span: Option<(usize, usize)>,
+    /// Anchor cell of a Ctrl+drag range link: set on Ctrl+press while a
+    /// formula edit is live, swept into `anchor:pointer` on each drag frame,
+    /// cleared on release.
+    link_drag_anchor: Option<CellRef>,
+    /// Editor to hand focus back to after a link gesture, applied on the
+    /// NEXT frame. Same-frame `request_focus` loses to the TextEdit's own
+    /// clicked-elsewhere surrender, which runs after the grid code.
+    link_refocus: Option<egui::Id>,
     /// True on the frame an edit begins, so we can grab keyboard focus once.
     just_started_edit: bool,
 
@@ -462,6 +483,11 @@ pub struct FerrixApp {
     /// time, which costs nothing.
     pending_block_move: Option<PendingBlockMove>,
 
+    /// A clipboard action requested from the ribbon/menu/palette, drained next
+    /// frame in `update` where `ctx` (needed to touch the system clipboard) is
+    /// in scope. The Ctrl+C/X/V keystrokes act inline and never set this.
+    pending_clipboard: Option<ClipboardAction>,
+
     /// Structured tables defined over the current sheet.
     ///
     /// Only the first is decorated today — the grid takes one `TableDecor` —
@@ -627,6 +653,22 @@ pub struct FerrixApp {
     theme_chosen: bool,
     /// Show empty rows past the end of the sheet (issue #20).
     show_empty_rows: bool,
+    /// The active ribbon toolbar tab (issue #102).
+    ribbon_tab: crate::command::RibbonTab,
+    /// The Selection side panel (DESIGN.md right dock): open state and the
+    /// recent-activity log it maintains from the status line.
+    selection_panel: crate::selection_panel::SelectionPanel,
+    /// The agent bridge (View → Agent bridge): when the user switches it on,
+    /// commands appended to `<workbook>.fxagent` execute visibly through the
+    /// same paths keyboard input takes. Off by default, every session.
+    agent_bridge: crate::agent_bridge::AgentBridge,
+    /// Whether the Agent window (log + prompt + launcher) is showing.
+    agent_window_open: bool,
+    /// The prompt the user is composing in the Agent window.
+    agent_prompt: String,
+    /// A launched agent process, so exit is reported and a second launch is
+    /// refused while one is running. The CLI itself decides its lifetime.
+    agent_child: Option<std::process::Child>,
     /// Frozen / split leading band for the active sheet.
     panes: crate::grid::Panes,
     /// Zoom for the active sheet, 0.25..=4.0. Persisted per sheet name.
@@ -790,6 +832,9 @@ impl FerrixApp {
             focus: Focus::Grid,
             editing: None,
             edit_buffer: String::new(),
+            linked_ref_span: None,
+            link_drag_anchor: None,
+            link_refocus: None,
             just_started_edit: false,
             formula_input: String::new(),
             formula_result: None,
@@ -858,6 +903,7 @@ impl FerrixApp {
             fill_target: None,
             move_origin: None,
             pending_block_move: None,
+            pending_clipboard: None,
             tables: Vec::new(),
             table_mask: None,
             table_uniques: Vec::new(),
@@ -925,6 +971,15 @@ impl FerrixApp {
             theme: Theme::of(prefs.theme.unwrap_or_default()),
             theme_chosen: prefs.theme.is_some(),
             show_empty_rows: prefs.show_empty_rows,
+            ribbon_tab: crate::command::RibbonTab::from_slug(&prefs.ribbon_tab)
+                .unwrap_or(crate::command::RibbonTab::Home),
+            selection_panel: crate::selection_panel::SelectionPanel::with_open(
+                prefs.selection_panel,
+            ),
+            agent_bridge: crate::agent_bridge::AgentBridge::default(),
+            agent_window_open: false,
+            agent_prompt: String::new(),
+            agent_child: None,
             panes: crate::grid::Panes::default(),
             // The first sheet is named before any file is opened, so its
             // remembered zoom is adopted here and re-adopted on every sheet
@@ -1286,6 +1341,91 @@ impl FerrixApp {
         self.edit_caret = self.edit_buffer.len();
         self.focus = Focus::Cell;
         self.just_started_edit = true;
+        self.linked_ref_span = None;
+    }
+
+    /// Ctrl+click linking: splice `cell`'s A1 reference into the live edit
+    /// buffer. The FIRST link inserts at the caret; a SECOND Ctrl+click with
+    /// no typing in between replaces the reference the first wrote, so
+    /// clicking around re-aims instead of stacking `B2C3D4`.
+    fn insert_ref_into_edit(&mut self, cell: CellRef) {
+        self.link_ref_text(&cell.to_a1());
+    }
+
+    /// Point mode: whether the live formula edit is EXPECTING a reference,
+    /// i.e. the text before the caret ends with `=`, an opening paren, an
+    /// operator, or an argument separator. This is what lets `=(` + click
+    /// G3 + `*` + click D2 + `)` build `=(G3*D2)` by pointing, instead of a
+    /// click committing the half-typed formula as a parse error — the
+    /// classic spreadsheet gesture. A formula ending in a value or `)` is
+    /// NOT pointing, so a click there still commits like always.
+    fn formula_edit_wants_ref(&self) -> bool {
+        if self.editing.is_none() || !self.edit_buffer.trim_start().starts_with('=') {
+            return false;
+        }
+        // A just-linked reference keeps point mode alive: the next click
+        // re-aims it (link_ref_text replaces the span).
+        if self.linked_ref_span.is_some() {
+            return true;
+        }
+        let upto = {
+            let mut at = self.edit_caret.min(self.edit_buffer.len());
+            while at > 0 && !self.edit_buffer.is_char_boundary(at) {
+                at -= 1;
+            }
+            &self.edit_buffer[..at]
+        };
+        matches!(
+            upto.trim_end().chars().last(),
+            Some('=' | '(' | '+' | '-' | '*' | '/' | '^' | '&' | '<' | '>' | ',' | ';' | ':')
+        )
+    }
+
+    /// Ctrl+drag linking: the same splice, with a RANGE (`B2:C9`) built from
+    /// the drag anchor and the cell under the pointer, corners normalised so
+    /// sweeping upward cannot produce an inverted `C9:B2`.
+    fn insert_range_into_edit(&mut self, a: CellRef, b: CellRef) {
+        let tl = CellRef::new(a.row.min(b.row), a.col.min(b.col));
+        let br = CellRef::new(a.row.max(b.row), a.col.max(b.col));
+        if tl == br {
+            self.link_ref_text(&tl.to_a1());
+        } else {
+            self.link_ref_text(&format!("{}:{}", tl.to_a1(), br.to_a1()));
+        }
+    }
+
+    /// The splice engine both linking gestures share: replace the previous
+    /// linked reference if it is still intact (no typing since), else insert
+    /// at the caret (clamped to a char boundary).
+    fn link_ref_text(&mut self, a1: &str) {
+        if let Some((start, end)) = self.linked_ref_span {
+            if end <= self.edit_buffer.len()
+                && self.edit_buffer.is_char_boundary(start)
+                && self.edit_buffer[start..end]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ':')
+            {
+                self.edit_buffer.replace_range(start..end, a1);
+                self.linked_ref_span = Some((start, start + a1.len()));
+                self.edit_caret = start + a1.len();
+                self.pending_caret = Some(self.edit_caret);
+                self.formula_input.clone_from(&self.edit_buffer);
+                self.recompute_formula();
+                self.status = format!("Linked {a1}");
+                return;
+            }
+        }
+        let mut at = self.edit_caret.min(self.edit_buffer.len());
+        while at > 0 && !self.edit_buffer.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.edit_buffer.insert_str(at, a1);
+        self.linked_ref_span = Some((at, at + a1.len()));
+        self.edit_caret = at + a1.len();
+        self.pending_caret = Some(self.edit_caret);
+        self.formula_input.clone_from(&self.edit_buffer);
+        self.recompute_formula();
+        self.status = format!("Linked {a1}");
     }
 
     /// Text being edited right now, and whether it lives in the CELL editor.
@@ -1821,7 +1961,7 @@ impl FerrixApp {
         }
     }
 
-    fn set_show_empty_rows(&mut self, on: bool) {
+    pub(crate) fn set_show_empty_rows(&mut self, on: bool) {
         self.show_empty_rows = on;
         self.prefs.show_empty_rows = on;
         self.persist_prefs();
@@ -1882,12 +2022,54 @@ impl FerrixApp {
     /// Columns the cursor may reach. A sheet with no base columns offers a
     /// blank page's worth (issue #52) — the column mirror of
     /// [`Self::pad_rows`], and on the base for the same reason.
+    ///
+    /// With data present, the "Show empty rows" toggle also continues the
+    /// sheet PAST the last data column (F, G, H… as blank spreadsheet
+    /// columns), so five data columns do not leave the rest of a wide window
+    /// an undifferentiated empty field. Off = data columns only, and the
+    /// paint-count tests use that configuration for a stable narrow surface.
     fn navigable_cols(&self) -> usize {
         let view = self.wb.view().col_count();
         if self.wb.base.col_count() == 0 {
             return view.max(crate::grid::BLANK_SHEET_COLS);
         }
-        view
+        if self.show_empty_rows {
+            view + crate::grid::EMPTY_COL_PADDING
+        } else {
+            view
+        }
+    }
+
+    /// Whether the Selection panel is open. Exposed for the harness test that
+    /// drives the `ViewSelectionPanel` command through `run_command`.
+    #[doc(hidden)]
+    pub fn selection_panel_open_for_test(&self) -> bool {
+        self.selection_panel.open
+    }
+
+    /// Whether the agent bridge is attached. For the harness test that drives
+    /// the `ViewAgentBridge` command through `run_command`.
+    #[doc(hidden)]
+    pub fn agent_bridge_enabled_for_test(&self) -> bool {
+        self.agent_bridge.enabled
+    }
+
+    /// The Agent window's log as (raw line, outcome) pairs, for the harness
+    /// test that asserts commands are recorded verbatim.
+    #[doc(hidden)]
+    pub fn agent_log_for_test(&self) -> Vec<(String, String)> {
+        self.agent_bridge
+            .log
+            .iter()
+            .map(|e| (e.raw.clone(), e.outcome.clone()))
+            .collect()
+    }
+
+    /// The active sheet's view, for tests that compute panel aggregates
+    /// through the same read path the panel itself uses.
+    #[doc(hidden)]
+    pub fn wb_view_for_test(&self) -> crate::sheet_view::SheetView<'_> {
+        self.wb.view()
     }
 
     /// True only for the launch state that has no workbook to show: nothing
@@ -3134,63 +3316,81 @@ impl FerrixApp {
         let mut do_copy = false;
         let mut do_cut = false;
         let mut do_clear = false;
-        let mut do_insert_row = false;
+        let mut do_insert_row_above = false;
+        let mut do_insert_row_below = false;
         let mut do_delete_row = false;
-        let mut do_insert_col = false;
+        let mut do_insert_col_left = false;
+        let mut do_insert_col_right = false;
         let mut do_delete_col = false;
         let mut do_set_print_area = false;
         let mut insert_comment = false;
         let mut delete_comment = false;
         let mut close = false;
+        // True on frames a nested Insert submenu is open. A click into a
+        // submenu lands outside the parent menu's rect, so without this the
+        // click-outside dismissal would fire and the submenu could never be used.
+        let mut submenu_open = false;
 
         let resp = egui::Area::new(egui::Id::new("ferrix_cell_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(self.context_pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(190.0);
+                    ui.set_min_width(CONTEXT_MENU_WIDTH);
                     let heading = if multi {
                         format!("{} selected", cell_label(cell))
                     } else {
                         cell_label(cell)
                     };
-                    ui.label(RichText::new(heading).weak().size(11.0));
-                    ui.separator();
+                    context_menu_heading(ui, heading);
 
                     // Clipboard. Paste is intentionally absent: egui exposes no
                     // clipboard-read API (it only delivers a Paste event on
                     // Ctrl+V), so a menu item could not read the clipboard. The
                     // item would have to lie or do nothing; Ctrl+V stays the way
                     // to paste and the menu says so.
-                    if ui.button("Copy").clicked() {
+                    if context_menu_item(ui, "Copy") {
                         do_copy = true;
                     }
-                    if ui.button("Cut").clicked() {
+                    if context_menu_item(ui, "Cut") {
                         do_cut = true;
                     }
-                    if ui.button("Clear Contents").clicked() {
+                    if context_menu_item(ui, "Clear Contents") {
                         do_clear = true;
                     }
-                    ui.add_enabled(false, egui::Button::new("Paste  (Ctrl+V)"));
+                    context_menu_item_enabled(ui, false, "Paste  (Ctrl+V)");
                     ui.separator();
 
-                    // Structure.
-                    if ui.button("Insert row(s)").clicked() {
-                        do_insert_row = true;
-                    }
-                    if ui.button("Delete row(s)").clicked() {
+                    // Structure. Insert nests direction so the four choices —
+                    // rows above/below, columns left/right — are one hover away
+                    // rather than four flat items.
+                    let (_, row_sub_open) = context_submenu(ui, "ins_row", "Insert row", |ui| {
+                        if context_menu_item(ui, "Above") {
+                            do_insert_row_above = true;
+                        }
+                        if context_menu_item(ui, "Below") {
+                            do_insert_row_below = true;
+                        }
+                    });
+                    let (_, col_sub_open) = context_submenu(ui, "ins_col", "Insert column", |ui| {
+                        if context_menu_item(ui, "Left") {
+                            do_insert_col_left = true;
+                        }
+                        if context_menu_item(ui, "Right") {
+                            do_insert_col_right = true;
+                        }
+                    });
+                    submenu_open = row_sub_open || col_sub_open;
+                    if context_menu_item(ui, "Delete row(s)") {
                         do_delete_row = true;
                     }
-                    if ui.button("Insert column(s)").clicked() {
-                        do_insert_col = true;
-                    }
-                    if ui.button("Delete column(s)").clicked() {
+                    if context_menu_item(ui, "Delete column(s)") {
                         do_delete_col = true;
                     }
                     ui.separator();
 
                     // Print / comment.
-                    if ui.button("Set Print Area").clicked() {
+                    if context_menu_item(ui, "Set Print Area") {
                         do_set_print_area = true;
                     }
                     let comment_label = if has_comment {
@@ -3198,21 +3398,21 @@ impl FerrixApp {
                     } else {
                         "Insert Comment…"
                     };
-                    if ui.button(comment_label).clicked() {
+                    if context_menu_item(ui, comment_label) {
                         insert_comment = true;
                     }
-                    if ui
-                        .add_enabled(has_comment, egui::Button::new("Delete Comment"))
-                        .clicked()
-                    {
+                    if context_menu_item_enabled(ui, has_comment, "Delete Comment") {
                         delete_comment = true;
                     }
                 });
             });
 
         // Dismiss on Escape, or on a click anywhere outside the menu. Without
-        // the second the menu would be modal in practice.
+        // the second the menu would be modal in practice. A click into an open
+        // submenu lands outside the parent rect, so suppress the outside-close
+        // while a submenu is open — the submenu's own item handles the action.
         let clicked_outside = ctx.input(|i| i.pointer.any_click())
+            && !submenu_open
             && !resp.response.rect.contains(
                 ctx.input(|i| i.pointer.interact_pos())
                     .unwrap_or(egui::Pos2::ZERO),
@@ -3234,16 +3434,24 @@ impl FerrixApp {
             self.clear_selection();
             close = true;
         }
-        if do_insert_row {
-            self.run_command(crate::command::CommandId::DataInsertRow);
+        if do_insert_row_above {
+            self.insert_rows_above_selection();
+            close = true;
+        }
+        if do_insert_row_below {
+            self.insert_rows_below_selection();
             close = true;
         }
         if do_delete_row {
             self.run_command(crate::command::CommandId::DataDeleteRow);
             close = true;
         }
-        if do_insert_col {
-            self.run_command(crate::command::CommandId::DataInsertColumn);
+        if do_insert_col_left {
+            self.insert_cols_left_selection();
+            close = true;
+        }
+        if do_insert_col_right {
+            self.insert_cols_right_selection();
             close = true;
         }
         if do_delete_col {
@@ -3675,12 +3883,30 @@ impl FerrixApp {
         };
 
         let kind = self.chart.kind;
+        // A fresh chart from a new grid selection derives its columns from that
+        // selection, so drop any explicit picks left over from a previous one —
+        // including extra series and custom text, which described the OLD data.
+        self.chart.y_col = None;
+        self.chart.x_col = None;
+        self.chart.extra_y_cols.clear();
+        self.chart.title_override = None;
+        self.chart.x_label_override = None;
+        self.chart.y_label_override = None;
+        self.chart.series_override = None;
         {
             let view = self.wb.view();
             self.chart.build(&view, sel, kind);
         }
         self.chart.open = true;
         self.status = self.chart.status.clone();
+    }
+
+    /// What the chart panel is currently charting, for tests: `(open, source
+    /// selection)`. Lets a harness prove the full "select a column → chart it"
+    /// flow builds from the selection, without reaching into private state.
+    #[doc(hidden)]
+    pub fn chart_state_for_test(&self) -> (bool, Option<Selection>) {
+        (self.chart.open, self.chart.source)
     }
 
     /// Rebuild the chart from its stored source range, after a kind change.
@@ -3693,6 +3919,97 @@ impl FerrixApp {
             }
             self.status = self.chart.status.clone();
         }
+    }
+
+    /// Set the chart's kind and rebuild — what the chart window's kind
+    /// buttons do, exposed so a headless agent can drive the same flow.
+    pub fn set_chart_kind(&mut self, kind: crate::chart_panel::ChartKind) {
+        self.chart.kind = kind;
+        self.rebuild_chart();
+    }
+
+    /// Set the chart's Y (values) column and rebuild (issue #106).
+    ///
+    /// This is what the chart window's Y picker applies, so the chart can be
+    /// re-aimed at a different data column without reselecting in the grid.
+    pub fn set_chart_y_col(&mut self, col: u32) {
+        self.chart.y_col = Some(col);
+        self.rebuild_chart();
+    }
+
+    /// Set the chart's X (category/labels) column and rebuild, or clear it
+    /// (None = "(row number)", i.e. plot against the row index).
+    pub fn set_chart_x_col(&mut self, col: Option<u32>) {
+        self.chart.x_col = col;
+        self.rebuild_chart();
+    }
+
+    /// The chart's current Y (values) column, resolving the selection-derived
+    /// default when no explicit pick has been made.
+    pub fn chart_y_col(&self) -> Option<u32> {
+        self.chart.y_col.or_else(|| {
+            self.chart.source.map(|s| {
+                let (tl, br) = s.bounds();
+                br.col.min(tl.col + 1).max(tl.col)
+            })
+        })
+    }
+
+    /// The chart's current X (category) column: the explicit pick, else the
+    /// selection's leading column when it differs from the value column, else
+    /// None (plot against the row number).
+    pub fn chart_x_col(&self) -> Option<u32> {
+        if self.chart.x_col.is_some() {
+            return self.chart.x_col;
+        }
+        let sel = self.chart.source?;
+        let (tl, br) = sel.bounds();
+        if br.col > tl.col {
+            Some(tl.col)
+        } else {
+            None
+        }
+    }
+
+    /// Header names for every data column in the sheet, as
+    /// `(index, "header · Letter")`, for the chart's column-picker dropdowns.
+    pub fn chart_column_choices(&self) -> Vec<(u32, String)> {
+        let view = self.wb.view();
+        let n = view.col_count() as u32;
+        (0..n)
+            .map(|c| {
+                let h = view.header_or_letter(c as usize);
+                let letter = ferrix_core::column_name(c);
+                let label = if h == letter {
+                    letter
+                } else {
+                    format!("{h} · {letter}")
+                };
+                (c, label)
+            })
+            .collect()
+    }
+
+    /// The chart's SVG export, exactly what the Export button writes, minus
+    /// the file dialog a headless agent cannot answer. `None` when no chart
+    /// scene has been built.
+    #[doc(hidden)]
+    pub fn chart_svg_for_test(&self, w: f32, h: f32) -> Option<String> {
+        self.chart.to_svg(w, h)
+    }
+
+    /// Direct access to the chart panel, for tests that drive the series
+    /// list and label overrides the chart window's controls edit.
+    #[doc(hidden)]
+    pub fn chart_mut_for_test(&mut self) -> &mut crate::chart_panel::ChartPanel {
+        &mut self.chart
+    }
+
+    /// Rebuild the chart from its stored source, for tests — the same thing
+    /// every chart-window control does after changing panel state.
+    #[doc(hidden)]
+    pub fn rebuild_chart_for_test(&mut self) {
+        self.rebuild_chart();
     }
 
     /// Write the current chart, annotations included, to an SVG file.
@@ -3773,6 +4090,231 @@ impl FerrixApp {
                         .size(11.0)
                         .color(th.text_dim),
                 );
+
+                // --- data column pickers (issue #106) ---
+                //
+                // Show WHICH columns feed the chart and let them be changed in
+                // place — no closing the window and reselecting in the grid.
+                // Y is the values column; X is the category/labels column (or
+                // "(row number)" to plot against the row index). The pickers
+                // list every column by its header, and the two need not be
+                // adjacent, so you can chart e.g. region against revenue.
+                let choices = self.chart_column_choices();
+                let cur_y = self.chart_y_col();
+                let cur_x = self.chart_x_col();
+                let label_of = |c: u32| -> String {
+                    choices
+                        .iter()
+                        .find(|(i, _)| *i == c)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| ferrix_core::column_name(c))
+                };
+                let mut set_y: Option<u32> = None;
+                let mut set_x: Option<Option<u32>> = None;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Y (values)")
+                            .size(11.0)
+                            .color(th.text_dim),
+                    );
+                    let y_text = cur_y.map(label_of).unwrap_or_else(|| "—".to_string());
+                    egui::ComboBox::from_id_salt("chart_y_col")
+                        .selected_text(y_text)
+                        .show_ui(ui, |ui| {
+                            for (i, lbl) in &choices {
+                                if ui.selectable_label(cur_y == Some(*i), lbl).clicked() {
+                                    set_y = Some(*i);
+                                }
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("X (labels)")
+                            .size(11.0)
+                            .color(th.text_dim),
+                    );
+                    let x_text = cur_x
+                        .map(label_of)
+                        .unwrap_or_else(|| "(row number)".to_string());
+                    egui::ComboBox::from_id_salt("chart_x_col")
+                        .selected_text(x_text)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(cur_x.is_none(), "(row number)")
+                                .clicked()
+                            {
+                                set_x = Some(None);
+                            }
+                            for (i, lbl) in &choices {
+                                if ui.selectable_label(cur_x == Some(*i), lbl).clicked() {
+                                    set_x = Some(Some(*i));
+                                }
+                            }
+                        });
+                });
+                if let Some(c) = set_y {
+                    self.set_chart_y_col(c);
+                }
+                if let Some(c) = set_x {
+                    self.set_chart_x_col(c);
+                }
+
+                // --- extra series (multi-variable charts) ---
+                //
+                // Every extra Y column is one more series on the chart, with
+                // its own colour and legend entry. Line and bar honour them;
+                // histogram/scatter are single-series by nature.
+                let mut drop_series: Option<usize> = None;
+                let mut add_series: Option<u32> = None;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Series")
+                            .size(11.0)
+                            .color(th.text_dim),
+                    );
+                    for (i, c) in self.chart.extra_y_cols.iter().enumerate() {
+                        let color = crate::chart_panel::SERIES_COLORS
+                            [(i + 1) % crate::chart_panel::SERIES_COLORS.len()];
+                        let swatch = egui::Color32::from_rgb(color.0, color.1, color.2);
+                        if ui
+                            .button(
+                                egui::RichText::new(format!("{} ✕", label_of(*c)))
+                                    .size(11.0)
+                                    .color(swatch),
+                            )
+                            .on_hover_text("Remove this series")
+                            .clicked()
+                        {
+                            drop_series = Some(i);
+                        }
+                    }
+                    let at_cap = self.chart.extra_y_cols.len() + 1
+                        >= crate::chart_panel::SERIES_COLORS.len();
+                    let single_series_kind = matches!(
+                        self.chart.kind,
+                        crate::chart_panel::ChartKind::Histogram
+                            | crate::chart_panel::ChartKind::Scatter
+                    );
+                    if at_cap || single_series_kind {
+                        let why = if single_series_kind {
+                            "Histogram and scatter plot one series; switch to line or bar to overlay more"
+                        } else {
+                            "At the series limit"
+                        };
+                        ui.add_enabled(false, egui::Button::new("+ add"))
+                            .on_disabled_hover_text(why);
+                    } else {
+                        egui::ComboBox::from_id_salt("chart_add_series")
+                            .selected_text("+ add")
+                            .width(64.0)
+                            .show_ui(ui, |ui| {
+                                for (i, lbl) in &choices {
+                                    let taken = cur_y == Some(*i)
+                                        || self.chart.extra_y_cols.contains(i);
+                                    if !taken && ui.selectable_label(false, lbl).clicked() {
+                                        add_series = Some(*i);
+                                    }
+                                }
+                            });
+                    }
+                });
+                if let Some(i) = drop_series {
+                    self.chart.extra_y_cols.remove(i);
+                    rebuild = true;
+                }
+                if let Some(c) = add_series {
+                    self.chart.extra_y_cols.push(c);
+                    rebuild = true;
+                }
+
+                // --- chart text (title, axis names, series name) ---
+                //
+                // The user's words beat the generated ones: type "Profit by
+                // Region" over "H by G" and it sticks — through rebuilds,
+                // kind switches, re-aims, and into the SVG export. Clearing
+                // a field brings the generated default back.
+                let scene_text = self.chart.scene.as_ref().map(|s| {
+                    (
+                        s.title.clone().unwrap_or_default(),
+                        s.x_label.clone().unwrap_or_default(),
+                        s.y_label.clone().unwrap_or_default(),
+                    )
+                });
+                if let Some((cur_title, cur_x_label, cur_y_label)) = scene_text {
+                    let mut title_buf = self
+                        .chart
+                        .title_override
+                        .clone()
+                        .unwrap_or(cur_title);
+                    let mut x_buf = self
+                        .chart
+                        .x_label_override
+                        .clone()
+                        .unwrap_or(cur_x_label);
+                    let mut y_buf = self
+                        .chart
+                        .y_label_override
+                        .clone()
+                        .unwrap_or(cur_y_label);
+                    let mut text_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Title")
+                                .size(11.0)
+                                .color(th.text_dim),
+                        );
+                        let w = ((ui.available_width() - 150.0) * 0.5).max(120.0);
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut title_buf)
+                                    .desired_width(w),
+                            )
+                            .changed()
+                        {
+                            self.chart.title_override =
+                                non_empty(&title_buf);
+                            text_changed = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("X")
+                                .size(11.0)
+                                .color(th.text_dim),
+                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut x_buf)
+                                    .desired_width((w * 0.5).max(70.0)),
+                            )
+                            .changed()
+                        {
+                            self.chart.x_label_override = non_empty(&x_buf);
+                            text_changed = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("Y")
+                                .size(11.0)
+                                .color(th.text_dim),
+                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut y_buf)
+                                    .desired_width((w * 0.5).max(70.0)),
+                            )
+                            .changed()
+                        {
+                            self.chart.y_label_override = non_empty(&y_buf);
+                            text_changed = true;
+                        }
+                    });
+                    if text_changed {
+                        // An override edit re-applies text over the existing
+                        // scene; a CLEARED override needs the generated text
+                        // back, which only a rebuild recomputes.
+                        rebuild = true;
+                    }
+                }
+
                 ui.separator();
 
                 let avail = ui.available_size();
@@ -6822,6 +7364,13 @@ impl FerrixApp {
         self.selection
     }
 
+    /// Whether filter mode is on (search bar filtering rows). Exposed for the
+    /// harness test that drives the `DataFilter` command through `run_command`.
+    #[doc(hidden)]
+    pub fn is_filtering_for_test(&self) -> bool {
+        self.search_filter_mode
+    }
+
     /// Type into the formula bar, as the TextEdit's `changed()` branch does.
     pub fn set_formula_input(&mut self, text: &str) {
         self.formula_input = text.to_string();
@@ -6923,6 +7472,25 @@ impl FerrixApp {
         self.apply_structural(outcome);
     }
 
+    /// Insert as many rows as the selection is tall, ABOVE it (the selection's
+    /// first row keeps its content and slides down). Same as the default
+    /// insert; named for the directional context-menu items.
+    pub fn insert_rows_above_selection(&mut self) {
+        self.insert_rows_at_selection();
+    }
+
+    /// Insert as many rows as the selection is tall, BELOW it — at the display
+    /// position just past the selection's last row.
+    pub fn insert_rows_below_selection(&mut self) {
+        let (a, count) = self.selected_row_span();
+        let at = a + count;
+        let outcome = self
+            .wb
+            .insert_rows(at, count)
+            .map(|()| format!("Inserted {count} row(s) below, at row {}", at + 1));
+        self.apply_structural(outcome);
+    }
+
     pub fn delete_rows_at_selection(&mut self) {
         let (at, count) = self.selected_row_span();
         let outcome = self
@@ -6937,6 +7505,26 @@ impl FerrixApp {
         let outcome = self.wb.insert_columns(at, count).map(|()| {
             format!(
                 "Inserted {count} column(s) at {}",
+                ferrix_core::column_name(at as u32)
+            )
+        });
+        self.apply_structural(outcome);
+    }
+
+    /// Insert as many columns as the selection is wide, to its LEFT (same as
+    /// the default insert; named for the directional context-menu items).
+    pub fn insert_cols_left_selection(&mut self) {
+        self.insert_columns_at_selection();
+    }
+
+    /// Insert as many columns as the selection is wide, to its RIGHT — at the
+    /// display position just past the selection's last column.
+    pub fn insert_cols_right_selection(&mut self) {
+        let (a, count) = self.selected_col_span();
+        let at = a + count;
+        let outcome = self.wb.insert_columns(at, count).map(|()| {
+            format!(
+                "Inserted {count} column(s) to the right, at {}",
                 ferrix_core::column_name(at as u32)
             )
         });
@@ -7834,12 +8422,36 @@ impl FerrixApp {
                                     continue;
                                 }
 
+                                // Active tab: the grid background plus a 2px
+                                // accent edge along its top — shape and text
+                                // weight, not colour alone. Inactive: flat,
+                                // muted.
+                                let is_active = *id == active;
+                                let tab_text = if is_active {
+                                    RichText::new(name.as_str()).color(th.text).strong()
+                                } else {
+                                    RichText::new(name.as_str()).color(th.text_dim)
+                                };
                                 let resp = ui
-                                    .selectable_label(*id == active, name.as_str())
+                                    .add(egui::Button::new(tab_text).fill(if is_active {
+                                        th.bg
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    }))
                                     .on_hover_text(
                                         "Click to switch · double-click to rename · \
                                          drag to reorder · right-click for more",
                                     );
+                                if is_active {
+                                    let r = resp.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(r.left() + 2.0, r.top()),
+                                            egui::pos2(r.right() - 2.0, r.top()),
+                                        ],
+                                        egui::Stroke::new(2.0_f32, th.accent),
+                                    );
+                                }
                                 if resp.clicked() {
                                     switch_to = Some(*id);
                                 }
@@ -8047,9 +8659,61 @@ impl FerrixApp {
         self.scroll_to_selection();
     }
 
-    // ========================================================================
-    // Issue #34: Remove Duplicates, Subtotals, Consolidate
-    // ========================================================================
+    /// Cycle a column's sort (asc -> desc -> none), non-additive. Exposed so a
+    /// harness test can exercise sort SEMANTICS through the same entry point the
+    /// header menu calls, without depending on where that menu happens to open.
+    #[doc(hidden)]
+    pub fn cycle_sort_for_test(&mut self, col: usize) {
+        self.sort_by_column(col, false);
+    }
+
+    /// Sort a column to an explicit direction (not a cycle): used by the header
+    /// menu's "Sort ascending"/"Sort descending" items, which name the outcome
+    /// rather than toggling. Clears any existing keys first so the chosen column
+    /// becomes the sole sort key in the requested direction.
+    pub fn sort_column_to(&mut self, col: usize, dir: ferrix_core::SortDir) {
+        if let Some(d) = self
+            .wb
+            .protection()
+            .deny_action(ferrix_core::ProtectAction::Sort)
+        {
+            self.status = format!("Sort refused — {d}");
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        // Land on `dir` regardless of the current state: cycle_click toggles, so
+        // reset first and drive it to the wanted direction deterministically.
+        self.sort_keys.clear();
+        ferrix_core::cycle_click(&mut self.sort_keys, col as u32, false); // -> Asc
+        if dir == ferrix_core::SortDir::Desc {
+            ferrix_core::cycle_click(&mut self.sort_keys, col as u32, false); // Asc -> Desc
+        }
+        self.rebuild_sort_order();
+        self.status = match dir {
+            ferrix_core::SortDir::Asc => format!(
+                "Sorted by {} ascending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+            ferrix_core::SortDir::Desc => format!(
+                "Sorted by {} descending — a view only; no data moved",
+                ferrix_core::column_name(col as u32)
+            ),
+        };
+        self.scroll_to_selection();
+    }
+
+    /// Clear all sort keys, restoring the original row order.
+    pub fn clear_sort(&mut self) {
+        if self.sort_keys.is_empty() {
+            return;
+        }
+        self.sort_keys.clear();
+        self.rebuild_sort_order();
+        self.status = "Sort cleared — original order restored".to_string();
+        self.scroll_to_selection();
+    }
 
     /// Cap on rows one Remove Duplicates can drop in a single undo step.
     ///
@@ -8577,6 +9241,581 @@ impl FerrixApp {
         self.header_menu = Some((col, egui::pos2(0.0, 0.0)));
     }
 
+    /// Toggle the agent bridge on/off (View → Agent bridge). Attaching names
+    /// the watched file in the status line so the user knows exactly what is
+    /// listening; only commands appended AFTER this moment execute.
+    pub(crate) fn toggle_agent_bridge(&mut self) {
+        if self.agent_bridge.enabled {
+            self.agent_bridge.detach();
+            self.status = "Agent bridge OFF".into();
+            return;
+        }
+        let Some(src) = &self.source_path else {
+            self.status = "Agent bridge needs an open file to derive its command path".into();
+            return;
+        };
+        let mut watch = src.as_os_str().to_owned();
+        watch.push(".fxagent");
+        let watch = std::path::PathBuf::from(watch);
+        self.agent_bridge
+            .attach(watch.clone(), std::time::Duration::from_millis(80));
+        self.agent_window_open = true;
+        self.status = format!(
+            "Agent bridge ON — watching {} (View → Agent bridge to stop)",
+            watch.display()
+        );
+    }
+
+    /// Execute pending agent commands, one per frame, VISIBLY: the selection
+    /// moves on screen, edits run through the exact commit path typing uses
+    /// (validation, undo, recalc, status), and every step lands in the status
+    /// line — which is also what the Selection panel's activity log records.
+    fn agent_bridge_frame(&mut self, ctx: &egui::Context) {
+        if !self.agent_bridge.enabled {
+            return;
+        }
+        // Keep frames coming while the bridge listens, so commands appended
+        // while the window is idle still execute promptly.
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+
+        use crate::agent_bridge::AgentCmd;
+        let (raw, cmd) = match self.agent_bridge.tick() {
+            Ok(Some(item)) => item,
+            Ok(None) => return,
+            Err(e) => {
+                self.status = format!("Agent bridge: {e}");
+                self.agent_bridge.push_log("<parse error>".into(), e);
+                return;
+            }
+        };
+        let status_before = self.status.clone();
+        match cmd {
+            AgentCmd::Select(range) => match parse_a1_selection(&range) {
+                Some(sel) => {
+                    self.selection = sel;
+                    self.scroll_to_selection();
+                    self.sync_formula_bar();
+                    self.status = format!("Agent: selected {range}");
+                }
+                None => self.status = format!("Agent: bad range {range:?}"),
+            },
+            AgentCmd::Put { cell, text } => match ferrix_core::CellRef::from_a1(&cell) {
+                Some(cref) => {
+                    // The same visible flow as typing: move there, then commit
+                    // through the validation/undo/status chokepoint.
+                    self.selection.move_to(cref);
+                    self.scroll_to_selection();
+                    self.begin_edit(cref, Some(text));
+                    self.commit_edit();
+                }
+                None => self.status = format!("Agent: bad cell {cell:?}"),
+            },
+            AgentCmd::Get(range) => match parse_a1_selection(&range) {
+                Some(sel) => {
+                    self.selection = sel;
+                    self.scroll_to_selection();
+                    let (tl, br) = sel.bounds();
+                    let mut out = String::new();
+                    for r in tl.row..=br.row {
+                        let mut first = true;
+                        for c in tl.col..=br.col {
+                            if !first {
+                                out.push('\t');
+                            }
+                            first = false;
+                            out.push_str(&self.display(CellRef::new(r, c)));
+                        }
+                        out.push('\n');
+                    }
+                    if let Some(path) = self.agent_bridge.out_path() {
+                        use std::io::Write;
+                        let ok = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .and_then(|mut f| f.write_all(out.as_bytes()));
+                        self.status = match ok {
+                            Ok(()) => format!("Agent: read {range} → {}", path.display()),
+                            Err(e) => format!("Agent: get failed: {e}"),
+                        };
+                    }
+                }
+                None => self.status = format!("Agent: bad range {range:?}"),
+            },
+            AgentCmd::Chart { range, kind, x_col } => match parse_a1_selection(&range) {
+                Some(sel) => {
+                    self.selection = sel;
+                    self.scroll_to_selection();
+                    self.open_chart();
+                    if let Some(k) = kind {
+                        use crate::chart_panel::ChartKind;
+                        let kind = match k.as_str() {
+                            "bar" => Some(ChartKind::Bar),
+                            "line" => Some(ChartKind::Line),
+                            "histogram" => Some(ChartKind::Histogram),
+                            "scatter" => Some(ChartKind::Scatter),
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            self.set_chart_kind(kind);
+                        }
+                    }
+                    if let Some(xs) = x_col {
+                        // A column letter (or A1 cell whose column is used).
+                        let col = ferrix_core::CellRef::from_a1(&format!("{xs}1"))
+                            .map(|c| c.col)
+                            .or_else(|| ferrix_core::CellRef::from_a1(&xs).map(|c| c.col));
+                        if let Some(col) = col {
+                            self.set_chart_x_col(Some(col));
+                        }
+                    }
+                    self.status = format!("Agent: charted {range}");
+                }
+                None => self.status = format!("Agent: bad range {range:?}"),
+            },
+            AgentCmd::Label {
+                title,
+                x,
+                y,
+                series,
+            } => {
+                if self.chart.scene.is_none() {
+                    self.status = "Agent: no chart open to label".into();
+                } else {
+                    let labels = crate::chart_panel::ChartLabels {
+                        title: title.unwrap_or_default(),
+                        x_axis: x.unwrap_or_default(),
+                        y_axis: y.unwrap_or_default(),
+                        series: series.unwrap_or_default(),
+                    };
+                    self.chart.set_custom_labels(labels);
+                    self.status = "Agent: chart labels set".into();
+                }
+            }
+            AgentCmd::Series(cols) => {
+                let mut parsed = Vec::new();
+                let mut bad = None;
+                for c in &cols {
+                    // A column letter ("I") or an A1 cell whose column is used.
+                    let col = ferrix_core::CellRef::from_a1(&format!("{c}1"))
+                        .map(|r| r.col)
+                        .or_else(|| ferrix_core::CellRef::from_a1(c).map(|r| r.col));
+                    match col {
+                        Some(col) => parsed.push(col),
+                        None => bad = Some(c.clone()),
+                    }
+                }
+                match bad {
+                    Some(b) => self.status = format!("Agent: bad series column {b:?}"),
+                    None => {
+                        self.chart.extra_y_cols = parsed;
+                        self.rebuild_chart();
+                        self.status = format!(
+                            "Agent: {} series on the chart",
+                            self.chart.extra_y_cols.len() + 1
+                        );
+                    }
+                }
+            }
+            AgentCmd::Svg(path) => {
+                let svg = self.chart.to_svg(1200.0, 600.0);
+                self.status = match svg {
+                    Some(svg) => match std::fs::write(&path, svg) {
+                        Ok(()) => format!("Agent: chart exported → {}", path.display()),
+                        Err(e) => format!("Agent: export failed: {e}"),
+                    },
+                    None => "Agent: no chart to export".into(),
+                };
+            }
+        }
+        // The verbatim line plus what came of it, for the Agent window's log.
+        // `put` routes through the normal commit path whose status ("H1
+        // updated (…)") is the honest outcome; if the status did not move,
+        // record that too rather than inventing one.
+        let outcome = if self.status == status_before {
+            "(no status change)".to_string()
+        } else {
+            self.status.clone()
+        };
+        self.agent_bridge.push_log(raw, outcome);
+    }
+
+    /// The Agent window: the verbatim execution log (every command line the
+    /// agent wrote, formulas included, with its outcome), a prompt box, and a
+    /// harness-agnostic Launch button driven by the `agent_command` prefs
+    /// template. Shown whenever the bridge is on (View → Agent bridge).
+    fn show_agent_window(&mut self, ctx: &egui::Context) {
+        if !self.agent_window_open {
+            return;
+        }
+        let th = self.theme;
+
+        // A launched agent that exited gets reported once, honestly.
+        if let Some(child) = &mut self.agent_child {
+            if let Ok(Some(code)) = child.try_wait() {
+                self.status = format!("Agent process exited ({code})");
+                self.agent_child = None;
+            }
+        }
+
+        let mut open = self.agent_window_open;
+        let mut launch_requested = false;
+        egui::Window::new("Agent")
+            .open(&mut open)
+            .default_width(460.0)
+            .default_height(360.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                // ---- status line: watched file + count ----
+                let watching = self
+                    .agent_bridge
+                    .watch_path()
+                    .map(|p| p.display().to_string());
+                match (&watching, self.agent_bridge.enabled) {
+                    (Some(w), true) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "listening · {} · {} command{} run",
+                                w,
+                                self.agent_bridge.executed,
+                                if self.agent_bridge.executed == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            ))
+                            .color(th.text_dim)
+                            .size(11.5),
+                        );
+                    }
+                    _ => {
+                        ui.label(
+                            egui::RichText::new("bridge off — View → Agent bridge to listen")
+                                .color(th.text_dim)
+                                .size(11.5),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+
+                // ---- the verbatim log ----
+                let row_h = 16.0;
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - 88.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.agent_bridge.log.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No commands yet. Every line the agent runs will \
+                                     appear here verbatim — formulas included.",
+                                )
+                                .color(th.text_dim)
+                                .italics(),
+                            );
+                        }
+                        for entry in &self.agent_bridge.log {
+                            ui.horizontal(|ui| {
+                                ui.set_min_height(row_h);
+                                ui.label(
+                                    egui::RichText::new(format!("t+{:6.1}s", entry.at_secs))
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(th.text_dim),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&entry.raw)
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(th.text),
+                                );
+                            });
+                            // The outcome, indented under the command.
+                            ui.horizontal(|ui| {
+                                ui.add_space(64.0);
+                                let err = entry.outcome.contains("bad ")
+                                    || entry.outcome.contains("failed")
+                                    || entry.outcome.contains("error");
+                                ui.label(
+                                    egui::RichText::new(format!("→ {}", entry.outcome))
+                                        .size(10.5)
+                                        .color(if err { th.error } else { th.text_dim }),
+                                );
+                            });
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.separator();
+
+                // ---- prompt + harness-agnostic launch ----
+                let template = self.prefs.agent_command.trim().to_string();
+                ui.horizontal(|ui| {
+                    let hint = if template.is_empty() {
+                        "set agent_command in prefs to launch from here"
+                    } else {
+                        "ask the agent to do something with this sheet…"
+                    };
+                    let edit = egui::TextEdit::singleline(&mut self.agent_prompt)
+                        .hint_text(hint)
+                        .desired_width(ui.available_width() - 76.0);
+                    let resp = ui.add(edit);
+                    let can_launch = !template.is_empty()
+                        && !self.agent_prompt.trim().is_empty()
+                        && self.agent_child.is_none()
+                        && self.agent_bridge.enabled;
+                    let go = ui.add_enabled(can_launch, egui::Button::new("Launch"));
+                    let why = if template.is_empty() {
+                        "No launch template. Set e.g. `agent_command = \"claude -p {prompt}\"` \
+                         in prefs.toml — any agent CLI works."
+                    } else if !self.agent_bridge.enabled {
+                        "The bridge is off; toggle View → Agent bridge first."
+                    } else if self.agent_child.is_some() {
+                        "An agent is already running."
+                    } else {
+                        "Runs your agent CLI with this prompt plus the bridge protocol."
+                    };
+                    let go = go.on_hover_text(why);
+                    let submitted = resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && can_launch;
+                    if go.clicked() || submitted {
+                        launch_requested = true;
+                    }
+                });
+                if self.agent_child.is_some() {
+                    ui.label(
+                        egui::RichText::new("agent running…")
+                            .color(th.accent)
+                            .size(10.5),
+                    );
+                }
+            });
+        self.agent_window_open = open;
+
+        if launch_requested {
+            self.launch_agent();
+        }
+    }
+
+    /// Start the configured agent CLI with the composed prompt. The template
+    /// is split into argv FIRST and placeholders substituted per-token —
+    /// never through a shell — so prompt content cannot become arguments.
+    /// Harness-agnostic by construction: Hermes, Claude Code, Codex, or any
+    /// script that can append lines to a file will do.
+    fn launch_agent(&mut self) {
+        use crate::agent_bridge::{protocol_briefing, split_template, substitute};
+        let template = self.prefs.agent_command.trim().to_string();
+        let Some(watch) = self.agent_bridge.watch_path().map(|p| p.to_path_buf()) else {
+            self.status = "Agent launch needs the bridge attached".into();
+            return;
+        };
+        let Some(workbook) = self.source_path.clone() else {
+            self.status = "Agent launch needs an open file".into();
+            return;
+        };
+        let prompt = format!(
+            "{}{}",
+            self.agent_prompt.trim(),
+            protocol_briefing(&watch, &workbook)
+        );
+        let tokens = split_template(&template);
+        let Some((exe, args)) = tokens.split_first() else {
+            self.status = "Agent launch template is empty".into();
+            return;
+        };
+        let mut cmd = std::process::Command::new(exe);
+        for a in args {
+            cmd.arg(substitute(a, &prompt, &watch, &workbook));
+        }
+        // The same values as env vars, for CLIs that prefer them.
+        cmd.env("FERRIX_AGENT_FILE", &watch)
+            .env("FERRIX_WORKBOOK", &workbook)
+            .env("FERRIX_PROMPT", &prompt);
+        match cmd.spawn() {
+            Ok(child) => {
+                self.status = format!("Agent launched: {exe} (pid {})", child.id());
+                self.agent_child = Some(child);
+                self.agent_prompt.clear();
+            }
+            Err(e) => {
+                self.status = format!("Agent launch failed: {e} ({exe})");
+            }
+        }
+    }
+
+    /// The Selection side panel: active range, bounded aggregates, a
+    /// sparkline, and the recent-activity log (DESIGN.md right dock).
+    ///
+    /// Aggregation cost is bounded by `selection_panel::MAX_AGG_CELLS` per
+    /// frame regardless of sheet or selection size, and a capped scan says so
+    /// in the panel. On a narrow window the whole panel steps aside: below
+    /// `MIN_GRID_WIDTH` of remaining grid space it simply does not show, so
+    /// the grid never loses its flexible area to chrome.
+    fn show_selection_panel(&mut self, ctx: &egui::Context) {
+        use crate::selection_panel::{age_label, fmt_stat, SelectionStats};
+
+        // Feed the activity log every frame, open or closed, so history is
+        // there the moment the panel opens.
+        self.selection_panel.observe_status(&self.status);
+
+        if !self.selection_panel.open || self.is_cold_start() {
+            return;
+        }
+        // Yield to the grid on a narrow window rather than squeezing it.
+        const PANEL_WIDTH: f32 = 250.0;
+        const MIN_GRID_WIDTH: f32 = 520.0;
+        if ctx.screen_rect().width() < PANEL_WIDTH + MIN_GRID_WIDTH {
+            return;
+        }
+
+        let th = self.theme;
+        let sel = self.selection;
+        let stats = SelectionStats::compute(&self.wb.view(), sel);
+        let (tl, br) = sel.bounds();
+        let range_label = if sel.is_single() {
+            tl.to_a1()
+        } else {
+            format!("{}:{}", tl.to_a1(), br.to_a1())
+        };
+
+        egui::SidePanel::right("selection_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(th.panel)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .exact_width(PANEL_WIDTH)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Selection").color(th.text).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .button(RichText::new("✕").size(11.0))
+                            .on_hover_text("Close (View → Selection panel)")
+                            .clicked()
+                        {
+                            self.selection_panel.open = false;
+                            self.prefs.selection_panel = false;
+                            self.persist_prefs();
+                        }
+                    });
+                });
+                ui.separator();
+
+                ui.label(RichText::new("ACTIVE RANGE").color(th.text_dim).size(10.0));
+                ui.label(
+                    RichText::new(range_label)
+                        .color(th.accent)
+                        .monospace()
+                        .size(13.0),
+                );
+                ui.add_space(6.0);
+
+                // The stat rows: label left, monospace value right.
+                let stat_row = |ui: &mut egui::Ui, label: &str, value: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).color(th.text_dim).size(12.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(value).color(th.text).monospace().size(12.0));
+                        });
+                    });
+                };
+                stat_row(ui, "Count", fmt_stat(stats.count as f64));
+                if stats.numbers > 0 {
+                    stat_row(ui, "Sum", fmt_stat(stats.sum));
+                    if let Some(avg) = stats.average() {
+                        stat_row(ui, "Average", fmt_stat(avg));
+                    }
+                    if let Some(min) = stats.min {
+                        stat_row(ui, "Minimum", fmt_stat(min));
+                    }
+                    if let Some(max) = stats.max {
+                        stat_row(ui, "Maximum", fmt_stat(max));
+                    }
+                }
+                if stats.truncated {
+                    // Not muted: a capped result that LOOKS complete is the
+                    // honesty failure DESIGN.md forbids.
+                    ui.label(
+                        RichText::new(format!(
+                            "first {} cells only — selection is larger",
+                            fmt_int(stats.scanned as usize)
+                        ))
+                        .color(th.error)
+                        .size(11.0),
+                    );
+                }
+
+                // Sparkline of the sampled numeric values, drawn with the
+                // painter on a fixed-height strip.
+                if stats.spark.len() >= 2 {
+                    ui.add_space(8.0);
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, th.bg);
+                    let lo = stats.spark.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let hi = stats
+                        .spark
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let span = (hi - lo).max(f64::EPSILON);
+                    let n = stats.spark.len();
+                    let pts: Vec<egui::Pos2> = stats
+                        .spark
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let x = rect.left() + rect.width() * (i as f32 / (n - 1) as f32);
+                            let t = ((v - lo) / span) as f32;
+                            let y = rect.bottom() - 4.0 - (rect.height() - 8.0) * t;
+                            egui::pos2(x, y)
+                        })
+                        .collect();
+                    ui.painter().add(egui::Shape::line(
+                        pts,
+                        egui::Stroke::new(1.5_f32, th.accent),
+                    ));
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(
+                    RichText::new("RECENT ACTIVITY")
+                        .color(th.text_dim)
+                        .size(10.0),
+                );
+                ui.add_space(2.0);
+                // Activity rows in the reference layout: a muted monospace
+                // age column at the left, the message beside it — a row, not
+                // undifferentiated stacked body text.
+                for entry in self.selection_panel.activity() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [52.0, 14.0],
+                            egui::Label::new(
+                                RichText::new(age_label(entry.at.elapsed().as_secs()))
+                                    .color(th.text_dim)
+                                    .monospace()
+                                    .size(10.0),
+                            ),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&entry.message).color(th.text).size(11.5),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    ui.add_space(3.0);
+                }
+            });
+    }
+
     /// The hide/unhide menu a right-click on a header opens.
     ///
     /// Painted as an egui Area so it floats above the grid; the grid already
@@ -8587,18 +9826,51 @@ impl FerrixApp {
             return;
         };
         let mut close = false;
-        egui::Area::new(egui::Id::new("ferrix_header_menu"))
+        let resp = egui::Area::new(egui::Id::new("ferrix_header_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(
-                        RichText::new(format!("Column {}", ferrix_core::column_name(col as u32)))
-                            .strong(),
+                    ui.set_min_width(CONTEXT_MENU_WIDTH);
+                    context_menu_heading(
+                        ui,
+                        format!("Column {}", ferrix_core::column_name(col as u32)),
                     );
+                    if context_menu_item(ui, "Sort ascending") {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.sort_column_to(col, ferrix_core::SortDir::Asc);
+                        close = true;
+                    }
+                    if context_menu_item(ui, "Sort descending") {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.sort_column_to(col, ferrix_core::SortDir::Desc);
+                        close = true;
+                    }
+                    if context_menu_item(ui, "Clear sort") {
+                        self.clear_sort();
+                        close = true;
+                    }
                     ui.separator();
-                    if ui.button("Hide").clicked() {
+                    // Structure lives here, on the object it acts on — the
+                    // ribbon carries analysis, the right-click carries the
+                    // knife (the cell menu has the same ops for rows).
+                    if context_menu_item(ui, "Insert column left") {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.insert_cols_left_selection();
+                        close = true;
+                    }
+                    if context_menu_item(ui, "Insert column right") {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.insert_cols_right_selection();
+                        close = true;
+                    }
+                    if context_menu_item(ui, "Delete column") {
+                        self.select_column(col as u32, egui::Modifiers::default());
+                        self.run_command(crate::command::CommandId::DataDeleteColumn);
+                        close = true;
+                    }
+                    ui.separator();
+                    if context_menu_item(ui, "Hide") {
                         self.set_col_hidden(col, true);
                         close = true;
                     }
@@ -8608,39 +9880,33 @@ impl FerrixApp {
                     let hidden_left = (0..col).rev().find(|&c| self.is_col_hidden(c));
                     let hidden_right = (col + 1..self.stats_cols).find(|&c| self.is_col_hidden(c));
                     if let Some(h) = hidden_left {
-                        if ui
-                            .button(format!(
-                                "Unhide {} (left)",
-                                ferrix_core::column_name(h as u32)
-                            ))
-                            .clicked()
-                        {
+                        if context_menu_item(
+                            ui,
+                            format!("Unhide {} (left)", ferrix_core::column_name(h as u32)),
+                        ) {
                             self.set_col_hidden(h, false);
                             close = true;
                         }
                     }
                     if let Some(h) = hidden_right {
-                        if ui
-                            .button(format!(
-                                "Unhide {} (right)",
-                                ferrix_core::column_name(h as u32)
-                            ))
-                            .clicked()
-                        {
+                        if context_menu_item(
+                            ui,
+                            format!("Unhide {} (right)", ferrix_core::column_name(h as u32)),
+                        ) {
                             self.set_col_hidden(h, false);
                             close = true;
                         }
                     }
-                    if ui.button("Unhide all columns").clicked() {
+                    if context_menu_item(ui, "Unhide all columns") {
                         self.unhide_all_cols();
                         close = true;
                     }
                     ui.separator();
-                    if ui.button("Autofit width").clicked() {
+                    if context_menu_item(ui, "Autofit width") {
                         self.autofit_column(col);
                         close = true;
                     }
-                    if ui.button("Reset width").clicked() {
+                    if context_menu_item(ui, "Reset width") {
                         self.set_col_width(col, crate::grid::DEFAULT_COL_WIDTH);
                         close = true;
                     }
@@ -8648,40 +9914,38 @@ impl FerrixApp {
                     // Row operations on the current selection, so grouping and
                     // hiding rows are reachable without a second menu.
                     let (r0, r1) = self.selection.row_range();
-                    if ui
-                        .button(format!("Hide rows {}–{}", r0 + 1, r1 + 1))
-                        .clicked()
-                    {
+                    if context_menu_item(ui, format!("Hide rows {}–{}", r0 + 1, r1 + 1)) {
                         self.hide_rows(r0, r1);
                         close = true;
                     }
-                    if ui.button("Unhide all rows").clicked() {
+                    if context_menu_item(ui, "Unhide all rows") {
                         let n = self.wb.view().row_count() as u32;
                         self.unhide_rows(0, n.saturating_sub(1));
                         close = true;
                     }
-                    if ui
-                        .button(format!("Group rows {}–{}", r0 + 1, r1 + 1))
-                        .clicked()
-                    {
+                    if context_menu_item(ui, format!("Group rows {}–{}", r0 + 1, r1 + 1)) {
                         if let Err(e) = self.group_rows(r0, r1) {
                             self.status = format!("Group failed: {e}");
                         }
                         close = true;
                     }
-                    if ui.button("Ungroup rows").clicked() {
+                    if context_menu_item(ui, "Ungroup rows") {
                         if !self.ungroup_rows(r0) {
                             self.status = "No group at that row".to_string();
                         }
                         close = true;
                     }
-                    ui.separator();
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
                 });
             });
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Dismiss like any context menu: Escape, a click anywhere outside,
+        // or the action itself. No "Close" item — a menu you must aim at to
+        // leave is a door with the handle on the wrong side.
+        let clicked_outside = ctx.input(|i| i.pointer.any_click())
+            && !resp.response.rect.contains(
+                ctx.input(|i| i.pointer.interact_pos())
+                    .unwrap_or(egui::Pos2::ZERO),
+            );
+        if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.header_menu = None;
         }
     }
@@ -9640,6 +10904,16 @@ impl FerrixApp {
             C::DataInsertColumn => self.insert_columns_at_selection(),
             C::DataDeleteColumn => self.delete_columns_at_selection(),
             C::DataChart => self.open_chart(),
+            // Sort/Filter as commands. Sort cycles the cursor column through
+            // the same call the header menu uses; Filter opens the search bar
+            // if needed, then toggles filter mode.
+            C::DataSort => self.sort_by_column(self.selection.cursor.col as usize, false),
+            C::DataFilter => {
+                if !self.search_open {
+                    self.search_open = true;
+                }
+                self.toggle_filter_mode();
+            }
             // Issue #34. These call the SAME methods the harness drives, so a
             // test that goes through `run_command` exercises the production
             // dispatch path rather than a parallel entry point.
@@ -9662,7 +10936,18 @@ impl FerrixApp {
             C::ViewZoomReset => self.zoom_reset(),
             C::ViewTheme => self.set_theme(self.theme.mode.toggled()),
             C::ViewEmptyRows => self.set_show_empty_rows(!self.show_empty_rows),
+            C::ViewSelectionPanel => {
+                self.selection_panel.open = !self.selection_panel.open;
+                self.prefs.selection_panel = self.selection_panel.open;
+                self.persist_prefs();
+                self.status = if self.selection_panel.open {
+                    "Selection panel shown".into()
+                } else {
+                    "Selection panel hidden".into()
+                };
+            }
             C::ViewShowFormulas => self.toggle_show_formulas(),
+            C::ViewAgentBridge => self.toggle_agent_bridge(),
             C::ViewPageBreaks => self.toggle_page_breaks(),
             C::ViewInsertPageBreak => self.insert_page_break_at_cursor(),
             C::ViewRemovePageBreak => self.remove_page_break_at_cursor(),
@@ -9682,6 +10967,12 @@ impl FerrixApp {
                 }
             }
             C::EditSelectAll => self.select_all(),
+            // Clipboard from a button: deferred to next frame's `update`, which
+            // has the `ctx` these need to touch the system clipboard. The
+            // Ctrl+C/X/V keystrokes act inline and never come through here.
+            C::EditCopy => self.pending_clipboard = Some(ClipboardAction::Copy),
+            C::EditCut => self.pending_clipboard = Some(ClipboardAction::Cut),
+            C::EditPaste => self.pending_clipboard = Some(ClipboardAction::Paste),
             // Issue #30. Opening the dialog does not paste; the request is
             // assembled first and applied when the user confirms it.
             C::EditPasteSpecial => self.paste_special_open(),
@@ -9974,172 +11265,76 @@ impl FerrixApp {
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(th.panel).inner_margin(8.0))
             .show(ctx, |ui| {
+                // --- ribbon toolbar (issue #102) ---
+                //
+                // Row 1 is the tab bar: brand, tab selectors, right-aligned
+                // progress/stats. Row 2 is the active tab's controls, wrapped
+                // so they reflow instead of overflowing on a narrow window. The
+                // tab bodies are drawn from the same command REGISTRY the menu
+                // bar and palette use, so nothing drifts.
+                let cmd_state = self.command_state();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("FERRIX").color(th.accent).strong().size(15.0));
-                    ui.add_space(12.0);
-                    if ui.button("Open CSV…").clicked() {
-                        chosen_command = Some(crate::command::CommandId::FileOpen);
-                    }
-                    if ui
-                        .button("⬈ Export CSV…")
-                        .on_hover_text("Write this sheet, including edits, to a CSV file")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileExportCsv);
-                    }
-                    if ui
-                        .button("📈 Chart…")
-                        .on_hover_text("Chart the selected range")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::DataChart);
-                    }
-                    ui.separator();
-                    if ui
-                        .button("⬓ Merge")
-                        .on_hover_text("Merge the selection, or unmerge it if already merged")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FormatMerge);
-                    }
-                    self.type_controls(ui, th);
-                    ui.separator();
-                    if ui
-                        .button("Open xlsx…")
-                        .on_hover_text(
-                            "Open a workbook, importing any Excel Tables with their \
-                             validation, formatting, and filters",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileOpenXlsx);
-                    }
-                    if ui
-                        .add_enabled(!self.tables.is_empty(), egui::Button::new("⬈ Export xlsx…"))
-                        .on_hover_text(
-                            "Write this sheet and its table as a real Excel Table, with \
-                             dataValidation, conditionalFormatting, and autoFilter parts",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileExportXlsx);
-                    }
-                    ui.add_space(4.0);
-                    let dirty = self.wb.is_dirty();
-                    if ui
-                        .add_enabled(
-                            dirty && self.edits_path.is_some(),
-                            egui::Button::new(if dirty { "💾 Save*" } else { "💾 Save" }),
-                        )
-                        .on_hover_text("Save edits (Ctrl+S)")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::FileSave);
-                    }
-                    if ui
-                        .add_enabled(self.wb.can_undo(), egui::Button::new("↶ Undo"))
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::EditUndo);
-                    }
-                    if ui
-                        .add_enabled(self.wb.can_redo(), egui::Button::new("↷ Redo"))
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::EditRedo);
-                    }
-                    ui.add_space(4.0);
-                    // --- theme toggle (issue #19) ---
-                    if ui
-                        .button(self.theme.mode.toggle_label())
-                        .on_hover_text("Switch between light and dark. Remembered between runs.")
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewTheme);
-                    }
-                    // --- empty rows toggle (issue #20) ---
-                    if ui
-                        .selectable_label(self.showing_formulas(), "ƒ Formulas")
-                        .on_hover_text(
-                            "Ctrl+` — show formula source instead of values, for this sheet",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewShowFormulas);
-                    }
-                    if ui
-                        .selectable_label(self.show_empty_rows, "⬓ Empty rows")
-                        .on_hover_text(
-                            "Show empty rows past the end of the sheet so there is \
-                             somewhere to type. They are not data: exports, SUM and \
-                             the row count ignore them until you type in one.",
-                        )
-                        .clicked()
-                    {
-                        chosen_command = Some(crate::command::CommandId::ViewEmptyRows);
-                    }
-                    // --- menu bar (issue #40) ---
-                    //
-                    // Every menu is drawn from command::REGISTRY, the same
-                    // table the palette searches. This used to be five
-                    // hand-written closures, which is exactly how a command
-                    // ends up in a menu and nowhere else. Availability, and
-                    // the reason for it, come from the registry too, so a
-                    // greyed item explains itself in both front-ends.
-                    let cmd_state = self.command_state();
-                    for menu in crate::command::Menu::ALL {
-                        ui.menu_button(menu.title(), |ui| {
-                            if let Some(id) = crate::command::menu_items(ui, menu, &cmd_state) {
-                                chosen_command = Some(id);
-                            }
-                        });
-                    }
-
-                    if self.loading {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        // A 10GB conversion takes minutes, so show real
-                        // progress rather than an indefinite spinner.
-                        if self.progress.total > 0 {
-                            let frac = self.progress.done as f32 / self.progress.total as f32;
-                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
-                                format!(
-                                    "{:.0}%  ({:.1}/{:.1} GB)",
-                                    frac * 100.0,
-                                    self.progress.done as f64 / 1e9,
-                                    self.progress.total as f64 / 1e9
-                                ),
-                            ));
+                    ui.add_space(10.0);
+                    // Tabs in the reference treatment: no boxed background —
+                    // the active tab is stronger text plus a restrained 2px
+                    // accent underline; inactive tabs are muted text.
+                    for tab in crate::command::RibbonTab::ALL {
+                        let selected = self.ribbon_tab == tab;
+                        let text = if selected {
+                            RichText::new(tab.title()).color(th.text).strong()
                         } else {
-                            ui.label(RichText::new("opening…").color(th.text_dim));
+                            RichText::new(tab.title()).color(th.text_dim)
+                        };
+                        let resp = ui
+                            .add(egui::Label::new(text).sense(egui::Sense::click()))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let rect = resp.rect;
+                        if selected {
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(rect.left(), rect.bottom() + 5.0),
+                                    egui::pos2(rect.right(), rect.bottom() + 5.0),
+                                ],
+                                egui::Stroke::new(2.0_f32, th.accent),
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(rect.left(), rect.bottom() + 5.0),
+                                    egui::pos2(rect.right(), rect.bottom() + 5.0),
+                                ],
+                                egui::Stroke::new(2.0_f32, th.grid_line),
+                            );
                         }
-                        // Every operation over a second needs a way out that
-                        // is not killing the process.
-                        if ui.button("✖ Cancel").clicked() {
-                            self.cancel_load();
+                        ui.add_space(4.0);
+                        if resp.clicked() {
+                            self.ribbon_tab = tab;
+                            self.prefs.ribbon_tab = tab.slug().to_string();
+                            let _ = self.prefs.save();
                         }
                     }
-
-                    if self.exporting {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        if self.export_progress.total > 0 {
-                            let frac = self.export_progress.done as f32
-                                / self.export_progress.total as f32;
-                            ui.add(egui::ProgressBar::new(frac).desired_width(180.0).text(
-                                format!(
-                                    "export {:.0}%  ({}/{} rows)",
-                                    frac * 100.0,
-                                    fmt_int(self.export_progress.done as usize),
-                                    fmt_int(self.export_progress.total as usize)
-                                ),
-                            ));
-                        } else {
-                            ui.label(RichText::new("exporting…").color(self.theme.text_dim));
+                    // A compact overflow menu keeps the FULL command tree one
+                    // click away without the always-visible menu bar the ribbon
+                    // replaced. Every menu is drawn from the same REGISTRY, so
+                    // it never drifts from the ribbon or the palette.
+                    ui.separator();
+                    ui.menu_button("☰", |ui| {
+                        for menu in crate::command::Menu::ALL {
+                            ui.menu_button(menu.title(), |ui| {
+                                if let Some(id) = crate::command::menu_items(ui, menu, &cmd_state) {
+                                    chosen_command = Some(id);
+                                }
+                            });
                         }
-                        if ui.button("✖ Cancel export").clicked() {
-                            self.cancel_export();
-                        }
-                    }
+                    })
+                    .response
+                    .on_hover_text("All commands, grouped by menu");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // These are telemetry, not controls: on a narrow window
+                        // they TRUNCATE to whatever width is left rather than
+                        // painting over the tab bar (DESIGN.md: telemetry
+                        // yields before core controls; nothing may overlap).
                         if self.stats_rows > 0 {
                             let edits = self.wb.edit_count();
                             let mut label = format!(
@@ -10153,22 +11348,104 @@ impl FerrixApp {
                             if edits > 0 {
                                 label.push_str(&format!(" · {edits} edits"));
                             }
-                            ui.label(RichText::new(label).color(th.text_dim).size(12.0));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(label).color(th.text_dim).size(12.0),
+                                )
+                                .truncate(),
+                            );
                         }
-                        // Say what the machine actually has and how much of it
-                        // we are willing to use. A cap the user cannot see is
-                        // indistinguishable from a bug.
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {}",
-                                self.budget.describe(),
-                                ferrix_io::pool::describe()
-                            ))
-                            .color(self.theme.text_dim)
-                            .size(12.0),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    self.budget.describe(),
+                                    ferrix_io::pool::describe()
+                                ))
+                                .color(self.theme.text_dim)
+                                .size(12.0),
+                            )
+                            .truncate(),
                         );
+                        if self.loading {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            if self.progress.total > 0 {
+                                let frac = self.progress.done as f32 / self.progress.total as f32;
+                                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(
+                                    format!(
+                                        "{:.0}%  ({:.1}/{:.1} GB)",
+                                        frac * 100.0,
+                                        self.progress.done as f64 / 1e9,
+                                        self.progress.total as f64 / 1e9
+                                    ),
+                                ));
+                            } else {
+                                ui.label(RichText::new("opening…").color(th.text_dim));
+                            }
+                            if ui.button("✖ Cancel").clicked() {
+                                self.cancel_load();
+                            }
+                        }
+                        if self.exporting {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            if self.export_progress.total > 0 {
+                                let frac = self.export_progress.done as f32
+                                    / self.export_progress.total as f32;
+                                ui.add(egui::ProgressBar::new(frac).desired_width(160.0).text(
+                                    format!(
+                                        "export {:.0}%  ({}/{} rows)",
+                                        frac * 100.0,
+                                        fmt_int(self.export_progress.done as usize),
+                                        fmt_int(self.export_progress.total as usize)
+                                    ),
+                                ));
+                            } else {
+                                ui.label(RichText::new("exporting…").color(self.theme.text_dim));
+                            }
+                            if ui.button("✖ Cancel export").clicked() {
+                                self.cancel_export();
+                            }
+                        }
                     });
                 });
+
+                ui.separator();
+
+                // Row 2: the active tab's controls, wrapped so they reflow on a
+                // narrow window rather than overrunning the row.
+                let active = self.ribbon_tab;
+                // Every tab is drawn as labelled groups (the banded ribbon in
+                // the design mock): clusters of related buttons with a muted
+                // caption beneath, split by thin rules. `ribbon_groups` packs
+                // whole groups into as many rows as the width demands — no
+                // outer wrap here, it owns its rows.
+                if let Some(id) = crate::command::ribbon_groups(ui, active, &cmd_state, th.text_dim)
+                {
+                    chosen_command = Some(id);
+                }
+                if active == crate::command::RibbonTab::Format {
+                    // The font family/size controls are stateful widgets, not
+                    // registry commands. They are dressed as one more ribbon
+                    // group — same caption treatment as the command groups —
+                    // so the Format tab reads as a single composition rather
+                    // than groups plus a stray strip of controls.
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            let row = ui.horizontal(|ui| {
+                                self.type_controls(ui, th);
+                            });
+                            let rect = row.response.rect;
+                            ui.painter().text(
+                                egui::pos2(rect.center().x, rect.bottom() + 1.0),
+                                egui::Align2::CENTER_TOP,
+                                "Type",
+                                egui::FontId::proportional(10.0),
+                                th.text_dim,
+                            );
+                            ui.add_space(12.0);
+                        });
+                    });
+                }
             });
 
         // One dispatch point for every menu item and toolbar button, so a
@@ -10176,6 +11453,31 @@ impl FerrixApp {
         // exactly as one invoked from the palette is.
         if let Some(id) = chosen_command {
             self.run_command(id);
+        }
+
+        // Drain a clipboard action requested from a button this frame. It waits
+        // for `ctx` (unavailable inside `run_command`): copy/cut write the
+        // system clipboard, paste reads back the block this window last copied.
+        if let Some(action) = self.pending_clipboard.take() {
+            match action {
+                ClipboardAction::Copy => self.copy_selection(ctx, false),
+                ClipboardAction::Cut => self.copy_selection(ctx, true),
+                ClipboardAction::Paste => {
+                    // egui delivers the OS clipboard only as a keystroke Paste
+                    // event, never a readable API, so a BUTTON paste can only
+                    // replay the block this window last copied. Ctrl+V remains
+                    // the path for pasting from another application.
+                    if let Some(block) = self.clip_block.clone() {
+                        let text = ferrix_core::tsv::to_tsv(&block.to_text_grid());
+                        self.paste_clipboard(&text);
+                    } else {
+                        self.status =
+                            "Nothing copied in this window yet — use Ctrl+V to paste from \
+                             another application"
+                                .into();
+                    }
+                }
+            }
         }
 
         // --- formula bar ---
@@ -10236,11 +11538,14 @@ impl FerrixApp {
                     if ui.small_button("▾").on_hover_text("Name Manager").clicked() {
                         self.names_open = true;
                     }
-                    ui.separator();
+                    ui.add_space(2.0);
                     ui.label(RichText::new("fx").color(th.text_dim).italics());
 
                     let fid = egui::Id::new(FORMULA_BAR_ID);
-                    let bar_w = ui.available_width() * 0.5;
+                    // The editor is the DOMINANT field: it takes the row's
+                    // remaining width minus a reserved strip for the result
+                    // preview at the right (DESIGN.md formula-bar hierarchy).
+                    let bar_w = (ui.available_width() - 170.0).max(200.0);
                     // ONE id for both shapes, so the caret survives the bar
                     // being expanded mid-formula.
                     //
@@ -10250,12 +11555,23 @@ impl FerrixApp {
                     // strand the user in a field they cannot leave. Alt+Enter
                     // inserts the newline, matching Excel.
                     let resp = if bar_rows > 1 {
+                        // References wear their grid-outline colours in the
+                        // bar too (see `formula_layout_job`).
+                        let ref_colors = th.ref_colors;
+                        let text_color = th.text;
+                        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            let mut job = formula_layout_job(text, font, text_color, &ref_colors);
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts(|f| f.layout_job(job))
+                        };
                         ui.add_sized(
                             [bar_w, row_px * bar_rows as f32],
                             egui::TextEdit::multiline(&mut self.formula_input)
                                 .id(fid)
                                 .hint_text("=SUM(E1:E10000000)")
                                 .font(egui::TextStyle::Monospace)
+                                .layouter(&mut layouter)
                                 .desired_rows(bar_rows)
                                 .return_key(egui::KeyboardShortcut::new(
                                     egui::Modifiers::ALT,
@@ -10263,12 +11579,21 @@ impl FerrixApp {
                                 )),
                         )
                     } else {
+                        let ref_colors = th.ref_colors;
+                        let text_color = th.text;
+                        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            let mut job = formula_layout_job(text, font, text_color, &ref_colors);
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts(|f| f.layout_job(job))
+                        };
                         ui.add_sized(
                             [bar_w, 22.0],
                             egui::TextEdit::singleline(&mut self.formula_input)
                                 .id(fid)
                                 .hint_text("=SUM(E1:E10000000)")
-                                .font(egui::TextStyle::Monospace),
+                                .font(egui::TextStyle::Monospace)
+                                .layouter(&mut layouter),
                         )
                     };
                     if resp.gained_focus() {
@@ -10689,9 +12014,10 @@ impl FerrixApp {
                         } else {
                             0.0
                         };
-                        let color = if fps >= 55.0 {
-                            th.number
-                        } else if fps >= 30.0 {
+                        let color = if fps >= 30.0 {
+                            // Ordinary healthy telemetry is QUIET (DESIGN.md:
+                            // diagnostics are muted; green is for semantic
+                            // success, not decorative terminal styling).
                             th.text_dim
                         } else {
                             th.error
@@ -10762,6 +12088,29 @@ impl FerrixApp {
         // The header hide/unhide menu floats over the grid, so it is shown
         // before the CentralPanel paints underneath it.
         self.show_header_menu(ctx);
+
+        // --- agent bridge (View → Agent bridge) ---
+        //
+        // Executes at most one queued agent command per frame, before the
+        // panels paint, so every effect of the command is on screen THIS
+        // frame: the moved selection, the committed edit, the status line.
+        self.agent_bridge_frame(ctx);
+
+        // Deferred link-gesture refocus: applied at the START of the frame
+        // after the gesture, so it wins over the TextEdit's own
+        // clicked-elsewhere surrender (which ran last frame).
+        if let Some(id) = self.link_refocus.take() {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+
+        // The Agent window rides with the bridge: verbatim log + launcher.
+        self.show_agent_window(ctx);
+
+        // --- Selection side panel (right dock) ---
+        //
+        // Before the CentralPanel, so it claims its width first and the grid
+        // takes the remaining flexible space (DESIGN.md application anatomy).
+        self.show_selection_panel(ctx);
 
         // --- grid ---
         egui::CentralPanel::default()
@@ -11240,35 +12589,90 @@ impl FerrixApp {
                 // than what it asked for.
                 self.zoom = resp.zoom;
 
-                if let Some(cell) = resp.clicked {
-                    // Clicking the in-cell dropdown arrow (issue #41) opens
-                    // the list rather than merely re-selecting the cell: an
-                    // arrow that does nothing when clicked is worse than no
-                    // arrow. Keyed off the rectangle the grid actually
-                    // PAINTED, so it cannot drift from what is on screen.
-                    let hit_arrow = self
-                        .dropdown_button
-                        .zip(ui.ctx().pointer_interact_pos())
-                        .is_some_and(|((c, r), p)| c == cell && r.contains(p));
-                    if hit_arrow {
-                        self.open_validation_dropdown(cell);
-                    }
-                    if self.editing.is_some() && self.editing != Some(cell) {
-                        self.commit_edit();
-                    }
-                    // Shift+click extends from the existing anchor, like every
-                    // other spreadsheet and file list.
-                    if ui.input(|i| i.modifiers.shift) {
-                        self.selection.extend_to(cell);
+                // --- formula linking: point mode, Ctrl+click, Ctrl+drag ---
+                //
+                // Keyed on PRESS so a drag can grow a RANGE from the pressed
+                // cell: press links `C2`, sweeping to C9 rewrites it live to
+                // `C2:C9`, release ends the gesture. A press with no sweep is
+                // the single-cell link. The gesture fires when the formula is
+                // POINTING (text ends with `=`, `(`, an operator or a comma —
+                // see `formula_edit_wants_ref`) or when Ctrl forces it.
+                let ctrl_down = ui.input(|i| i.modifiers.command);
+                if let Some(cell) = resp.cell_press {
+                    // A press that started a reference-outline drag (handled
+                    // above) is that gesture alone — it must not also commit
+                    // the edit or move the selection out from under it.
+                    if self.ref_drag.is_some() {
+                        // no-op: the outline drag owns this press
+                    } else if (ctrl_down || self.formula_edit_wants_ref())
+                        && self.editing.is_some()
+                        && self.editing != Some(cell)
+                        && self.edit_buffer.trim_start().starts_with('=')
+                    {
+                        self.insert_ref_into_edit(cell);
+                        self.link_drag_anchor = Some(cell);
                     } else {
-                        self.selection.move_to(cell);
+                        // The selection moves on PRESS, like every other
+                        // spreadsheet. Moving it on release meant the frames
+                        // in between extended from the OLD anchor — a flash
+                        // of phantom range on every quick click-drag.
+                        if self.editing.is_some() && self.editing != Some(cell) {
+                            self.commit_edit();
+                        }
+                        // Shift+press extends from the existing anchor, like
+                        // every other spreadsheet and file list.
+                        if ui.input(|i| i.modifiers.shift) {
+                            self.selection.extend_to(cell);
+                        } else {
+                            self.selection.move_to(cell);
+                        }
+                        self.focus = Focus::Grid;
+                        self.sync_formula_bar();
                     }
-                    self.focus = Focus::Grid;
-                    self.sync_formula_bar();
                 }
-                // Drag extends without moving the anchor, so a press-and-sweep
-                // paints a range. Ignored while editing, where a drag is text
-                // selection inside the cell editor.
+                if let (Some(anchor), Some(cell)) = (self.link_drag_anchor, resp.drag_to) {
+                    if self.editing.is_some() {
+                        self.insert_range_into_edit(anchor, cell);
+                    }
+                }
+
+                if let Some(cell) = resp.clicked {
+                    // The selection already moved on press. The release only
+                    // finishes things a full click means: ending a link
+                    // gesture (focus back to the editor), or opening the
+                    // in-cell dropdown (issue #41) — keyed off the rectangle
+                    // the grid actually PAINTED, so it cannot drift from
+                    // what is on screen.
+                    if self.link_drag_anchor.take().is_some() {
+                        self.link_refocus = Some(if self.focus == Focus::FormulaBar {
+                            egui::Id::new(FORMULA_BAR_ID)
+                        } else {
+                            egui::Id::new(CELL_EDITOR_ID)
+                        });
+                    } else {
+                        let hit_arrow = self
+                            .dropdown_button
+                            .zip(ui.ctx().pointer_interact_pos())
+                            .is_some_and(|((c, r), p)| c == cell && r.contains(p));
+                        if hit_arrow {
+                            self.open_validation_dropdown(cell);
+                        }
+                    }
+                }
+                // A link DRAG travels too far to count as a click, so the
+                // block above never sees it end — return focus to the editor
+                // on the release frame here instead.
+                if self.link_drag_anchor.is_some() && !ui.input(|i| i.pointer.primary_down()) {
+                    self.link_drag_anchor = None;
+                    self.link_refocus = Some(if self.focus == Focus::FormulaBar {
+                        egui::Id::new(FORMULA_BAR_ID)
+                    } else {
+                        egui::Id::new(CELL_EDITOR_ID)
+                    });
+                }
+                // Drag-to-extend the selection: the button is held and the
+                // pointer swept to another cell. Ignored while editing, where
+                // a drag is text selection inside the cell editor.
                 if let Some(cell) = resp.drag_to {
                     if self.editing.is_none() && cell != self.selection.cursor {
                         self.selection.extend_to(cell);
@@ -11355,17 +12759,14 @@ impl FerrixApp {
                 if resp.header_released {
                     if let (Some(src), Some(dst)) = (self.header_drag, resp.header_drag_to) {
                         if src == dst {
-                            // Released on the column it was pressed on: that is
-                            // a CLICK, not a reorder, and a click on a header
-                            // cycles that column's sort asc -> desc -> none.
-                            //
-                            // Keyed on release rather than press on purpose:
-                            // pressing must be free to become a drag, and
-                            // sorting on press would fire a full sort every
-                            // time the user started to move a column.
-                            let additive = ui.input(|i| i.modifiers.shift);
+                            // Released on the column it was pressed on: that is a
+                            // plain CLICK, which SELECTS the column (done on
+                            // press) and nothing more. Sorting used to fire here,
+                            // but that meant every attempt to select a column —
+                            // e.g. to chart it — also reordered the data. Sort is
+                            // now on the header right-click menu (Sort ascending /
+                            // descending / Clear sort).
                             self.header_drag = None;
-                            self.sort_by_column(src, additive);
                         } else {
                             // `to` is an insertion point in the ORIGINAL
                             // indexing: dropping onto a column to the right
@@ -11477,7 +12878,17 @@ impl FerrixApp {
                 }
 
                 if let Some(cell) = resp.double_clicked {
-                    self.begin_edit(cell, None);
+                    // NOT while Ctrl is down, and NOT while a formula edit is
+                    // pointing: egui's double-click detection is time-only
+                    // (no distance test in 0.29), so two quick links on
+                    // different cells read as a double-click — which would
+                    // abandon the formula being built and start editing the
+                    // clicked cell instead.
+                    let pointing =
+                        self.editing.is_some() && self.edit_buffer.trim_start().starts_with('=');
+                    if !ui.input(|i| i.modifiers.command) && !pointing {
+                        self.begin_edit(cell, None);
+                    }
                 }
 
                 // --- in-cell editor, overlaid exactly on the cell ---
@@ -11502,11 +12913,23 @@ impl FerrixApp {
                                 .max_rect(rect.expand(1.0))
                                 .layout(Layout::left_to_right(Align::Center)),
                         );
+                        // References wear their outline colours inside the
+                        // editor too, so "which B2 is outlined" is answerable
+                        // by colour match alone.
+                        let ref_colors = th.ref_colors;
+                        let text_color = th.text;
+                        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            let font = egui::TextStyle::Monospace.resolve(ui.style());
+                            let mut job = formula_layout_job(text, font, text_color, &ref_colors);
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts(|f| f.layout_job(job))
+                        };
                         let edit = child.add_sized(
                             rect.size(),
                             egui::TextEdit::singleline(&mut self.edit_buffer)
                                 .id(id)
                                 .font(egui::TextStyle::Monospace)
+                                .layouter(&mut layouter)
                                 .margin(egui::Margin::symmetric(4.0, 2.0)),
                         );
                         if self.just_started_edit {
@@ -11541,6 +12964,10 @@ impl FerrixApp {
                         // live (issue #38), so a long formula is readable in
                         // the expanded bar even when the column is narrow.
                         if edit.changed() {
+                            // Typing ends the Ctrl+click re-aim window: the
+                            // next link inserts rather than replacing text
+                            // the user has since edited.
+                            self.linked_ref_span = None;
                             self.formula_input.clone_from(&self.edit_buffer);
                             self.recompute_formula();
                         }
@@ -11718,6 +13145,62 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// `Some(trimmed)` when the field has text, `None` when it is empty — the
+/// chart-text fields use this so a cleared field restores the generated
+/// default instead of pinning an empty string.
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Layout a formula with its cell references coloured — `B2` in the editor
+/// wears the same colour as the outline drawn around B2 in the grid, because
+/// both index [`crate::theme::Theme::ref_colors`] by span order. Non-formula
+/// text lays out plain.
+fn formula_layout_job(
+    text: &str,
+    font: egui::FontId,
+    base: egui::Color32,
+    ref_colors: &[egui::Color32; 5],
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: base,
+        ..Default::default()
+    };
+    if !text.trim_start().starts_with('=') {
+        job.append(text, 0.0, plain);
+        return job;
+    }
+    let spans = ferrix_formula::refedit::spans(text);
+    let mut pos = 0usize;
+    for (i, s) in spans.iter().enumerate() {
+        if s.start > pos {
+            job.append(&text[pos..s.start], 0.0, plain.clone());
+        }
+        job.append(
+            &text[s.start..s.end],
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: ref_colors[i % ref_colors.len()],
+                ..Default::default()
+            },
+        );
+        pos = s.end;
+    }
+    if pos < text.len() {
+        job.append(&text[pos..], 0.0, plain);
+    }
+    job
 }
 
 /// Parse `A1` or `A1:B10` as a selection. `None` for anything else.
@@ -12255,6 +13738,103 @@ fn restore_edits(base: &Path, rows: u64, cols: u32) -> RestoredEdits {
 /// A1-style label for a cell, for status messages.
 fn cell_label(cell: CellRef) -> String {
     format!("{}{}", ferrix_core::column_name(cell.col), cell.row + 1)
+}
+
+/// One shared minimum width for every right-click context menu, so the cell
+/// menu and the column-header menu match. Kept snug — the menu still grows to
+/// fit a longer label, this is only the floor.
+const CONTEXT_MENU_WIDTH: f32 = 150.0;
+
+/// The heading row shared by every context menu: a dim, small label followed by
+/// a separator. Unifies the two menus, which previously used different weights
+/// (one `.strong()`, one `.weak()`).
+fn context_menu_heading(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(RichText::new(text.into()).weak().size(11.0));
+    ui.separator();
+}
+
+/// A context-menu item, styled the same across every menu. Returns whether it
+/// was clicked.
+fn context_menu_item(ui: &mut egui::Ui, label: impl Into<String>) -> bool {
+    context_menu_item_enabled(ui, true, label)
+}
+
+/// A context-menu item that may be disabled.
+fn context_menu_item_enabled(ui: &mut egui::Ui, enabled: bool, label: impl Into<String>) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label.into()).wrap_mode(egui::TextWrapMode::Extend),
+    )
+    .clicked()
+}
+
+/// A nested submenu inside a hand-rolled context menu, popping out to the SIDE
+/// on HOVER (not click) — the behaviour of a real menu, which egui's own
+/// `menu_button` only gives inside its native menu context (unavailable here,
+/// because the grid paints on a raw `Painter` with no widget to hang a menu
+/// off). `body` draws the submenu's items into a child popup placed to the
+/// right of the header row. Returns `(inner, open)` where `open` is true while
+/// the submenu is showing, so the caller can suppress the parent's
+/// click-outside dismissal. `id_src` disambiguates multiple submenus.
+fn context_submenu<R>(
+    ui: &mut egui::Ui,
+    id_src: &str,
+    label: impl Into<String>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (Option<R>, bool) {
+    let id = ui.id().with(id_src);
+    // Persist the open state across frames so the popup stays up while the
+    // pointer travels from the header to the child.
+    let mut open = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+
+    // The header row: label on the left, a ⏵ affordance on the right, drawn as
+    // a full-width button so it reads like the other items and the whole strip
+    // is the hover target.
+    let header = ui.add(
+        egui::Button::new(format!("{}      ⏵", label.into()))
+            .min_size(egui::vec2(ui.available_width(), 0.0))
+            .wrap_mode(egui::TextWrapMode::Extend),
+    );
+    let header_rect = header.rect;
+    if header.hovered() {
+        open = true;
+    }
+
+    let mut inner = None;
+    if open {
+        // Place the child just to the right of the header, slightly overlapping
+        // so the pointer can cross without leaving both rects.
+        let pos = egui::pos2(header_rect.right() - 2.0, header_rect.top());
+        let area = egui::Area::new(id.with("popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_min_width(120.0);
+                        body(ui)
+                    })
+                    .inner
+            });
+        inner = Some(area.inner);
+
+        // Stay open while the pointer is over the header OR the child popup;
+        // close once it has left both.
+        let over_child = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| area.response.rect.expand(4.0).contains(p));
+        let over_header = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| header_rect.expand(4.0).contains(p));
+        if !over_child && !over_header {
+            open = false;
+        }
+    }
+
+    ui.data_mut(|d| d.insert_temp(id, open));
+    (inner, open)
 }
 
 /// Draw a dashed page-break line between two points (#37). Dashed so it reads

@@ -6,6 +6,18 @@ benchdata/
 *.ferrix-tmp/
 *.fxedits
 *.fxedits.tmp
+# The other per-workbook sidecars (comments, formats, page setup, pivots,
+# column sizing) and their autosaves/temps — user-local state, never source.
+*.fxnotes
+*.fxfmt
+*.fxpage
+*.fxpivot
+*.fxsize
+*.fx*.tmp
+*.fxedits.autosave
+# Agent-bridge command files (View → Agent bridge): local machine traffic.
+*.fxagent
+*.fxagent.out
 
 # Agent-local helpers and handoff notes — never part of the source tree.
 .ghenv.sh

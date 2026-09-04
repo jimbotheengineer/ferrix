@@ -197,6 +197,11 @@ pub struct Scene {
     /// this when the data warrants a log axis, and every consumer maps and
     /// ticks the axes from it so the screen and the SVG export agree.
     pub scale: ScaleHint,
+    /// True when the x axis is a category index, not a magnitude: the scene
+    /// draws its own category labels (bar charts), so consumers must NOT
+    /// print numeric x ticks — "0 2 4" under "Central East West" is two axes
+    /// fighting over one edge.
+    pub x_categorical: bool,
 }
 
 impl Scene {
@@ -210,6 +215,7 @@ impl Scene {
             y_label: None,
             legend: Vec::new(),
             scale: ScaleHint::default(),
+            x_categorical: false,
         }
     }
 
@@ -231,6 +237,13 @@ impl Scene {
     /// Attach a series legend. Replaces any existing entries.
     pub fn with_legend(mut self, entries: Vec<LegendEntry>) -> Self {
         self.legend = entries;
+        self
+    }
+
+    /// Mark the x axis as categorical: the scene carries its own category
+    /// labels, so consumers suppress numeric x ticks.
+    pub fn with_categorical_x(mut self) -> Self {
+        self.x_categorical = true;
         self
     }
 
@@ -691,6 +704,11 @@ pub fn to_svg(scene: &Scene, width: f32, height: f32) -> String {
         );
     }
     for (i, t) in x_ticks.iter().enumerate() {
+        // A categorical x axis draws its own labels from the scene; numeric
+        // ticks under them would be a second, meaningless axis.
+        if scene.x_categorical {
+            break;
+        }
         if !x_keep[i] {
             continue;
         }

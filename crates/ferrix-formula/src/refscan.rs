@@ -152,7 +152,13 @@ const REF_CONSTANT: &str = "#REF!";
 /// rewrite every broken reference in the workbook.
 fn skip_ref_constant(src: &str, at: usize) -> Option<usize> {
     let end = at + REF_CONSTANT.len();
-    (src.len() >= end && src[at..end].eq_ignore_ascii_case(REF_CONSTANT)).then_some(end)
+    // `get` rather than indexing: `end` may fall inside a multi-byte char
+    // (e.g. an em-dash in a text literal), where `src[at..end]` PANICS. A
+    // formula is user input; a scanner that panics on one is a crash anyone
+    // can type — or any agent can type into a live session.
+    src.get(at..end)
+        .is_some_and(|s| s.eq_ignore_ascii_case(REF_CONSTANT))
+        .then_some(end)
 }
 
 /// Index one past the closing `'` of a quoted run starting at `at`.

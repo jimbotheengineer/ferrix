@@ -201,12 +201,36 @@ impl EditOverlay {
         }
     }
 
+    /// Intern text typed into the overlay. The returned id carries
+    /// [`crate::arena::OVERLAY_TEXT_TAG`], so a composite view can tell an
+    /// overlay string from a base string with the same raw index — the
+    /// collision that used to make formulas misread base text columns the
+    /// moment any text was typed anywhere.
     pub fn intern(&mut self, s: &str) -> StrId {
-        self.arena.intern(s)
+        let raw = self.arena.intern(s);
+        debug_assert!(
+            raw.0 & (crate::arena::OVERLAY_TEXT_TAG | crate::arena::FORMULA_TEXT_TAG) == 0,
+            "overlay arena produced an id colliding with a provenance tag"
+        );
+        StrId(raw.0 | crate::arena::OVERLAY_TEXT_TAG)
     }
 
+    /// Resolve an id THIS overlay produced (tagged), or a formula-text id.
+    /// A plain untagged id belongs to the base and returns `None`, which is
+    /// what lets `SheetView::resolve` route overlay-first without ever
+    /// serving a base id from the wrong arena.
     pub fn resolve(&self, id: StrId) -> Option<&str> {
-        self.arena.resolve(id)
+        if id.0 & crate::arena::FORMULA_TEXT_TAG != 0 {
+            // Formula-produced text: the arena routes it to the process-wide
+            // interner regardless of which arena is asked.
+            return self.arena.resolve(id);
+        }
+        if id.0 & crate::arena::OVERLAY_TEXT_TAG != 0 {
+            return self
+                .arena
+                .resolve(StrId(id.0 & !crate::arena::OVERLAY_TEXT_TAG));
+        }
+        None
     }
 
     /// Update just the cached result of a formula, leaving its source intact.

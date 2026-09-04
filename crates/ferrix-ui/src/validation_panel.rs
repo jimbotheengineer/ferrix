@@ -280,10 +280,19 @@ impl ValidationForm {
         self.max_text.trim().parse().unwrap_or(0.0)
     }
 
-    /// The list values, one per line, blanks dropped.
+    /// The list values, split on newlines AND commas, blanks dropped.
+    ///
+    /// Both separators are accepted because both are natural: the field is
+    /// laid out one-per-line, but comma-separated is the spreadsheet
+    /// convention (it is how Excel's inline list is written), and a user who
+    /// types `North, South, East` on one line means three values, not one.
+    /// Splitting on newlines alone turned that whole line into a SINGLE allowed
+    /// value, so the dropdown offered one giant option and every real cell
+    /// failed validation.
     pub fn list_values(&self) -> Vec<String> {
         self.list_text
             .lines()
+            .flat_map(|line| line.split(','))
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -340,7 +349,7 @@ impl ValidationForm {
     pub fn problem(&self) -> Option<&'static str> {
         match self.domain {
             ValueDomain::List if self.list_values().is_empty() => {
-                Some("Enter at least one allowed value, one per line.")
+                Some("Enter at least one allowed value, one per line or comma-separated.")
             }
             ValueDomain::Custom if self.formula.trim().is_empty() => {
                 Some("Enter a formula. It must evaluate to TRUE for a cell to pass.")
@@ -554,7 +563,7 @@ fn show_form(ui: &mut egui::Ui, st: &mut ValidationState, th: Theme, out: &mut V
 
     match f.domain {
         ValueDomain::List => {
-            ui.label("Allowed values, one per line:");
+            ui.label("Allowed values (one per line or comma-separated):");
             ui.add(
                 egui::TextEdit::multiline(&mut f.list_text)
                     .desired_rows(5)

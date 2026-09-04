@@ -67,6 +67,116 @@ fn every_menu_item_is_a_registry_command() {
 }
 
 #[test]
+fn every_ribbon_tab_slug_round_trips() {
+    // The persisted tab is stored by slug; a slug that does not round-trip
+    // would silently reset the user's tab to Home on restart.
+    for tab in RibbonTab::ALL {
+        assert_eq!(
+            RibbonTab::from_slug(tab.slug()),
+            Some(tab),
+            "{} did not round-trip through its slug",
+            tab.title()
+        );
+    }
+    assert_eq!(RibbonTab::from_slug("nonsense"), None);
+}
+
+#[test]
+fn the_home_tab_lists_only_real_commands() {
+    // The Home tab is a hand-picked list of CommandIds rather than a menu, so
+    // unlike the category tabs it can name a command that does not exist. This
+    // is the guard the compiler cannot give us for that list.
+    let mut h = crate::harness::Harness::new(None);
+    h.step();
+    let st = h.app().command_state();
+    let ctx = egui::Context::default();
+    let mut ran = false;
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Drawing the Home ribbon touches every HOME_COMMANDS entry; a bad
+            // id would have failed the registry lookup and drawn nothing.
+            let _ = ribbon_row(ui, RibbonTab::Home, &st);
+            ran = true;
+        });
+    });
+    assert!(ran);
+}
+
+#[test]
+fn the_home_groups_list_only_real_commands() {
+    // Like the flat list, HOME_GROUPS names CommandIds by hand, so a bad id is
+    // possible. Every id must resolve in the registry, and the flat
+    // HOME_COMMANDS must be exactly the groups' union in order (they are two
+    // views of one list and must not drift).
+    let mut flat = Vec::new();
+    for (label, ids) in HOME_GROUPS {
+        assert!(!label.is_empty(), "a Home group has no caption");
+        assert!(!ids.is_empty(), "Home group {label:?} has no commands");
+        for &id in *ids {
+            assert!(
+                command(id).is_some(),
+                "Home group {label:?} names a command not in the registry: {id:?}"
+            );
+            flat.push(id);
+        }
+    }
+    let want: Vec<_> = HOME_COMMANDS.to_vec();
+    assert_eq!(
+        flat, want,
+        "HOME_COMMANDS drifted from HOME_GROUPS — they must stay in sync"
+    );
+}
+
+#[test]
+fn ribbon_excluded_commands_stay_reachable_elsewhere() {
+    // Off the ribbon must not mean out of the product: every excluded id
+    // still resolves in the registry AND still belongs to a menu, so the ☰
+    // overflow and the Ctrl+K palette keep offering it.
+    for &id in RIBBON_EXCLUDED {
+        let cmd = command(id).unwrap_or_else(|| panic!("{id:?} vanished from the registry"));
+        assert!(
+            cmd.menu.is_some(),
+            "{id:?} lost its menu — it would be unreachable outside the right-click menus"
+        );
+    }
+}
+
+#[test]
+fn every_tab_group_covers_its_menu_exactly() {
+    // Each category tab's groups are a hand-maintained partition of that
+    // menu's commands. A command in no group would silently vanish from the
+    // ribbon (reachable only through the overflow menu); one in two groups
+    // would draw twice. Either is a bug this asserts against — including for
+    // every command ADDED in the future.
+    for tab in RibbonTab::ALL {
+        let Some(menu) = tab.menu() else {
+            continue; // Home is cross-category, checked by its own test.
+        };
+        let mut grouped: Vec<CommandId> = Vec::new();
+        for (label, ids) in tab_groups(tab) {
+            assert!(!label.is_empty(), "{tab:?}: a group has no caption");
+            assert!(!ids.is_empty(), "{tab:?}: group {label:?} has no commands");
+            grouped.extend_from_slice(ids);
+        }
+        let mut in_menu: Vec<CommandId> = for_menu(menu)
+            .map(|c| c.id)
+            .filter(|id| !RIBBON_EXCLUDED.contains(id))
+            .collect();
+        let mut got = grouped.clone();
+        let n = got.len();
+        got.sort_by_key(|id| format!("{id:?}"));
+        got.dedup();
+        assert_eq!(got.len(), n, "{tab:?}: a command appears in two groups");
+        in_menu.sort_by_key(|id| format!("{id:?}"));
+        assert_eq!(
+            got, in_menu,
+            "{tab:?}: the tab's groups and its menu disagree — a command was \
+             added to one and not the other"
+        );
+    }
+}
+
+#[test]
 fn slugs_and_ids_are_unique() {
     // A duplicated slug silently merges two commands' recency entries.
     let mut slugs: Vec<&str> = REGISTRY.iter().map(|c| c.slug).collect();

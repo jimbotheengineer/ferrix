@@ -285,6 +285,13 @@ registry! {
 
     DataGoalSeek { "data.goal_seek", Some(Menu::Data), "🎯 Goal Seek…", None, false, None,
         "Set a formula cell to a target value by changing one input cell. The whole run is a single undo step." }
+    // Sort and Filter as first-class commands (ribbon + palette), not only a
+    // header-menu click and the search bar's filter toggle. Sort cycles the
+    // cursor column asc → desc → none, the same call the header menu makes.
+    DataSort { "data.sort", Some(Menu::Data), "⇅ Sort column", None, true, Some(Note::Selection),
+        "Sort by the cursor's column, cycling ascending → descending → none. A view only; the data on disk never moves." }
+    DataFilter { "data.filter", Some(Menu::Data), "⚗ Filter rows", None, false, None,
+        "Show only rows matching the search box, opening it if needed. Original row numbers are kept, never renumbered 1…N." }
     DataChart { "data.chart", Some(Menu::Data), "📈 Chart…", None, false, None,
         "Chart the selected range." }
 
@@ -335,6 +342,10 @@ registry! {
         "Clear every manual page break, back to automatic pagination." }
     ViewEmptyRows { "view.empty_rows", Some(Menu::View), "⬓ Show empty rows", None, false, None,
         "Show empty rows past the end of the sheet so there is somewhere to type. They are not data: exports, SUM and the row count ignore them until you type in one." }
+    ViewSelectionPanel { "view.selection_panel", Some(Menu::View), "▤ Selection panel", None, false, None,
+        "Show the Selection panel: count, sum, average and extremes for the selected range, with recent activity. Aggregation is capped, and says so, rather than scanning 200M cells." }
+    ViewAgentBridge { "view.agent_bridge", Some(Menu::View), "🤝 Agent bridge", None, false, None,
+        "Let an agent drive this window, visibly: commands appended to <workbook>.fxagent execute through the same paths typing uses — selection moves on screen, edits are undoable, every step lands in the status line. OFF by default, every session." }
 
     // ---- palette only ----
     //
@@ -346,6 +357,17 @@ registry! {
         "Undo the last edit." }
     EditRedo { "edit.redo", None, "↷ Redo", Some("Ctrl+Y"), false, None,
         "Redo the last undone edit." }
+    // Clipboard as commands so the ribbon, overflow menu and palette all reach
+    // them, not only the Ctrl+C/X/V keystrokes. They dispatch through the SAME
+    // copy_selection / paste path the keys use. Paste from a button can only
+    // reach the block THIS window last copied — the OS clipboard is delivered
+    // to egui as a keystroke event, never a readable API — so its hint says so.
+    EditCut { "edit.cut", None, "✂ Cut", Some("Ctrl+X"), false, Some(Note::Selection),
+        "Copy the selection to the clipboard and clear it." }
+    EditCopy { "edit.copy", None, "⧉ Copy", Some("Ctrl+C"), false, Some(Note::Selection),
+        "Copy the selection to the clipboard." }
+    EditPaste { "edit.paste", None, "📋 Paste", Some("Ctrl+V"), false, None,
+        "Paste what this window last copied at the selection. To paste from another application, use Ctrl+V." }
     EditSelectAll { "edit.select_all", None, "▣ Select all", Some("Ctrl+A"), false, None,
         "Select the whole sheet." }
     EditFind { "edit.find", None, "🔍 Find…", Some("Ctrl+F"), false, None,
@@ -544,6 +566,536 @@ pub fn menu_items(ui: &mut egui::Ui, menu: Menu, st: &CommandState) -> Option<Co
             ui.close_menu();
         }
     }
+    chosen
+}
+
+// ---------------------------------------------------------------------------
+// ribbon (issue #102): tabbed toolbar
+// ---------------------------------------------------------------------------
+
+/// One tab of the ribbon toolbar. `Home` is a curated set of the most-used
+/// commands across categories; the rest map one-to-one onto the menus, so a
+/// tab's contents come straight from the registry and never drift from the
+/// menu bar or the command palette.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RibbonTab {
+    Home,
+    File,
+    Format,
+    Formula,
+    Data,
+    View,
+}
+
+impl RibbonTab {
+    pub const ALL: [RibbonTab; 6] = [
+        RibbonTab::Home,
+        RibbonTab::File,
+        RibbonTab::Format,
+        RibbonTab::Formula,
+        RibbonTab::Data,
+        RibbonTab::View,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "Home",
+            RibbonTab::File => "File",
+            RibbonTab::Format => "Format",
+            RibbonTab::Formula => "Formula",
+            RibbonTab::Data => "Data",
+            RibbonTab::View => "View",
+        }
+    }
+
+    /// A stable slug for persisting the selected tab across runs.
+    pub fn slug(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "home",
+            RibbonTab::File => "file",
+            RibbonTab::Format => "format",
+            RibbonTab::Formula => "formula",
+            RibbonTab::Data => "data",
+            RibbonTab::View => "view",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<RibbonTab> {
+        Self::ALL.into_iter().find(|t| t.slug() == s)
+    }
+
+    /// The menu whose commands a category tab shows, or `None` for `Home`.
+    /// Test-only since the ribbon went fully grouped: the partition tests use
+    /// it to assert the groups cover each menu exactly.
+    #[cfg(test)]
+    fn menu(self) -> Option<Menu> {
+        match self {
+            RibbonTab::Home => None,
+            RibbonTab::File => Some(Menu::File),
+            RibbonTab::Format => Some(Menu::Format),
+            RibbonTab::Formula => Some(Menu::Formula),
+            RibbonTab::Data => Some(Menu::Data),
+            RibbonTab::View => Some(Menu::View),
+        }
+    }
+}
+
+/// The Home tab, organised into labelled groups like the design mock: a small
+/// cluster of buttons under a muted group caption, clusters divided by a thin
+/// rule. These are the actions reached for constantly, pulled from across the
+/// categories; anything not here is one tab (or one palette search) away.
+///
+/// Order is display order, both of the groups and within each. Every id is a
+/// real registry command, asserted by `the_home_groups_list_only_real_commands`.
+pub const HOME_GROUPS: &[(&str, &[CommandId])] = &[
+    ("File", &[CommandId::FileOpen, CommandId::FileSave]),
+    (
+        "Edit",
+        &[
+            CommandId::EditUndo,
+            CommandId::EditRedo,
+            CommandId::EditCut,
+            CommandId::EditCopy,
+            CommandId::EditPaste,
+        ],
+    ),
+    (
+        "Format",
+        &[
+            CommandId::FormatBold,
+            CommandId::FormatItalic,
+            CommandId::FormatMerge,
+        ],
+    ),
+    (
+        "Analyze",
+        &[
+            CommandId::DataSort,
+            CommandId::DataFilter,
+            CommandId::DataChart,
+            CommandId::DataPivotTable,
+        ],
+    ),
+    ("Navigate", &[CommandId::EditFind]),
+];
+
+/// The category tabs, organised into the same labelled groups. Every command
+/// of the tab's menu appears in exactly one group — asserted by
+/// `every_tab_group_covers_its_menu_exactly`, so a new registry command cannot
+/// silently vanish from the ribbon.
+const FILE_GROUPS: &[(&str, &[CommandId])] = &[
+    (
+        "Open",
+        &[
+            CommandId::FileOpen,
+            CommandId::FileOpenXlsx,
+            CommandId::FileOpenRecent,
+            CommandId::FileStartScreen,
+        ],
+    ),
+    ("Save", &[CommandId::FileSave, CommandId::FileCompact]),
+    (
+        "Export",
+        &[
+            CommandId::FileExportCsv,
+            CommandId::FileExportXlsx,
+            CommandId::FileExportParquet,
+        ],
+    ),
+    (
+        "Print",
+        &[
+            CommandId::FilePrintPdf,
+            CommandId::FilePrintHtml,
+            CommandId::FilePageSetup,
+            CommandId::FileSetPrintArea,
+            CommandId::FileClearPrintArea,
+        ],
+    ),
+];
+
+const FORMAT_GROUPS: &[(&str, &[CommandId])] = &[
+    (
+        "Text",
+        &[
+            CommandId::FormatBold,
+            CommandId::FormatItalic,
+            CommandId::FormatUnderline,
+        ],
+    ),
+    (
+        "Align",
+        &[
+            CommandId::FormatAlignLeft,
+            CommandId::FormatAlignCenter,
+            CommandId::FormatAlignRight,
+            CommandId::FormatWrapText,
+        ],
+    ),
+    (
+        "Cells",
+        &[
+            CommandId::FormatMerge,
+            CommandId::FormatBorderBox,
+            CommandId::FormatBorderNone,
+        ],
+    ),
+    (
+        "Rules",
+        &[CommandId::FormatCondNew, CommandId::FormatCondManage],
+    ),
+    (
+        "Sparklines",
+        &[
+            CommandId::FormatSparkLine,
+            CommandId::FormatSparkColumn,
+            CommandId::FormatSparkWinLoss,
+            CommandId::FormatSparkClear,
+        ],
+    ),
+];
+
+const FORMULA_GROUPS: &[(&str, &[CommandId])] = &[
+    (
+        "Trace",
+        &[
+            CommandId::FormulaTracePrecedents,
+            CommandId::FormulaTraceDependents,
+            CommandId::FormulaTraceClear,
+        ],
+    ),
+    ("Names", &[CommandId::FormulaNames]),
+];
+
+/// Commands deliberately NOT on any ribbon group: structure ops act on a
+/// specific row/column, so their first-class home is the right-click menu on
+/// that object (cell menu: Insert row ▸/Insert column ▸/Delete; header menu:
+/// Insert/Delete column). They remain in the ☰ menu and the Ctrl+K palette
+/// via the registry — off the ribbon, not out of the product.
+#[cfg(test)]
+pub const RIBBON_EXCLUDED: &[CommandId] = &[
+    CommandId::DataInsertRow,
+    CommandId::DataDeleteRow,
+    CommandId::DataInsertColumn,
+    CommandId::DataDeleteColumn,
+];
+
+const DATA_GROUPS: &[(&str, &[CommandId])] = &[
+    (
+        "Analyze",
+        &[
+            CommandId::DataSort,
+            CommandId::DataFilter,
+            CommandId::DataChart,
+            CommandId::DataPivotTable,
+            CommandId::DataRefreshPivot,
+            CommandId::DataGoalSeek,
+        ],
+    ),
+    (
+        "Clean",
+        &[
+            CommandId::DataRemoveDuplicates,
+            CommandId::DataSubtotals,
+            CommandId::DataConsolidate,
+        ],
+    ),
+    (
+        "Validate",
+        &[
+            CommandId::DataValidationNew,
+            CommandId::DataValidationManage,
+            CommandId::DataValidationClear,
+            CommandId::DataCircleInvalid,
+            CommandId::DataClearCircles,
+            CommandId::DataAutocomplete,
+        ],
+    ),
+    (
+        "Protect",
+        &[
+            CommandId::DataLockCells,
+            CommandId::DataUnlockCells,
+            CommandId::DataProtectSheet,
+            CommandId::DataProtectWorkbook,
+        ],
+    ),
+];
+
+const VIEW_GROUPS: &[(&str, &[CommandId])] = &[
+    (
+        "Panes",
+        &[
+            CommandId::ViewFreezeRows,
+            CommandId::ViewFreezeCols,
+            CommandId::ViewFreezeBoth,
+            CommandId::ViewUnfreeze,
+            CommandId::ViewSplit,
+        ],
+    ),
+    (
+        "Zoom",
+        &[
+            CommandId::ViewZoomIn,
+            CommandId::ViewZoomOut,
+            CommandId::ViewZoomReset,
+        ],
+    ),
+    (
+        "Show",
+        &[
+            CommandId::ViewShowFormulas,
+            CommandId::ViewEmptyRows,
+            CommandId::ViewSelectionPanel,
+            CommandId::ViewAgentBridge,
+            CommandId::ViewTheme,
+        ],
+    ),
+    (
+        "Page breaks",
+        &[
+            CommandId::ViewPageBreaks,
+            CommandId::ViewInsertPageBreak,
+            CommandId::ViewRemovePageBreak,
+            CommandId::ViewResetPageBreaks,
+        ],
+    ),
+];
+
+/// The labelled groups for a ribbon tab.
+pub fn tab_groups(tab: RibbonTab) -> &'static [(&'static str, &'static [CommandId])] {
+    match tab {
+        RibbonTab::Home => HOME_GROUPS,
+        RibbonTab::File => FILE_GROUPS,
+        RibbonTab::Format => FORMAT_GROUPS,
+        RibbonTab::Formula => FORMULA_GROUPS,
+        RibbonTab::Data => DATA_GROUPS,
+        RibbonTab::View => VIEW_GROUPS,
+    }
+}
+
+/// Flat view of the Home groups, in display order. Test-only since the ribbon
+/// draws from the groups; the sync test keeps the two views agreeing.
+#[cfg(test)]
+const HOME_COMMANDS: &[CommandId] = &[
+    CommandId::FileOpen,
+    CommandId::FileSave,
+    CommandId::EditUndo,
+    CommandId::EditRedo,
+    CommandId::EditCut,
+    CommandId::EditCopy,
+    CommandId::EditPaste,
+    CommandId::FormatBold,
+    CommandId::FormatItalic,
+    CommandId::FormatMerge,
+    CommandId::DataSort,
+    CommandId::DataFilter,
+    CommandId::DataChart,
+    CommandId::DataPivotTable,
+    CommandId::EditFind,
+];
+
+/// Look a command up in the registry by id.
+pub fn command(id: CommandId) -> Option<&'static Command> {
+    REGISTRY.iter().find(|c| c.id == id)
+}
+
+/// A command's ribbon label: its title, minus a leading pictograph the
+/// installed fonts cannot draw. A missing glyph renders as a tofu box, which
+/// reads as a checkbox-like prefix on every button — worse than no icon.
+/// Checked per-glyph against the live font atlas, so machines whose symbol
+/// fonts DO cover it keep the icon.
+fn ribbon_label(ui: &egui::Ui, title: &str) -> String {
+    let mut chars = title.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if first.is_alphanumeric() {
+        return title.to_string();
+    }
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let known = ui.fonts(|f| f.has_glyphs(&font, &first.to_string()));
+    if known {
+        title.to_string()
+    } else {
+        chars.as_str().trim_start().to_string()
+    }
+}
+
+/// Draw one command as a ribbon button (availability + hover come from the
+/// registry, exactly like the menu). Returns the id when clicked. The button
+/// geometry is the compact command treatment: ~30px tall via the global
+/// button padding, flat at rest, structural fill on hover, small radius.
+fn ribbon_button(ui: &mut egui::Ui, cmd: &Command, st: &CommandState) -> Option<CommandId> {
+    let reason = cmd.disabled_reason(st);
+    let hover = match &reason {
+        Some(r) => r.clone(),
+        None => cmd.hint.to_string(),
+    };
+    // The ribbon shows the plain title (no shortcut suffix) to stay compact;
+    // the shortcut still lives in the hover text and the palette.
+    let label = ribbon_label(ui, cmd.title);
+    let resp = ui
+        .add_enabled(
+            reason.is_none(),
+            egui::Button::new(label)
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+        .on_hover_text(&hover)
+        .on_disabled_hover_text(&hover);
+    if resp.clicked() {
+        Some(cmd.id)
+    } else {
+        None
+    }
+}
+
+/// Draw the buttons of one ribbon tab into the CURRENT ui, flat. Superseded by
+/// [`ribbon_groups`] in the app; kept for tests that assert every entry
+/// resolves (`the_home_tab_lists_only_real_commands`).
+#[cfg(test)]
+pub fn ribbon_buttons(ui: &mut egui::Ui, tab: RibbonTab, st: &CommandState) -> Option<CommandId> {
+    let mut chosen = None;
+    match tab.menu() {
+        // A category tab: every registry command in that menu, in order.
+        Some(menu) => {
+            let mut first = true;
+            for cmd in for_menu(menu) {
+                if cmd.separator_before && !first {
+                    ui.separator();
+                }
+                first = false;
+                if let Some(id) = ribbon_button(ui, cmd, st) {
+                    chosen = Some(id);
+                }
+            }
+        }
+        // Home: the curated cross-category list.
+        None => {
+            for &id in HOME_COMMANDS {
+                if let Some(cmd) = command(id) {
+                    if let Some(hit) = ribbon_button(ui, cmd, st) {
+                        chosen = Some(hit);
+                    }
+                }
+            }
+        }
+    }
+    chosen
+}
+
+/// Draw one ribbon tab as labelled groups: each group is a row of its buttons
+/// with a small muted caption beneath, groups separated by a thin vertical
+/// rule — the banded ribbon in the design mock. Returns the chosen command.
+///
+/// `caption` is the muted colour for the group labels (the caller's
+/// `theme.text_dim`), passed in so this stays theme-driven rather than baking a
+/// constant. Each group is one widget in the caller's wrapped row, so a narrow
+/// window wraps BETWEEN groups and never splits one in half.
+pub fn ribbon_groups(
+    ui: &mut egui::Ui,
+    tab: RibbonTab,
+    st: &CommandState,
+    caption: egui::Color32,
+) -> Option<CommandId> {
+    // Measured width of one group's button row: each button is its title's
+    // laid-out width plus the button padding, buttons separated by the item
+    // gap. The groups are packed into explicit rows up front, so layout is
+    // deterministic: a group that will not fit WHOLE moves to the next row —
+    // wrapping happens between groups, never through the middle of one
+    // (DESIGN.md: ribbon controls may wrap, never clip or overlap).
+    let group_width = |ui: &egui::Ui, ids: &[CommandId]| -> f32 {
+        let pad = ui.spacing().button_padding.x * 2.0;
+        let gap = ui.spacing().item_spacing.x;
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let mut w = 0.0;
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(cmd) = command(id) {
+                let text_w = ui.fonts(|f| {
+                    f.layout_no_wrap(cmd.title.to_string(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                });
+                w += text_w + pad;
+                if i > 0 {
+                    w += gap;
+                }
+            }
+        }
+        w
+    };
+    // A separator plus its surrounding item gaps.
+    let sep_width = ui.spacing().item_spacing.x * 2.0 + 6.0;
+
+    let groups = tab_groups(tab);
+    let total = ui.available_width();
+    let mut chosen = None;
+    let mut i = 0;
+    while i < groups.len() {
+        // Greedily take whole groups while they fit on this row. The first
+        // group always goes on (even wider than the window it must land
+        // somewhere; its own buttons then fold inside the group).
+        let mut end = i + 1;
+        let mut used = group_width(ui, groups[i].1);
+        while end < groups.len() {
+            let w = group_width(ui, groups[end].1);
+            if used + sep_width + w <= total {
+                used += sep_width + w;
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        ui.horizontal(|ui| {
+            for (gi, (label, ids)) in groups[i..end].iter().enumerate() {
+                if gi > 0 {
+                    ui.separator();
+                }
+                // A group is a vertical stack: the button row, then its
+                // caption. The caption is PAINTED centred under the row
+                // rather than laid out — a caption widget would claim row
+                // width and distort the packing.
+                ui.vertical(|ui| {
+                    // Wrapped as a last resort: a group wider than the whole
+                    // window still folds inside itself rather than clipping.
+                    let row = ui.horizontal_wrapped(|ui| {
+                        for &id in *ids {
+                            if let Some(cmd) = command(id) {
+                                if let Some(hit) = ribbon_button(ui, cmd, st) {
+                                    chosen = Some(hit);
+                                }
+                            }
+                        }
+                    });
+                    let rect = row.response.rect;
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.bottom() + 1.0),
+                        egui::Align2::CENTER_TOP,
+                        *label,
+                        egui::FontId::proportional(10.0),
+                        caption,
+                    );
+                    // Reserve the height the painted caption occupies, so the
+                    // panel grows to fit it instead of clipping.
+                    ui.add_space(12.0);
+                });
+            }
+        });
+        i = end;
+    }
+    chosen
+}
+
+/// Draw the body of one ribbon tab into a wrapped row (buttons reflow when the
+/// window is narrow). Thin wrapper over [`ribbon_buttons`]. Returns the chosen
+/// command, if any.
+#[cfg(test)]
+pub fn ribbon_row(ui: &mut egui::Ui, tab: RibbonTab, st: &CommandState) -> Option<CommandId> {
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        chosen = ribbon_buttons(ui, tab, st);
+    });
     chosen
 }
 
