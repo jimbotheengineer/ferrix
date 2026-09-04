@@ -263,6 +263,12 @@ impl Theme {
     /// Push this palette into egui's own widget styling, so buttons, windows,
     /// scrollbars and text edits follow the theme along with the hand-painted
     /// grid.
+    ///
+    /// The widget treatment is the DESIGN.md "modern industrial utility"
+    /// composition: FLAT transparent buttons at rest (a command strip, not a
+    /// field of grey boxes), a quiet structural fill plus one-pixel border on
+    /// hover, and the blue-tinted fill reserved for genuinely active state.
+    /// Rounding stays small (2-3px) — no pills.
     pub fn apply(&self, ctx: &egui::Context) {
         let mut v = if self.is_dark() {
             Visuals::dark()
@@ -274,19 +280,110 @@ impl Theme {
         v.extreme_bg_color = self.bg;
         v.override_text_color = Some(self.text);
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.grid_line);
-        v.widgets.inactive.bg_fill = self.header_bg;
-        v.widgets.hovered.bg_fill = self.accent_soft;
+        // Buttons: flat and borderless at rest…
+        v.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+        v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        v.widgets.inactive.bg_stroke = Stroke::NONE;
+        // …a structural fill and a one-pixel border on hover…
+        v.widgets.hovered.bg_fill = self.header_bg;
+        v.widgets.hovered.weak_bg_fill = self.header_bg;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.grid_line);
+        // …and the accent-tinted fill only while genuinely active/pressed.
         v.widgets.active.bg_fill = self.accent_soft;
+        v.widgets.active.weak_bg_fill = self.accent_soft;
+        v.widgets.active.bg_stroke = Stroke::new(1.0_f32, self.accent);
+        // Selected toggles (selectable_label on) read as active, not hovered.
         v.selection.bg_fill = self.accent_soft;
         v.selection.stroke = Stroke::new(1.0_f32, self.accent);
+        // Text fields recess into the surface via extreme_bg_color (set
+        // above): darker than the panel, per the DESIGN.md formula-bar spec.
+        let r = Rounding::same(3.0);
         v.widgets.noninteractive.rounding = Rounding::same(2.0);
+        v.widgets.inactive.rounding = r;
+        v.widgets.hovered.rounding = r;
+        v.widgets.active.rounding = r;
+        v.widgets.open.rounding = r;
+        v.window_rounding = Rounding::same(6.0);
+        v.menu_rounding = Rounding::same(6.0);
         ctx.set_visuals(v);
 
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(8.0, 5.0);
+        // DESIGN.md type hierarchy: UI 13, monospace 13, secondary 11.5.
+        use egui::{FontFamily, FontId, TextStyle};
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(13.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(11.5, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(16.0, FontFamily::Proportional),
+        );
         ctx.set_style(style);
     }
+}
+
+/// Install the platform type ramp once at startup: Segoe UI for interface
+/// text and Cascadia Mono (falling back to Consolas) for data — DESIGN.md's
+/// Windows preferences — with Segoe UI Symbol appended for coverage of the
+/// arrow/math glyphs command titles use. Fully graceful: any font that fails
+/// to load is skipped and egui's bundled fonts remain as the final fallback,
+/// so a non-Windows machine or a stripped install changes nothing.
+pub fn install_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily};
+    let mut fonts = egui::FontDefinitions::default();
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let font_dir = std::path::Path::new(&windir).join("Fonts");
+    let load = |file: &str| -> Option<FontData> {
+        std::fs::read(font_dir.join(file))
+            .ok()
+            .map(FontData::from_owned)
+    };
+
+    // UI face: highest priority for proportional text.
+    if let Some(data) = load("segoeui.ttf") {
+        fonts.font_data.insert("segoe-ui".into(), data);
+        fonts
+            .families
+            .get_mut(&FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "segoe-ui".into());
+    }
+    // Data face: highest priority for monospace.
+    if let Some(data) = load("CascadiaMono.ttf").or_else(|| load("consola.ttf")) {
+        fonts.font_data.insert("mono".into(), data);
+        fonts
+            .families
+            .get_mut(&FontFamily::Monospace)
+            .unwrap()
+            .insert(0, "mono".into());
+    }
+    // Symbol coverage (⬈ ⌗ ⇅ 𝐁 …): appended LAST so it only serves glyphs
+    // nothing above carries — without it those render as tofu boxes, which is
+    // what made every ribbon button look checkbox-prefixed.
+    if let Some(data) = load("seguisym.ttf") {
+        fonts.font_data.insert("segoe-symbol".into(), data);
+        for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts
+                .families
+                .get_mut(&fam)
+                .unwrap()
+                .push("segoe-symbol".into());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Colours for the chart's own chrome (background, gridlines, tick labels),

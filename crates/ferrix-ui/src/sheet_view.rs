@@ -258,7 +258,17 @@ impl<'a> SheetView<'a> {
 
     #[inline]
     pub fn col_count(&self) -> usize {
-        self.base.col_count().max(self.overlay.extent().1)
+        // A COLUMN permutation defines how many display positions exist, just
+        // like the row case above. Inserting a column grows the order by one
+        // display position; reading only the base's count here would leave
+        // that new position unpainted and push the sheet's last real column
+        // off the right edge (it silently vanished after an insert). Removing
+        // a column likewise drops a display position without erasing base data.
+        let displayed = match self.order.and_then(|o| o.cols.as_ref()) {
+            Some(a) => a.len() as usize,
+            None => self.base.col_count(),
+        };
+        displayed.max(self.overlay.extent().1)
     }
 
     /// Read a cell: overlay wins, base is the fallback.

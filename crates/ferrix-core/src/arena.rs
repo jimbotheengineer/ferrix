@@ -58,6 +58,24 @@ pub struct StrId(pub u32);
 /// per-sheet arena id.
 pub const FORMULA_TEXT_TAG: u32 = 0x8000_0000;
 
+/// Bit 30 of a [`StrId`] marking it as interned by an EDIT OVERLAY's arena
+/// rather than the base sheet's.
+///
+/// The two arenas both hand out dense indices from zero, and a composite
+/// view resolves overlay-first — so before this tag, base id N silently
+/// resolved to the overlay's Nth string once the overlay had interned that
+/// many. The visible failure: type a text label anywhere, and every formula
+/// reading a base text column starts comparing against the WRONG strings
+/// ("South" resolves as "Bearing"), so SUMIF/COUNTIF/lookups return zeros —
+/// precisely the "agent fills in helper columns while the user works on a
+/// mapped file" flow. Overlay ids now carry this bit, so provenance travels
+/// with the id and the composite resolver routes by construction.
+///
+/// Capacity: bit 30 still leaves 2^30 distinct strings per arena, and the
+/// formula tag (bit 31) remains distinguishable — a tagged formula id never
+/// carries this bit.
+pub const OVERLAY_TEXT_TAG: u32 = 0x4000_0000;
+
 /// Hard ceiling on retained formula-result text. Past this, interning fails
 /// and text functions report `#VALUE!` — bounded memory beats a silent leak.
 pub const FORMULA_TEXT_BUDGET: usize = 64 * 1024 * 1024;

@@ -976,6 +976,29 @@ impl Harness {
         true
     }
 
+    /// Ctrl+click a cell — the formula-linking gesture. The modifier rides
+    /// `RawInput.modifiers` for the click frame, exactly as a held key does.
+    pub fn ctrl_click_cell(&mut self, cell: ferrix_core::CellRef) -> bool {
+        self.step();
+        let Some((x, y)) = self.app.cell_center(cell) else {
+            return false;
+        };
+        self.move_to(x, y).press();
+        self.pending_modifiers = Modifiers::COMMAND;
+        self.step();
+        self.release();
+        self.pending_modifiers = Modifiers::COMMAND;
+        self.steps(2);
+        true
+    }
+
+    /// Set the aggregate modifier state for the NEXT frame — how a held
+    /// Ctrl/Cmd key looks to the app during a multi-frame gesture (e.g. the
+    /// Ctrl+drag range link).
+    pub fn set_modifiers_for_test(&mut self, modifiers: Modifiers) {
+        self.pending_modifiers = modifiers;
+    }
+
     /// Click a raw viewport POINT — the whole point of the zoom hit-test
     /// check, where the test must supply the pixel and the app must resolve it.
     pub fn click_point(&mut self, x: f32, y: f32) -> &mut Self {
@@ -1567,6 +1590,42 @@ mod tests {
             Some(&["Northern".to_string(), "Southern".to_string()][..])
         );
         assert_eq!(rules[0].message.as_deref(), Some("Pick a listed region"));
+    }
+
+    /// A comma-separated line of allowed values is split into SEPARATE values,
+    /// not stored as one giant value. Typing "North, South, East" on one line
+    /// used to become a single allowed value: the dropdown offered only that
+    /// whole string, picking it dumped the whole list into the cell, and every
+    /// real value failed validation.
+    #[test]
+    fn a_comma_separated_list_becomes_separate_allowed_values() {
+        use crate::command::CommandId;
+        let mut h = open_regions("dv-commas");
+        h.select(CellRef::new(1, 0), CellRef::new(4, 0));
+        h.app_mut().run_command(CommandId::DataValidationNew);
+        h.steps(2);
+        h.dv_form(|f| {
+            f.domain = ferrix_core::ValueDomain::List;
+            // One line, comma-separated — the natural spreadsheet way.
+            f.list_text = "North, South, East, West, Central".into();
+        });
+        h.dv_click_ok();
+
+        let rules = h.dv_rules();
+        assert_eq!(rules.len(), 1, "OK stored nothing; status: {}", h.status());
+        assert_eq!(
+            rules[0].list_values(),
+            Some(
+                &[
+                    "North".to_string(),
+                    "South".to_string(),
+                    "East".to_string(),
+                    "West".to_string(),
+                    "Central".to_string(),
+                ][..]
+            ),
+            "a comma-separated line must split into five values, not stay one giant value"
+        );
     }
 
     /// A rule over a huge selection is ONE entry.
@@ -3288,6 +3347,100 @@ xxx,yyy,zzz
     }
 
     #[test]
+    fn the_sort_and_filter_commands_reach_the_same_behaviour_as_the_ui() {
+        // Sort and Filter became first-class registry commands (ribbon + palette
+        // + menu), not only a header-menu click and the search-bar toggle. Both
+        // must drive the SAME behaviour through run_command: DataSort reorders by
+        // the cursor's column, DataFilter turns filter mode on.
+        use crate::command::CommandId;
+        let p = write_csv("sortfiltercmd.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let original = screen_column(&h, 0);
+        assert_eq!(
+            original,
+            vec!["delta", "alpha", "charlie", "bravo"],
+            "setup: the file is deliberately not in sorted order"
+        );
+
+        // Park the cursor on column A, then invoke the Sort command: the rows
+        // sort ascending by that column, a view transform (no data moved).
+        h.select(CellRef::new(0, 0), CellRef::new(0, 0));
+        h.run_command(CommandId::DataSort);
+        assert_eq!(
+            screen_column(&h, 0),
+            vec!["alpha", "bravo", "charlie", "delta"],
+            "the Sort command should order rows ascending by the cursor column; status: {}",
+            h.status()
+        );
+
+        // Filter is off to start; the command turns it on.
+        assert!(!h.app().is_filtering_for_test(), "filter starts off");
+        h.run_command(CommandId::DataFilter);
+        assert!(
+            h.app().is_filtering_for_test(),
+            "the Filter command should turn filter mode on; status: {}",
+            h.status()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_selection_panel_toggles_and_aggregates_honestly() {
+        // The Selection side panel (DESIGN.md right dock): the View command
+        // toggles it, and its aggregates are computed from the REAL selection
+        // through the same SheetView the grid paints from — with the scan cap
+        // reported rather than hidden.
+        use crate::command::CommandId;
+        use crate::selection_panel::{SelectionStats, MAX_AGG_CELLS};
+        let p = write_csv("selpanel.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Toggle through run_command, like the ribbon button does.
+        assert!(!h.app().selection_panel_open_for_test(), "starts closed");
+        h.run_command(CommandId::ViewSelectionPanel);
+        assert!(
+            h.app().selection_panel_open_for_test(),
+            "the View command should open the panel; status: {}",
+            h.status()
+        );
+        // A frame with the panel open draws it (and computes stats) without
+        // panicking, even while the selection is a single cell.
+        h.step();
+
+        // Aggregates over qty (column B: 40, 10, 30, 20).
+        h.select(CellRef::new(0, 1), CellRef::new(3, 1));
+        h.step();
+        let stats = SelectionStats::compute(&h.app().wb_view_for_test(), h.app().selection());
+        assert_eq!(stats.count, 4, "four non-empty cells");
+        assert_eq!(stats.numbers, 4, "all four are numeric");
+        assert_eq!(stats.sum, 100.0, "40+10+30+20");
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(40.0));
+        assert_eq!(stats.average(), Some(25.0));
+        assert!(!stats.truncated, "4 cells is nowhere near the cap");
+        assert!(
+            stats.spark.len() >= 2,
+            "numeric values should sample into the sparkline"
+        );
+
+        // Honesty at scale: a selection bigger than the cap reports truncation
+        // and scans exactly the cap, not the whole range. The selection spans
+        // far past the sheet's 4 rows; empty cells cost the same as data ones.
+        h.select(CellRef::new(0, 0), CellRef::new(200_000, 1));
+        let big = SelectionStats::compute(&h.app().wb_view_for_test(), h.app().selection());
+        assert!(big.truncated, "a 400k-cell selection must report the cap");
+        assert_eq!(big.scanned, MAX_AGG_CELLS, "scan stops AT the cap");
+
+        // And the command closes it again.
+        h.run_command(CommandId::ViewSelectionPanel);
+        assert!(!h.app().selection_panel_open_for_test());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn selecting_a_column_then_charting_it_builds_from_that_column() {
         // The end-to-end flow the header-click fix unblocks: click a column to
         // select it, then chart it. Before the fix the click sorted the data,
@@ -3324,6 +3477,370 @@ xxx,yyy,zzz
             "the chart must build from the column that was selected (B/qty); status: {}",
             h.status()
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_chart_columns_can_be_re_aimed_without_reselecting() {
+        // Issue #106: the chart window's column pickers let the X and Y columns
+        // be changed in place, so a chart can be pointed at different (and
+        // non-adjacent) columns without closing the window and reselecting.
+        let p = write_csv(
+            "chartreaim.csv",
+            "region,product,revenue\na,x,40\nb,y,10\nc,z,30\n",
+        );
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Chart column C (revenue) to start with — a single-column selection.
+        h.select(CellRef::new(0, 2), CellRef::new(2, 2));
+        h.run_command(crate::command::CommandId::DataChart);
+        h.steps(2);
+        assert_eq!(h.app().chart_y_col(), Some(2), "Y starts on C (revenue)");
+        assert_eq!(
+            h.app().chart_x_col(),
+            None,
+            "no X column yet — plots by row"
+        );
+
+        // Point Y at a different column (A) and X at C — NON-adjacent to prove
+        // the pickers are not limited to a contiguous range.
+        h.app_mut().set_chart_y_col(0);
+        h.app_mut().set_chart_x_col(Some(2));
+        h.steps(2);
+        assert_eq!(h.app().chart_y_col(), Some(0), "Y is now column A");
+        assert_eq!(h.app().chart_x_col(), Some(2), "X is now column C");
+
+        // The picker choices name every column by header.
+        let choices = h.app().chart_column_choices();
+        assert!(
+            choices
+                .iter()
+                .any(|(i, l)| *i == 2 && l.contains("revenue")),
+            "column choices should name headers; got {choices:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The full "agent drives Ferrix" flow (agent compatibility): a headless
+    /// agent loads the demo workbook, types real spreadsheet formulas to
+    /// answer a question — which region sold the most of each product, and
+    /// that region's average revenue per unit — reads the computed answers
+    /// back, aims the chart at the computed columns, and exports the graphic
+    /// as SVG. Every step goes through the same paths the UI uses: cell
+    /// editing, the formula engine, the chart pickers, the SVG exporter.
+    #[test]
+    fn an_agent_can_answer_a_question_with_formulas_and_chart_it() {
+        // The demo file lives at the repo root; it is local data, not a
+        // committed fixture, so skip (loudly) where it does not exist.
+        let demo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("pagebreak_demo.csv");
+        if !demo.exists() {
+            eprintln!("SKIP: pagebreak_demo.csv not present; agent-flow test needs it");
+            return;
+        }
+        let mut h = Harness::new(Some(&demo));
+        assert!(h.step_until(400, |a| a.row_count() >= 200));
+
+        // Data: A=id B=region C=product D=units E=revenue, rows 1..200.
+        // Helper block the agent types, in the blank columns past the data:
+        //   G1:G6   product names
+        //   H8:L8   region names (INDEX target for the top-region lookup)
+        //   H1:L6   SUMIFS units sold, product × region
+        //   M1:M6   top region by units = INDEX(regions, MATCH(MAX(row)))
+        //   N1:N6   that region's revenue per unit = SUMIFS(rev)/SUMIFS(units)
+        //   O1:O6   chart label "product — region"
+        let products = ["Bearing", "Cog", "Gadget", "Sprocket", "Valve", "Widget"];
+        let regions = ["North", "South", "East", "West", "Central"];
+        let put = |h: &mut Harness, row: u32, col: u32, text: &str| {
+            h.select(CellRef::new(row, col), CellRef::new(row, col));
+            h.type_text(text).step();
+            h.press_key(Key::Enter).steps(2);
+        };
+        for (i, p) in products.iter().enumerate() {
+            put(&mut h, i as u32, 6, p);
+        }
+        for (j, r) in regions.iter().enumerate() {
+            put(&mut h, 7, 7 + j as u32, r);
+        }
+        for i in 0..products.len() as u32 {
+            let r = i + 1; // 1-based row in A1 notation
+            for (j, _) in regions.iter().enumerate() {
+                let col_letter = ["H", "I", "J", "K", "L"][j];
+                put(
+                    &mut h,
+                    i,
+                    7 + j as u32,
+                    &format!("=SUMIFS(D1:D200,C1:C200,G{r},B1:B200,{col_letter}8)"),
+                );
+            }
+            put(
+                &mut h,
+                i,
+                12,
+                &format!("=INDEX(H8:L8,1,MATCH(MAX(H{r}:L{r}),H{r}:L{r},0))"),
+            );
+            put(
+                &mut h,
+                i,
+                13,
+                &format!(
+                    "=ROUND(SUMIFS(E1:E200,C1:C200,G{r},B1:B200,M{r})\
+                     /SUMIFS(D1:D200,C1:C200,G{r},B1:B200,M{r}),2)"
+                ),
+            );
+            put(&mut h, i, 14, &format!("=CONCAT(G{r},\" — \",M{r})"));
+        }
+
+        // The computed answers, against ground truth computed independently
+        // from the same CSV (python, no Ferrix code involved).
+        let want = [
+            ("Bearing", "South", "19.02"),
+            ("Cog", "Central", "20.97"),
+            ("Gadget", "North", "25.16"),
+            ("Sprocket", "Central", "26.71"),
+            ("Valve", "East", "15.92"),
+            ("Widget", "East", "16.94"),
+        ];
+        for (i, (product, region, rev_per_unit)) in want.iter().enumerate() {
+            let r = i as u32;
+            assert_eq!(
+                h.app().display(CellRef::new(r, 12)),
+                *region,
+                "{product}: wrong top region; row {r} status: {}",
+                h.status()
+            );
+            assert_eq!(
+                h.app().display(CellRef::new(r, 13)),
+                *rev_per_unit,
+                "{product}: wrong revenue per unit; status: {}",
+                h.status()
+            );
+        }
+
+        // Chart the computed summary: labels = O (product — region),
+        // values = N (revenue per unit), as a bar chart — non-adjacent
+        // columns, the exact case the pickers exist for.
+        h.select(CellRef::new(0, 13), CellRef::new(5, 13));
+        h.run_command(crate::command::CommandId::DataChart);
+        h.steps(2);
+        h.app_mut()
+            .set_chart_kind(crate::chart_panel::ChartKind::Bar);
+        h.app_mut().set_chart_x_col(Some(14));
+        h.steps(2);
+        let (open, _) = h.app().chart_state_for_test();
+        assert!(open, "the chart window should be open");
+
+        // Export the graphic exactly as the Export button would.
+        let svg = h
+            .app()
+            .chart_svg_for_test(1200.0, 600.0)
+            .expect("a built chart exports SVG");
+        assert!(svg.contains("<svg"), "the export is real SVG");
+        // The graphic names the products and their top regions.
+        for (product, region, _) in &want {
+            assert!(
+                svg.contains(product) && svg.contains(region),
+                "the chart should label {product} — {region}"
+            );
+        }
+        let out = std::env::temp_dir().join("ferrix_agent_chart.svg");
+        std::fs::write(&out, &svg).expect("write the exported SVG");
+        eprintln!("agent chart exported to {}", out.display());
+    }
+
+    /// The LIVE agent bridge: commands appended to the watched file execute
+    /// in the running app, visibly — the selection moves, the edit commits
+    /// through the normal chokepoint (undoable, status narrated), and the
+    /// answer file is written. This is the "user watches the agent work in
+    /// their open window" contract, driven end to end.
+    #[test]
+    fn the_agent_bridge_executes_appended_commands_visibly() {
+        use std::io::Write;
+        let p = write_csv("agentbridge.csv", SORTABLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // OFF by default: nothing watches until the user says so.
+        assert!(!h.app().agent_bridge_enabled_for_test(), "off by default");
+
+        // A stale command file from an earlier run must NOT replay.
+        let watch = std::path::PathBuf::from(format!("{}.fxagent", p.display()));
+        std::fs::write(&watch, "put D1 stale\n").unwrap();
+
+        // The user toggles it on (View → Agent bridge).
+        h.run_command(crate::command::CommandId::ViewAgentBridge);
+        assert!(h.app().agent_bridge_enabled_for_test());
+        assert!(
+            h.status().contains("Agent bridge ON"),
+            "attaching names the watched file; status: {}",
+            h.status()
+        );
+        h.steps(3);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "",
+            "the stale pre-attach command must not have run"
+        );
+
+        // The agent appends real work: select, compute, read back.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&watch)
+            .unwrap();
+        writeln!(f, "select B1:B4").unwrap();
+        writeln!(f, "put D1 =SUM(B1:B4)").unwrap();
+        writeln!(f, "get D1").unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        // Poll interval (150ms) and per-command throttle mean a few frames.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.app().display(CellRef::new(0, 3)) != "100" && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            h.steps(2);
+        }
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "100",
+            "the agent's formula should be committed and evaluated (10+20+30+40); status: {}",
+            h.status()
+        );
+        // Visible: the edit narrated through the SAME status path typing
+        // uses ("D1 updated…"). The get command that follows narrates as
+        // agent work and writes the answer file; wait for it.
+        let out = std::path::PathBuf::from(format!("{}.out", watch.display()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !out.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            h.steps(2);
+        }
+        let answer = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            answer.contains("100"),
+            "the get command should write the displayed value; got {answer:?}"
+        );
+        assert!(
+            h.status().contains("Agent"),
+            "the status line should narrate agent work; status: {}",
+            h.status()
+        );
+        // The edit is a NORMAL edit: one undo step removes it.
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "",
+            "an agent edit must be undoable like any other edit"
+        );
+
+        // The Agent window's log carries every executed line VERBATIM —
+        // the full formula text, not a summary — with an outcome each.
+        let log = h.app().agent_log_for_test();
+        assert!(
+            log.iter().any(|(raw, _)| raw == "put D1 =SUM(B1:B4)"),
+            "the log shows the exact formula the agent typed; log: {log:?}"
+        );
+        assert!(
+            log.iter().any(|(raw, _)| raw == "select B1:B4"),
+            "every command appears, not just edits; log: {log:?}"
+        );
+        assert!(
+            log.iter().all(|(_, outcome)| !outcome.is_empty()),
+            "every entry records an outcome; log: {log:?}"
+        );
+
+        // Toggling off detaches: a command appended after has no effect.
+        h.run_command(crate::command::CommandId::ViewAgentBridge);
+        assert!(!h.app().agent_bridge_enabled_for_test());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&watch)
+            .unwrap();
+        writeln!(f, "put D2 999").unwrap();
+        drop(f);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        h.steps(4);
+        assert_eq!(
+            h.app().display(CellRef::new(1, 3)),
+            "",
+            "a detached bridge must not execute anything"
+        );
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&watch);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Granular chart control, end to end: multiple Y series, custom title /
+    /// axis / series text ("H by G" → "Profit by Region"), all in-app, all
+    /// surviving a rebuild, all reaching the exported SVG.
+    #[test]
+    fn chart_text_and_series_are_user_controllable_in_app() {
+        const SALES: &str = "region,units,revenue,cost\n\
+            East,10,100,40\nWest,20,150,60\nEast,5,50,20\nNorth,8,90,30\n";
+        let p = write_csv("chartcontrol.csv", SALES);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Chart revenue by region (bar), then overlay cost as a second series.
+        h.select(CellRef::new(0, 0), CellRef::new(3, 1));
+        h.run_command(crate::command::CommandId::DataChart);
+        h.steps(2);
+        h.app_mut().set_chart_y_col(2); // revenue
+        h.app_mut().set_chart_x_col(Some(0)); // region
+        h.steps(1);
+        h.app_mut().chart_mut_for_test().extra_y_cols = vec![3]; // + cost
+        h.app_mut().rebuild_chart_for_test();
+        h.steps(1);
+
+        let svg = h
+            .app()
+            .chart_svg_for_test(1000.0, 500.0)
+            .expect("chart with two series");
+        assert!(
+            svg.contains("revenue") && svg.contains("cost"),
+            "both series must appear in the legend"
+        );
+
+        // Now the words: the generated title gives way to the user's.
+        h.app_mut()
+            .chart_mut_for_test()
+            .set_custom_labels(crate::chart_panel::ChartLabels {
+                title: "Profit by Region".into(),
+                x_axis: "Region".into(),
+                y_axis: "Dollars".into(),
+                series: "Revenue".into(),
+            });
+        let svg = h
+            .app()
+            .chart_svg_for_test(1000.0, 500.0)
+            .expect("labelled chart");
+        assert!(svg.contains("Profit by Region"), "custom title in export");
+        assert!(svg.contains("Dollars"), "custom y label in export");
+
+        // The user's words survive a rebuild (kind switch and back).
+        h.app_mut()
+            .set_chart_kind(crate::chart_panel::ChartKind::Line);
+        h.app_mut()
+            .set_chart_kind(crate::chart_panel::ChartKind::Bar);
+        let svg = h
+            .app()
+            .chart_svg_for_test(1000.0, 500.0)
+            .expect("rebuilt chart");
+        assert!(
+            svg.contains("Profit by Region"),
+            "custom title must survive a rebuild"
+        );
+
+        // And a bar chart's baseline carries category names, not numeric
+        // ticks fighting them ("0 2 4" under "East West North").
+        assert!(
+            !svg.contains(">0.5<") && !svg.contains(">1.5<"),
+            "no numeric x ticks under category labels"
+        );
+
         let _ = std::fs::remove_file(&p);
     }
 
@@ -5069,8 +5586,23 @@ xxx,yyy,zzz
         );
 
         // A row further down, to catch an off-by-a-scale-factor that happens to
-        // work near the top of the viewport.
-        let deeper = CellRef::new(12, 1);
+        // work near the top of the viewport. Chosen from the rows actually
+        // painted at 200% rather than a hardcoded number, so the test stays
+        // valid when ribbon/formula-bar height changes the viewport size. Not
+        // the LAST painted row — that one can be clipped at the bottom edge,
+        // putting its centre outside the grid where a click lands on nothing.
+        let painted = h.app().painted_underlying_rows();
+        let below: Vec<u32> = painted
+            .iter()
+            .copied()
+            .filter(|&r| r > target.row + 2)
+            .collect();
+        assert!(
+            below.len() >= 2,
+            "not enough painted rows below the target to test with: {painted:?}"
+        );
+        let deeper_row = below[below.len() / 2];
+        let deeper = CellRef::new(deeper_row, 1);
         let pt = h.app().cell_center(deeper).expect("deeper cell on screen");
         h.click_point(pt.0, pt.1);
         assert_eq!(h.app().cursor(), deeper);
@@ -8514,6 +9046,421 @@ xxx,yyy,zzz
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Hand-typed formulas work exactly as users write them: lowercase refs
+    /// (`=(c2*c3)`), `$`-anchored refs (`=$c$2*2`), anchored ranges — and
+    /// the anchors survive structural rewriting when rows shift. Plus POINT
+    /// MODE: while the formula ends in `=`/`(`/operator, a PLAIN click on a
+    /// cell links it instead of committing the half-typed text — so
+    /// `=(` click G3 `*` click D2 `)` builds `=(G3*D2)` by pointing.
+    #[test]
+    fn typed_formulas_lowercase_anchors_and_point_mode_work() {
+        let p = write_csv("probeuser.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+        // Lowercase refs TYPED through the real editor path
+        let d1 = CellRef::new(0, 3);
+        h.select(d1, d1);
+        h.app_mut().begin_edit_for_test(d1, None);
+        h.steps(1);
+        h.type_text("=(c2*c3)");
+        h.steps(1);
+        h.key(Key::Enter, Modifiers::default());
+        h.steps(3);
+        assert_eq!(h.app().display(d1), "600", "lowercase refs evaluate");
+        assert_eq!(
+            h.app().wb_view_for_test().edit_text(d1),
+            "=(c2*c3)",
+            "the user's own casing is preserved, not rewritten"
+        );
+        // Typed $ anchors
+        let d5 = CellRef::new(4, 3);
+        h.select(d5, d5);
+        h.app_mut().begin_edit_for_test(d5, None);
+        h.steps(1);
+        h.type_text("=$c$2*2");
+        h.steps(1);
+        h.key(Key::Enter, Modifiers::default());
+        h.steps(3);
+        assert_eq!(h.app().display(d5), "40", "typed $ anchors evaluate");
+
+        // Anchored refs
+        h.app_mut()
+            .commit_edit_for_test(CellRef::new(1, 3), "=$c$2+c3");
+        h.steps(2);
+        assert_eq!(h.app().display(CellRef::new(1, 3)), "50");
+        h.app_mut()
+            .commit_edit_for_test(CellRef::new(2, 3), "=SUM($C$2:C4)");
+        h.steps(2);
+        assert_eq!(h.app().display(CellRef::new(2, 3)), "90");
+        // Uppercase plain, control
+        h.app_mut()
+            .commit_edit_for_test(CellRef::new(3, 3), "=(C2*C3)");
+        h.steps(2);
+        assert_eq!(h.app().display(CellRef::new(3, 3)), "600");
+        // Insert a row above row 2 and see whether $ anchors survive rewriting
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.app_mut().insert_rows_above_selection();
+        h.steps(2);
+        // Anchors survive a row insert: the $ stays, the coordinates follow
+        // the data (both anchored and bare refs point at the same records).
+        assert_eq!(
+            h.app().wb_view_for_test().edit_text(CellRef::new(2, 3)),
+            "=$C$3+C4",
+            "$ anchoring survives structural rewriting"
+        );
+        assert_eq!(
+            h.app().wb_view_for_test().edit_text(CellRef::new(3, 3)),
+            "=SUM($C$3:C5)",
+            "anchored range endpoints survive too"
+        );
+
+        // POINT MODE: =( then a PLAIN click links, * then another click
+        // links again, ) closes — no Ctrl anywhere.
+        let d6 = CellRef::new(5, 3);
+        h.select(d6, d6);
+        h.app_mut().begin_edit_for_test(d6, Some("=("));
+        h.steps(2);
+        assert!(h.click_cell(CellRef::new(2, 2)), "cell on screen");
+        assert_eq!(
+            h.app().live_edit_buffer().as_deref(),
+            Some("=(C3"),
+            "a plain click while the formula wants a ref LINKS it"
+        );
+        h.type_text("*");
+        h.steps(1);
+        assert!(h.click_cell(CellRef::new(3, 2)), "cell on screen");
+        assert_eq!(
+            h.app().live_edit_buffer().as_deref(),
+            Some("=(C3*C4"),
+            "the operator re-arms point mode for the next click"
+        );
+        h.type_text(")");
+        h.key(Key::Enter, Modifiers::default());
+        h.steps(3);
+        // With the blank row inserted above row 2: C3=beta 20, C4=gamma 30.
+        assert_eq!(h.app().display(d6), "600", "the pointed formula computes");
+
+        // And a click when the formula is COMPLETE (ends in a value/paren)
+        // still commits — point mode only holds while a ref is expected.
+        h.app_mut()
+            .begin_edit_for_test(CellRef::new(6, 3), Some("=C3+1"));
+        h.steps(1);
+        assert!(h.click_cell(CellRef::new(0, 0)));
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "a complete formula commits on click, as before"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The selection moves the moment the button goes DOWN — not on release.
+    /// When it moved on release, the in-between frames extended from the OLD
+    /// anchor, flashing a phantom range on every quick click (user report).
+    #[test]
+    fn a_press_moves_the_selection_immediately_with_no_phantom_range() {
+        let p = write_csv("pressmove.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Park a multi-cell selection somewhere else first, so a phantom
+        // extend would be visible.
+        h.select(CellRef::new(0, 0), CellRef::new(2, 1));
+
+        let (x, y) = h.app().cell_center(CellRef::new(3, 2)).expect("on screen");
+        h.move_to(x, y).press();
+        h.step();
+        // STILL HELD — the selection must already be exactly the pressed
+        // cell, not a range from the old anchor.
+        let sel = h.app().selection();
+        assert!(
+            sel.is_single(),
+            "on the press frame the selection must be a single cell, got {}",
+            sel.label()
+        );
+        assert_eq!(sel.cursor, CellRef::new(3, 2), "and it is the pressed cell");
+
+        // Holding and sweeping still paints a range from the NEW anchor.
+        let (x2, y2) = h.app().cell_center(CellRef::new(1, 2)).expect("on screen");
+        h.move_to(x2, y2);
+        h.steps(2);
+        let sel = h.app().selection();
+        assert!(
+            !sel.is_single(),
+            "sweeping while held extends the selection"
+        );
+        h.release();
+        h.steps(2);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Ctrl+clicking a cell while typing a formula LINKS it: the reference
+    /// lands in the formula text at the caret, the edit stays live, and a
+    /// second Ctrl+click re-aims (replaces) rather than stacking references.
+    /// A plain click, by contrast, commits the edit and moves the selection.
+    #[test]
+    fn ctrl_clicking_links_cells_into_a_formula() {
+        let p = write_csv("ctrllink.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        // Start a formula in D1 (an empty cell clear of the data).
+        let target = CellRef::new(0, 3);
+        h.select(target, target);
+        h.app_mut().begin_edit_for_test(target, Some("=("));
+        h.steps(2);
+
+        // Ctrl+click C2 (qty 10, numeric): the edit must survive and the
+        // reference must land in the buffer.
+        assert!(h.ctrl_click_cell(CellRef::new(1, 2)), "cell on screen");
+        let buf = h.app().live_edit_buffer().expect("edit still live");
+        assert_eq!(
+            buf, "=(C2",
+            "the clicked cell's reference is spliced at the caret"
+        );
+
+        // Ctrl+click a different cell: RE-AIM, not stack.
+        assert!(h.ctrl_click_cell(CellRef::new(2, 2)), "cell on screen");
+        let buf = h.app().live_edit_buffer().expect("edit still live");
+        assert_eq!(
+            buf, "=(C3",
+            "a second Ctrl+click replaces the reference the first wrote"
+        );
+
+        // Type on, then link again: the typed text is untouched and the new
+        // reference lands after it.
+        h.type_text("+");
+        h.steps(1);
+        assert!(h.ctrl_click_cell(CellRef::new(3, 2)), "cell on screen");
+        let buf = h.app().live_edit_buffer().expect("edit still live");
+        assert_eq!(buf, "=(C3+C4", "typing ends the re-aim window");
+
+        // Close and commit through the normal path; the formula computes.
+        h.type_text(")");
+        h.key(Key::Enter, Modifiers::default());
+        h.steps(3);
+        // C3 (row index 2) = gamma's qty 30, C4 = delta's 40: 30+40.
+        assert_eq!(
+            h.app().display(target),
+            "70",
+            "the linked formula must evaluate to the two cells' sum"
+        );
+
+        // A PLAIN click while editing still commits and moves — the gesture
+        // only diverts when Ctrl is down.
+        h.app_mut().begin_edit_for_test(target, Some("=1"));
+        h.steps(1);
+        assert!(h.click_cell(CellRef::new(0, 0)));
+        assert!(
+            h.app().live_edit_buffer().is_none(),
+            "a plain click commits the edit"
+        );
+
+        // Ctrl+DRAG links a whole RANGE: press on C2, sweep to C4, and the
+        // single-cell reference grows into `C2:C4` live under the pointer.
+        h.app_mut().begin_edit_for_test(target, Some("=SUM("));
+        h.steps(2);
+        let from = h.app().cell_center(CellRef::new(1, 2)).expect("on screen");
+        let to = h.app().cell_center(CellRef::new(3, 2)).expect("on screen");
+        h.move_to(from.0, from.1).press();
+        h.set_modifiers_for_test(Modifiers::COMMAND);
+        h.step();
+        let buf = h.app().live_edit_buffer().expect("edit still live");
+        assert_eq!(buf, "=SUM(C2", "the press links the anchor cell");
+        h.move_to(to.0, to.1);
+        h.set_modifiers_for_test(Modifiers::COMMAND);
+        h.steps(2);
+        let buf = h.app().live_edit_buffer().expect("edit still live");
+        assert_eq!(
+            buf, "=SUM(C2:C4",
+            "sweeping grows the reference into a range"
+        );
+        h.release();
+        h.set_modifiers_for_test(Modifiers::COMMAND);
+        h.steps(2);
+        h.type_text(")");
+        h.key(Key::Enter, Modifiers::default());
+        h.steps(3);
+        // C2+C3+C4 = 10+30+40 = 80 (alpha 10, gamma 30, delta 40... rows
+        // 1-3 are beta 20, gamma 30, delta 40 → 90).
+        assert_eq!(
+            h.app().display(target),
+            "90",
+            "the dragged range must evaluate to the swept cells' sum"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Structural edits are undoable (the old #17 gap, now closed): insert a
+    /// row → undo → the sheet reads exactly as before; same for a deletion,
+    /// where undo must bring the record back. Redo replays the insert.
+    #[test]
+    fn inserting_and_deleting_rows_are_undoable() {
+        let p = write_csv("undorow.csv", SAMPLE);
+        let mut h = Harness::new(Some(&p));
+        assert!(h.step_until(200, |a| a.row_count() > 0));
+
+        let col1 = |h: &Harness| -> Vec<String> {
+            (0..h.app().wb_view_for_test().row_count() as u32)
+                .map(|r| h.app().display(CellRef::new(r, 1)))
+                .collect()
+        };
+        let original = col1(&h);
+
+        // Insert one row above row 2 (display index 1), then undo it.
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.app_mut().insert_rows_above_selection();
+        h.steps(2);
+        assert_eq!(
+            col1(&h).len(),
+            original.len() + 1,
+            "the insert must land before undo is tested"
+        );
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(
+            col1(&h),
+            original,
+            "undoing an inserted row must restore the exact prior sheet"
+        );
+
+        // Redo brings the blank row back, then undo again for the next leg.
+        h.run_command(crate::command::CommandId::EditRedo);
+        h.steps(2);
+        assert_eq!(
+            col1(&h).len(),
+            original.len() + 1,
+            "redo must replay the insert"
+        );
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+
+        // Delete a data row, then undo: the record must come back.
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.run_command(crate::command::CommandId::DataDeleteRow);
+        h.steps(2);
+        assert_eq!(
+            col1(&h).len(),
+            original.len() - 1,
+            "the delete must land before undo is tested"
+        );
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(
+            col1(&h),
+            original,
+            "undoing a deleted row must bring the record back"
+        );
+
+        // Columns take the same path (one structural_edit implementation).
+        let row0 = |h: &Harness| -> Vec<String> {
+            (0..h.app().wb_view_for_test().col_count() as u32)
+                .map(|c| h.app().display(CellRef::new(0, c)))
+                .collect()
+        };
+        let header_row = row0(&h);
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.app_mut().insert_cols_left_selection();
+        h.steps(2);
+        h.run_command(crate::command::CommandId::EditUndo);
+        h.steps(2);
+        assert_eq!(
+            row0(&h),
+            header_row,
+            "undoing an inserted column must restore the exact prior sheet"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn directional_inserts_land_on_the_right_side_of_the_selection() {
+        // The cell menu's nested Insert row ▸ Above/Below and Insert column ▸
+        // Left/Right. "Above"/"Left" insert at the selection; "Below"/"Right"
+        // insert just past it, so the selected record keeps its neighbours on
+        // the expected side.
+
+        // --- rows: select "beta" (row 1) and insert BELOW it ---
+        let (p, mut h) = structural_fixture("ins_below.csv");
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.app_mut().insert_rows_below_selection();
+        h.steps(2);
+        // "beta" stays put; the blank row lands under it, before "gamma".
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "beta",
+            "below leaves beta"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(2, 1)),
+            "",
+            "the new row is directly BELOW the selection"
+        );
+        assert_eq!(h.app().display(CellRef::new(3, 1)), "gamma");
+        let _ = std::fs::remove_file(&p);
+
+        // --- rows: select "beta" and insert ABOVE it ---
+        let (p, mut h) = structural_fixture("ins_above.csv");
+        h.select(CellRef::new(1, 0), CellRef::new(1, 0));
+        h.app_mut().insert_rows_above_selection();
+        h.steps(2);
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "alpha",
+            "alpha untouched"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(1, 1)),
+            "",
+            "the new row is directly ABOVE the selection"
+        );
+        assert_eq!(h.app().display(CellRef::new(2, 1)), "beta");
+        let _ = std::fs::remove_file(&p);
+
+        // --- columns: select the "name" column (B) and insert RIGHT of it ---
+        let (p, mut h) = structural_fixture("ins_right.csv");
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.app_mut().insert_cols_right_selection();
+        h.steps(2);
+        // "name" stays in B; the blank column lands in C, "qty" shifts to D.
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "alpha",
+            "name stays in B"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "",
+            "the new column is directly RIGHT of the selection"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 3)),
+            "10",
+            "qty shifted to D"
+        );
+        let _ = std::fs::remove_file(&p);
+
+        // --- columns: select "name" (B) and insert LEFT of it ---
+        let (p, mut h) = structural_fixture("ins_left.csv");
+        h.select(CellRef::new(0, 1), CellRef::new(0, 1));
+        h.app_mut().insert_cols_left_selection();
+        h.steps(2);
+        // "id" stays in A; the blank column lands in B, "name" shifts to C.
+        assert_eq!(h.app().display(CellRef::new(0, 0)), "1", "id stays in A");
+        assert_eq!(
+            h.app().display(CellRef::new(0, 1)),
+            "",
+            "the new column is directly LEFT of the selection"
+        );
+        assert_eq!(
+            h.app().display(CellRef::new(0, 2)),
+            "alpha",
+            "name shifted to C"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn remove_duplicates_reports_how_many_it_removed() {
         let (p, mut h) = dupe_fixture("dedupe_report");
@@ -8783,16 +9730,22 @@ xxx,yyy,zzz
     }
 
     #[test]
-    fn an_inserted_column_is_named_by_position_not_a_stray_letter() {
+    fn an_inserted_column_is_named_by_position_and_nothing_falls_off() {
         use crate::command::CommandId;
-        // Bug: inserting a column allocated it a synthetic data index from
-        // beyond the base extent, and the header resolver looked that index up
-        // in the base headers — so the new EMPTY column was named after a stray
-        // letter (an insert in a 3-column sheet showed "D" over position C).
+        // Two bugs, one insert:
+        // 1. The new column got a synthetic data index from beyond the base
+        //    extent, and the header resolver looked it up in the base headers,
+        //    so the empty column was named after a stray letter ("D" over C).
+        // 2. col_count() never counted the column order's length, so an insert
+        //    grew the order but not the reported width — the sheet's LAST real
+        //    column was shifted to a display position that was never painted
+        //    and silently VANISHED.
         let (p, mut h) = structural_fixture("ins_col_header.csv");
 
-        // Sanity: C (index 2) is "qty" before the insert.
+        // Sanity: 3 columns, C (index 2) is "qty" holding real data.
+        assert_eq!(h.app().workbook().view().col_count(), 3);
         assert_eq!(h.app().workbook().view().header_or_letter(2), "qty");
+        assert_eq!(h.app().display(CellRef::new(0, 2)), "10");
 
         // Insert a column at C.
         h.select(CellRef::new(0, 2), CellRef::new(0, 2));
@@ -8800,17 +9753,35 @@ xxx,yyy,zzz
         h.steps(2);
 
         let v = h.app().workbook().view();
+        // The sheet is now one column WIDER — the insert added a display
+        // position rather than overwriting one.
+        assert_eq!(
+            v.col_count(),
+            4,
+            "the insert must widen the sheet, or the last column falls off the edge"
+        );
         // The NEW empty column at C is named by its position, not "D".
         assert_eq!(
             v.header_or_letter(2),
             "C",
             "the inserted empty column must be named by its position, not a stray letter"
         );
-        // The displaced data keeps its own header, now one column right.
+        assert_eq!(
+            v.display(CellRef::new(0, 2)),
+            "",
+            "the inserted column is empty"
+        );
+        // The displaced "qty" column survives with its header AND its data,
+        // now one column to the right.
         assert_eq!(
             v.header_or_letter(3),
             "qty",
             "the shifted column must carry its own header to its new position"
+        );
+        assert_eq!(
+            v.display(CellRef::new(0, 3)),
+            "10",
+            "the shifted column's data must not vanish off the right edge"
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -10193,8 +11164,9 @@ xxx,yyy,zzz
     }
 
     /// A loaded sheet's real column count is NOT widened by the blank-page
-    /// fallback. The fallback applies only when the sheet has no columns at
-    /// all, so a 3-column CSV keeps 3 columns.
+    /// fallback or by the empty-column padding: a 3-column CSV keeps 3 REAL
+    /// columns (what exports and the status bar see) even while the viewport
+    /// continues into blank spreadsheet columns past the data.
     #[test]
     fn a_loaded_sheet_keeps_its_own_column_count() {
         let p = write_csv(&unique("new_sheet_cols", "csv"), "a,b,c\n1,2,3\n");
@@ -10205,7 +11177,26 @@ xxx,yyy,zzz
             3,
             "the blank-page column fallback leaked into a sheet that has data"
         );
-        // And the cursor cannot walk past the last real column.
+        // With the empty-rows/columns toggle ON (the default), the cursor MAY
+        // walk right past the last data column into the blank padding — the
+        // sheet continues as D, E, F… — and the REAL count above stays 3.
+        h.select(CellRef::new(0, 2), CellRef::new(0, 2));
+        for _ in 0..5 {
+            h.press_key(egui::Key::ArrowRight).steps(1);
+        }
+        assert_eq!(
+            h.app().selection().cursor.col,
+            7,
+            "with padding on, arrowing right should continue into blank columns"
+        );
+        assert_eq!(
+            h.app().workbook().view().col_count(),
+            3,
+            "walking into the padding must not widen the real column count"
+        );
+        // With the toggle OFF, the padding is gone and the cursor stops at
+        // the last real column.
+        h.app_mut().set_show_empty_rows(false);
         h.select(CellRef::new(0, 2), CellRef::new(0, 2));
         for _ in 0..5 {
             h.press_key(egui::Key::ArrowRight).steps(1);
@@ -10213,7 +11204,7 @@ xxx,yyy,zzz
         assert_eq!(
             h.app().selection().cursor.col,
             2,
-            "arrowing right past a loaded sheet's last column must stop there"
+            "with padding off, arrowing right past the last column must stop there"
         );
         let _ = std::fs::remove_file(&p);
     }

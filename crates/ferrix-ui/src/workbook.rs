@@ -49,6 +49,12 @@ pub struct UndoEntry {
     /// instead of a copy of every removed row's cells, which on a 10M-row
     /// dedupe would be the entire sheet.
     order: Option<(ferrix_core::SheetOrder, ferrix_core::SheetOrder)>,
+    /// The axis shift a structural insert/delete applied to the side tables
+    /// (comments, formats, merges), with `true` = rows. Undo applies the
+    /// INVERSE shift so those tables move back in step with the restored
+    /// order; redo re-applies the forward shift. `None` for every entry that
+    /// changed no structure.
+    shift: Option<(ferrix_core::AxisShift, bool)>,
 }
 
 /// Default cap on the undo stack. A long session would otherwise grow it
@@ -781,6 +787,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok(n)
@@ -1960,6 +1967,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.dirty = true;
         self.recalc_all();
@@ -2093,6 +2101,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: Some((before, after)),
+            shift: None,
         });
         self.dirty = true;
         self.recalc_all();
@@ -2367,7 +2376,11 @@ impl Workbook {
         }
 
         // The axis is materialised at the sheet's CURRENT extent first, so an
-        // insert at the end still has a display position to land on.
+        // insert at the end still has a display position to land on. The
+        // order is snapshotted around the permutation edit — run lists, a few
+        // kilobytes — because undo restores structure by restoring the order,
+        // never by copying cells.
+        let before_order = self.order.clone();
         {
             let order = match axis {
                 Axis::Row => self.order.rows_mut(extent),
@@ -2383,6 +2396,7 @@ impl Workbook {
                 }
             }
         }
+        let order_snapshot = (before_order, self.order.clone());
 
         let at32 = u32::try_from(at).map_err(|_| "position out of range".to_string())?;
         let count32 = u32::try_from(count).map_err(|_| "count out of range".to_string())?;
@@ -2399,6 +2413,12 @@ impl Workbook {
 
         let changes = self.apply_axis_shift(shift, axis);
 
+        // Structural edits ARE undoable (the #17 gap, closed): the entry
+        // carries the forward shift so undo can (a) reverse the order
+        // permutation via the snapshot below and (b) apply the inverse shift
+        // to the display-keyed side tables, keeping them in step.
+        let (before_order, after_order) = order_snapshot;
+
         self.push_undo(UndoEntry {
             sheet: self.active_sheet(),
             cell: match axis {
@@ -2408,10 +2428,8 @@ impl Workbook {
             changes,
             side_effects: Vec::new(),
             bulk: true,
-            // An insert/delete shifts the DATA, not the display permutation,
-            // so there is no order snapshot to restore. Undo of the structural
-            // edit itself remains the documented gap from #17.
-            order: None,
+            order: Some((before_order, after_order)),
+            shift: Some((shift, axis == Axis::Row)),
         });
         self.dirty = true;
         self.recalc_all();
@@ -2617,6 +2635,7 @@ impl Workbook {
             // dedupe is deliberately not claimed here rather than wired
             // half-way during a merge — see the note on #50.
             order: None,
+            shift: None,
         });
         self.dirty = true;
         self.recalc_all();
@@ -2962,6 +2981,7 @@ impl Workbook {
                 side_effects,
                 bulk: false,
                 order: None,
+                shift: None,
             });
         }
         self.last_edit = Some((at, now));
@@ -3544,6 +3564,22 @@ impl Workbook {
         if let Some((before, _)) = &entry.order {
             self.order = before.clone();
         }
+        // Side tables follow: a structural entry recorded the forward shift,
+        // so applying its INVERSE walks comments/formats/merges back to the
+        // positions the restored order now addresses.
+        if let Some((shift, is_row)) = entry.shift {
+            let inverse = match shift {
+                ferrix_core::AxisShift::Insert { at, count } => {
+                    ferrix_core::AxisShift::Delete { at, count }
+                }
+                ferrix_core::AxisShift::Delete { at, count } => {
+                    ferrix_core::AxisShift::Insert { at, count }
+                }
+            };
+            self.comments.shift_axis(inverse, is_row);
+            self.format.shift_axis(inverse, is_row);
+            self.merges.shift_axis(inverse, is_row);
+        }
         // Reverse order so overlapping writes unwind exactly as they were made.
         for ch in entry.changes.iter().rev() {
             self.overlay.restore(ch.cell, ch.before.clone());
@@ -3569,6 +3605,13 @@ impl Workbook {
         self.last_edit = None;
         if let Some((_, after)) = &entry.order {
             self.order = after.clone();
+        }
+        // Redo re-applies the forward shift to the side tables, mirroring the
+        // inverse applied on undo.
+        if let Some((shift, is_row)) = entry.shift {
+            self.comments.shift_axis(shift, is_row);
+            self.format.shift_axis(shift, is_row);
+            self.merges.shift_axis(shift, is_row);
         }
         for ch in &entry.changes {
             self.overlay.restore(ch.cell, ch.after.clone());
@@ -3879,6 +3922,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok(n)
@@ -4074,6 +4118,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok(n)
@@ -4304,6 +4349,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok(written)
@@ -4482,6 +4528,7 @@ impl Workbook {
                 side_effects: Vec::new(),
                 bulk: true,
                 order: None,
+                shift: None,
             });
             self.recalc_all();
         }
@@ -4579,6 +4626,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok(n)
@@ -4771,6 +4819,7 @@ impl Workbook {
             side_effects: Vec::new(),
             bulk: true,
             order: None,
+            shift: None,
         });
         self.recalc_all();
         Ok((n, kind))

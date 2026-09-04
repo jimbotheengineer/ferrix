@@ -35,6 +35,8 @@ pub struct Prefs {
     pub theme: Option<ThemeMode>,
     /// Issue #20: show empty padding rows past the end of the sheet.
     pub show_empty_rows: bool,
+    /// The Selection side panel (right dock) is open.
+    pub selection_panel: bool,
     /// Autosave cadence in seconds. `None` means "not configured", and the
     /// app uses `DEFAULT_AUTOSAVE_SECS`. Zero disables autosave entirely.
     pub autosave_secs: Option<u64>,
@@ -79,6 +81,11 @@ pub struct Prefs {
     /// tab reorder cannot reassign it. Empty string means "not chosen" and the
     /// app opens on Home.
     pub ribbon_tab: String,
+    /// The agent launch template for the Agent window, e.g.
+    /// `hermes run {prompt}` or `claude -p {prompt}`. Harness-agnostic: any
+    /// CLI works. Split into argv before placeholder substitution and exec'd
+    /// directly (no shell). Empty = the Launch button is disabled.
+    pub agent_command: String,
 }
 
 impl Default for Prefs {
@@ -90,6 +97,7 @@ impl Default for Prefs {
             // can click and type into — not stop dead at the last data row.
             // The View → Empty rows toggle turns it off for a data-only view.
             show_empty_rows: true,
+            selection_panel: false,
             autosave_secs: None,
             zoom: Vec::new(),
             recent: Vec::new(),
@@ -97,6 +105,7 @@ impl Default for Prefs {
             formula_bar_rows: 1,
             import_rules: Vec::new(),
             ribbon_tab: String::new(),
+            agent_command: String::new(),
         }
     }
 }
@@ -301,6 +310,13 @@ impl Prefs {
                 // falls back to the OS preference rather than to a guess.
                 "theme" => out.theme = ThemeMode::parse(v),
                 "show_empty_rows" => out.show_empty_rows = v == "true",
+                "selection_panel" => out.selection_panel = v == "true",
+                // The agent launch template (Agent window). Split into argv
+                // BEFORE {prompt}/{fxagent}/{workbook} substitution — never
+                // run through a shell — so prompt text cannot inject
+                // arguments. Empty = launching disabled, listening still
+                // works.
+                "agent_command" => out.agent_command = v.to_string(),
                 // Issue #102: the last selected ribbon tab, by slug. An
                 // unrecognised slug is kept as-is and simply won't match any
                 // tab at load time, so the app falls back to Home — a newer
@@ -384,6 +400,10 @@ impl Prefs {
             s.push_str(&format!("theme = \"{}\"\n", t.as_str()));
         }
         s.push_str(&format!("show_empty_rows = {}\n", self.show_empty_rows));
+        s.push_str(&format!("selection_panel = {}\n", self.selection_panel));
+        if !self.agent_command.is_empty() {
+            s.push_str(&format!("agent_command = \"{}\"\n", self.agent_command));
+        }
         if !self.ribbon_tab.is_empty() {
             s.push_str(&format!("ribbon_tab = \"{}\"\n", self.ribbon_tab));
         }
@@ -543,6 +563,7 @@ mod tests {
                     let p = Prefs {
                         theme,
                         show_empty_rows,
+                        selection_panel: show_empty_rows,
                         autosave_secs,
                         zoom: Vec::new(),
                         recent: Vec::new(),
@@ -550,6 +571,7 @@ mod tests {
                         formula_bar_rows: 1,
                         import_rules: Vec::new(),
                         ribbon_tab: "data".into(),
+                        agent_command: "claude -p {prompt}".into(),
                     };
                     assert_eq!(Prefs::parse(&p.to_text()), p);
                 }
@@ -560,6 +582,7 @@ mod tests {
                 let p = Prefs {
                     theme,
                     show_empty_rows,
+                    selection_panel: false,
                     autosave_secs: Some(45),
                     // Keyed on (workbook path, sheet name) since #45. Two
                     // different books both with a "Sheet1" is the case the
@@ -600,6 +623,9 @@ mod tests {
                         },
                     ],
                     ribbon_tab: "format".into(),
+                    // Spaces and quotes in the template are the hard case:
+                    // the value is quoted in the file, so it must survive.
+                    agent_command: "codex exec {prompt}".into(),
                 };
                 assert_eq!(Prefs::parse(&p.to_text()), p);
             }
@@ -744,6 +770,7 @@ mod tests {
         let full = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            selection_panel: true,
             autosave_secs: None,
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 3.0)],
             recent: Vec::new(),
@@ -751,6 +778,7 @@ mod tests {
             formula_bar_rows: 1,
             import_rules: Vec::new(),
             ribbon_tab: String::new(),
+            agent_command: String::new(),
         }
         .to_text();
         let cut = &full[..full.len() - 8];
@@ -776,6 +804,7 @@ mod tests {
         let want = Prefs {
             theme: Some(ThemeMode::Light),
             show_empty_rows: true,
+            selection_panel: false,
             autosave_secs: Some(45),
             zoom: vec![("/a.csv".into(), "Sheet1".into(), 2.0)],
             recent: vec![crate::recent::RecentEntry::new("/a.csv")],
@@ -794,6 +823,9 @@ mod tests {
                 skip_rows: 2,
             }],
             ribbon_tab: "view".into(),
+            // The launch template survives a restart like every other pref;
+            // {prompt} must round-trip literally, not get substituted.
+            agent_command: "hermes run {prompt}".into(),
         };
         want.save().expect("save");
         // A fresh `load` is exactly what the next process run does.

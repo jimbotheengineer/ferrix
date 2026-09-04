@@ -61,12 +61,80 @@ const BUCKETS: usize = 800;
 const SERIES_BLUE: Rgba = Rgba::rgb(0x4a, 0x9e, 0xff);
 const SERIES_ORANGE: Rgba = Rgba::rgb(0xff, 0x9f, 0x40);
 
+/// The full series palette, in assignment order: first series blue, second
+/// orange, then green, purple, red. Chosen to read on both the app's dark
+/// chrome and the always-light SVG export.
+pub const SERIES_COLORS: [Rgba; 5] = [
+    SERIES_BLUE,
+    SERIES_ORANGE,
+    Rgba::rgb(0x53, 0xb8, 0x7a),
+    Rgba::rgb(0xb1, 0x83, 0xe8),
+    Rgba::rgb(0xe8, 0x6a, 0x6a),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChartKind {
     Line,
     Bar,
     Histogram,
     Scatter,
+}
+
+/// A complete set of custom chart text, applied in one call: what the agent
+/// bridge and tests use. The window's label fields edit the same overrides
+/// one at a time.
+#[derive(Clone, Debug, Default)]
+pub struct ChartLabels {
+    pub title: String,
+    pub x_axis: String,
+    pub y_axis: String,
+    pub series: String,
+}
+
+impl ChartPanel {
+    /// Replace the chart's generated text with the user's own words —
+    /// "H by G" becomes "Profit by Region". Empty strings clear back to the
+    /// derived defaults. The overrides are stored on the panel, so they
+    /// survive rebuilds (kind switches, column re-aims) and travel into the
+    /// SVG export; they are NOT lost when the data changes.
+    pub fn set_custom_labels(&mut self, labels: ChartLabels) {
+        let opt = |s: String| {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        };
+        self.title_override = opt(labels.title);
+        self.x_label_override = opt(labels.x_axis);
+        self.y_label_override = opt(labels.y_axis);
+        self.series_override = opt(labels.series);
+        self.apply_overrides_in_place();
+    }
+
+    /// Lay the stored overrides over the current scene. Called after every
+    /// build and after every override edit, so the scene on screen and the
+    /// scene exported are always the same words.
+    pub fn apply_overrides_in_place(&mut self) {
+        let Some(s) = self.scene.as_mut() else {
+            return;
+        };
+        if let Some(t) = &self.title_override {
+            s.title = Some(t.clone());
+        }
+        if let Some(x) = &self.x_label_override {
+            s.x_label = Some(x.clone());
+        }
+        if let Some(y) = &self.y_label_override {
+            s.y_label = Some(y.clone());
+        }
+        if let Some(name) = &self.series_override {
+            if let Some(first) = s.legend.first_mut() {
+                first.label = name.clone();
+            }
+        }
+    }
 }
 
 impl ChartKind {
@@ -115,6 +183,27 @@ pub struct ChartPanel {
     /// small values against the baseline. X stays linear (it is a row number or
     /// a category index, not a magnitude).
     pub y_log: bool,
+    /// Explicit column choices from the chart window's column pickers (issue
+    /// #106). `None` means "derive from the selection" (the old behaviour):
+    /// `y_col` is the values column, `x_col` the category/x column. Both are
+    /// absolute sheet column indices, so they can be non-adjacent (e.g. chart
+    /// `region` against `revenue` while skipping the columns between them).
+    pub y_col: Option<u32>,
+    pub x_col: Option<u32>,
+    /// Additional Y (values) columns beyond `y_col` — each is its own series
+    /// with its own colour and legend entry. Line and bar charts draw them
+    /// all; histogram and scatter use only the primary. Added and removed in
+    /// the chart window's series row.
+    pub extra_y_cols: Vec<u32>,
+    /// User text overrides for the chart's words. `None` = the derived
+    /// default ("H by G"); `Some` = exactly what the user typed ("Profit by
+    /// Region"). They survive rebuilds and re-aims, travel into the SVG
+    /// export, and clear back to the defaults when emptied.
+    pub title_override: Option<String>,
+    pub x_label_override: Option<String>,
+    pub y_label_override: Option<String>,
+    /// Renames the FIRST series in the legend ("sum of H" → "Profit").
+    pub series_override: Option<String>,
 }
 
 impl Default for ChartPanel {
@@ -134,6 +223,13 @@ impl Default for ChartPanel {
             note_buffer: String::new(),
             placing_note: false,
             y_log: false,
+            y_col: None,
+            x_col: None,
+            extra_y_cols: Vec::new(),
+            title_override: None,
+            x_label_override: None,
+            y_label_override: None,
+            series_override: None,
         }
     }
 }
@@ -163,18 +259,35 @@ impl ChartPanel {
         self.source = Some(sel);
         self.kind = kind;
 
-        // First numeric column in the selection carries the values; a second
-        // column, when present, supplies x for scatter or labels for bar.
-        let value_col = c1.min(c0 + 1).max(c0);
-        let has_second = c1 > c0;
+        // Which columns carry x and y. By default (the selection-derived case)
+        // the values come from the second column of the range and the labels/x
+        // from the first — the classic "select two columns" convention. The
+        // chart window's column pickers override either one with an explicit,
+        // possibly NON-ADJACENT sheet column, so you can chart e.g. `region`
+        // against `revenue` without them being side by side.
+        let default_value_col = c1.min(c0 + 1).max(c0);
+        let value_col = self.y_col.unwrap_or(default_value_col);
+        let label_col = self.x_col.unwrap_or(c0);
+        // A second series exists when the label column genuinely differs from
+        // the value column (adjacent selection, or an explicit x pick).
+        let has_second = label_col != value_col;
 
         // Real column headers (falling back to the spreadsheet letter) so the
         // axes, title and legend name the user's own columns rather than the
-        // placeholders "row"/"value"/"x"/"y" the panel used to draw. `c0` is
-        // the leading column of the selection: the label column for a bar
-        // chart, the x column for a scatter.
+        // placeholders "row"/"value"/"x"/"y" the panel used to draw.
         let value_header = view.header_or_letter(value_col as usize);
-        let first_header = view.header_or_letter(c0 as usize);
+        let first_header = view.header_or_letter(label_col as usize);
+
+        // The full series list: the primary Y column plus every extra the
+        // user added in the window's series row. Line and bar draw them all;
+        // histogram and scatter are single-series by nature and say so.
+        let mut series_cols: Vec<u32> = vec![value_col];
+        for &c in &self.extra_y_cols {
+            if !series_cols.contains(&c) {
+                series_cols.push(c);
+            }
+        }
+        let multi = series_cols.len() > 1 && matches!(kind, ChartKind::Line | ChartKind::Bar);
 
         let values: Vec<Option<f64>> = (r0 as usize..last_row)
             .map(|r| match view.get(CellRef::new(r as u32, value_col)) {
@@ -198,40 +311,74 @@ impl ChartPanel {
             },
         );
 
-        let scene = match kind {
-            ChartKind::Line => Self::build_line(&values, r0 as usize, &value_header, scale),
-            ChartKind::Histogram => Self::build_histogram(&values, &value_header, scale),
-            ChartKind::Bar => {
-                let labels: Vec<String> = if has_second {
-                    (r0 as usize..last_row)
-                        .map(|r| view.display(CellRef::new(r as u32, c0)))
-                        .collect()
-                } else {
-                    // Without a label column every row is its own bar, which
-                    // is a line chart with extra steps. Say so instead of
-                    // drawing something misleading.
-                    Vec::new()
-                };
-                if labels.is_empty() {
-                    self.status = "Bar charts need two columns: labels then values".to_string();
-                    self.scene = None;
-                    return;
-                }
-                Self::build_bar(&labels, &values, &first_header, &value_header, scale)
-            }
-            ChartKind::Scatter => {
-                if !has_second {
-                    self.status = "Scatter needs two numeric columns: x then y".to_string();
-                    self.scene = None;
-                    return;
-                }
-                let xs: Vec<Option<f64>> = (r0 as usize..last_row)
-                    .map(|r| match view.get(CellRef::new(r as u32, c0)) {
+        let scene = if multi {
+            // Read every series column once; names come from the headers so
+            // the legend names real columns.
+            let read_col = |c: u32| -> Vec<Option<f64>> {
+                (r0 as usize..last_row)
+                    .map(|r| match view.get(CellRef::new(r as u32, c)) {
                         Value::Number(n) if n.is_finite() => Some(n),
+                        Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
                         _ => None,
                     })
-                    .collect();
-                Self::build_scatter(&xs, &values, &first_header, &value_header, scale)
+                    .collect()
+            };
+            let series: Vec<(String, Vec<Option<f64>>)> = series_cols
+                .iter()
+                .map(|&c| (view.header_or_letter(c as usize), read_col(c)))
+                .collect();
+            match kind {
+                ChartKind::Line => Self::build_multi_line(&series, r0 as usize, scale),
+                ChartKind::Bar => {
+                    if !has_second {
+                        self.status = "Bar charts need two columns: labels then values".to_string();
+                        self.scene = None;
+                        return;
+                    }
+                    let labels: Vec<String> = (r0 as usize..last_row)
+                        .map(|r| view.display(CellRef::new(r as u32, label_col)))
+                        .collect();
+                    Self::build_multi_bar(&labels, &series, &first_header, scale)
+                }
+                // Unreachable: `multi` is only true for Line | Bar.
+                _ => None,
+            }
+        } else {
+            match kind {
+                ChartKind::Line => Self::build_line(&values, r0 as usize, &value_header, scale),
+                ChartKind::Histogram => Self::build_histogram(&values, &value_header, scale),
+                ChartKind::Bar => {
+                    let labels: Vec<String> = if has_second {
+                        (r0 as usize..last_row)
+                            .map(|r| view.display(CellRef::new(r as u32, label_col)))
+                            .collect()
+                    } else {
+                        // Without a label column every row is its own bar, which
+                        // is a line chart with extra steps. Say so instead of
+                        // drawing something misleading.
+                        Vec::new()
+                    };
+                    if labels.is_empty() {
+                        self.status = "Bar charts need two columns: labels then values".to_string();
+                        self.scene = None;
+                        return;
+                    }
+                    Self::build_bar(&labels, &values, &first_header, &value_header, scale)
+                }
+                ChartKind::Scatter => {
+                    if !has_second {
+                        self.status = "Scatter needs two numeric columns: x then y".to_string();
+                        self.scene = None;
+                        return;
+                    }
+                    let xs: Vec<Option<f64>> = (r0 as usize..last_row)
+                        .map(|r| match view.get(CellRef::new(r as u32, label_col)) {
+                            Value::Number(n) if n.is_finite() => Some(n),
+                            _ => None,
+                        })
+                        .collect();
+                    Self::build_scatter(&xs, &values, &first_header, &value_header, scale)
+                }
             }
         };
 
@@ -267,6 +414,9 @@ impl ChartPanel {
                     truncated
                 );
                 self.scene = Some(s);
+                // The user's words go back on top after every rebuild, so a
+                // kind switch or re-aim never silently reverts the text.
+                self.apply_overrides_in_place();
             }
             None => {
                 self.status = "No numeric data in the selected range".to_string();
@@ -398,7 +548,8 @@ impl ChartPanel {
             .with_axis_labels(label_header, y_label.clone())
             .with_title(format!("{value_header} by {label_header}"))
             .with_legend(vec![LegendEntry::new(y_label, SERIES_ORANGE)])
-            .with_scale(bar_scale);
+            .with_scale(bar_scale)
+            .with_categorical_x();
         for (i, c) in cats.iter().take(shown).enumerate() {
             s.push(Primitive::Rect {
                 x0: i as f64 - 0.38,
@@ -411,6 +562,159 @@ impl ChartPanel {
             s.push(Primitive::Text {
                 at: DataPoint::new(i as f64, y.min.min(0.0)),
                 text: c.label.clone(),
+                size_px: 10.0,
+                color: Rgba::rgb(0xa0, 0xa8, 0xb4),
+                anchor: Anchor::Middle,
+                offset_px: (0.0, 14.0),
+            });
+        }
+        Some(s)
+    }
+
+    /// Multi-series line: one polyline per Y column over the shared row axis,
+    /// each in its own palette colour with its own legend entry.
+    fn build_multi_line(
+        series: &[(String, Vec<Option<f64>>)],
+        row_offset: usize,
+        scale: ScaleHint,
+    ) -> Option<Scene> {
+        let mut y = Bounds::unbounded();
+        let mut lines: Vec<(usize, Vec<DataPoint>)> = Vec::new();
+        let mut x_len = 0usize;
+        for (idx, (_, values)) in series.iter().enumerate() {
+            let dec = decimate_min_max(values, BUCKETS);
+            if dec.points.is_empty() {
+                continue;
+            }
+            for p in &dec.points {
+                y.include(p.y);
+            }
+            x_len = x_len.max(values.len());
+            lines.push((
+                idx,
+                dec.points
+                    .iter()
+                    .map(|p| DataPoint::new(p.x + row_offset as f64 + 1.0, p.y))
+                    .collect(),
+            ));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let x = Bounds::new(row_offset as f64 + 1.0, row_offset as f64 + x_len as f64);
+        let title = series
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let legend = series
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| LegendEntry::new(n.clone(), SERIES_COLORS[i % SERIES_COLORS.len()]))
+            .collect();
+        let mut s = Scene::new(x, y)
+            .with_axis_labels("row", "value")
+            .with_title(title)
+            .with_legend(legend)
+            .with_scale(scale);
+        for (idx, points) in lines {
+            s.push(Primitive::Polyline {
+                points,
+                color: SERIES_COLORS[idx % SERIES_COLORS.len()],
+                width: 1.4,
+            });
+        }
+        Some(s)
+    }
+
+    /// Multi-series bar: grouped bars — for each category, one bar per Y
+    /// column, side by side, each series in its own colour.
+    fn build_multi_bar(
+        labels: &[String],
+        series: &[(String, Vec<Option<f64>>)],
+        label_header: &str,
+        scale: ScaleHint,
+    ) -> Option<Scene> {
+        // Aggregate each series over the same label column, then align the
+        // categories on the FIRST series' order so groups line up.
+        let grouped: Vec<Vec<ferrix_core::chart::Category>> = series
+            .iter()
+            .map(|(_, values)| group_by(labels, values, Aggregate::Sum))
+            .collect();
+        let first = grouped.first()?;
+        if first.is_empty() {
+            return None;
+        }
+        let shown = first.len().min(40);
+        let cats: Vec<&str> = first.iter().take(shown).map(|c| c.label.as_str()).collect();
+
+        let mut y = Bounds::new(0.0, 0.0);
+        let mut heights: Vec<Vec<f64>> = Vec::new(); // [series][category]
+        for g in &grouped {
+            let by_label: std::collections::HashMap<&str, f64> =
+                g.iter().map(|c| (c.label.as_str(), c.value)).collect();
+            let hs: Vec<f64> = cats
+                .iter()
+                .map(|l| by_label.get(l).copied().unwrap_or(0.0))
+                .collect();
+            for &h in &hs {
+                y.include(h);
+            }
+            heights.push(hs);
+        }
+        y.include(0.0);
+
+        let n = series.len() as f64;
+        // Log y on grouped sums has the same zero problem as single-series
+        // bars; keep linear unless everything is strictly positive.
+        let bar_scale = if scale.y == Scale::Log && y.min > 0.0 {
+            scale
+        } else {
+            ScaleHint::new(scale.x, Scale::Linear)
+        };
+        let title = format!(
+            "{} by {label_header}",
+            series
+                .iter()
+                .map(|(nm, _)| nm.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let legend = series
+            .iter()
+            .enumerate()
+            .map(|(i, (nm, _))| {
+                LegendEntry::new(nm.clone(), SERIES_COLORS[i % SERIES_COLORS.len()])
+            })
+            .collect();
+        let mut s = Scene::new(Bounds::new(-0.6, shown as f64 - 0.4), y)
+            .with_axis_labels(label_header, "value")
+            .with_title(title)
+            .with_legend(legend)
+            .with_scale(bar_scale)
+            .with_categorical_x();
+        // Group geometry: the group spans ±0.38 around the category index;
+        // each series gets an equal slice.
+        let group_w = 0.76;
+        let slice = group_w / n;
+        for (si, hs) in heights.iter().enumerate() {
+            let color = SERIES_COLORS[si % SERIES_COLORS.len()];
+            for (ci, &h) in hs.iter().enumerate() {
+                let x0 = ci as f64 - group_w / 2.0 + si as f64 * slice;
+                s.push(Primitive::Rect {
+                    x0: x0 + slice * 0.06,
+                    y0: 0.0,
+                    x1: x0 + slice * 0.94,
+                    y1: h,
+                    fill: color,
+                    stroke: None,
+                });
+            }
+        }
+        for (ci, label) in cats.iter().enumerate() {
+            s.push(Primitive::Text {
+                at: DataPoint::new(ci as f64, y.min.min(0.0)),
+                text: (*label).to_string(),
                 size_px: 10.0,
                 color: Rgba::rgb(0xa0, 0xa8, 0xb4),
                 anchor: Anchor::Middle,
@@ -581,6 +885,11 @@ pub fn paint_scene(
         );
     }
     for (i, t) in x_ticks.iter().enumerate() {
+        // Categorical scenes draw their own labels; numeric ticks under them
+        // are the "0 2 4 under Central East West" bug.
+        if scene.x_categorical {
+            break;
+        }
         if !x_keep[i] {
             continue;
         }
@@ -894,6 +1203,45 @@ mod tests {
         assert!(
             !svg.contains(">x<") && !svg.contains(">y<"),
             "placeholder axis label regressed"
+        );
+    }
+
+    #[test]
+    fn custom_labels_replace_generated_chart_text_and_reach_svg() {
+        let labels = vec!["west".to_string(), "east".to_string(), "west".to_string()];
+        let scene = ChartPanel::build_bar(
+            &labels,
+            &[Some(1.0), Some(2.0), Some(3.0)],
+            "G",
+            "H",
+            ScaleHint::default(),
+        )
+        .expect("bar scene");
+        let mut panel = ChartPanel {
+            scene: Some(scene),
+            ..Default::default()
+        };
+
+        panel.set_custom_labels(ChartLabels {
+            title: "Profit by region".into(),
+            x_axis: "Region".into(),
+            y_axis: "Profit ($)".into(),
+            series: "Profit".into(),
+        });
+
+        let scene = panel.scene.as_ref().expect("scene remains available");
+        assert_eq!(scene.title.as_deref(), Some("Profit by region"));
+        assert_eq!(scene.x_label.as_deref(), Some("Region"));
+        assert_eq!(scene.y_label.as_deref(), Some("Profit ($)"));
+        assert_eq!(scene.legend[0].label, "Profit");
+
+        let svg = panel.to_svg(800.0, 400.0).expect("custom chart exports");
+        assert!(svg.contains("Profit by region"));
+        assert!(svg.contains("Profit ($)"));
+        assert!(!svg.contains("H by G"), "generated title survived override");
+        assert!(
+            !svg.contains("sum of H"),
+            "generated legend survived override"
         );
     }
 
