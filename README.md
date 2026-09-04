@@ -1,7 +1,5 @@
 # Ferrix
 
-[![CI](https://github.com/jimbotheengineer/ferrix/actions/workflows/ci.yml/badge.svg)](https://github.com/jimbotheengineer/ferrix/actions/workflows/ci.yml)
-
 A source-available spreadsheet built in Rust for datasets that break Excel.
 Free for noncommercial use.
 
@@ -27,16 +25,34 @@ Measured on a 16-core Windows 11 machine with 31 GB RAM — note the 10.85 GB
 file is larger than the free memory on that box, which is the entire point.
 Reproduce with `just bench` (see below).
 
-## Status
+## Status: public test
 
-Early, but the hard parts work. Loading, scrolling, editing, formulas, and
-recalculation all function at 200M rows today. Not yet built: `.xlsx` import,
-saving edits back out, sort/filter/pivot.
+Ferrix is in **public testing**. The engine and most spreadsheet features
+work at 200M-row scale; expect rough edges in the UI and please
+[open an issue](../../issues) for anything surprising. What works today:
+
+- Loading: CSV (any size), `.xlsx` (multi-sheet), Parquet / Arrow IPC
+- Editing: formulas, undo/redo (including structural edits), fill,
+  copy/paste (TSV interop with Excel), find & replace, comments,
+  merged cells, data validation with dropdowns and autocomplete
+- Formulas: 80+ functions (SUMIFS/AVERAGEIFS/INDEX/MATCH/VLOOKUP…),
+  cross-sheet refs, named ranges, dynamic array spills, `$` anchoring,
+  F4 cycling, point-mode / Ctrl+click cell linking, trace precedents
+- Views: sort, filter, remove duplicates, subtotals, group/outline,
+  freeze/split panes, hide rows/columns, conditional formatting,
+  sparklines, zoom, per-sheet state
+- Analysis: charts (line/bar/histogram/scatter, multi-series, custom
+  labels, SVG export), pivot tables, goal seek, consolidate
+- Output: CSV / `.xlsx` / Parquet export, print to PDF/HTML with page
+  setup, print areas and page breaks
+- Protection: sheet/workbook protection, lock/unlock cells
+- **Agent bridge**: let an AI agent drive the live app, visibly (below)
+- Not yet: collaborative editing, scripting hooks, a macro recorder
 
 ## Quick start
 
 ```bash
-git clone https://github.com/ferrix-sheets/ferrix
+git clone https://github.com/jimbotheengineer/ferrix
 cd ferrix
 cargo build --release
 ./target/release/ferrix your-data.csv
@@ -58,21 +74,27 @@ then `just clean-data` when finished.
 
 ## How it works
 
+The design has one governing invariant: **memory is bounded by what is on
+screen plus what you have edited — never by the row count.** Every feature
+below is shaped by it.
+
 ### Two storage paths
 
-Files under 1 GB parse straight into RAM. Larger ones are converted once into a
-columnar `.ferrix` file beside the source, then memory-mapped — so dataset size
-is bounded by **disk, not memory**, and reopening is instant.
+Files under 1 GB parse straight into RAM. Larger ones — or smaller ones that
+the *measured* memory budget says would not fit — are converted once into a
+columnar `.ferrix` file beside the source, then memory-mapped, so dataset
+size is bounded by **disk, not memory**, and reopening is instant.
 
-The conversion streams: CSV is read in 64 MB blocks, parsed into per-column
-spill files, then concatenated into the final layout. Peak memory is one block
-plus the string arena, independent of file size. Converting the 10.85 GB
-benchmark used 64 MB.
+The conversion streams: CSV is read in 32 MB blocks (record-aligned and
+quote-aware), split at exact record boundaries across every core, parsed in
+parallel, and merged in source order into per-column spill files. Peak memory
+is one block plus the string arena, independent of file size. Converting the
+10.85 GB benchmark used 64 MB.
 
 Once mapped, reading a cell indexes into the mapping and lets the OS fault in
-the containing page. The page cache keeps hot rows resident and evicts cold
-ones under pressure — exactly the behaviour you want, implemented by the kernel
-rather than by us.
+the containing 4 KB page. The page cache keeps hot rows resident and evicts
+cold ones under pressure — exactly the behaviour you want, implemented by the
+kernel rather than by us.
 
 ### Columnar, type-segregated storage
 
@@ -80,6 +102,8 @@ A column keeps parallel arrays: a 1-byte type tag, an 8-byte float array (only
 if the column ever holds a number), a 4-byte string-id array (only if it ever
 holds text), and a 1-bit validity bitmap. A numeric column costs ~9.1
 bytes/cell against the ~40 a `Vec<Option<Cell>>` of boxed enums would burn.
+Every section of the on-disk format is 8-byte aligned so `f64` slices are
+read straight out of the mapping — no copy, no unaligned loads.
 
 ### String interning
 
@@ -88,231 +112,18 @@ arena and cells hold a 4-byte `StrId`. The 200M-row benchmark contains **18
 distinct strings**, stored once. This also keeps `Value` at 16 bytes, enforced
 by a unit test.
 
-### Viewport virtualization
-
-The renderer paints only the rows and columns intersecting the visible rect —
-about 280 cells, whether the sheet holds 100 rows or 200 million. Cells are
-painted directly onto the `Painter` rather than as egui widgets, avoiding
-~1,500 id allocations and hit-tests per frame.
-
-Scroll position is an **f64 row index**, not a pixel offset. An f32 pixel
-canvas (the obvious approach) silently breaks past ~16.7M rows because one ulp
-grows larger than a row; f64 row indices stay exact past 10^15 rows. Two tests
-pin this boundary.
-
-### Numerically exact aggregates
-
-`SUM` uses Kahan compensated summation, not a naive accumulator. This is not
-academic at spreadsheet scale: summing the integers 0…200,000,000 naively
-returns `19,999,999,867,108,864` instead of `19,999,999,900,000,000` — off by
-33 million — because once the running total passes 2^53 each addition rounds
-away the addend's low bits. Ferrix returns the exact value, and it is *faster*
-(2.5 s vs 3.4 s over 200M rows), because the loop is bound by memory bandwidth
-rather than arithmetic. Four tests pin this, including one that reproduces the
-original 200M-row drift in miniature.
-
-### Search that scales with cardinality, not size
-
-`Ctrl+F` over 1.6 billion cells (200M rows x 8 cols, 12 GB cache):
-
-```
-     needle          hits    pass 1   pass 2
-      north    33,343,436   4663 ms   478 ms
- consulting    24,991,111    517 ms   432 ms
-  cancelled    49,988,488    605 ms   596 ms
-       4242           808    485 ms   319 ms   (numeric path)
- zzz-absent             0      0 ms     0 ms   (nothing matched the arena)
-```
-
-Two passes are reported because the cache is larger than RAM. The first needle
-searched pays to fault ~12 GB off disk — 4663 ms for `north` is I/O, not search
-work, and the same needle costs 478 ms once resident. Steady-state cost tracks
-hit count as expected (`cancelled`, with 1.5x more hits, is the slowest). At
-40M rows, where the cache fits in memory, both passes are identical.
-
-The trick is inverting the problem. A naive search compares the needle against
-every cell — 1.6 billion string comparisons, each needing the value formatted
-first. But text cells don't store text; they store a 4-byte id into an arena
-holding each *distinct* string once. So Ferrix:
-
-1. Matches the needle against the arena — **18 comparisons** for this dataset,
-   not 1.6 billion — producing a bitset of matching ids.
-2. Scans the columns comparing 4-byte integers against that bitset, in
-   parallel across cores.
-
-Search cost therefore tracks the *cardinality* of the data, not its size. When
-nothing matches the arena the column scan is skipped entirely, which is why the
-absent-needle case costs 0 ms. Numbers are compared numerically against the
-parsed needle, never by formatting 200M values into strings.
-
-### Filter mode
-
-`Ctrl+F` also filters. The **⬍ Filter** toggle in the search bar hides every row
-without a match, and the grid renders over a **row-index mapping** — a sorted
-`Vec<u32>` of the matching rows — instead of the raw row range. Visible row *i*
-resolves to underlying row `rows[i]`; the reverse direction is a binary search.
-
-The mapping is built **once per search**, never per frame. A frame takes a
-borrowed subslice of it (`RowFilter::window`) covering just the ~50 rows on
-screen, so filtering allocates nothing per row per frame and scrolling a
-filtered 200M-row sheet costs the same as scrolling an unfiltered one. The
-worst measured frame in `cargo run --release --bin bench-filter` is **0.7 µs**
-against the 16.67 ms budget.
-
-Two things filter mode must not get wrong:
-
-* **Row numbers stay original.** A filtered view showing rows renumbered 1..N
-  would be actively misleading — the point of finding row 4,912,733 is knowing
-  it *is* row 4,912,733. Headers, hit-testing, the address box, and the cell
-  editor all work in underlying row space, so clicking and editing a filtered
-  row writes through to the real row.
-* **A capped result set says so.** Search stops collecting at 100,000 matches.
-  Unfiltered that is survivable — `F3` still steps forward. Filtered it is
-  dangerous, because the view *looks* complete: you scroll to the bottom and it
-  ends. So a truncated filter is labelled in red, in the search bar:
-  `⚠ INCOMPLETE — first 100,000 of 400,000 matches only; more matching rows are
-  NOT shown`.
-
-### Selection that scales
-
-A selection is two corners — an anchor and a cursor — never a list of cells.
-Selecting an entire 200M-row column is therefore 16 bytes, not 1.6 GB, and
-`Selection` is asserted to stay exactly that size by a test.
-
-Drag, Shift+click, and Shift+Arrow extend a range; `Ctrl+A` takes the used
-range. Copy and paste speak **TSV**, the format Excel and Google Sheets put on
-the clipboard, so blocks move between applications rather than only within
-Ferrix.
-
-Bulk operations are **one undo step**, not one per cell: clearing a 50-cell
-block pushes a single entry, and one undo restores all 50. Clipboard and clear
-operations are capped at 1,000,000 cells and refused with a message beyond
-that — a whole-column select must not try to build 200M strings.
-
-### Fill
-
-Dragging the handle at a selection's corner fills. Two numeric cells continue
-their progression (`0,1` becomes `0,1,2,3,…`); anything else tiles.
-
-Formulas have their **relative references offset** — `=A1*2` filled down
-becomes `=A2*2` — while `$` anchors stay pinned, so `=$A$1*2` fills unchanged
-and the running-total idiom `=SUM($A$1:A1)` grows correctly to `=SUM($A$1:A2)`.
-
-That rewriting happens on the formula *text* rather than its parsed tree. The
-tokenizer records `$` as `abs_col`/`abs_row` flags, but `Expr::Ref` keeps only
-a `CellRef`, so an AST rewrite would silently drop absolute markers. Rewriting
-the source preserves `$`, the user's spacing, and anything the scanner does not
-recognise — including `"A1"` inside a string literal, which is text, not a
-reference.
-
-### Charts: aggregating more data than there are pixels
-
-A chart canvas is ~1,000 pixels wide. A 200M-row column has ~200,000 points
-per pixel column, so building one primitive per row would allocate gigabytes
-to draw something the eye cannot resolve.
-
-Aggregation therefore happens in the columnar store, before any geometry
-exists. Measured over **20 million rows**:
-
-| Aggregation | Output | Time | Reduction |
-|---|---|---|---|
-| Line, 500 buckets | 1,000 points | 17 ms | 20,000x |
-| Histogram, 64 bins | 64 bars | 35 ms | — |
-| Scatter, 128x128 grid | 16,384 cells | 93 ms | 1,220x |
-| Group-by category | 6 bars | 308 ms | — |
-
-Output size tracks the canvas, never the input.
-
-**Line charts use min/max decimation, not sampling.** Sampling every 200,000th
-point would give a one-row spike a 1-in-200,000 chance of being drawn — it
-would silently delete the outliers a human is scanning for. Min/max emits both
-extremes of each pixel column, so a single anomalous row in a million always
-appears. A test pins exactly that.
-
-Gaps are gaps: an empty or non-numeric cell is skipped rather than plotted as
-zero, because inventing a data point the source never contained is worse than
-a break in the line.
-
-### Vector charts and annotations
-
-Charts are described as **geometry in data coordinates** -- polylines, rects,
-text with anchors -- and mapped to device pixels only at draw time. Nothing is
-rasterised, so the same `Scene` feeds the egui painter at any zoom and an SVG
-writer at any size. A 1,000,000-row line chart is **6 primitives in an 18 KB
-SVG**, and the identical scene emitted at 4x is the same geometry with
-different coordinates.
-
-Axis ticks land on 1/2/5 x 10^n values, so an axis over 0..97 reads
-0, 20, 40, 60, 80 rather than 19.4, 38.8, 58.2.
-
-**Annotations anchor to data, not pixels.** A note stored at pixel (412, 88)
-drifts the moment the chart is resized or the axis range changes -- and lands
-somewhere plausible but wrong, which a reader cannot detect. Storing the data
-coordinate instead means resizing moves the pixels while the note stays on its
-point. Tests pin that a note maps to the same proportional position in a
-100x100 and a 1000x800 viewport, and to the correct place after a zoom.
-
-Annotation text is XML-escaped on export, so a label containing an ampersand
-or an angle bracket cannot produce an SVG no viewer will open.
-
-### Charting a range
-
-Select a range, press **Chart**, pick a kind. A lone cursor widens to the whole
-column. Line, bar, histogram and scatter all rebuild live from the source
-range, and the panel reports rows used, primitives drawn and build time.
-
-Charts cap at 2,000,000 rows per build. Aggregation is bounded by the canvas,
-but *reading* a column costs one `get` per row -- seconds at 200M, far too slow
-for the UI thread. When a range is larger the status line says `first N of M
-rows` rather than quietly charting a subset. Bar and scatter need two columns
-and say so instead of drawing something misleading from one.
-
-Click the canvas with **Note** active to place an annotation. It is stored in
-data coordinates, so resizing the window moves the pixels and leaves the note
-on its point. **SVG** exports the chart and its notes as a vector file at any
-size.
-
-### Getting data back out
-
-Saving writes a `.fxedits` sidecar that only Ferrix reads, so **Export CSV**
-writes the sheet as the grid shows it — base data with edits applied — to a
-file any other tool can open.
-
-The exporter streams: rows are formatted one at a time into a single reused
-buffer, so peak memory tracks the widest row rather than the row count.
-Measured at **89 MB/s** over 500,000 rows, and verified end-to-end at
-**200,000,000 rows / 10.85 GB in 143 s (76 MB/s)** — output size matching the
-source to within a rounding digit, with an edit on the final row surviving the
-round trip.
-
-The round-trip check covers the two cases that silently corrupt naive
-exporters: a field containing `has,comma and "quotes"`, and a field containing
-an embedded newline, which must round-trip **without splitting the row**.
-
-Exports are written to a temp file and renamed, so a cancelled or failed export
-cannot replace good data with a truncated file. A test asserts exactly that.
-
-Fields containing the delimiter, quotes, or newlines are quoted per RFC 4180.
-This is not cosmetic — without it a value containing a comma silently becomes
-two columns on reimport, and one containing a newline becomes two rows. A
-round-trip test exports `has,comma and "quotes"` and `two\nlines`, reimports
-with the ordinary CSV loader, and asserts both come back byte-identical.
-
-Writes go to a temporary file and are renamed into place, so a cancelled or
-failed export leaves the previous file untouched rather than replacing it with
-a truncated one. A test pins exactly that.
-
-Exports above 5,000,000 rows are currently refused with a message rather than
-blocking the UI; streaming those off-thread is tracked in issue #10.
-
 ### Editing without touching the base
 
 Edits never modify the dataset. They live in a sparse copy-on-write overlay
-consulted ahead of the base, so editing costs O(edits) rather than O(rows) and
-the base can stay a read-only memory map.
+consulted ahead of the read-only base:
 
-Saving follows from that design: only the overlay is written, to a `.fxedits`
-sidecar beside the data.
+```
+get(cell) -> overlay.get(cell).unwrap_or_else(|| base.get(cell))
+```
+
+Editing is O(edits), not O(rows) — three edits in a 200M-row file cost three
+entries — and saving writes only the overlay, to a `.fxedits` sidecar beside
+the data:
 
 ```
 sales.csv                  the original
@@ -320,171 +131,132 @@ sales.ferrix               columnar cache (12 GB, mmap'd)
 sales.ferrix.fxedits       edits only (bytes)
 ```
 
-Measured on a 40M-row / 2.14 GB dataset: **5 edits saved to 181 bytes in
-1.07 ms**, reloaded in 4.78 ms, with the base file untouched. Save cost tracks
-the number of edits, not the size of the data.
+A sidecar records a fingerprint of the base it was written against; if the
+base changes, the sidecar is rejected with a visible warning rather than
+silently applied to rows that may now hold something else. Comments, number
+formats, page setup, pivots and column sizing each keep their own sidecar,
+stored per column or range — never per cell.
 
-Formulas are stored as **source text**, not just their last computed value, and
-are re-evaluated in dependency order on load — a cached number can never
-outlive the data it was derived from.
+### Structure as view transforms
 
-A sidecar records a fingerprint of the base it was written against (length,
-mtime, row and column counts). If the base changes, the sidecar is **rejected
-with a visible warning** rather than applied to cells that may now hold
-something entirely different. Silent misapplication is the failure mode that
-loses data, so it is the one case treated as fatal.
+Sort, filter, hide, group, remove-duplicates, and row/column insert/delete
+are all **permutations of display order** over the immutable base — a run
+list of row ranges, kilobytes at any scale. That is also what makes
+structural undo cheap: undoing a 10M-row dedupe restores a snapshot of the
+run list, never a copy of the removed rows. Everything keyed by display
+position (edits, comments, formats, merges) moves in the same operation, so
+data can never slide out from under its annotations.
 
-Edits live in a sparse copy-on-write overlay consulted before the base:
+### Formulas
+
+Tokenizer → Pratt parser → evaluator, with a workbook-wide dependency graph
+that stores ranges as rectangles: `SUM(A1:A200000000)` is one node with one
+rectangular precedent, resolved by containment test rather than 200M edges.
+Recalculation is incremental and ordered; cycles are detected, including
+across sheets.
+
+Reference rewriting (fill, insert/delete, paste) edits the formula **text**,
+not the parsed tree — the parser discards `$` markers, so an AST round-trip
+would silently drop anchoring. `=$A$1*2` fills unchanged; `=SUM($A$1:A1)`
+grows to `=SUM($A$1:A2)`; inserting a row above turns `=$C$2+C3` into
+`=$C$3+C4` with the anchors intact.
+
+Formulas are entered the way you expect: type them (any casing — `=(g3*d2)`
+works), or point — while the text ends in `=`, `(`, an operator or a comma,
+clicking a cell links its reference instead of committing, Ctrl+drag links a
+range, and each reference is coloured to match its outline in the grid.
+
+### Numerically exact aggregates
+
+`SUM` uses Kahan compensated summation. Summing 0…200,000,000 naively is off
+by 33 million once the running total passes 2^53; Ferrix returns the exact
+value, and is *faster*, because the loop is bound by memory bandwidth rather
+than arithmetic.
+
+### Search that scales with cardinality, not size
+
+Text cells store arena ids, so `Ctrl+F` matches the needle against the arena
+first — 18 comparisons, not 1.6 billion — then scans columns comparing 4-byte
+integers against the resulting id set, in parallel. Search cost tracks how
+many *distinct* values the data has, not how many rows. Filter mode renders
+through a row-index mapping built once per search; a truncated result set is
+labelled in red rather than pretending to be complete.
+
+### Charts: aggregating more data than there are pixels
+
+Charts aggregate in the columnar store before any geometry exists — min/max
+decimation for lines (a one-row spike in a million rows always survives),
+binning for histograms, density grids for scatter. Output size tracks the
+canvas, never the input. The result is a `Scene` of geometry in data
+coordinates that feeds both the screen and the SVG exporter, so what you see
+is what exports. Titles, axis labels and series names are editable in the
+chart window; multiple Y columns overlay as separate coloured series.
+
+### The agent bridge
+
+Ferrix is built to be **agent-compatible**: an AI assistant can drive the
+running app while you watch. Toggle **View → 🤝 Agent bridge** and the app
+watches `<workbook>.fxagent` for appended commands:
 
 ```
-get(cell) -> overlay.get(cell).unwrap_or_else(|| base.get(cell))
+select E1:E200            move the visible selection
+put H1 =SUMIFS(...)       type into a cell (validation + undo + status)
+get M1:N6                 append displayed values to <file>.out as TSV
+chart N1:N6 bar O         chart a range
+label title=Profit by Region; y=Profit ($)
+series I K                overlay more value columns
+svg out/chart.svg         export the chart
 ```
 
-Editing is therefore O(edits), not O(rows) — three edits in a 200M-row file
-cost three HashMap entries — and the base can stay a read-only memory mapping.
-Undo restores a previous overlay entry and never touches the base.
-
-The dependency graph holds **only formula cells**, with ranges stored as
-rectangles rather than expanded edges. `SUM(A1:A200000000)` is one node with
-one rectangular precedent, so a change anywhere in that range resolves via a
-containment test rather than 200M edge lookups.
+Every command executes through the same paths keyboard input takes — the
+selection moves on screen, edits are undoable, the status line narrates, and
+the Agent window shows each executed line verbatim. It is off by default,
+per session; stale command files never replay; and the Launch button runs
+*any* agent CLI you configure (`agent_command = "claude -p {prompt}"`,
+`hermes -z {prompt}`, `codex exec {prompt}`…) with no shell in between, so
+prompt text cannot become arguments.
 
 ## Architecture
 
 ```
 crates/
   ferrix-core     storage: columns, arena, bitmap, sheet, values, edit overlay
-  ferrix-io       CSV ingest, .ferrix format, streaming conversion, mmap reader
-  ferrix-formula  tokenizer, Pratt parser, evaluator, dependency graph
-  ferrix-ui       egui front-end: virtualized grid, editor, formula bar
+  ferrix-io       CSV/xlsx/Parquet ingest, .ferrix format, streaming
+                  conversion, mmap reader, sidecars, PDF/HTML print
+  ferrix-formula  tokenizer, Pratt parser, evaluator, dependency graph,
+                  reference scanning/rewriting, fill
+  ferrix-ui       egui front-end: virtualized grid, editors, ribbon, charts,
+                  pivots, agent bridge, headless test harness
   ferrix-bench    data generator + benchmark harnesses
 ```
 
 `ferrix-core` has no UI and no I/O dependencies, so it compiles fast and is
-trivial to fuzz and benchmark in isolation.
-
-## Editing
-
-Click or arrow to a cell and type. `F2` edits in place, `Esc` cancels, `Enter`
-commits and moves down, `Tab` commits and moves right. `Delete` clears.
-`Ctrl+Z` / `Ctrl+Y` undo and redo. Formula cells are marked with a small dot.
-
-### Undo history
-
-Undo history is **bounded at 500 entries**. A long session would otherwise grow
-it without limit; when the cap is reached the *oldest* entry is dropped. The
-edits themselves are never lost by this — only the ability to step back past
-them.
-
-Rapid edits to the **same cell** collapse into **one** undo entry. The rule is
-deliberately narrow, because unpredictable undo is worse than verbose undo:
-
-- same cell, **and**
-- within **1 second** of the previous edit, **and**
-- neither edit is a bulk operation.
-
-Moving the cursor off the cell, undoing, redoing, or saving all end the run, so
-the next edit starts a fresh entry. Bulk operations — paste, range clear, fill —
-are each exactly one undo step and are never merged into a neighbouring edit.
-
-**Undo history is cleared on save.** It is not persisted alongside the
-`.fxedits` sidecar. The sidecar stores the overlay, a snapshot, not a timeline;
-undoing past a save would leave the screen and the file on disk disagreeing
-about what the document is. Clearing is the honest option, and it is not done
-silently — the status bar reports it:
-
-```
-Saved 12 edits (431 bytes) to sales.ferrix.fxedits in 0.9 ms · undo history cleared (7 steps)
-```
-
-### Sheets
-
-A workbook holds any number of named sheets, shown as tabs along the bottom.
-Click a tab to switch, **+** to add, double-click (or right-click → Rename) to
-rename, drag to reorder, right-click → Delete to remove. Duplicate names are
-refused, case-insensitively, and the last sheet cannot be deleted.
-
-**Each sheet has its own storage.** One can be a 12GB memory-mapped file while
-its neighbour is a small in-RAM scratch sheet — the size check that chooses
-mmap runs per sheet, on the file behind it. Each sheet also remembers its own
-scroll position and selection, restored when you switch back to it.
-
-Importing a multi-sheet `.xlsx` populates every sheet.
-
-#### Cross-sheet references
-
-Formulas reach across sheets with `Sheet2!A1`, including ranges:
-`=SUM(Sheet2!A1:A100)`. Sheet names resolve **case-insensitively**, so
-`sheet2!A1` finds `Sheet2`.
-
-A name containing anything other than letters, digits, `_` or `.` — or one
-starting with a digit — must be **single-quoted**, with interior quotes
-doubled, exactly as Excel does it:
-
-```
-=Sheet2!A1          bare name
-='My Sheet'!A1      name with a space
-='Bob''s Data'!B2   escaped quote inside the name
-='2024'!A1          name that starts with a digit
-```
-
-A reference to a sheet that does not exist evaluates to `#REF!` rather than a
-silent zero, and **deleting a sheet turns formulas that referenced it into
-`#REF!`** instead of leaving them showing a stale value. Renaming a sheet does
-*not* rewrite formula text — references to the old name become `#REF!`, which
-is deliberate: silently rebinding them to whatever later takes that name would
-be worse than saying so.
-
-3-D references spanning two sheets (`Sheet1!A1:Sheet2!B4`) are **not**
-supported and are rejected at parse time rather than quietly misread.
-
-The dependency graph is workbook-wide, keyed by (sheet, cell), so recalculation
-order and cycle detection both span sheets: `Sheet1!A1 = Sheet2!A1` together
-with `Sheet2!A1 = Sheet1!A1` is detected as circular, not hung on.
-
-### Closing with unsaved changes
-
-Closing the window while edits are unsaved is intercepted: the close is
-cancelled and a modal offers **Save and close**, **Discard and close**, or
-**Cancel**. If the save fails, the window stays open with the error in the
-status bar rather than closing over the top of unsaved work.
-
-Formulas: `SUM` `AVERAGE` `COUNT` `MIN` `MAX` `IF` `AND` `OR` `NOT` `ABS`
-`SQRT` `ROUND` `FLOOR` `CEILING` `INT` `LN` `LOG10` `EXP`, operators
-`+ - * / ^ & % = <> < > <= >=`, parentheses, ranges, and absolute refs.
-
-Excel-compatible semantics are tested: right-associative `^` (`2^3^2` = 512),
-error propagation through ranges, the full `#DIV/0!` / `#VALUE!` / `#NUM!` /
-`#NAME?` error set, circular-reference detection, and the `LOG10` ambiguity
-(bare `LOG10` is a cell reference; `LOG10(` is a function — same as Excel).
-
-## Roadmap
-
-- [x] Columnar engine, 10M+ rows in RAM
-- [x] Parallel CSV ingest
-- [x] Virtualized grid at 60fps+
-- [x] Formula parser and evaluator
-- [x] Cell editing, dependency graph, incremental recalc, undo/redo
-- [x] Out-of-core mmap storage — 200M rows / 10GB+ verified
-- [x] Multi-sheet workbooks with cross-sheet formulas
-- [ ] Save edits back to CSV / `.ferrix`
-- [ ] Native `.xlsx` import/export
-- [ ] Sort, filter, pivot
-- [ ] Lua scripting hooks
-- [ ] CRDT groundwork for collaborative editing
+trivial to fuzz and benchmark in isolation. The UI is tested through a
+headless harness that feeds real input events into the real app — see
+`crates/ferrix-ui/src/harness.rs`.
 
 ## Testing
 
 ```bash
 cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Tests assert real invariants, not happy paths: `Value` must stay <=16 bytes, a
-numeric column must stay under 12 bytes/cell, parallel chunking must preserve
-row order, embedded newlines must survive chunk splitting, mmap sections must
-be 8-byte aligned, a corrupt cache must be rejected, formulas must recalculate
-in dependency order, and cycles must be detected rather than hang — including
-a cycle that spans two sheets.
+2,100+ tests assert real invariants, not happy paths: `Value` must stay
+≤16 bytes, a numeric column under 12 bytes/cell, parallel chunking must
+preserve row order, embedded newlines must survive chunk splitting, mmap
+sections must be 8-byte aligned and a corrupt cache rejected, formulas must
+recalculate in dependency order, cycles must be detected rather than hang,
+`$` anchors must survive structural rewriting, and a capped aggregation must
+say so instead of looking complete.
+
+## Contributing
+
+Issues and PRs welcome. Read [.github/AGENT_GUIDE.md](.github/AGENT_GUIDE.md)
+first — it encodes the scale invariants and workflow this codebase holds
+contributors (human and AI alike) to, and every rule in it was learned from
+something going wrong.
 
 ## License
 
