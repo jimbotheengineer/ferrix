@@ -3,7 +3,7 @@ name = "ferrix-io"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 description = "File format ingest/export for Ferrix (CSV now, xlsx next)"
 

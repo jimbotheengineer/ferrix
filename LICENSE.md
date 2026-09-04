@@ -1,8 +1,6 @@
-# Ferrix Noncommercial License 1.0.0
+# PolyForm Noncommercial License 1.0.0
 
-Based on a standardized plain-language noncommercial license,
-modified to exclude government use. This is not an open-source
-license as defined by the OSI.
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
 
 > Required Notice: Copyright 2026 jimbotheengineer
 
@@ -55,8 +53,7 @@ to license, that you would infringe by using the software.
 
 ## Noncommercial Purposes
 
-Any noncommercial purpose is a permitted purpose, except as
-limited by [Government Use](#government-use).
+Any noncommercial purpose is a permitted purpose.
 
 ## Personal Uses
 
@@ -70,35 +67,10 @@ is use for a permitted purpose.
 
 Use by any charitable organization, educational institution,
 public research organization, public safety or health
-organization, or environmental protection organization
-is use for a permitted purpose regardless of the source of
-funding or obligations resulting from the funding.  This
-section does not grant any license for use by or for
-government institutions.
-
-## Government Use
-
-Use by or for any government institution is not a permitted
-purpose under these terms, even if that use would otherwise
-qualify as a noncommercial purpose, a personal use, or use
-by a noncommercial organization.  This includes use by any
-national, state, provincial, regional, or local government
-body; any government agency, department, ministry, or armed
-service; any court or legislature; any government-owned or
-government-controlled corporation or entity; and any
-contractor or other person acting on behalf of, or for the
-benefit of, any of the above in that capacity.
-
-Government institutions and their contractors may obtain a
-separate written license from the licensor.
-
-An educational institution, public research organization,
-public safety or health organization, or environmental
-protection organization is not a government institution for
-the purposes of this section merely because it is publicly
-funded or state-operated, so long as the use is for the
-organization's educational, research, safety, health, or
-environmental purpose and not for another government purpose.
+organization, environmental protection organization,
+or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting
+from the funding.
 
 ## Fair Use
 

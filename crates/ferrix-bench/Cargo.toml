@@ -3,7 +3,7 @@ name = "ferrix-bench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 publish = false
 description = "Benchmark harness and data generator for Ferrix"
 

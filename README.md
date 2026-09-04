@@ -260,14 +260,7 @@ something going wrong.
 
 ## License
 
-[Ferrix Noncommercial 1.0.0](LICENSE.md) — free for noncommercial use:
-personal projects, research, education, and use by charitable, educational,
-public research, public safety, or environmental organizations.
-
-**Commercial use and government use each require a separate license** —
-government institutions (and contractors acting for them) are not covered
-by the free grant, even for noncommercial purposes. Contact the author
-via GitHub for licensing.
-
-This is source-available rather than OSI open-source; the restrictions are
-deliberate for now and can be relaxed later.
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — a standard source-available
+license: use it, study it, change it, share it, for any noncommercial
+purpose. **Making money with it requires a separate commercial license** —
+contact the author via GitHub.
