@@ -260,10 +260,7 @@ something going wrong.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md) — free for any noncommercial
-purpose: personal projects, research, education, and use by charitable,
-educational, public research, public safety, environmental, or government
-organizations. Commercial use requires a separate license.
-
-This is source-available rather than OSI open-source; the noncommercial
-restriction is deliberate for now and can be relaxed later.
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — a standard source-available
+license: use it, study it, change it, share it, for any noncommercial
+purpose. **Making money with it requires a separate commercial license** —
+contact the author via GitHub.
