@@ -1359,8 +1359,15 @@ mod tests {
         // which would flatter the ratio.
         let _ = order_time(1000);
 
-        let small = order_time(4000);
-        let large = order_time(8000);
+        // Take the MINIMUM of three runs per size: the minimum is the run
+        // least disturbed by scheduler noise, and on a shared CI runner a
+        // single ~1ms sample can easily wobble past the bar (observed: a
+        // nightly linux runner measured 3.2x on 1.0ms -> 3.2ms samples while
+        // the same commit passed everywhere else). The algorithmic shape —
+        // what this test guards — survives min-sampling; noise does not.
+        let sample = |f: u32| (0..3).map(|_| order_time(f)).min().expect("three samples");
+        let small = sample(4000);
+        let large = sample(8000);
 
         let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
         assert!(
